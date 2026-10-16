@@ -1,0 +1,21 @@
+{
+  "name": "chaldea",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "26.10.0"
+  },
+  "bin": {
+    "chaldea": "bin/chaldea"
+  },
+  "scripts": {
+    "exec:check": "tsc --noEmit",
+    "exec:test": "node --test test/exec/*.test.ts",
+    "exec:e2e": "node --test test/exec/e2e.ts"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2"
+  }
+}

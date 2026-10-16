@@ -1,0 +1,118 @@
+# Fleet compute v0
+
+`chaldea exec --host agent-a [--artifact out/file] [--gpu] -- CMD ARG...`
+runs the current Git worktree on an enrolled Linux job host. Run it from any
+directory inside that worktree; the command keeps that relative working directory.
+Arguments are sent as an array, without shell expansion. Request a shell explicitly
+as `-- sh -c '...'` when the build needs one; that shell runs inside the sandbox.
+SSH itself never grants a shell.
+
+Use Node **26.10.0** (`mise install`), `npm ci`, then
+`node bin/chaldea exec ...` or install the package's `chaldea` bin entry.
+Only development/type-check dependencies are installed; the client has no runtime
+npm dependencies. The package.json is deliberately small to merge with quota work.
+Remote commands use system tools in `/usr/bin:/bin`; the operator's mise installs,
+Rust home, credentials and caches are not imported. Install required system tools
+on a job host or download toolchains into the job workspace.
+
+The companion role is in
+[iryzhkov/chaldea-fleet-config](https://github.com/iryzhkov/chaldea-fleet-config),
+`roles/chaldea_job_host` and `roles/chaldea_job_client`. Deployment, public-key
+enrollment and firewall changes require operator review; this client provisions
+nothing. See that repository's `docs/job-host.md` for per-host apply commands.
+
+## Protocol (version 1, forced command chaldea-exec-v0)
+
+1. Every frame is one uppercase ASCII type, a four-byte big-endian length, then bytes; maximum frame size is 1 MiB. Server sends H JSON with version 1; client checks it before upload.
+2. Client sends Q JSON: version, UUID jobId, argv, relative cwd, gpu, artifact paths, and files with relative path, size, 0644/0755 mode and SHA-256.
+3. Client sends B frames of at most 64 KiB in manifest order, followed by empty E; stdin remains open so EOF cancels the job.
+4. Server streams O stdout and S stderr, then A JSON artifact metadata and B bytes for each named artifact (regular files only).
+5. Server deletes the workspace before X JSON exitCode (0–255); R JSON is an error. Missing X or a failed SSH session leaves the journal outcome uncertain; no replay or automatic retry exists.
+
+## Snapshot and sandbox contract
+
+The manifest follows the spike at 9d659aa: `git ls-files -c -o --exclude-standard -z`,
+current bytes, executable modes, tracked deletions absent, already tracked ignored
+files included. Two equal scans detect ordinary concurrent edits; they are not an
+atomic filesystem snapshot. Names must be UTF-8 safe relative paths. Symlinks,
+special files and submodules are refused. Git metadata is never copied.
+`.chaldea/` is reserved and added to Git's local info/exclude, including for linked
+worktrees. It holds only returned artifacts. Workspace files are inputs: callers
+must not keep credentials in tracked or non-ignored input files.
+
+The host creates a fresh data-disk workspace, runs argv in bubblewrap with fresh
+PID/user/IPC/UTS namespaces, no capabilities, a read-only root, read-only /usr and
+only public resolver/certificate/loader files from /etc. Only the workspace and
+its disposable HOME and TMPDIR are writable on the host. Sandbox /tmp is backed
+by that workspace, not host /tmp. /run and the original home are absent. No Huyang,
+Docker, SSH-agent or D-Bus user sockets, credentials, sudo grants or host tool
+configuration are mounted. All subprocess environment variables are rebuilt.
+
+**Networking is on by default, including host/loopback reachability. There is no
+egress allowlist.** Bubblewrap does not provide one. Network authorization for
+services remains their responsibility. This v0 does not offer job credentials.
+
+NVIDIA device nodes are mounted only for --gpu. The operator selects the RTX 4090
+nodes and NVIDIA Vulkan ICD; the AMD iGPU (normally Vulkan device 0 on omarchy-pc)
+is not exposed. Native x86_64 and aarch64 Linux jobs only: a narrow seccomp filter
+rejects foreign syscall ABIs and Btrfs subvolume/snapshot/readonly-setting ioctls
+so jobs cannot bypass the Btrfs quota by creating nested subvolumes. It is not a
+general syscall allowlist.
+
+## Bounds and recovery
+
+- Snapshot: 64 MiB, 10,000 files; request metadata: 1 MiB.
+- Artifacts: at most 32 explicitly named regular files, 64 MiB aggregate per job.
+- Output: 64 MiB combined stdout/stderr, streamed without a persisted host log.
+- Runtime: six hours; upload: two minutes; one active job per host, immediate busy refusal.
+- Workspaces, successful or failed: deleted immediately. Stale workspaces after
+  an uncatchable server crash are removed on the next admitted connection/start,
+  under the host lock, with the kernel quota still bounding their disk use.
+- Host workspace state: 20 GiB hard filesystem quota (Btrfs qgroup or Unix user
+  quota); admission also reserves 256 MiB free space plus snapshot capacity.
+  Authentication logs have a separate 16 MiB, 14-day journal namespace.
+- Local artifacts: 14 days, pruned at invocation start/end; new dispatch is refused
+  near 20 GiB of artifacts. Partial artifacts share the same retention.
+- Local client journal: mode 0600, fsynced before SSH dispatch and atomically
+  replaced after confirmed completion; 14 days / 1,000 entries, no output logs.
+
+The local journal lives in `~/.local/state/chaldea/exec/journal/<job-id>.json`.
+Its initial outcome is deliberately `uncertain`, and only a confirmed clean result
+changes it to `finished`. A crash before dispatch, during upload/execution, after
+remote cleanup or before journal completion never triggers another run. Inspect
+an uncertain entry; an explicit new invocation is a new job.
+
+SSH uses `~/.ssh/chaldea-job.conf` only, a dedicated private key, IdentityAgent none,
+ControlMaster auto and ControlPersist 60. No user's agent is consulted. Multiplexing
+reuses authentication while each request still reaches a new forced-command process.
+The role pins known hosts separately in `~/.ssh/chaldea-job_known_hosts`; unknown
+keys fail closed. A real disconnect closes stdin and kills the job process group;
+bubblewrap's parent-death behavior and PID namespace also kill escaped descendants.
+A silent network partition is detected by SSH keepalives (15 s, two missed replies).
+There is no reconnect-without-rerun support.
+
+`CHALDEA_SSH_CONFIG` and `CHALDEA_STATE_DIR` override those two client paths for
+isolated tests. They are local operator configuration, never remote job input.
+
+## Verification
+
+```sh
+export TMPDIR=/home/igor/.cache/chaldea-scratch/laneC
+npm ci
+npm run exec:check
+npm run exec:test
+# Companion checkout contains the exact server under review:
+CHALDEA_JOB_SERVER=/home/igor/Work/chaldea/fleet-config-jobhost/roles/chaldea_job_host/files/chaldea-job-server npm run exec:e2e
+```
+
+The E2E must run without root and uses a free loopback port, disposable fixture
+keys and its own sshd. It never changes the real daemon, firewall, keys or users.
+It tests live output/status, artifacts and cleanup, real forwarding/PTY/shell
+refusals, isolated HOME/sockets/GPU/environment, quota-escape syscall refusal,
+connection loss (including a descendant with its own session), uncertain intent,
+and fault-injected disk-full/over-cap admission. It reports spawn-to-first-stdout
+latency on the second multiplexed invocation and asserts under two seconds.
+Filesystem quota installation, real GPU execution and real-host desktop policy
+are not exercised by this rootless test. Unit tests in the fleet repository cover
+the idle gate's fail-closed decisions; that repository's CI also tests client
+key metadata and SSH configuration without opening a connection.
