@@ -196,6 +196,23 @@ test("the first snapshot on a host reports no history and starts from there", ()
   assert.deepEqual(observe(state, { kind: "snapshot", sequence: 60, threads: [resumedLongAgo] }, T0 + 603_000), []);
 });
 
+test("a thread parked with no reset at first start gets its one quota_reset_unknown", () => {
+  const state = emptyState();
+  const resetless = limited("run-7", T0, null, { id: "thread-resetless" });
+  const continued = thread({
+    id: "thread-old",
+    status: "completed",
+    latestRunId: "run-2",
+    latestRunStartedAt: iso(T0 + 13_000),
+    limitRecovery: { runId: "run-1", resetAt: RESET, autoResume: true },
+  });
+  const first = observe(state, { kind: "snapshot", sequence: 70, threads: [continued, resetless] }, T0 + 1_000);
+  assert.deepEqual(first.map((r) => [r.kind, r.threadId, r.runId, r.reconciled]), [["quota_reset_unknown", "thread-resetless", "run-7", true]]);
+  // A thread update and a snapshot fallback add nothing; the continued stop stays silent.
+  assert.deepEqual(observe(state, { kind: "thread", sequence: 71, thread: resetless }, T0 + 2_000), []);
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 72, threads: [continued, resetless] }, T0 + 3_000), []);
+});
+
 test("reconciliation respects keys already posted and the age cut-off", () => {
   const state = emptyState();
   state.cursor = 1;

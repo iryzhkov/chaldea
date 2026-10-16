@@ -140,11 +140,14 @@ and follows it. The port is read from `~/.t3/userdata/server-runtime.json`
 | `quota_reset_unknown` | warn | the same, but no reset is known | thread, run, provider |
 | `quota_resumed` | info | a parked thread has a newer run | thread, parked run, continuation run and start, provider, `resetAt`, `latenessSeconds`, `trigger` |
 
-**First start.** With no state file (no cursor yet) the observer reports
-nothing from its first snapshot and starts from that point. Stops already
+**First start.** With no state file (no cursor yet) the observer reports no
+history from its first snapshot and starts from that point. Stops already
 continued are claimed silently so a later snapshot cannot report them as
-history. A thread parked at that moment gets no `quota_parked`, but it is
-remembered, so its `quota_resumed` is still posted.
+history. A thread parked at that moment with a reset gets no `quota_parked`,
+but it is remembered, so its `quota_resumed` is still posted. A thread parked
+at that moment with no reset gets its one `quota_reset_unknown` (marked
+`"reconciled": true`), since it stays parked until a later event supplies a
+reset.
 
 **Missed events.** When T3 cannot replay the shell from the observer's cursor
 it sends a snapshot instead, and the transitions in between are gone. On a

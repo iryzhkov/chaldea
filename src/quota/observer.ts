@@ -181,12 +181,14 @@ export function observeThread(
 }
 
 /**
- * Absorbs one thread of the first snapshot without reporting anything: keys
- * for history are claimed silently so later snapshots cannot reconcile it, and
- * a thread parked at this moment is cached so its resume is still reported.
+ * Absorbs one thread of the first snapshot: keys for history are claimed
+ * silently so later snapshots cannot reconcile it, and a thread parked at this
+ * moment is cached so its resume is still reported. The one exception is a
+ * thread parked right now with no reset: it stays parked until a later event
+ * supplies one, so its single warning is posted rather than suppressed.
  */
-function seed(state: ObserverState, thread: ShellThread, nowMs: number): void {
-  if (thread.deleted || thread.archived) return;
+function seed(state: ObserverState, thread: ShellThread, nowMs: number): Array<QuotaRecord> {
+  if (thread.deleted || thread.archived) return [];
   // A stop already continued is history: claim what a later snapshot would reconcile.
   const recovery = thread.limitRecovery;
   if (recovery !== null && thread.latestRunId !== null && recovery.runId !== thread.latestRunId) {
@@ -194,13 +196,27 @@ function seed(state: ObserverState, thread: ShellThread, nowMs: number): void {
     claim(state, "quota_parked", thread.id, recovery.runId, stopAt, nowMs);
     claim(state, "quota_resumed", thread.id, recovery.runId, stopAt, nowMs);
   }
-  if (!isUsageLimitStop(thread)) return;
+  if (!isUsageLimitStop(thread)) return [];
   const runId = thread.latestRunId!;
   const resetAt = thread.usageLimitResetAt;
   const stopAt = stopTime(resetAt, thread.latestRunCompletedAt, nowMs);
-  if (nowMs - stopAt > MAX_STOP_AGE_MS) return;
+  if (nowMs - stopAt > MAX_STOP_AGE_MS) return [];
   state.parked.set(thread.id, { runId, resetAt, provider: thread.providerInstanceId, stopAt, seenAt: nowMs });
-  claim(state, resetAt === null ? "quota_reset_unknown" : "quota_parked", thread.id, runId, stopAt, nowMs);
+  if (resetAt !== null) {
+    claim(state, "quota_parked", thread.id, runId, stopAt, nowMs);
+    return [];
+  }
+  if (!claim(state, "quota_reset_unknown", thread.id, runId, stopAt, nowMs)) return [];
+  return [{
+    kind: "quota_reset_unknown",
+    severity: "warn",
+    threadId: thread.id,
+    runId,
+    provider: thread.providerInstanceId,
+    resetAt: null,
+    subagent: thread.relationshipToParent === "subagent",
+    reconciled: true,
+  }];
 }
 
 /** Applies one shell event, advancing the cursor, and returns new records. */
@@ -223,10 +239,11 @@ export function observe(state: ObserverState, event: ShellEvent, nowMs: number):
     case "snapshot": {
       if (state.cursor === null) {
         // First run on this host: start from now. History is not reported;
-        // threads parked at this moment are remembered so their resume is.
-        for (const thread of event.threads) seed(state, thread, nowMs);
+        // threads parked at this moment are remembered so their resume is,
+        // and a resetless one gets its single warning.
+        const records = event.threads.flatMap((thread) => seed(state, thread, nowMs));
         state.cursor = event.sequence;
-        return [];
+        return records;
       }
       // A snapshot replaces the replay when T3 cannot serve the cursor. Threads
       // missing from it are not treated as removed: enrichment snapshots can be partial.
