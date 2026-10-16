@@ -19,6 +19,8 @@ next upgrade a straight replacement. The files are erasable-syntax TypeScript
 (upstream compiles with `erasableSyntaxOnly`), so Node 26 runs them directly
 without a build step.
 
-The installed `t3` npm package (v0.1.0, executable SHA-256
-`4baaddb56353e7fe0e356ec587e2546082933b6b1c0445756d4a02ef5e0f1929`) embeds the
-same contracts; the end-to-end tests run against that executable.
+The installed `t3` npm package (v0.1.0) embeds the same contracts; the
+end-to-end tests run against that executable, also installed by T3 itself as
+`~/.t3/runtime/versions/0.1.0/t3`. CI checks it against this line:
+
+- T3 executable SHA-256: `4baaddb56353e7fe0e356ec587e2546082933b6b1c0445756d4a02ef5e0f1929`
