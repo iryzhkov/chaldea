@@ -13,7 +13,6 @@ jobs:
     # GitHub-hosted runners are unavailable to this account; agent-a hosts this one.
     runs-on: [self-hosted, chaldea]
     env:
-      CHALDEA_TEST_SCRATCH: ${{ runner.temp }}/chaldea-test
       CHALDEA_REQUIRE_E2E: "1"
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +31,8 @@ jobs:
             exit 1
           fi
           echo "CHALDEA_T3_BIN=$bin" >> "$GITHUB_ENV"
+          # Fixtures and TMPDIR stay in the runner's own temporary directory.
+          echo "CHALDEA_TEST_SCRATCH=$RUNNER_TEMP/chaldea-test" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
