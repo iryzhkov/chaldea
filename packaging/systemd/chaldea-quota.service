@@ -8,6 +8,8 @@
 [Unit]
 Description=Chaldea quota observer (T3 usage limits to the feed)
 Documentation=https://github.com/iryzhkov/chaldea/blob/main/docs/quota.md
+# Ordering only: the observer waits for T3 by itself and does not require it.
+After=t3code.service
 StartLimitIntervalSec=10min
 StartLimitBurst=10
 

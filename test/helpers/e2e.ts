@@ -49,15 +49,16 @@ export class ObserverProcess {
   readonly #child: ChildProcess;
   readonly lines: Array<Record<string, unknown>> = [];
 
-  constructor(options: { serverUrl: string; tokenFile: string; statePath: string; feedLog: string; scratch: string }) {
+  /** Pass `serverUrl`, or `t3BaseDir` to discover the URL as the installed unit does. */
+  constructor(options: { serverUrl?: string; t3BaseDir?: string; tokenFile: string; statePath: string; feedLog: string; scratch: string }) {
+    const target = options.serverUrl !== undefined ? ["--server-url", options.serverUrl] : ["--t3-base-dir", options.t3BaseDir ?? ""];
     this.#child = spawn(
       process.execPath,
       [
         join(repoRoot, "src/cli.ts"),
         "quota",
         "observe",
-        "--server-url",
-        options.serverUrl,
+        ...target,
         "--token-file",
         options.tokenFile,
         "--state-file",
@@ -85,6 +86,10 @@ export class ObserverProcess {
         }
       }
     });
+  }
+
+  get exitCode(): number | null {
+    return this.#child.exitCode;
   }
 
   subscriptions(): number {

@@ -152,8 +152,53 @@ test("a snapshot reconciles a stop and resume that happened while the observer w
   assert.deepEqual(observe(state, { kind: "thread", sequence: 92, thread: resumed }, T0 + 21_000), []);
 });
 
+test("a snapshot after a cached park also reconciles a later stop the observer missed", () => {
+  // Cached park for run A; while away: A continued as B, B limited, B continued as C.
+  const state = emptyState();
+  state.cursor = 10;
+  const resetA = RESET;
+  const resetB = iso(T0 + 60_000);
+  assert.deepEqual(observeThread(state, limited("run-A", T0, resetA), T0).map((r) => r.kind), ["quota_parked"]);
+  const snapshot = thread({
+    status: "completed",
+    latestRunId: "run-C",
+    latestRunStartedAt: iso(T0 + 63_000),
+    latestRunCompletedAt: iso(T0 + 64_000),
+    limitRecovery: { runId: "run-B", resetAt: resetB, autoResume: true },
+  });
+  const records = observe(state, { kind: "snapshot", sequence: 99, threads: [snapshot] }, T0 + 70_000);
+  assert.deepEqual(records.map((r) => [r.kind, r.runId]), [
+    ["quota_resumed", "run-A"],
+    ["quota_parked", "run-B"],
+    ["quota_resumed", "run-B"],
+  ]);
+  assert.equal(records[2]!.continuationRunId, "run-C");
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 100, threads: [snapshot] }, T0 + 71_000), []);
+});
+
+test("the first snapshot on a host reports no history and starts from there", () => {
+  const state = emptyState();
+  const resumedLongAgo = thread({
+    id: "thread-old",
+    status: "completed",
+    latestRunId: "run-2",
+    latestRunStartedAt: iso(T0 + 13_000),
+    limitRecovery: { runId: "run-1", resetAt: RESET, autoResume: true },
+  });
+  const parkedNow = limited("run-5", T0, iso(T0 + 600_000), { id: "thread-now" });
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 50, threads: [resumedLongAgo, parkedNow] }, T0 + 20_000), []);
+  assert.equal(state.cursor, 50);
+  // The thread parked at that moment is remembered: its resume is reported, its park never is.
+  assert.deepEqual(observe(state, { kind: "thread", sequence: 51, thread: parkedNow }, T0 + 21_000), []);
+  const resumed = thread({ id: "thread-now", status: "running", latestRunId: "run-6", latestRunStartedAt: iso(T0 + 602_000) });
+  assert.deepEqual(observe(state, { kind: "thread", sequence: 52, thread: resumed }, T0 + 602_000).map((r) => [r.kind, r.runId]), [["quota_resumed", "run-5"]]);
+  // Later snapshots do not revive the first snapshot's history.
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 60, threads: [resumedLongAgo] }, T0 + 603_000), []);
+});
+
 test("reconciliation respects keys already posted and the age cut-off", () => {
   const state = emptyState();
+  state.cursor = 1;
   observeThread(state, limited("run-1", T0, RESET), T0);
   state.parked.clear(); // As if the parked entry had been evicted at its cap.
   const resumed = thread({ status: "idle", latestRunId: "run-2", latestRunStartedAt: iso(T0 + 12_000), limitRecovery: { runId: "run-1", resetAt: RESET, autoResume: true } });

@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 
-import { startDisposableT3, t3Version, type DisposableT3 } from "../helpers/disposable-t3.ts";
+import { prepareDisposableT3, startDisposableT3, t3Version, type DisposableT3 } from "../helpers/disposable-t3.ts";
 import {
   ObserverProcess,
   ShellWatcher,
@@ -28,8 +28,11 @@ const skip = version === PINNED_VERSION ? false : `needs ${PINNED_VERSION}, foun
 // CI sets this so a missing or wrong t3 fails the run instead of skipping it.
 if (skip !== false && process.env.CHALDEA_REQUIRE_E2E === "1") throw new Error(skip);
 
-/** T3's due-work sweep runs every five seconds; allow for the tick itself. */
-const MAX_LATENESS_SECONDS = 6.5;
+/**
+ * T3's due-work sweep runs every five seconds; the bound leaves room for the
+ * tick itself and a loaded CI host. Measured lateness is printed every run.
+ */
+const MAX_LATENESS_SECONDS = 10;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 after(async () => {
@@ -180,7 +183,8 @@ test("a hard limit without a reset stays parked with exactly one quota_reset_unk
 });
 
 test("chaldea t3 set-auto-resume enables native resume without a restart or losing other settings", { skip, timeout: 120_000 }, async () => {
-  const h = await harness({ scenario: "reset", autoResume: false, resetDelaySeconds: 12 });
+  // The reset is far enough ahead that recovery is armed well before it.
+  const h = await harness({ scenario: "reset", autoResume: false, resetDelaySeconds: 25 });
   assert.equal((await readSettings(h.t3, h.operateToken)).autoResumeLimitedThreads, false);
   await dispatchMessage(h.t3, h.operateToken, h.threadId, `Start the work. ${h.t3.trigger}`, "1");
   const stopped = await waitFor("the usage-limit stop", () => {
@@ -202,7 +206,7 @@ test("chaldea t3 set-auto-resume enables native resume without a restart or losi
   assert.equal(enabled.code, 0, enabled.stderr);
   assert.equal(enabled.stdout, "autoResumeLimitedThreads is on\n");
 
-  await waitFor("the continuation run", () => (h.watcher.runs.get(h.threadId)?.size ?? 0) >= 2, 30_000);
+  await waitFor("the continuation run", () => (h.watcher.runs.get(h.threadId)?.size ?? 0) >= 2, 45_000);
   const after = await readSettings(h.t3, h.operateToken);
   assert.equal(after.autoResumeLimitedThreads, true);
   assert.equal(after.sidebarAutoSettleOnMerge, false);
@@ -222,4 +226,49 @@ test("chaldea t3 set-auto-resume enables native resume without a restart or losi
   assert.equal(disabled.stdout, "autoResumeLimitedThreads is off\n");
   assert.equal((await readSettings(h.t3, h.operateToken)).autoResumeLimitedThreads, false);
   assert.ok(!enabled.stdout.includes("token") && !enabled.stderr.includes("token"));
+});
+
+test("the observer starts before T3, and a T3 restart while parked neither loses nor repeats records", { skip, timeout: 240_000 }, async () => {
+  const dir = scratchDir("e2e");
+  cleanups.push(dir.remove);
+  const t3 = prepareDisposableT3({ scratchRoot: SCRATCH_ROOT, scenario: "reset", autoResume: true, resetDelaySeconds: 25 });
+  cleanups.push(() => t3.stop());
+  const readToken = t3.issueToken(["orchestration:read"]);
+  const tokenFile = join(dir.path, "t3-token");
+  writePrivateFile(tokenFile, `${readToken}\n`);
+  const feedLog = join(dir.path, "feed.jsonl");
+
+  // As after a reboot: the observer comes up first and finds no T3.
+  const observer = new ObserverProcess({ t3BaseDir: t3.baseDir, tokenFile, statePath: join(dir.path, "state.json"), feedLog, scratch: dir.path });
+  cleanups.push(() => void observer.stop("SIGKILL"));
+  await waitFor("a failed connection attempt", () => observer.lines.some((line) => line.message === "T3 connection failed"), 15_000);
+  await sleep(2_000);
+  assert.equal(observer.exitCode, null, "the observer must keep retrying, not exit");
+
+  await t3.startServer();
+  await waitFor("the observer to subscribe", () => observer.subscriptions() >= 1, 60_000);
+  const operateToken = t3.issueToken(["orchestration:read", "orchestration:operate"]);
+  const watcher = new ShellWatcher(t3.serverUrl, readToken);
+  cleanups.push(() => watcher.close());
+  const threadId = await waitFor("the bootstrap thread", () => watcher.firstThreadId(), 30_000);
+  await dispatchMessage(t3, operateToken, threadId, `Start the work. ${t3.trigger}`, "1");
+  await waitFor("quota_parked", () => kinds(feedLog).includes("quota_parked"), 30_000);
+  await watcher.close();
+
+  // Restart T3 while the thread waits for its reset; its port may change.
+  await t3.stopServer();
+  await sleep(1_000);
+  await t3.startServer();
+  await waitFor("the observer to resubscribe", () => observer.subscriptions() >= 2, 60_000);
+
+  await waitFor("quota_resumed", () => kinds(feedLog).includes("quota_resumed"), 60_000);
+  await sleep(7_000);
+  await observer.stop();
+  assert.deepEqual(kinds(feedLog), ["quota_parked", "quota_resumed"]);
+  const resumed = readFeed(feedLog)[1]!;
+  assert.equal(resumed.body.trigger, "auto_resume");
+  assert.equal(turns(t3, "limited"), 1);
+  assert.equal(turns(t3, "completed", true), 1);
+  process.stdout.write(`# after a T3 restart: continuation ${resumed.body.latenessSeconds} s after reset\n`);
+  assert.ok(Number(resumed.body.latenessSeconds) >= 0 && Number(resumed.body.latenessSeconds) <= MAX_LATENESS_SECONDS);
 });

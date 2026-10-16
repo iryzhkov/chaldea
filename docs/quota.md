@@ -140,15 +140,21 @@ and follows it. The port is read from `~/.t3/userdata/server-runtime.json`
 | `quota_reset_unknown` | warn | the same, but no reset is known | thread, run, provider |
 | `quota_resumed` | info | a parked thread has a newer run | thread, parked run, continuation run and start, provider, `resetAt`, `latenessSeconds`, `trigger` |
 
-On its first start on a host the observer reports the threads that are parked
-at that moment (stops younger than 35 days), then only changes.
+**First start.** With no state file (no cursor yet) the observer reports
+nothing from its first snapshot and starts from that point. Stops already
+continued are claimed silently so a later snapshot cannot report them as
+history. A thread parked at that moment gets no `quota_parked`, but it is
+remembered, so its `quota_resumed` is still posted.
 
 **Missed events.** When T3 cannot replay the shell from the observer's cursor
 it sends a snapshot instead, and the transitions in between are gone. On a
 snapshot, a thread whose `limitRecovery` names a run that is no longer the
 latest run had a usage-limit stop that was later continued; the observer then
 posts the `quota_parked` and `quota_resumed` it missed, marked
-`"reconciled": true`, subject to the same keys and age limit. A stop that
+`"reconciled": true`, subject to the same keys and age limit. This also runs
+for a thread the observer had cached as parked, so if a thread was continued,
+stopped again and continued again while the observer was away, both the
+cached stop's resume and the later stop's park and resume are posted. A stop that
 happened and was continued while the observer was away is reported this way
 only if T3 armed recovery for it (`limitRecovery` is set by the native worker
 when auto-resume or snooze is on, or by the per-thread control). Lateness in a
@@ -171,9 +177,14 @@ file (fsync, rename, fsync of the directory) before the record is queued for
 the feed. A crash can therefore lose a record but never repeat one, across
 restarts, reconnects and snapshot replays. The end-to-end test kills the
 observer with SIGKILL while a thread is parked and restarts it twice. If the
-state file cannot be written (disk full, permissions), records are still
-posted, one error is logged for the outage, and the write is retried on the
-next event; only a crash during such an outage could repeat a record.
+state file cannot be written (disk full, permissions), new records are held
+back, not posted, until a write succeeds: one error is logged for the outage,
+and the write is retried on the next event and on one backoff timer (1 s up to
+60 s) that exists only while the state is unsaved. At most 256 records wait;
+more are dropped with an error. If the observer crashes or stops during the
+outage, the held records are lost together with their unsaved claims, so a
+restart that replays the same events posts each of them once. A record is
+never posted before its claim is on disk.
 
 **Feed failures never block, and are not retried.** Records go to an
 in-memory queue of at most 256. Each gets exactly one `feed post` attempt with
@@ -189,8 +200,38 @@ token file that is missing, empty, not owned by the user or readable by group
 or others, and so does a state file it cannot read (rather than starting
 afresh and repeating records). The unit does not restart on 78. HTTP 401/403 (expired or revoked
 token) is retried every two minutes, re-reading the token file each time, so a
-replaced token is picked up without a restart. Other connection failures back
-off from 1 s to 60 s. There is no periodic scan.
+replaced token is picked up without a restart. Other connection failures,
+including T3 not running or not listening yet, back off from 1 s to 60 s and
+never exit. There is no periodic scan.
+
+## Reboots and restarts
+
+- **Boot.** The unit is `WantedBy=default.target` of the user manager, which
+  starts at boot without a login because lingering is enabled for `igor`
+  (`loginctl show-user igor -p Linger` gives `Linger=yes`). It is ordered
+  `After=t3code.service`, T3's own user unit on omarchy-pc, but does not
+  require it.
+- **T3 not up yet.** If T3 is not running or not yet listening, the observer
+  logs `T3 connection failed` and retries with backoff; it does not exit 78.
+  It rediscovers the port from `~/.t3/userdata/server-runtime.json` on every
+  attempt, so a new port after a restart is found. Covered by the end-to-end
+  test that starts the observer before the disposable T3.
+- **T3 restart.** The stream ends, the observer reconnects with backoff and
+  resumes from its saved cursor; T3's shell sequence is stored in its
+  database, so replay continues where it stopped, or T3 sends a snapshot that
+  is reconciled as described above. Records are not repeated (the keys are on
+  disk) and not lost beyond the trade-offs documented here.
+- **Native auto-resume across a T3 restart.** `limitRecovery` is part of the
+  thread record in T3's database, and the recovery worker's candidate query
+  reads the database on every tick, so a parked thread still resumes at its
+  reset after T3 restarts. The same end-to-end test restarts T3 while a thread
+  is parked and checks for exactly one continuation and exactly one
+  `quota_parked` and one `quota_resumed`.
+- **Host reboot or observer restart.** The state file is written atomically
+  and fsynced, so the cursor and claims survive. Events that arrived after
+  the last save are replayed by T3 and deduplicated. A reset that passes
+  while the host is down is handled by T3 once it is back, and the observer
+  records that resume then.
 
 ## Retention
 
@@ -285,14 +326,17 @@ skip themselves when the pinned `t3` is not found. The disposable servers
 listen on 127.0.0.1 only and never touch a host's own T3.
 
 The end-to-end tests assert: exactly one continuation message and one new run,
-starting 0 to 6.5 s after the reset; exactly one `quota_parked` and one
-`quota_resumed` across an observer crash and two restarts; for a resetless
-stop, exactly one `quota_reset_unknown`, no continuation through more than two
-sweeps, and an observer restart adds nothing; `chaldea t3 set-auto-resume`
-with a `settings:write`-only token enables resume for an already parked
-thread without a restart and keeps a setting another client changed. The
-first two scenarios start T3 with the key already in `settings.json`, which
-is the stopped-server fallback.
+starting 0 to 10 s after the reset (the measured lateness is printed on every
+run); exactly one `quota_parked` and one `quota_resumed` across an observer
+crash and two restarts; for a resetless stop, exactly one
+`quota_reset_unknown`, no continuation through more than two sweeps, and an
+observer restart adds nothing; `chaldea t3 set-auto-resume` with a
+`settings:write`-only token enables resume for an already parked thread
+without a restart and keeps a setting another client changed; an observer
+started before T3 keeps retrying, finds T3 once it is up, and a T3 restart
+while a thread is parked still yields exactly one continuation and one
+`quota_parked` and `quota_resumed`. The scenarios that start T3 with the key
+already in `settings.json` exercise the stopped-server fallback.
 
 CI runs on the self-hosted runner on agent-a (labels `self-hosted, chaldea`),
 because GitHub-hosted runners are unavailable to this account. The workflow

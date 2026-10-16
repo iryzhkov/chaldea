@@ -3,14 +3,14 @@
 // Connects to local T3, follows the shell stream from the persisted cursor,
 // feeds every event to the observer and hands new records to the feed poster.
 // A record's key is saved to disk before the record is queued, so a crash can
-// lose a record but never repeat one (unless the state file cannot be written,
-// which is logged as an error). Connection failures back off and
-// reconnect; there is no periodic scan. A refused protocol (HTTP 426) or data
+// lose a record but never repeat one; while the state file cannot be written,
+// new records wait. Connection failures, including T3 not running yet, back
+// off and reconnect; there is no periodic scan. A refused protocol (HTTP 426) or data
 // the pinned contracts reject stops the observer with exit status 78, which
 // the systemd unit does not restart.
 import { existsSync, statSync, readFileSync } from "node:fs";
 
-import { FeedPoster } from "../feed/poster.ts";
+import { FeedPoster, MAX_QUEUED_RECORDS } from "../feed/poster.ts";
 import type { Logger } from "../log.ts";
 import {
   AbortedError,
@@ -20,7 +20,7 @@ import {
   discoverServerUrl,
   type ShellEvent,
 } from "../t3/adapter.ts";
-import { observe } from "./observer.ts";
+import { observe, type QuotaRecord } from "./observer.ts";
 import { loadState, saveState, type ObserverState } from "./state.ts";
 
 /** Exit status for a configuration or protocol problem a restart cannot fix (EX_CONFIG). */
@@ -72,61 +72,116 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 
 /**
  * Applies shell events to the observer state, persists it, and queues new
- * records. Saving never throws: a failed write leaves the state dirty and the
- * next event retries it, while records are still queued, so a broken disk
- * costs at-most-once delivery only if the process also crashes meanwhile.
+ * records for the feed only once their claims are on disk. Saving never
+ * throws: a failed write leaves the state dirty, holds new records back as
+ * pending, and is retried on the next event and on one backoff timer that
+ * exists only while the state is dirty. A crash during the outage loses the
+ * pending records' claims with them, so a restart reports them once; it can
+ * never post a record whose claim was not durable.
  */
 export class EventSink {
   #lastSave = 0;
   #dirty = false;
   #saveFailing = false;
+  #retryTimer: NodeJS.Timeout | null = null;
+  #retryAttempt = 0;
+  readonly #pending: Array<QuotaRecord> = [];
 
   readonly state: ObserverState;
   readonly statePath: string;
   readonly poster: Pick<FeedPoster, "enqueue">;
   readonly logger: Logger;
+  readonly retryDelaysMs: ReadonlyArray<number>;
 
-  constructor(state: ObserverState, statePath: string, poster: Pick<FeedPoster, "enqueue">, logger: Logger) {
+  constructor(
+    state: ObserverState,
+    statePath: string,
+    poster: Pick<FeedPoster, "enqueue">,
+    logger: Logger,
+    retryDelaysMs: ReadonlyArray<number> = BACKOFF_MS,
+  ) {
     this.state = state;
     this.statePath = statePath;
     this.poster = poster;
     this.logger = logger;
+    this.retryDelaysMs = retryDelaysMs;
   }
 
   get dirty(): boolean {
     return this.#dirty;
   }
 
+  get pending(): number {
+    return this.#pending.length;
+  }
+
   save(): void {
     try {
       saveState(this.statePath, this.state, Date.now());
-      this.#lastSave = Date.now();
-      this.#dirty = false;
-      if (this.#saveFailing) {
-        this.#saveFailing = false;
-        this.logger.info("state file written again", { path: this.statePath });
-      }
     } catch (error) {
       this.#dirty = true;
       // Logged once per outage, not once per event.
       if (!this.#saveFailing) {
         this.#saveFailing = true;
-        this.logger.error("state file write failed; records are still posted but could repeat after a crash", {
+        this.logger.error("state file write failed; holding new records until it can be written", {
           path: this.statePath,
           error: error instanceof Error ? error.message : String(error),
         });
       }
+      this.#scheduleRetry();
+      return;
     }
+    this.#lastSave = Date.now();
+    this.#dirty = false;
+    this.#retryAttempt = 0;
+    if (this.#retryTimer !== null) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = null;
+    }
+    if (this.#saveFailing) {
+      this.#saveFailing = false;
+      this.logger.info("state file written again", { path: this.statePath, pending: this.#pending.length });
+    }
+    // Their claims are durable now.
+    for (const record of this.#pending.splice(0)) this.poster.enqueue(record);
+  }
+
+  #scheduleRetry(): void {
+    if (this.#retryTimer !== null) return;
+    const delay = this.retryDelaysMs[Math.min(this.#retryAttempt, this.retryDelaysMs.length - 1)]!;
+    this.#retryAttempt += 1;
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = null;
+      this.save();
+    }, delay);
+    this.#retryTimer.unref();
   }
 
   handle(event: ShellEvent): void {
     const records = observe(this.state, event, Date.now());
+    for (const record of records) {
+      this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
+      if (this.#pending.length >= MAX_QUEUED_RECORDS) {
+        this.logger.error("pending record dropped: the state file has been unwritable too long", { kind: record.kind, thread: record.threadId, run: record.runId });
+        continue;
+      }
+      this.#pending.push(record);
+    }
     if (records.length > 0 || this.#dirty || event.kind === "synchronized" || Date.now() - this.#lastSave > CURSOR_SAVE_INTERVAL_MS) {
       this.save();
     }
-    for (const record of records) {
-      this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
-      this.poster.enqueue(record);
+  }
+
+  /** Final save at shutdown; records still pending are dropped with an error. */
+  close(): void {
+    this.save();
+    if (this.#retryTimer !== null) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = null;
+    }
+    if (this.#pending.length > 0) {
+      this.logger.error("records not posted: their claims could not be saved before shutdown", { count: this.#pending.length });
+      this.#pending.length = 0;
     }
   }
 }
@@ -174,8 +229,8 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
     if (!connected) attempt += 1;
     await sleep(delay, signal);
   }
-  // save() never throws, so a failed final write cannot change the exit status or skip the drain.
-  sink.save();
+  // close() never throws, so a failed final write cannot change the exit status or skip the drain.
+  sink.close();
   await Promise.race([poster.idle(), new Promise((r) => setTimeout(r, 30_000).unref())]);
   logger.info("quota observer stopped", { exitCode });
   return exitCode;

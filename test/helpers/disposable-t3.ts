@@ -3,7 +3,10 @@
 // Runs the real pinned `t3` executable against a fresh base directory on the
 // scratch disk, with an isolated HOME, a PATH that holds only the fake
 // `claude`, node and the system directories, and settings that exist only in
-// this instance. Nothing here touches the live T3 server, its settings or ~/.t3.
+// this instance. The server listens on 127.0.0.1 only. It can be prepared
+// before it starts and restarted on the same base directory, as a host's T3
+// would be across a restart. Nothing here touches the live T3 server, its
+// settings or ~/.t3.
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createWriteStream, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { createServer } from "node:net";
@@ -42,14 +45,20 @@ export interface DisposableT3Options {
 
 export interface DisposableT3 {
   readonly root: string;
+  /** The running server's URL; throws while it is stopped. */
   readonly serverUrl: string;
   readonly baseDir: string;
   readonly settingsPath: string;
   readonly workspaceDir: string;
   readonly fakeClaudeLog: string;
   readonly trigger: string;
+  /** Starts the server on this base directory; resolves once it accepts WebSocket upgrades. */
+  startServer(): Promise<void>;
+  /** Stops the server (and its provider children) but keeps the base directory. */
+  stopServer(): Promise<void>;
   issueToken(scopes: ReadonlyArray<string>): string;
   fakeClaudeEvents(): Array<Record<string, unknown>>;
+  /** Stops the server and removes the fixture. */
   stop(): Promise<void>;
 }
 
@@ -92,6 +101,18 @@ function shellQuote(value: string): string {
 }
 
 export async function startDisposableT3(options: DisposableT3Options): Promise<DisposableT3> {
+  const t3 = prepareDisposableT3(options);
+  try {
+    await t3.startServer();
+  } catch (error) {
+    await t3.stop();
+    throw error;
+  }
+  return t3;
+}
+
+/** Creates the fixture without starting the server. */
+export function prepareDisposableT3(options: DisposableT3Options): DisposableT3 {
   const executable = t3Executable();
   if (executable === null) throw new Error(`pinned t3 not found at ${T3_LAUNCHER}`);
   mkdirSync(options.scratchRoot, { recursive: true });
@@ -161,80 +182,84 @@ export async function startDisposableT3(options: DisposableT3Options): Promise<D
     XDG_CACHE_HOME: join(home, ".cache"),
     LANG: "C.UTF-8",
   };
-  const port = await freePort();
-  const log = createWriteStream(join(root, "t3.log"));
-  const child = spawn(
-    executable,
-    ["start", "--base-dir", baseDir, "--host", "127.0.0.1", "--port", String(port), "--no-browser", "--auto-bootstrap-project-from-cwd", workspaceDir],
-    { cwd: workspaceDir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] },
-  );
-  child.stdout?.pipe(log);
-  child.stderr?.pipe(log);
+  const log = createWriteStream(join(root, "t3.log"), { flags: "a" });
+
+  let child: ChildProcess | null = null;
+  let currentUrl: string | null = null;
   // If the test process exits without stopping the server, take the group down with it.
   const killOnExit = () => {
     try {
-      if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+      if (child?.pid !== undefined) process.kill(-child.pid, "SIGKILL");
     } catch {
       // Already gone.
     }
   };
-  process.once("exit", killOnExit);
-  // T3 may not bind the requested port, so trust the address it reports.
-  let listeningUrl: string | null = null;
-  let pending = "";
-  const scan = (chunk: Buffer) => {
-    if (listeningUrl !== null) return;
-    pending = (pending + chunk.toString("utf8")).slice(-4096);
-    const match = /Listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(pending);
-    if (match?.[1]) listeningUrl = match[1];
-  };
-  child.stdout?.on("data", scan);
-  child.stderr?.on("data", scan);
 
-  let stopped = false;
-  const stop = async () => {
-    if (stopped) return;
-    stopped = true;
+  const stopServer = async () => {
+    const running = child;
+    child = null;
+    currentUrl = null;
     process.removeListener("exit", killOnExit);
-    if (child.pid !== undefined) {
-      const pid = child.pid;
-      const exited = child.exitCode !== null || child.signalCode !== null
-        ? Promise.resolve()
-        : new Promise<void>((r) => child.once("exit", () => r()));
-      const signalGroup = (signal: NodeJS.Signals) => {
-        try {
-          // The negative pid reaches the whole group, including provider children.
-          process.kill(-pid, signal);
-        } catch {
-          // Already gone.
-        }
-      };
-      signalGroup("SIGTERM");
-      const timeout = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref());
-      await Promise.race([exited, timeout(10_000)]);
-      signalGroup("SIGKILL");
-      await Promise.race([exited, timeout(5_000)]);
-    }
-    log.end();
-    if (process.env.CHALDEA_KEEP_FIXTURES !== "1") rmSync(root, { recursive: true, force: true });
+    if (running?.pid === undefined) return;
+    const pid = running.pid;
+    const exited = running.exitCode !== null || running.signalCode !== null
+      ? Promise.resolve()
+      : new Promise<void>((r) => running.once("exit", () => r()));
+    const signalGroup = (signal: NodeJS.Signals) => {
+      try {
+        // The negative pid reaches the whole group, including provider children.
+        process.kill(-pid, signal);
+      } catch {
+        // Already gone.
+      }
+    };
+    signalGroup("SIGTERM");
+    const timeout = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref());
+    await Promise.race([exited, timeout(10_000)]);
+    signalGroup("SIGKILL");
+    await Promise.race([exited, timeout(5_000)]);
   };
 
-  let serverUrl: string;
-  try {
-    serverUrl = await waitForServer(() => listeningUrl, child, 90_000);
-  } catch (error) {
-    await stop();
-    throw error;
-  }
+  const startServer = async () => {
+    if (child !== null) throw new Error("t3 is already running");
+    const port = await freePort();
+    const started = spawn(
+      executable,
+      ["start", "--base-dir", baseDir, "--host", "127.0.0.1", "--port", String(port), "--no-browser", "--auto-bootstrap-project-from-cwd", workspaceDir],
+      { cwd: workspaceDir, env, detached: true, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    child = started;
+    process.once("exit", killOnExit);
+    started.stdout?.pipe(log, { end: false });
+    started.stderr?.pipe(log, { end: false });
+    // T3 may not bind the requested port, so trust the address it reports.
+    let listeningUrl: string | null = null;
+    let pending = "";
+    const scan = (chunk: Buffer) => {
+      if (listeningUrl !== null) return;
+      pending = (pending + chunk.toString("utf8")).slice(-4096);
+      const match = /Listening on (http:\/\/127\.0\.0\.1:\d+)/.exec(pending);
+      if (match?.[1]) listeningUrl = match[1];
+    };
+    started.stdout?.on("data", scan);
+    started.stderr?.on("data", scan);
+    currentUrl = await waitForServer(() => listeningUrl, started, 90_000);
+  };
 
+  let removed = false;
   return {
     root,
-    serverUrl,
+    get serverUrl() {
+      if (currentUrl === null) throw new Error("t3 is not running");
+      return currentUrl;
+    },
     baseDir,
     settingsPath,
     workspaceDir,
     fakeClaudeLog,
     trigger,
+    startServer,
+    stopServer,
     issueToken(scopes) {
       const args = ["auth", "session", "issue", "--base-dir", baseDir, "--ttl", "1h", "--label", "chaldea-e2e", "--token-only"];
       for (const scope of scopes) args.push("--scope", scope);
@@ -246,6 +271,12 @@ export async function startDisposableT3(options: DisposableT3Options): Promise<D
       if (!existsSync(fakeClaudeLog)) return [];
       return readFileSync(fakeClaudeLog, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
     },
-    stop,
+    async stop() {
+      if (removed) return;
+      removed = true;
+      await stopServer();
+      log.end();
+      if (process.env.CHALDEA_KEEP_FIXTURES !== "1") rmSync(root, { recursive: true, force: true });
+    },
   };
 }
