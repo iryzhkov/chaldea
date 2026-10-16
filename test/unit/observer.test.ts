@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { observe, observeThread } from "../../src/quota/observer.ts";
-import { DAY_MS, emptyState, loadState, saveState } from "../../src/quota/state.ts";
+import { DAY_MS, MAX_POSTED_KEYS, emptyState, loadState, prune, recordKey, saveState } from "../../src/quota/state.ts";
 import { scratchDir } from "../helpers/scratch.ts";
 import { T0, iso, limited, thread } from "../helpers/threads.ts";
 
@@ -87,7 +87,8 @@ test("other failures, archived threads and stale stops are ignored", () => {
   const state = emptyState();
   assert.deepEqual(observeThread(state, limited("run-1", T0, RESET, { lastErrorClass: "provider_error" }), T0), []);
   assert.deepEqual(observeThread(state, limited("run-1", T0, RESET, { archived: true }), T0), []);
-  assert.deepEqual(observeThread(state, limited("run-1", T0 - 36 * DAY_MS, RESET), T0), []);
+  assert.deepEqual(observeThread(state, limited("run-1", T0 - 36 * DAY_MS, iso(T0 - 36 * DAY_MS + 10_000)), T0), []);
+  assert.deepEqual(observeThread(state, limited("run-1", T0 - 36 * DAY_MS, null), T0), []);
   assert.equal(state.parked.size, 0);
   observeThread(state, limited("run-9", T0, RESET, { id: "thread-b" }), T0);
   assert.equal(state.parked.size, 1);
@@ -109,6 +110,59 @@ test("the cursor follows the stream", () => {
   observe(state, { kind: "cursor", sequence: 17 }, T0);
   observe(state, { kind: "synchronized" }, T0);
   assert.equal(state.cursor, 17);
+});
+
+test("a stop whose key was evicted at the cap is not reported again", () => {
+  const state = emptyState();
+  const stop = limited("run-1", T0, RESET);
+  assert.equal(observeThread(state, stop, T0).length, 1);
+  // 10,000 newer stops push the first key out.
+  for (let i = 0; i < MAX_POSTED_KEYS; i += 1) state.posted.set(recordKey("quota_parked", `t${i}`, "r"), T0 + 60_000 + i);
+  prune(state, T0 + 120_000);
+  assert.equal(state.posted.has(recordKey("quota_parked", "thread-a", "run-1")), false);
+  assert.equal(state.evictedThrough, Date.parse(RESET));
+  state.parked.clear();
+  assert.deepEqual(observeThread(state, stop, T0 + 120_000), []);
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 1, threads: [stop] }, T0 + 120_000), []);
+  // A genuinely newer stop is still reported.
+  const newer = limited("run-2", T0 + 200_000, iso(T0 + 300_000), { id: "thread-b" });
+  assert.deepEqual(observeThread(state, newer, T0 + 200_000).map((r) => r.kind), ["quota_parked"]);
+});
+
+test("a snapshot reconciles a stop and resume that happened while the observer was away", () => {
+  const state = emptyState();
+  state.cursor = 40;
+  const resumed = thread({
+    status: "completed",
+    latestRunId: "run-2",
+    latestRunStartedAt: iso(T0 + 13_000),
+    latestRunCompletedAt: iso(T0 + 14_000),
+    limitRecovery: { runId: "run-1", resetAt: RESET, autoResume: true },
+  });
+  const records = observe(state, { kind: "snapshot", sequence: 90, threads: [resumed] }, T0 + 20_000);
+  assert.deepEqual(records.map((r) => [r.kind, r.runId, r.reconciled]), [
+    ["quota_parked", "run-1", true],
+    ["quota_resumed", "run-1", true],
+  ]);
+  assert.equal(records[1]!.continuationRunId, "run-2");
+  assert.equal(records[1]!.latenessSeconds, 3);
+  assert.equal(records[1]!.trigger, "auto_resume");
+  // Replays, later snapshots and the live event add nothing.
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 91, threads: [resumed] }, T0 + 21_000), []);
+  assert.deepEqual(observe(state, { kind: "thread", sequence: 92, thread: resumed }, T0 + 21_000), []);
+});
+
+test("reconciliation respects keys already posted and the age cut-off", () => {
+  const state = emptyState();
+  observeThread(state, limited("run-1", T0, RESET), T0);
+  state.parked.clear(); // As if the parked entry had been evicted at its cap.
+  const resumed = thread({ status: "idle", latestRunId: "run-2", latestRunStartedAt: iso(T0 + 12_000), limitRecovery: { runId: "run-1", resetAt: RESET, autoResume: true } });
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 5, threads: [resumed] }, T0 + 13_000).map((r) => r.kind), ["quota_resumed"]);
+  const old = thread({ id: "thread-old", latestRunId: "run-9", limitRecovery: { runId: "run-8", resetAt: iso(T0 - 36 * DAY_MS), autoResume: true } });
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 6, threads: [old] }, T0), []);
+  // A thread whose armed run is still the latest is handled by the live path, not reconciled.
+  const waiting = limited("run-3", T0, RESET, { id: "thread-c", limitRecovery: { runId: "run-3", resetAt: RESET, autoResume: true } });
+  assert.deepEqual(observe(state, { kind: "snapshot", sequence: 7, threads: [waiting] }, T0).map((r) => [r.kind, r.reconciled]), [["quota_parked", undefined]]);
 });
 
 test("a restart replaying the same events posts nothing new", () => {

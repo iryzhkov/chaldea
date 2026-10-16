@@ -59,6 +59,23 @@ test("a closed port is transient", async () => {
   await assert.rejects(connectShell({ serverUrl: url, token: "t" }, { onEvent: () => {} }), TransientConnectionError);
 });
 
+test("a frame that is not JSON fails closed", async () => {
+  const server = createServer();
+  const wss = new WebSocketServer({ server });
+  wss.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      if (JSON.parse(String(data))._tag === "Request") socket.send("{not json");
+    });
+  });
+  try {
+    const url = await listen(server);
+    await assert.rejects(connectShell({ serverUrl: url, token: "t" }, { onEvent: () => {} }), ProtocolIncompatibleError);
+  } finally {
+    wss.close();
+    server.close();
+  }
+});
+
 test("a stream item the pinned contracts reject fails closed", async () => {
   // Speaks just enough of Effect's RPC JSON protocol to answer the shell
   // subscription with an item whose sequence has the wrong type.

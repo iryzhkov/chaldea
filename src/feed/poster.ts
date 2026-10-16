@@ -1,9 +1,12 @@
 // Delivers quota records to the fleet feed through the `feed post` CLI.
 //
 // Posting never blocks the observer: records go into a bounded in-memory
-// queue drained by one worker. Each record gets a few attempts with backoff
-// and a per-attempt timeout; after that it is logged and dropped. Bodies carry
-// identifiers and timestamps only, never transcript text or credentials.
+// queue drained by one worker. Each record gets exactly one attempt with a
+// timeout. The CLI has no idempotency key, so a failed attempt may still have
+// reached the server; retrying could post the record twice. A failure is
+// therefore logged and the record dropped. Bodies carry identifiers and
+// timestamps only, never transcript text or credentials, and the CLI's stderr
+// is never logged (only its length), since it can echo URLs or account names.
 import { spawn } from "node:child_process";
 import { hostname } from "node:os";
 
@@ -13,7 +16,6 @@ import type { Logger } from "../log.ts";
 export const FEED_SOURCE = "chaldea-quota";
 export const FEED_TAGS = "quota chaldea";
 export const MAX_QUEUED_RECORDS = 256;
-export const ATTEMPT_DELAYS_MS: ReadonlyArray<number> = [0, 2_000, 10_000];
 export const ATTEMPT_TIMEOUT_MS = 20_000;
 
 export function shortHostname(): string {
@@ -46,8 +48,23 @@ export interface FeedPosterOptions {
   readonly command: string;
   readonly host: string;
   readonly logger: Logger;
-  readonly attemptDelaysMs?: ReadonlyArray<number>;
   readonly attemptTimeoutMs?: number;
+}
+
+/** Why an attempt failed, without any of the CLI's output. */
+class AttemptFailure extends Error {
+  readonly exitCode: number | null;
+  readonly signal: string | null;
+  readonly stderrBytes: number;
+  readonly spawnError: string | null;
+
+  constructor(exitCode: number | null, signal: string | null, stderrBytes: number, spawnError: string | null) {
+    super("feed post failed");
+    this.exitCode = exitCode;
+    this.signal = signal;
+    this.stderrBytes = stderrBytes;
+    this.spawnError = spawnError;
+  }
 }
 
 function runOnce(options: FeedPosterOptions, record: QuotaRecord): Promise<void> {
@@ -67,20 +84,24 @@ function runOnce(options: FeedPosterOptions, record: QuotaRecord): Promise<void>
   ];
   return new Promise((resolve, reject) => {
     const child = spawn(options.command, args, { stdio: ["pipe", "ignore", "pipe"] });
-    let stderr = "";
+    let stderrBytes = 0;
     child.stderr.on("data", (chunk: Buffer) => {
-      if (stderr.length < 512) stderr += chunk.toString("utf8");
+      stderrBytes += chunk.length;
     });
     const timer = setTimeout(() => child.kill("SIGKILL"), options.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS);
-    child.once("error", (error) => {
+    let settled = false;
+    const settle = (failure: AttemptFailure | null) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
-      reject(error);
+      if (failure === null) resolve();
+      else reject(failure);
+    };
+    child.once("error", (error: NodeJS.ErrnoException) => {
+      settle(new AttemptFailure(null, null, stderrBytes, error.code ?? "spawn_error"));
     });
     child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      // The CLI's stderr is short and never includes the feed token; cap it anyway.
-      else reject(new Error(`feed post exited with ${code ?? signal}: ${stderr.trim().slice(0, 200)}`));
+      settle(code === 0 ? null : new AttemptFailure(code, signal, stderrBytes, null));
     });
     child.stdin.on("error", () => {
       // The close handler reports the failure.
@@ -105,8 +126,14 @@ export class FeedPoster {
       return;
     }
     this.#queue.push(record);
+    this.#kick();
+  }
+
+  #kick(): void {
     this.#draining ??= this.#drain().finally(() => {
       this.#draining = null;
+      // A record queued after the loop's last check would otherwise wait for the next enqueue.
+      if (this.#queue.length > 0) this.#kick();
     });
   }
 
@@ -122,22 +149,19 @@ export class FeedPoster {
   }
 
   async #deliver(record: QuotaRecord): Promise<void> {
-    const delays = this.#options.attemptDelaysMs ?? ATTEMPT_DELAYS_MS;
-    for (const [attempt, delay] of delays.entries()) {
-      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
-      try {
-        await runOnce(this.#options, record);
-        this.#options.logger.info("posted feed record", { kind: record.kind, thread: record.threadId, run: record.runId });
-        return;
-      } catch (error) {
-        this.#options.logger.warn("feed post failed", {
-          kind: record.kind,
-          thread: record.threadId,
-          attempt: attempt + 1,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
+    const fields = { kind: record.kind, thread: record.threadId, run: record.runId };
+    try {
+      await runOnce(this.#options, record);
+      this.#options.logger.info("posted feed record", fields);
+    } catch (error) {
+      const failure = error instanceof AttemptFailure ? error : null;
+      this.#options.logger.error("feed post failed; record dropped", {
+        ...fields,
+        exitCode: failure?.exitCode ?? null,
+        signal: failure?.signal ?? null,
+        stderrBytes: failure?.stderrBytes ?? null,
+        spawnError: failure?.spawnError ?? null,
+      });
     }
-    this.#options.logger.error("dropping feed record after bounded retries", { kind: record.kind, thread: record.threadId, run: record.runId });
   }
 }

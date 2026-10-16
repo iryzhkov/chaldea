@@ -2,8 +2,8 @@
 //
 // Callers pass identifiers only; no credentials, URLs with tokens or
 // transcript text ever reach a log call. Volume is bounded in process: at
-// most `MAX_LINES_PER_MINUTE` lines per minute, after which lines are counted
-// and summarised once the minute ends.
+// most `MAX_LINES_PER_MINUTE` info and warn lines per minute, after which they
+// are counted and summarised once the minute ends. Error lines are not capped.
 export const MAX_LINES_PER_MINUTE = 120;
 
 export type Fields = Readonly<Record<string, string | number | boolean | null | undefined>>;
@@ -28,7 +28,8 @@ export function createLogger(write: (line: string) => void = (line) => process.s
       written = 0;
       suppressed = 0;
     }
-    if (written >= MAX_LINES_PER_MINUTE) {
+    // Errors are rare and always worth keeping, so the cap applies to info and warn only.
+    if (level !== "error" && written >= MAX_LINES_PER_MINUTE) {
       suppressed += 1;
       return;
     }

@@ -53,33 +53,50 @@ The setting is server-scoped and defaults to off. It lives in T3's settings
 file, `<base dir>/userdata/settings.json` (`~/.t3/userdata/settings.json` for
 the service), under the top-level key `autoResumeLimitedThreads`. T3 watches
 that file and reloads it about 100 ms after a change; the worker reads the
-settings on every tick, so **no T3 restart is needed**. Three equivalent ways
-to turn it on, none of which touches T3's database:
+settings on every tick, so **no T3 restart is needed**. Turn it on while T3 is
+running in one of two ways; both go through T3's own settings writer, so a
+change another client makes at the same moment is kept:
 
 1. In the T3 app: Settings, the switch "Auto-resume limited threads"
    ("Resume usage-limit stops at the reported reset time. Each thread can
    cancel its scheduled continuation.").
-2. Over the public WebSocket RPC: `server.updateSettings` with
-   `{ patch: { autoResumeLimitedThreads: true } }`. This needs a bearer with
-   the `settings:write` scope, which the observer's token deliberately lacks.
-3. Editing the file, which is what the orchestrator should do on omarchy-pc.
-   The end-to-end test performs exactly this replace-by-rename and checks that
-   a parked thread then resumes without a restart:
+2. With `chaldea t3 set-auto-resume on|off`, which calls the public
+   `server.updateSettings` RPC with `{ patch: { autoResumeLimitedThreads } }`
+   over the same adapter as the observer. That RPC needs only the
+   `settings:write` scope (B:373688, 373829), which the observer's token
+   deliberately lacks, so use a separate token that lives for minutes and is
+   deleted afterwards. Each step assumes the previous one succeeded:
 
    ```sh
-   cd ~/.t3/userdata
-   cp -p settings.json settings.json.before-chaldea-quota
-   jq '.autoResumeLimitedThreads = true' settings.json > settings.json.chaldea-tmp
-   chmod --reference=settings.json settings.json.chaldea-tmp
-   mv settings.json.chaldea-tmp settings.json
+   install -d -m 700 ~/.config/chaldea
+   (umask 077 && t3 auth session issue --base-dir ~/.t3 --scope settings:write \
+     --ttl 10m --label chaldea-set-auto-resume --token-only > ~/.config/chaldea/t3-settings-token)
+   node ~/.local/share/chaldea/app/src/cli.ts t3 set-auto-resume on
+   rm ~/.config/chaldea/t3-settings-token
    ```
 
-   To turn it off again, set the key to `false` the same way, or restore the
-   backup. T3 writes default values out of the file when it persists settings
-   itself, so after a later change in the app the key may be absent, which
-   means `false`.
+   It prints `autoResumeLimitedThreads is on` and exits 0. The token expires
+   on its own after ten minutes; `t3 auth session list` and
+   `t3 auth session revoke` end it sooner. The end-to-end test runs this
+   subcommand with a `settings:write`-only token after a thread has parked,
+   and checks that the thread resumes and that a setting changed just before
+   by another client survives.
 
-This repository does not change the live T3 settings on any host.
+**Fallback, only while T3 is stopped:** set the key in the file directly, then
+start T3. Editing the file while T3 runs is not supported: T3 also rewrites the
+file, and a concurrent change made through the app or the RPC can be lost.
+
+```sh
+cd ~/.t3/userdata
+cp -p settings.json settings.json.before-chaldea-quota
+jq '.autoResumeLimitedThreads = true' settings.json > settings.json.chaldea-tmp
+chmod --reference=settings.json settings.json.chaldea-tmp
+mv settings.json.chaldea-tmp settings.json
+```
+
+T3 leaves default values out of the file when it persists settings itself, so
+an absent key means `false`. This repository does not change the live T3
+settings on any host.
 
 ### `snoozeLimitedThreads`
 
@@ -126,6 +143,18 @@ and follows it. The port is read from `~/.t3/userdata/server-runtime.json`
 On its first start on a host the observer reports the threads that are parked
 at that moment (stops younger than 35 days), then only changes.
 
+**Missed events.** When T3 cannot replay the shell from the observer's cursor
+it sends a snapshot instead, and the transitions in between are gone. On a
+snapshot, a thread whose `limitRecovery` names a run that is no longer the
+latest run had a usage-limit stop that was later continued; the observer then
+posts the `quota_parked` and `quota_resumed` it missed, marked
+`"reconciled": true`, subject to the same keys and age limit. A stop that
+happened and was continued while the observer was away is reported this way
+only if T3 armed recovery for it (`limitRecovery` is set by the native worker
+when auto-resume or snooze is on, or by the per-thread control). Lateness in a
+reconciled record is measured to the thread's latest run, which may be later
+than the continuation if more turns followed.
+
 `trigger` is `auto_resume` when T3's armed recovery for that run was in place,
 otherwise `other` (for example a person sent a message first). If a reset
 arrives later for a `quota_reset_unknown` stop, a `quota_parked` follows.
@@ -138,14 +167,21 @@ end-to-end test checks the feed bodies and the observer's log for the tokens
 and the transcript.
 
 **At most once.** A record's key `(kind, thread, run)` is written to the state
-file (fsync, then rename) before the record is queued for the feed. A crash can
-therefore lose a record but never repeat one, across restarts, reconnects and
-snapshot replays. The end-to-end test kills the observer with SIGKILL while a
-thread is parked and restarts it twice.
+file (fsync, rename, fsync of the directory) before the record is queued for
+the feed. A crash can therefore lose a record but never repeat one, across
+restarts, reconnects and snapshot replays. The end-to-end test kills the
+observer with SIGKILL while a thread is parked and restarts it twice. If the
+state file cannot be written (disk full, permissions), records are still
+posted, one error is logged for the outage, and the write is retried on the
+next event; only a crash during such an outage could repeat a record.
 
-**Feed failures never block.** Records go to an in-memory queue of at most 256;
-each gets three attempts (immediately, after 2 s, after 10 s) with a 20 s
-timeout per attempt, then is logged and dropped.
+**Feed failures never block, and are not retried.** Records go to an
+in-memory queue of at most 256. Each gets exactly one `feed post` attempt with
+a 20 s timeout. The feed CLI has no idempotency key, so an attempt that failed
+may still have reached the server, and a retry could post it twice; a failed
+record is logged and dropped. The log line carries the exit status, signal and
+the byte length of the CLI's stderr, never its content, which can contain
+URLs or account names.
 
 **Fail closed.** T3 answering the handshake with HTTP 426, or sending data the
 pinned contracts reject, stops the observer with exit status 78; so does a
@@ -160,10 +196,16 @@ off from 1 s to 60 s. There is no periodic scan.
 
 | Resource | Location | Bound |
 | --- | --- | --- |
-| Observer state (cursor, posted-record keys, parked threads) | `~/.local/state/chaldea/quota-observer.json`, mode 0600 | keys and parked threads expire 42 days after they were recorded; at most 10,000 keys and 1,000 parked threads, oldest evicted first; 2.7 MB with both caps full of real-length T3 IDs |
-| Old stops | | a stop whose run completed more than 35 days ago is never reported, so expired keys cannot revive old history |
+| Observer state (cursor, posted-record keys, parked threads) | `~/.local/state/chaldea/quota-observer.json`, mode 0600 | keys expire 42 days after the stop they describe, parked threads 42 days after they were seen; at most 10,000 keys and 1,000 parked threads, oldest evicted first; 2.7 MB with both caps full of real-length T3 IDs |
+| Old stops | | a stop older than 35 days is never reported, so expired keys cannot revive old history |
+| Evicted keys | `evictedThrough` in the state file | every eviction raises this watermark to the evicted key's stop time, and stops at or before it are never reported, so eviction at the cap can lose a record but never repeat one |
 | Feed queue | memory | 256 records |
-| Logs | journald (`journalctl --user -u chaldea-quota`) | at most 120 lines per minute in process, plus `LogRateLimitBurst=200` per 60 s in the unit; journald's own size caps apply |
+| Logs | journald (`journalctl --user -u chaldea-quota`) | at most 120 info and warn lines per minute in process (error lines are rare and not capped), plus `LogRateLimitBurst=200` per 60 s in the unit; journald's own size caps apply |
+
+A stop's time, for the age limit and the watermark, is its reset when known,
+otherwise the failed run's completion. A parked thread evicted at the
+1,000-thread cap loses its `quota_resumed` unless a later snapshot reconciles
+it; its `quota_parked` key stays, so nothing is repeated.
 | Test fixtures | `$CHALDEA_TEST_SCRATCH` (default `~/.cache/chaldea-test`) | removed after each test, passed or failed; anything a crashed run left is removed by the next run once it is a day old |
 
 Pruning happens on every save, which is every state change and at most every
@@ -215,7 +257,8 @@ succeeded.
    Expect `subscribed to T3 shell` in the log. The unit runs at boot without a
    login because lingering is enabled for `igor` on omarchy-pc.
 
-4. Turn on `autoResumeLimitedThreads` as described above, if it is not on yet.
+4. Turn on `autoResumeLimitedThreads` with the app switch or `chaldea t3
+   set-auto-resume on` as described above, if it is not on yet.
 
 The unit's paths are absolute and specific to omarchy-pc (`/home/igor`, Node
 26.10.0 from mise, `feed` in `~/.local/bin`); step 2 of the plan (fleet
@@ -238,15 +281,24 @@ SDK stream-json protocol: its first trigger message gets a rejected five-hour
 `rate_limit_event` with `resetsAt` ten seconds ahead (or none) and a
 `blocking_limit` result; every later message completes. The feed command is
 `test/fixtures/feed-recorder`, so tests never post to the real feed. They
-skip themselves when the pinned `t3` is not installed, as in CI.
+skip themselves when the pinned `t3` is not found. The disposable servers
+listen on 127.0.0.1 only and never touch a host's own T3.
 
 The end-to-end tests assert: exactly one continuation message and one new run,
 starting 0 to 6.5 s after the reset; exactly one `quota_parked` and one
 `quota_resumed` across an observer crash and two restarts; for a resetless
 stop, exactly one `quota_reset_unknown`, no continuation through more than two
-sweeps, and an observer restart adds nothing; enabling the setting by editing
-`settings.json` takes effect without a restart; `server.updateSettings`
-changes the same key.
+sweeps, and an observer restart adds nothing; `chaldea t3 set-auto-resume`
+with a `settings:write`-only token enables resume for an already parked
+thread without a restart and keeps a setting another client changed. The
+first two scenarios start T3 with the key already in `settings.json`, which
+is the stopped-server fallback.
+
+CI runs on the self-hosted runner on agent-a (labels `self-hosted, chaldea`),
+because GitHub-hosted runners are unavailable to this account. The workflow
+points `CHALDEA_T3_BIN` at agent-a's `~/.t3/runtime/versions/0.1.0/t3` after
+checking its SHA-256 against `vendor/t3-contracts/PROVENANCE.md`, and keeps
+`TMPDIR` and fixtures under the runner's temporary directory.
 
 A fake Codex provider is not included; Codex stops reach the observer through
 the same shell fields.

@@ -3,7 +3,8 @@
 // Connects to local T3, follows the shell stream from the persisted cursor,
 // feeds every event to the observer and hands new records to the feed poster.
 // A record's key is saved to disk before the record is queued, so a crash can
-// lose a record but never repeat one. Connection failures back off and
+// lose a record but never repeat one (unless the state file cannot be written,
+// which is logged as an error). Connection failures back off and
 // reconnect; there is no periodic scan. A refused protocol (HTTP 426) or data
 // the pinned contracts reject stops the observer with exit status 78, which
 // the systemd unit does not restart.
@@ -20,7 +21,7 @@ import {
   type ShellEvent,
 } from "../t3/adapter.ts";
 import { observe } from "./observer.ts";
-import { loadState, saveState } from "./state.ts";
+import { loadState, saveState, type ObserverState } from "./state.ts";
 
 /** Exit status for a configuration or protocol problem a restart cannot fix (EX_CONFIG). */
 export const EXIT_CONFIG = 78;
@@ -41,9 +42,9 @@ export interface ObserverOptions {
   readonly signal: AbortSignal;
 }
 
-class ConfigurationError extends Error {}
+export class ConfigurationError extends Error {}
 
-/** Reads the bearer from a private file; refuses files other users can read. */
+/** Reads a bearer from a private file; refuses files other users can read. */
 export function readToken(path: string): string {
   if (!existsSync(path)) throw new ConfigurationError(`token file ${path} does not exist`);
   const stat = statSync(path);
@@ -69,15 +70,72 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Applies shell events to the observer state, persists it, and queues new
+ * records. Saving never throws: a failed write leaves the state dirty and the
+ * next event retries it, while records are still queued, so a broken disk
+ * costs at-most-once delivery only if the process also crashes meanwhile.
+ */
+export class EventSink {
+  #lastSave = 0;
+  #dirty = false;
+  #saveFailing = false;
+
+  readonly state: ObserverState;
+  readonly statePath: string;
+  readonly poster: Pick<FeedPoster, "enqueue">;
+  readonly logger: Logger;
+
+  constructor(state: ObserverState, statePath: string, poster: Pick<FeedPoster, "enqueue">, logger: Logger) {
+    this.state = state;
+    this.statePath = statePath;
+    this.poster = poster;
+    this.logger = logger;
+  }
+
+  get dirty(): boolean {
+    return this.#dirty;
+  }
+
+  save(): void {
+    try {
+      saveState(this.statePath, this.state, Date.now());
+      this.#lastSave = Date.now();
+      this.#dirty = false;
+      if (this.#saveFailing) {
+        this.#saveFailing = false;
+        this.logger.info("state file written again", { path: this.statePath });
+      }
+    } catch (error) {
+      this.#dirty = true;
+      // Logged once per outage, not once per event.
+      if (!this.#saveFailing) {
+        this.#saveFailing = true;
+        this.logger.error("state file write failed; records are still posted but could repeat after a crash", {
+          path: this.statePath,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  handle(event: ShellEvent): void {
+    const records = observe(this.state, event, Date.now());
+    if (records.length > 0 || this.#dirty || event.kind === "synchronized" || Date.now() - this.#lastSave > CURSOR_SAVE_INTERVAL_MS) {
+      this.save();
+    }
+    for (const record of records) {
+      this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
+      this.poster.enqueue(record);
+    }
+  }
+}
+
 export async function runObserver(options: ObserverOptions): Promise<number> {
   const { logger, signal } = options;
   const state = loadState(options.statePath, Date.now());
   const poster = new FeedPoster({ command: options.feedCommand, host: options.host, logger });
-  let lastSave = 0;
-  const save = () => {
-    saveState(options.statePath, state, Date.now());
-    lastSave = Date.now();
-  };
+  const sink = new EventSink(state, options.statePath, poster, logger);
   logger.info("quota observer starting", { cursor: state.cursor, parked: state.parked.size, posted: state.posted.size });
 
   let attempt = 0;
@@ -95,12 +153,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
           attempt = 0;
           logger.info("subscribed to T3 shell", { afterSequence: state.cursor });
         }
-        const records = observe(state, event, Date.now());
-        if (records.length > 0 || event.kind === "synchronized" || Date.now() - lastSave > CURSOR_SAVE_INTERVAL_MS) save();
-        for (const record of records) {
-          logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
-          poster.enqueue(record);
-        }
+        sink.handle(event);
       };
       await connectShell(
         { serverUrl, token, signal },
@@ -121,7 +174,8 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
     if (!connected) attempt += 1;
     await sleep(delay, signal);
   }
-  save();
+  // save() never throws, so a failed final write cannot change the exit status or skip the drain.
+  sink.save();
   await Promise.race([poster.idle(), new Promise((r) => setTimeout(r, 30_000).unref())]);
   logger.info("quota observer stopped", { exitCode });
   return exitCode;

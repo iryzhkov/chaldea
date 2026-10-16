@@ -153,17 +153,36 @@ export async function dispatchMessage(t3: DisposableT3, token: string, threadId:
   );
 }
 
-export async function readAutoResumeSetting(t3: DisposableT3, token: string): Promise<boolean> {
-  const settings = await withClient({ serverUrl: t3.serverUrl, token }, (client) =>
-    client["server.getSettings"]({}) as Effect.Effect<{ autoResumeLimitedThreads: boolean }, unknown>,
-  );
-  return settings.autoResumeLimitedThreads;
+export interface SomeSettings {
+  readonly autoResumeLimitedThreads: boolean;
+  readonly sidebarAutoSettleOnMerge: boolean;
 }
 
-export async function updateAutoResumeSetting(t3: DisposableT3, token: string, value: boolean): Promise<void> {
-  await withClient({ serverUrl: t3.serverUrl, token }, (client) =>
-    client["server.updateSettings"]({ patch: { autoResumeLimitedThreads: value } }) as Effect.Effect<unknown, unknown>,
+export async function readSettings(t3: DisposableT3, token: string): Promise<SomeSettings> {
+  return withClient({ serverUrl: t3.serverUrl, token }, (client) =>
+    client["server.getSettings"]({}) as Effect.Effect<SomeSettings, unknown>,
   );
+}
+
+export async function updateSettings(t3: DisposableT3, token: string, patch: Partial<SomeSettings>): Promise<void> {
+  await withClient({ serverUrl: t3.serverUrl, token }, (client) =>
+    client["server.updateSettings"]({ patch }) as Effect.Effect<unknown, unknown>,
+  );
+}
+
+/** Runs `chaldea <args>` to completion and returns its exit status and stdout. */
+export function runCli(args: ReadonlyArray<string>, scratch: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [join(repoRoot, "src/cli.ts"), ...args], {
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: scratch, TMPDIR: scratch },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk: Buffer) => (stdout += chunk.toString("utf8")));
+    child.stderr?.on("data", (chunk: Buffer) => (stderr += chunk.toString("utf8")));
+    child.once("close", (code) => resolve({ code, stdout, stderr }));
+  });
 }
 
 export function writePrivateFile(path: string, content: string): void {

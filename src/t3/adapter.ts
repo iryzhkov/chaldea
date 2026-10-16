@@ -225,9 +225,21 @@ function describe(cause: unknown): string {
   }
 }
 
-/** Effect's schema decoder fails with a `SchemaError` when a frame does not match the contracts. */
-function isDecodeFailure(cause: unknown): boolean {
-  return cause instanceof Error && (cause.name === "SchemaError" || cause.name === "ParseError");
+/**
+ * True for every failure that means T3 sent something the pinned contracts or
+ * the RPC wire format cannot decode: a `SchemaError` from a schema, or an
+ * `RpcClientDefect` (Effect's classification of malformed or incompatible
+ * protocol data, such as a frame that is not JSON).
+ */
+function isContractFailure(cause: unknown): boolean {
+  if (typeof cause !== "object" || cause === null) return false;
+  const failure = cause as { name?: unknown; _tag?: unknown; reason?: { _tag?: unknown } | null };
+  return (
+    failure.name === "SchemaError" ||
+    failure.name === "ParseError" ||
+    failure._tag === "RpcClientDefect" ||
+    failure.reason?._tag === "RpcClientDefect"
+  );
 }
 
 /**
@@ -273,11 +285,23 @@ export async function withClient<A>(
     if (/EnvironmentAuthorizationError|insufficient_scope|forbidden/i.test(text)) {
       throw new AuthenticationError(`T3 refused the request: ${text}`);
     }
-    if (isDecodeFailure(cause)) {
+    if (isContractFailure(cause)) {
       throw new ProtocolIncompatibleError(`T3 sent data the pinned contracts reject: ${text}`);
     }
     throw new TransientConnectionError(text);
   }
+}
+
+/**
+ * Sets T3's server-scoped `autoResumeLimitedThreads` through the public
+ * `server.updateSettings` RPC, so T3 persists it with its own writer. Needs a
+ * bearer with the `settings:write` scope. Resolves to the value T3 reports back.
+ */
+export async function setAutoResumeLimitedThreads(options: ConnectOptions, enabled: boolean): Promise<boolean> {
+  const settings = await withClient(options, (client) =>
+    client["server.updateSettings"]({ patch: { autoResumeLimitedThreads: enabled } }),
+  );
+  return settings.autoResumeLimitedThreads;
 }
 
 /**

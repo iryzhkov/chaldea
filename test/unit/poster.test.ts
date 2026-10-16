@@ -21,14 +21,10 @@ const record: QuotaRecord = {
   subagent: false,
 };
 
-function memoryLogger(): Logger & { lines: Array<{ level: string; message: string }> } {
-  const lines: Array<{ level: string; message: string }> = [];
-  return {
-    lines,
-    info: (message) => lines.push({ level: "info", message }),
-    warn: (message) => lines.push({ level: "warn", message }),
-    error: (message) => lines.push({ level: "error", message }),
-  };
+function memoryLogger(): Logger & { lines: Array<{ level: string; message: string; fields: string }> } {
+  const lines: Array<{ level: string; message: string; fields: string }> = [];
+  const push = (level: string) => (message: string, fields?: unknown) => void lines.push({ level, message, fields: JSON.stringify(fields ?? {}) });
+  return { lines, info: push("info"), warn: push("warn"), error: push("error") };
 }
 
 function recorded(log: string): Array<{ args: Array<string>; body: string }> {
@@ -60,19 +56,18 @@ test("posts with the source, tags, host and a JSON body of identifiers only", as
   }
 });
 
-test("a feed outage is retried a bounded number of times, then dropped", async () => {
+test("a feed outage costs the record, after exactly one attempt", async () => {
   const dir = scratchDir("poster");
   try {
     process.env.FEED_RECORDER_LOG = join(dir.path, "feed.jsonl");
     process.env.FEED_RECORDER_FAIL_FILE = join(dir.path, "down");
     writeFileSync(process.env.FEED_RECORDER_FAIL_FILE, "");
     const logger = memoryLogger();
-    const poster = new FeedPoster({ command: recorder, host: "h", logger, attemptDelaysMs: [0, 10, 10] });
+    const poster = new FeedPoster({ command: recorder, host: "h", logger });
     poster.enqueue(record);
     await poster.idle();
     assert.equal(recorded(process.env.FEED_RECORDER_LOG).length, 0);
-    assert.equal(logger.lines.filter((l) => l.message === "feed post failed").length, 3);
-    assert.equal(logger.lines.at(-1)?.message, "dropping feed record after bounded retries");
+    assert.deepEqual(logger.lines.map((l) => [l.level, l.message]), [["error", "feed post failed; record dropped"]]);
   } finally {
     delete process.env.FEED_RECORDER_LOG;
     delete process.env.FEED_RECORDER_FAIL_FILE;
@@ -80,17 +75,44 @@ test("a feed outage is retried a bounded number of times, then dropped", async (
   }
 });
 
+test("a post the server accepted but reported as failed is not repeated, and its stderr is not logged", async () => {
+  const dir = scratchDir("poster");
+  try {
+    process.env.FEED_RECORDER_LOG = join(dir.path, "feed.jsonl");
+    process.env.FEED_RECORDER_FAIL_AFTER_RECORD = "1";
+    const logger = memoryLogger();
+    const poster = new FeedPoster({ command: recorder, host: "h", logger });
+    poster.enqueue(record);
+    await poster.idle();
+    assert.equal(recorded(process.env.FEED_RECORDER_LOG).length, 1);
+    const [line] = logger.lines;
+    assert.equal(logger.lines.length, 1);
+    assert.equal(line!.level, "error");
+    const fields = JSON.parse(line!.fields);
+    assert.equal(fields.exitCode, 1);
+    assert.ok(fields.stderrBytes > 0);
+    for (const secret of ["someone@example.com", "SECRET-TOKEN-VALUE", "feed.example"]) {
+      assert.ok(!line!.fields.includes(secret), `log fields contain ${secret}`);
+    }
+  } finally {
+    delete process.env.FEED_RECORDER_LOG;
+    delete process.env.FEED_RECORDER_FAIL_AFTER_RECORD;
+    dir.remove();
+  }
+});
+
 test("a missing feed command is logged and dropped, not thrown", async () => {
   const logger = memoryLogger();
-  const poster = new FeedPoster({ command: "/nonexistent/feed", host: "h", logger, attemptDelaysMs: [0] });
+  const poster = new FeedPoster({ command: "/nonexistent/feed", host: "h", logger });
   poster.enqueue(record);
   await poster.idle();
   assert.equal(logger.lines.at(-1)?.level, "error");
+  assert.equal(JSON.parse(logger.lines.at(-1)!.fields).spawnError, "ENOENT");
 });
 
 test("the queue is bounded", async () => {
   const logger = memoryLogger();
-  const poster = new FeedPoster({ command: "/nonexistent/feed", host: "h", logger, attemptDelaysMs: [0] });
+  const poster = new FeedPoster({ command: "/nonexistent/feed", host: "h", logger });
   for (let i = 0; i < MAX_QUEUED_RECORDS + 10; i += 1) poster.enqueue(record);
   assert.ok(logger.lines.filter((l) => l.message === "feed queue full; dropping record").length >= 9);
   await poster.idle();
@@ -102,4 +124,7 @@ test("log output is rate limited", () => {
   for (let i = 0; i < MAX_LINES_PER_MINUTE + 50; i += 1) logger.info("x", { i });
   assert.equal(lines.length, MAX_LINES_PER_MINUTE);
   assert.equal(JSON.parse(lines[0]!).level, "info");
+  // Error lines are exempt from the cap.
+  logger.error("disk full");
+  assert.equal(JSON.parse(lines.at(-1)!).message, "disk full");
 });
