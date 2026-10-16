@@ -225,8 +225,9 @@ function describe(cause: unknown): string {
   }
 }
 
-function isDecodeFailure(text: string): boolean {
-  return /SchemaError|ParseError|Expected .* but got|Missing key|is missing/i.test(text);
+/** Effect's schema decoder fails with a `SchemaError` when a frame does not match the contracts. */
+function isDecodeFailure(cause: unknown): boolean {
+  return cause instanceof Error && (cause.name === "SchemaError" || cause.name === "ParseError");
 }
 
 /**
@@ -272,7 +273,7 @@ export async function withClient<A>(
     if (/EnvironmentAuthorizationError|insufficient_scope|forbidden/i.test(text)) {
       throw new AuthenticationError(`T3 refused the request: ${text}`);
     }
-    if (isDecodeFailure(text)) {
+    if (isDecodeFailure(cause)) {
       throw new ProtocolIncompatibleError(`T3 sent data the pinned contracts reject: ${text}`);
     }
     throw new TransientConnectionError(text);

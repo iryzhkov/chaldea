@@ -12,9 +12,9 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "node --test --test-concurrency=1 test/*.test.ts",
-    "test:unit": "node --test test/unit/*.test.ts",
-    "test:e2e": "node --test --test-concurrency=1 test/e2e/*.test.ts"
+    "test": "npm run test:unit && npm run test:e2e",
+    "test:unit": "scripts/with-scratch node --test 'test/unit/*.test.ts'",
+    "test:e2e": "scripts/with-scratch node --test --test-concurrency=1 'test/e2e/*.test.ts'"
   },
   "dependencies": {
     "effect": "4.0.4",

@@ -170,6 +170,15 @@ export async function startDisposableT3(options: DisposableT3Options): Promise<D
   );
   child.stdout?.pipe(log);
   child.stderr?.pipe(log);
+  // If the test process exits without stopping the server, take the group down with it.
+  const killOnExit = () => {
+    try {
+      if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  };
+  process.once("exit", killOnExit);
   // T3 may not bind the requested port, so trust the address it reports.
   let listeningUrl: string | null = null;
   let pending = "";
@@ -186,6 +195,7 @@ export async function startDisposableT3(options: DisposableT3Options): Promise<D
   const stop = async () => {
     if (stopped) return;
     stopped = true;
+    process.removeListener("exit", killOnExit);
     if (child.pid !== undefined) {
       const pid = child.pid;
       const exited = child.exitCode !== null || child.signalCode !== null

@@ -4,7 +4,8 @@
 // One small JSON file, written atomically (temporary file, fsync, rename) with
 // mode 0600. Retention is enforced on every save: posted keys and parked
 // threads expire after `KEY_TTL_MS` and each map is capped, oldest first, so
-// the file stays under a few megabytes whatever happens upstream.
+// the file stays under about 3 MB whatever happens upstream (2.7 MB with both
+// caps full of real-length T3 IDs).
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 
