@@ -135,6 +135,11 @@ an uncertain entry; an explicit new invocation is a new job.
 SSH uses `~/.ssh/chaldea-job.conf` only, a dedicated private key, IdentityAgent none,
 ControlMaster auto and ControlPersist 60. No user's agent is consulted. Multiplexing
 reuses authentication while each request still reaches a new forced-command process.
+The dedicated daemon allows the host slot count plus one session per connection,
+leaving room for a queued admission. Additional contenders may use OpenSSH's
+fresh-connection fallback. The client hides only the known mux-session refusal
+and socket-creation race diagnostics; other SSH errors remain visible. No job
+request is replayed.
 The role pins known hosts separately in `~/.ssh/chaldea-job_known_hosts`; unknown
 keys fail closed. A real disconnect closes stdin and kills the job process group;
 bubblewrap's parent-death behavior and PID namespace also kill escaped descendants.

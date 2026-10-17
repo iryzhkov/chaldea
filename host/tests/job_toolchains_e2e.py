@@ -56,6 +56,7 @@ def main():
             "chaldea_job_host_host_key": str(scratch / "host"),
             "chaldea_job_host_authorized_keys": str(scratch / "authorized_keys"),
             "chaldea_job_host_log_level": "VERBOSE",
+            "chaldea_job_host_slots": 1,
             "chaldea_job_host_command": f"/usr/bin/python3 -I {ROLE}/chaldea-job-server --config {config}",
             "chaldea_job_host_sources": [{"ip": "127.0.0.1",
                                          "public_key": (scratch / "client.pub").read_text().strip()}],

@@ -19,7 +19,8 @@ ClientAliveInterval 15
 ClientAliveCountMax 2
 LoginGraceTime 30
 MaxAuthTries 2
-MaxSessions 1
+# Running slots plus one queued admission per client connection.
+MaxSessions {{ (chaldea_job_host_slots | int) + 1 }}
 LogLevel {{ chaldea_job_host_log_level }}
 Match User {{ chaldea_job_host_user }}
     ForceCommand {{ chaldea_job_host_command }}
