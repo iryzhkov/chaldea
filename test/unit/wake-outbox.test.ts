@@ -75,7 +75,11 @@ test("fatal storage errors log once, refuse registrations and exit non-zero for 
       assert.equal(result.out.split("storage_fault").length-1,mode==="receipt"?2:1);
       if(mode==="logger"){
         assert.equal(result.out.split("report_attempt").length-1,1);
-        assert.equal(result.err,"Chaldea waits: fatal storage error; restarting\n");
+        const records=result.err.trim().split("\n").map(line=>JSON.parse(line));
+        assert.equal(records.length,1);
+        assert.equal(records[0].message,"Chaldea waits: fatal storage error; restarting");
+        assert.equal(records[0].level,"error");
+        assert.equal(new Date(records[0].at).toISOString(),records[0].at);
       }else{
         assert.equal(result.out.split("watcher_needs_attention").length-1,1);assert.equal(result.err,"");
       }

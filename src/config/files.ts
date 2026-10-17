@@ -28,7 +28,7 @@ export function readTrustedFile(path: string, policy: FilePolicy = {}): Buffer {
     const bytes = Buffer.alloc(max + 1);
     let size = 0, n: number;
     while (size < bytes.length && (n = readSync(fd, bytes, size, bytes.length - size, null)) > 0) size += n;
-    if (size > max) throw new ConfigurationError("Trusted file exceeds size limit", path, "size");
+    if (size > max) throw new ConfigurationError("Trusted file exceeds size limit", path, "read_size");
     return bytes.subarray(0, size);
   } finally { closeSync(fd); }
 }

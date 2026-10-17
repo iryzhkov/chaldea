@@ -1,4 +1,4 @@
-import { ConfigurationError } from '../config/files.ts';
+import { configFailure, ConfigurationError } from '../config/files.ts';
 import { EXIT } from '../config/exit.ts';
 import { createLogger } from '../config/log.ts';
 import { run } from './client.ts';
@@ -10,6 +10,6 @@ try {
       "       chaldea exec list | show JOB-ID [--full] | fetch JOB-ID\n");
   } else process.exitCode = await run(process.argv.slice(2));
 } catch (error) {
-  createLogger().error('exec failed', { error: (error as Error).message });
+  createLogger().error('exec failed', { ...configFailure(error), error: (error as Error).message });
   process.exitCode = error instanceof ConfigurationError ? EXIT.config : EXIT.transport;
 }

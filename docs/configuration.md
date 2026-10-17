@@ -132,6 +132,7 @@ waits' generic 64, Akasha's 1 or exec's 255. Missing/invalid Akasha config keys
 also use 78. Quota already used 78.
 Akasha's command-count usage error uses 64. Service-specific authorization,
 replay and storage errors still use 1. Exec argument errors retain 255.
+Unsafe Akasha adapter, trust and seed files at startup retain exit 1.
 Akasha adapter authorization failures retain their existing runtime status 1 and
 request-time HTTP error contract. Human help and command results are unchanged;
 diagnostic formatting and these exit statuses are the intentional operational

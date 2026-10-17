@@ -1,5 +1,5 @@
 import { clockHealth, HEALTH_FIELDS } from "../access/clock.ts";
-import { readTrustedFile, ConfigurationError } from "../config/files.ts";
+import { configFailure, readTrustedFile, ConfigurationError } from "../config/files.ts";
 import { akashaConfig } from "../config/akasha.ts";
 import { createLogger } from "../config/log.ts";
 import { EXIT } from "../config/exit.ts";
@@ -20,6 +20,7 @@ export function trustedFile(path: string, max: number, privateFile = false): Buf
   try { return readTrustedFile(path, { maxBytes: max, secret: privateFile, owners: [0, process.geteuid!()] }); }
   catch (error) {
     // Keep the existing request-time adapter error contract.
+    if (error instanceof ConfigurationError && error.reason === "read_size") ensure(false, "input_too_large");
     if (error instanceof ConfigurationError && ["type", "links", "owner", "mode", "size"].includes(error.reason)) ensure(false, "unsafe_input");
     throw error;
   }
@@ -104,7 +105,7 @@ export async function main(args: string[]): Promise<number> {
       process.off("SIGTERM", stop); process.off("SIGINT", stop); }
     return 0;
   } catch (error) {
-    createLogger().error("akasha operation failed; inspect configured adapters, authorization and capacity");
+    createLogger().error("akasha operation failed; inspect configured adapters, authorization and capacity", configFailure(error));
     return error instanceof ConfigurationError ? EXIT.config : EXIT.failure;
   } finally { await worker?.stop(); store?.close(); state?.close(); }
 }
