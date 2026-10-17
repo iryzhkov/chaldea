@@ -4,7 +4,7 @@ import { strictJson } from "../access/token.ts";
 export const KiB = 1024;
 export const MAX_EVENT = 64 * KiB, MAX_LEGACY = 256 * KiB, MAX_ENVELOPE = 320 * KiB;
 export const NEW_FEED_ID = 1_000_000_000_000;
-export const KINDS = ["feed_post", "report", "quota_headroom_snapshot", "quota_headroom_changed", "quota_headroom_low", "quota_parked", "quota_reset_unknown", "quota_resumed",
+export const KINDS = ["feed_post", "report", "quota_headroom_snapshot", "quota_headroom_changed", "quota_headroom_low", "quota_parked", "quota_reset_unknown", "quota_resumed", "restart_resumed",
   "provider_switched", "provider_switch_failed", "tool_call", "deployment_finished", "job_finished",
   "task_started", "task_finished", "review_verdict", "review_note", "agent_status"] as const;
 export type Kind = typeof KINDS[number];
@@ -84,6 +84,7 @@ const DATA: Record<Kind, readonly string[]> = {
   quota_parked: ["thread_id", "run_id", "provider", "reset_at", "transition_id"],
   quota_reset_unknown: ["thread_id", "run_id", "provider", "transition_id"],
   quota_resumed: ["thread_id", "run_id", "provider", "transition_id"],
+  restart_resumed: ["thread_id", "run_id", "provider", "transition_id"],
   provider_switched: ["thread_id", "run_id", "provider", "previous_provider", "model", "transition_id"],
   provider_switch_failed: ["thread_id", "run_id", "provider", "previous_provider", "model", "transition_id", "error_class"],
   tool_call: ["ts", "session", "proc", "seq", "client", "tool", "args", "outcome", "ok", "err", "exit", "ms",

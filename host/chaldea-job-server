@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import resource
+from types import SimpleNamespace
 import selectors
 import shutil
 import signal
@@ -37,6 +38,224 @@ MAX_OUTPUT = LIMITS["maxOutput"]
 CAP = 20 * 1024 ** 3
 RESERVE = 256 * 1024 * 1024
 CHUNK = LIMITS["chunk"]
+# Recovery code is inline: the deployed server consists of this file and the
+# shared protocol JSON, with no Python module installation dependency.
+RETENTION_LOG_CAP = MAX_OUTPUT
+RETENTION_ARTIFACT_CAP = MAX_ARTIFACT
+RETENTION_RESERVE = RETENTION_LOG_CAP + RETENTION_ARTIFACT_CAP + 256 * 1024
+RETENTION_JOB_ID = re.compile(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+
+
+def retention_job_id(value):
+    if not isinstance(value, str) or not RETENTION_JOB_ID.fullmatch(value):
+        raise ValueError("invalid job id")
+    return value
+
+
+def retention_directory(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        raise ValueError("recovery directory must be a directory, not a symlink")
+    path.chmod(0o700)
+
+
+def retention_open(path, flags):
+    return os.fdopen(os.open(path, flags | os.O_NOFOLLOW, 0o600), "w+b")
+
+
+@contextmanager
+def retention_lock(root):
+    retention_directory(root / ".retained")
+    with retention_open(root / ".retention.lock", os.O_RDWR | os.O_CREAT) as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield root / ".retained"
+
+
+def retention_metadata(path, value):
+    with retention_open(path / "metadata.new", os.O_RDWR | os.O_CREAT | os.O_TRUNC) as out:
+        out.write(json.dumps(value, separators=(",", ":")).encode())
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(path / "metadata.new", path / "metadata.json")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def retention_prune_locked(store, config, now, incoming=0):
+    cap = min(int(config.get("retention_cap_bytes", LIMITS["maxRetainedBytes"])),
+              LIMITS["maxRetainedBytes"])
+    rows = []
+    for path in store.iterdir():
+        if not RETENTION_JOB_ID.fullmatch(path.name) or not stat.S_ISDIR(path.lstat().st_mode):
+            print("chaldea: unexpected recovery entry ignored inside image bound", file=sys.stderr)
+            continue
+        # The store lock excludes new readers and writers. Once an entry has
+        # been checked, its descriptor can close before eviction under that lock.
+        with retention_open(path / "lock", os.O_RDWR | os.O_CREAT) as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                rows.append((path, False, now, RETENTION_RESERVE))
+                continue
+            try:
+                meta = json.loads((path / "metadata.json").read_text())
+                when = meta.get("ended", meta["started"])
+            except (OSError, ValueError, KeyError):
+                when = path.stat().st_mtime
+            size = sum(p.lstat().st_size for p in path.iterdir())
+            if when < now - LIMITS["retentionSeconds"]:
+                shutil.rmtree(path)
+            else:
+                rows.append((path, True, when, size))
+    total = sum(row[3] for row in rows)
+    count = len(rows)
+    for path, removable, _when, size in sorted(rows, key=lambda row: row[2]):
+        if total + incoming <= cap and count + bool(incoming) <= 1000:
+            break
+        if not removable:
+            continue
+        shutil.rmtree(path)
+        total -= size
+        count -= 1
+    if total + incoming > cap or count + bool(incoming) > 1000:
+        raise ValueError("recovery store full; active recovery data protected")
+
+
+def retention_prune(root, config, now=None):
+    if not (root / ".retained").exists():
+        return
+    with retention_lock(root) as store:
+        retention_prune_locked(store, config, time.time() if now is None else now)
+
+
+class RetainedJob:
+    def __init__(self, root, request, config, now=None):
+        self.request = request
+        self.meta = {"version": PROTOCOL["fetchVersion"], "jobId": retention_job_id(request["jobId"]),
+                     "started": time.time() if now is None else now, "outcome": "uncertain",
+                     "exitCode": None, "artifacts": [], "artifactErrors": [], "logTruncated": False}
+        self.bytes = 0
+        self.storage_error = False
+        with retention_lock(root) as store:
+            retention_prune_locked(store, config, self.meta["started"], RETENTION_RESERVE)
+            self.path = store / request["jobId"]
+            self.path.mkdir(mode=0o700)
+            self.lock = retention_open(self.path / "lock", os.O_RDWR | os.O_CREAT | os.O_EXCL)
+            fcntl.flock(self.lock, fcntl.LOCK_EX)
+            self.log = retention_open(self.path / "output.log", os.O_RDWR | os.O_CREAT | os.O_EXCL)
+            retention_metadata(self.path, self.meta)
+
+    def output(self, kind, data):
+        # Only job output enters this log, never host diagnostics or protocol input.
+        if kind not in ("O", "S"):
+            return
+        value = (b"\n[stdout]\n" if kind == "O" else b"\n[stderr]\n") + data
+        remaining = max(0, RETENTION_LOG_CAP - self.bytes)
+        if self.storage_error:
+            self.meta["logTruncated"] = True
+            return
+        try:
+            self.log.write(value[:remaining])
+            self.log.flush()
+            self.bytes += min(len(value), remaining)
+            self.meta["logTruncated"] |= len(value) > remaining
+        except OSError:
+            self.meta["logTruncated"] = True
+            self.storage_error = True
+            self.degraded()
+
+    def degraded(self):
+        if not self.meta.get("recoveryDegraded"):
+            print("chaldea: recovery storage degraded; job status delivery continues", file=sys.stderr)
+        self.meta["recoveryDegraded"] = True
+
+    def persist_metadata(self):
+        try:
+            retention_metadata(self.path, self.meta)
+        except OSError:
+            self.degraded()
+
+    def finish(self, workspace, artifact_file, outcome, code=None, now=None):
+        self.meta.update(outcome=outcome, exitCode=code, ended=time.time() if now is None else now)
+        total = 0
+        for index, name in enumerate(self.request["artifacts"]):
+            target = self.path / ("artifact-" + str(index))
+            try:
+                with artifact_file(workspace, name) as source:
+                    size = os.fstat(source.fileno()).st_size
+                    if total + size > RETENTION_ARTIFACT_CAP:
+                        self.meta["artifactErrors"].append({"path": name, "reason": "aggregate cap"})
+                        continue
+                    with retention_open(target, os.O_RDWR | os.O_CREAT | os.O_EXCL) as out:
+                        remaining = size
+                        while remaining:
+                            data = source.read(min(remaining, LIMITS["chunk"]))
+                            if not data:
+                                raise ValueError("artifact changed")
+                            out.write(data)
+                            remaining -= len(data)
+                        out.flush()
+                        os.fsync(out.fileno())
+                    total += size
+                    self.meta["artifacts"].append({"path": name, "size": size, "index": index})
+            except (OSError, ValueError):
+                target.unlink(missing_ok=True)
+                self.meta["artifactErrors"].append({"path": name, "reason": "unavailable regular file"})
+        try:
+            self.log.flush()
+            os.fsync(self.log.fileno())
+        except OSError:
+            self.meta["logTruncated"] = True
+            self.degraded()
+        self.persist_metadata()
+
+    def close(self, keep):
+        try:
+            try:
+                self.log.close()
+            except OSError:
+                self.degraded()
+            with retention_lock(self.path.parent.parent):
+                if not keep:
+                    shutil.rmtree(self.path)
+        except OSError:
+            self.degraded()
+        finally:
+            self.lock.close()
+
+
+@contextmanager
+def retention_fetch(root, request, config):
+    if (not isinstance(request, dict) or request.get("version") != PROTOCOL["fetchVersion"]):
+        raise ValueError("unsupported exec fetch protocol")
+    name = retention_job_id(request.get("jobId"))
+    retention_prune(root, config)
+    with retention_lock(root) as store:
+        path = store / name
+        if not path.exists():
+            raise ValueError("job recovery not retained: result sent successfully, expired, or never executed")
+        lock = retention_open(path / "lock", os.O_RDWR)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            raise ValueError("job recovery is still being finalized; fetch later") from None
+    try:
+        meta = json.loads((path / "metadata.json").read_text())
+        if "ended" not in meta:
+            raise ValueError("job recovery incomplete after host interruption")
+        yield path, meta
+    finally:
+        lock.close()
+
+
+retention = SimpleNamespace(RetainedJob=RetainedJob, prune=retention_prune,
+                            fetch=retention_fetch, LIMITS=LIMITS, time=time)
+
+RECOVERY = None
 
 
 def safe_path(name):
@@ -56,6 +275,8 @@ def encode(value):
 def send(kind, data=b""):
     if kind not in FRAME_TYPES or len(data) > MAX_FRAME:
         raise ValueError("frame too large")
+    if RECOVERY is not None and kind in ("O", "S"):
+        RECOVERY.output(kind, data)
     sys.stdout.buffer.write(kind.encode() + struct.pack("!I", len(data)) + data)
     sys.stdout.buffer.flush()
 
@@ -214,7 +435,7 @@ def cleanup(root):
         if time.monotonic() > deadline:
             print("chaldea: cleanup budget exhausted; leftovers remain bounded", file=sys.stderr)
             break
-        if (path.name in ("admission.lock", "lost+found")
+        if (path.name in ("admission.lock", "lost+found", ".retained", ".retention.lock")
                 or re.fullmatch(r"admission-[0-9]+\.lock|slot-[0-9]+", path.name)):
             continue
         try:
@@ -229,6 +450,7 @@ def cleanup(root):
 def admission(root, config):
     if config.get("require_mount", True) and not os.path.ismount(root):
         raise Refused("job storage unavailable: image is not mounted; host remains available")
+    retention.prune(root, config)
     cap = int(config.get("state_cap_bytes", CAP))
     reserve = max(int(config.get("min_free_bytes", RESERVE)), 0)
     usage = shutil.disk_usage(root)
@@ -830,6 +1052,21 @@ def execute(request, workspace, config):
         JOB_STARTED = JOB_STARTED or launched(launch)
         job_signal(launch, signal.SIGKILL, process.pid)
         kill_group(process)
+        if RECOVERY is not None:
+            # After killing the entire guest, preserve output still buffered in
+            # pipes even when the client has already closed its transport.
+            for pipe, kind in ((process.stdout, "O"), (process.stderr, "S")):
+                os.set_blocking(pipe.fileno(), False)
+                remaining = MAX_OUTPUT
+                while remaining:
+                    try:
+                        data = os.read(pipe.fileno(), min(CHUNK, remaining))
+                    except BlockingIOError:
+                        break
+                    if not data:
+                        break
+                    RECOVERY.output(kind, data)
+                    remaining -= len(data)
         process.stdout.close()
         process.stderr.close()
         launch.unlink(missing_ok=True)
@@ -863,6 +1100,81 @@ def artifacts(request, workspace):
             send("A", encode({"path": name, "size": size}))
             while data := file.read(CHUNK):
                 send("B", data)
+
+
+def run_job(root, slot_root, request, workspace, config):
+    global RECOVERY
+    saved = retention.RetainedJob(root, request, config)
+    RECOVERY = saved
+    code = None
+    outcome = "uncertain"
+    keep = True
+    try:
+        try:
+            code = execute(request, workspace, config)
+            outcome = "finished"
+            artifacts(request, workspace)
+        except Preempted:
+            outcome = "preempted"
+            raise
+        finally:
+            RECOVERY = None
+            # A closing SSH session often delivers several HUP/TERM signals.
+            # Complete the bounded recovery write before honoring more signals.
+            handlers = {sig: signal.signal(sig, signal.SIG_IGN)
+                        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+            signal.alarm(120)
+            try:
+                try:
+                    saved.finish(workspace, artifact_file, outcome, code)
+                finally:
+                    cleanup(slot_root)
+                # Workspace deletion recovers image space. Retry metadata after
+                # cleanup so ENOSPC cannot discard the known outcome.
+                saved.persist_metadata()
+            finally:
+                for sig, handler in handlers.items():
+                    signal.signal(sig, handler)
+        send("X", encode({"exitCode": code}))
+        keep = code != 0
+    finally:
+        RECOVERY = None
+        saved.close(keep)
+        try:
+            retention.prune(root, config)
+        except (OSError, ValueError):
+            print("chaldea: recovery prune deferred; image remains bounded", file=sys.stderr)
+
+
+def fetch_job(root, config):
+    send("H", encode({"version": VERSION, "fetchVersion": PROTOCOL["fetchVersion"]}))
+    kind, body = receive()
+    if kind != "F":
+        raise ValueError("expected versioned exec fetch request")
+    with retention.fetch(root, json.loads(body), config) as (path, meta):
+        send("M", encode(meta))
+        with (path / "output.log").open("rb") as log:
+            remaining = MAX_OUTPUT
+            while remaining:
+                data = log.read(min(CHUNK, remaining))
+                if not data:
+                    break
+                send("L", data)
+                remaining -= len(data)
+        total = 0
+        for item in meta["artifacts"]:
+            safe_path(item["path"])
+            size = item["size"]
+            total += size
+            if type(size) is not int or size < 0 or total > MAX_ARTIFACT:
+                raise ValueError("invalid retained artifacts")
+            with (path / ("artifact-" + str(item["index"]))).open("rb") as file:
+                if os.fstat(file.fileno()).st_size != size:
+                    raise ValueError("incomplete retained artifact")
+                send("A", encode({"path": item["path"], "size": size}))
+                while data := file.read(CHUNK):
+                    send("B", data)
+        send("X", encode({"retrieved": True}))
 
 
 def interrupted(_signum, _frame):
@@ -911,6 +1223,11 @@ def main():
     if config.get("require_mount", True) and not os.path.ismount(root):
         raise Refused("job storage unavailable: image is not mounted; host remains available")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    retention.prune(root, config)
+    if os.environ.get("SSH_ORIGINAL_COMMAND") == PROTOCOL["commands"]["fetch"]:
+        signal.alarm(120)
+        fetch_job(root, config)
+        return
     with job_admission(root, config, queued) as slot_root:
         cleanup(slot_root)
         signal.alarm(120)
@@ -930,12 +1247,10 @@ def main():
             resource.setrlimit(resource.RLIMIT_FSIZE, (CAP, CAP))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             signal.alarm(21720)
-            code = execute(request, workspace, config)
-            artifacts(request, workspace)
+            run_job(root, slot_root, request, workspace, config)
         finally:
             cleanup(slot_root)
-        # Result follows bounded cleanup; unremovable leftovers stay image-bounded.
-        send("X", encode({"exitCode": code}))
+        # run_job sends the result only after bounded cleanup and recovery writes.
 
 
 JOB_STARTED = False

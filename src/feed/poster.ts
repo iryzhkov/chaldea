@@ -25,6 +25,8 @@ export function title(record: QuotaRecord): string {
     case "quota_headroom_changed":
     case "quota_headroom_low":
       return `${record.kind}: ${record.headroom?.providers.map(p => p.alias).join(", ") ?? "unknown"}`;
+    case "restart_resumed":
+      return `restart_resumed: ${record.provider} thread ${thread}`;
     case "quota_parked":
       return `quota_parked: ${record.provider} thread ${thread} until ${record.resetAt}`;
     case "quota_reset_unknown":
