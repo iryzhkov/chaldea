@@ -54,7 +54,7 @@ project/server settings, strong provider session requirements and chain cap
 still apply; Chaldea does not bypass those for unplanned restarts. If native
 recovery is disabled, an unplanned interruption remains a documented gap.
 
-A further disposable secret-card probe found an upstream boundary: with native restart recovery enabled, one graceful group shutdown resumed a run whose secret card had been pending, although Chaldea admitted no journal row and dispatched nothing. Native uses equality between card-cancellation and run-cancellation times; a provider disconnect can cancel the card earlier. Chaldea conservatively blocks pending, cancelled and timed-out secret cards for the source run. Its switch cannot control native T3 recovery. Consequently this patch cannot certify the pinned native path as safe for every pending-secret shutdown ordering; disabling native recovery avoids that native behavior but leaves unplanned recovery unavailable.
+A further disposable secret-card probe found an upstream boundary: with native restart recovery enabled, one graceful group shutdown resumed a run whose secret card had been pending, although Chaldea admitted no journal row and dispatched nothing. Native uses equality between card-cancellation and run-cancellation times; a provider disconnect can cancel the card earlier. Chaldea conservatively blocks pending and cancelled secret cards for the source run. Its switch cannot control native T3 recovery. Consequently this patch cannot certify the pinned native path as safe for every pending-secret shutdown ordering; disabling native recovery avoids that native behavior but leaves unplanned recovery unavailable.
 
 ## Planned restarts
 
@@ -66,7 +66,7 @@ systemctl --user restart t3code.service
 
 Before running that command, Chaldea captures fresh projections of active turns
 into `~/.local/state/chaldea/t3-restarts.sqlite` (SQLite WAL, synchronous FULL).
-Capture gathers every projection first, then commits the complete invocation in one transaction. If capture fails, no intent is armed. A failed service command while the runtime identity is unchanged aborts that invocation, so a later unplanned death cannot activate it. Recovery pins the first changed runtime identity and never carries an intent to another boot.
+Capture gathers every projection first, then commits the complete invocation in one transaction. If capture fails, no intent is armed. A failed service command while the runtime identity is unchanged aborts that invocation, so a later unplanned death cannot activate it. Recovery admits unpinned intents only until capture time + timeoutMs + 10 seconds, and pins the first changed runtime identity it observes. Expiry and identity checks run before retry backoff; an intent cannot drift to another observed boot or revive days later. If both the CLI and observer miss that bounded recovery window, it fails closed. Old journal rows without deadlines also fail closed.
 
 Each row retains thread ID, run ID, provider, model, immutable command bytes and
 a hash of the local runtime file. The journal is scoped to the T3 base directory.

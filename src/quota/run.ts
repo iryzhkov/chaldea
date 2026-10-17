@@ -225,10 +225,12 @@ export function processObserverEvent(
 export async function runObserver(options: ObserverOptions): Promise<number> {
   const { logger, signal } = options;
   const restart = options.restart ?? restartConfig();
-  const journal = new RestartJournal(restart.journalPath);
+  let journal: RestartJournal | undefined;
+  try { journal = new RestartJournal(restart.journalPath); }
+  catch { logger.warn("restart journal unavailable; quota observation continues without restart recovery"); }
   const state = loadState(options.statePath, Date.now());
   const poster = new FeedPoster({ command: options.feedCommand, host: options.host, logger });
-  const restarts = new RestartRecoveryWorker({ ...options, config: restart }, journal, poster);
+  const restarts = journal ? new RestartRecoveryWorker({ ...options, config: restart }, journal, poster) : undefined;
   const sink = new EventSink(state, options.statePath, poster, logger);
   sink.save(); // Recover durable pending payloads even when T3 is offline.
   logger.info("quota observer starting", { cursor: state.cursor, parked: state.parked.size, posted: state.posted.size });
@@ -262,7 +264,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
           logger.info("subscribed to T3 shell", { afterSequence: state.cursor });
         }
         processObserverEvent(sink, switcher!, event);
-        if (event.kind === "synchronized" || event.kind === "thread") restarts.kick();
+        if (event.kind === "synchronized" || event.kind === "thread") restarts?.kick();
       };
       await connectShell(
         { serverUrl, token, signal },
@@ -285,12 +287,12 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
     await sleep(delay, signal);
   }
   // close() never throws, so a failed final write cannot change the exit status or skip the drain.
-  await restarts.close();
+  await restarts?.close();
   await switcher?.close();
   sink.close();
   await Promise.race([poster.idle(), new Promise((r) => setTimeout(r, 30_000).unref())]);
   poster.close();
-  journal.close();
+  journal?.close();
   logger.info("quota observer stopped", { exitCode });
   return exitCode;
 }

@@ -94,8 +94,8 @@ for (const boundary of ["dispatching", "resumed"]) test(`observer recovers proce
     const run = await f.start();
     await captureRestart(f.options, f.journal);
     await f.restart();
-    // Fresh child dies exactly after the RPC acceptance/readback, before saving
-    // resumed or posting a record. Its committed dispatching intent survives.
+    // dispatching dies before send; resumed dies after acceptance/readback but
+    // before acknowledgement. Both recover from the committed capture.
     const result = await new Promise<number | null>(resolve => {
       const child = spawn(process.execPath, ["test/helpers/crash-restart.ts", f.config.journalPath, f.t3.baseDir, f.tokenFile, boundary], {
         env: { PATH: process.env.PATH!, HOME: f.dir.path, TMPDIR: f.dir.path }, stdio: "ignore",
@@ -135,6 +135,51 @@ test("failed restart command cannot arm a later unplanned restart", { skip, time
       c => c["orchestration.getThreadProjection"]({ threadId: f.thread } as never));
     assert.equal(p.runs.length, 1);
   } finally { await f.close(); }
+});
+
+test("an unobserved expired intent cannot revive after a later boot", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  try {
+    await f.start(); await captureRestart(f.options, f.journal); await f.restart();
+    // Advance the fixture journal beyond its admission deadline without a real
+    // ninety-second sleep. No recovery process observed this first new boot.
+    f.journal.db.prepare("UPDATE restarts SET captured_at = ?, expires_at = ?")
+      .run(Date.now() - 200_000, Date.now() - 1);
+    await f.restart(); await recoverPlannedRestarts(f.options, f.journal, f.poster);
+    const p = await withClient({ serverUrl: f.t3.serverUrl, token: f.token },
+      c => c["orchestration.getThreadProjection"]({ threadId: f.thread } as never));
+    assert.equal(p.runs.length, 1); assert.equal(f.records.length, 0);
+    assert.equal(f.journal.entries(f.t3.baseDir).length, 0);
+  } finally { await f.close(); }
+});
+
+test("auth retry cannot drift into another observed boot", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  try {
+    await f.start(); await captureRestart(f.options, f.journal); await f.restart();
+    const readonly = join(f.dir.path, "read-token");
+    writePrivateFile(readonly, f.t3.issueToken(["orchestration:read"]));
+    await recoverPlannedRestarts({ ...f.options, tokenFile: readonly }, f.journal, f.poster);
+    assert.ok(f.journal.entries(f.t3.baseDir)[0]!.retry_at > Date.now());
+    await f.restart(); await recoverPlannedRestarts(f.options, f.journal, f.poster);
+    assert.equal(f.records.length, 0); assert.equal(f.journal.entries(f.t3.baseDir).length, 0);
+  } finally { await f.close(); }
+});
+
+test("unavailable restart journal does not stop quota observation", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  const { ObserverProcess } = await import("../helpers/e2e.ts");
+  let observer: InstanceType<typeof ObserverProcess> | undefined;
+  try {
+    const config = join(f.dir.path, "bad-config.json"), feed = join(f.dir.path, "feed.jsonl");
+    writeFileSync(config, JSON.stringify({ ...f.config, journalPath: f.dir.path }));
+    observer = new ObserverProcess({ t3BaseDir: f.t3.baseDir, tokenFile: f.tokenFile,
+      statePath: join(f.dir.path, "quota.json"), feedLog: feed, scratch: f.dir.path, restartConfig: config });
+    await waitFor("quota subscription despite bad journal", () => observer!.subscriptions() === 1, 30_000);
+    await dispatchMessage(f.t3, f.token, f.thread, f.t3.trigger, "bad-restart-journal");
+    await waitFor("quota observation", () => readFeed(feed).some(e => e.body.kind === "quota_reset_unknown"), 30_000);
+    assert.equal(observer.subscriptions(), 1);
+  } finally { await observer?.stop(); await f.close(); }
 });
 
 test("provider disabled during restart is terminal and never retries a continuation", { skip, timeout: 120_000 }, async () => {
@@ -199,7 +244,7 @@ for (const native of [false, true]) test(`Chaldea never admits a secret card (na
     if (!native) assert.equal(p.runs.length, 1);
     // Native 0.1.0 can race secret cancellation against shutdown; any linked
     // continuation here is native: Chaldea has no captured row or feed record.
-    assert.equal(p.messages.filter(m => m.id.startsWith("message:restart-continuation:")).length, 0);
+    assert.equal(f.journal.entries(f.t3.baseDir).length, 0, "no Chaldea intent exists to dispatch");
     console.log(JSON.stringify({ nativeSecretProbe: native, runsAfterRestart: p.runs.length }));
     assert.equal(f.records.length, 0);
   } finally { await f.close(); }

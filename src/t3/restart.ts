@@ -10,7 +10,7 @@ import { FeedPoster } from "../feed/poster.ts";
 import type { Logger } from "../log.ts";
 import { readToken } from "../quota/run.ts";
 import { AuthenticationError, ProtocolIncompatibleError, discoverServerUrl,
-  type ConnectOptions, type ShellThread } from "./adapter.ts";
+  switchPort, type ConnectOptions, type ShellThread } from "./adapter.ts";
 import { dispatchRestart } from "./restart-dispatch.ts";
 import { restartPayload, restartProjection, restartSnapshot } from "./restart-port.ts";
 
@@ -44,6 +44,7 @@ export function runtimeEpoch(baseDir: string): string | null {
 interface Intent {
   thread: string; run: string; epoch: string; payload: string;
   provider: string; model: string; subagent: number; phase: string; retry_at: number;
+  invocation: string; captured_at: number; expires_at: number;
 }
 export class RestartJournal {
   readonly db: DatabaseSync;
@@ -51,15 +52,18 @@ export class RestartJournal {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
     chmodSync(path, 0o600);
-    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS restarts (
         scope TEXT NOT NULL, thread TEXT NOT NULL, run TEXT NOT NULL, epoch TEXT NOT NULL,
         provider TEXT NOT NULL, model TEXT NOT NULL, subagent INTEGER NOT NULL,
         payload TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'captured', posted INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(scope, thread, run));`);
-    const columns = this.db.prepare("PRAGMA table_info(restarts)").all().map(c => c.name);
-    for (const [name, type] of [["invocation", "TEXT"], ["recovery_epoch", "TEXT"], ["retry_at", "INTEGER NOT NULL DEFAULT 0"]])
-      if (!columns.includes(name!)) this.db.exec(`ALTER TABLE restarts ADD COLUMN ${name} ${type}`);
+    this.transaction(() => {
+      const columns = this.db.prepare("PRAGMA table_info(restarts)").all().map(c => c.name);
+      for (const [name, type] of [["invocation", "TEXT"], ["recovery_epoch", "TEXT"],
+        ["retry_at", "INTEGER NOT NULL DEFAULT 0"], ["captured_at", "INTEGER NOT NULL DEFAULT 0"], ["expires_at", "INTEGER NOT NULL DEFAULT 0"]])
+        if (!columns.includes(name!)) this.db.exec(`ALTER TABLE restarts ADD COLUMN ${name} ${type}`);
+    });
   }
   transaction(write: () => void): void {
     this.db.exec("BEGIN IMMEDIATE");
@@ -85,13 +89,14 @@ export class RestartJournal {
       .get(resolve(baseDir));
     return typeof row?.next === "number" ? row.next : null;
   }
-  capture(baseDir: string, epoch: string, thread: ShellThread, run: string, payload: string, provider: string, model: string, invocation: string): void {
+  capture(baseDir: string, epoch: string, thread: ShellThread, run: string, payload: string, provider: string, model: string, invocation: string, timeoutMs: number): void {
     this.db.prepare(`INSERT INTO restarts
-      (scope, thread, run, epoch, provider, model, subagent, payload, invocation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (scope, thread, run, epoch, provider, model, subagent, payload, invocation, captured_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(scope, thread, run) DO UPDATE SET epoch = excluded.epoch,
-        invocation = excluded.invocation, phase = 'captured', recovery_epoch = NULL, retry_at = 0
+        invocation = excluded.invocation, phase = 'captured', recovery_epoch = NULL, retry_at = 0,
+        captured_at = excluded.captured_at, expires_at = excluded.expires_at
       WHERE restarts.phase = 'aborted'`)
-      .run(resolve(baseDir), thread.id, run, epoch, provider, model, Number(thread.relationshipToParent === "subagent"), payload, invocation);
+      .run(resolve(baseDir), thread.id, run, epoch, provider, model, Number(thread.relationshipToParent === "subagent"), payload, invocation, Date.now(), Date.now() + timeoutMs + 10_000);
   }
   entries(baseDir: string): Intent[] {
     return this.db.prepare("SELECT * FROM restarts WHERE scope = ? AND (phase NOT IN ('skipped', 'aborted') AND (phase != 'resumed' OR posted = 0))")
@@ -148,7 +153,7 @@ export async function captureRestart(options: RestartOptions, journal: RestartJo
     const run = p.run;
     captures.push(() => journal.capture(options.t3BaseDir, epoch, p.thread, run.id,
       restartPayload(thread.id, run.id, run.modelSelection),
-      run.providerInstanceId, run.modelSelection.model, invocation));
+      run.providerInstanceId, run.modelSelection.model, invocation, options.config.timeoutMs));
   }
   journal.transaction(() => { for (const capture of captures) capture(); });
   return invocation;
@@ -163,47 +168,57 @@ export async function recoverPlannedRestarts(options: RestartOptions, journal: R
   const epoch = runtimeEpoch(options.t3BaseDir);
   if (epoch === null) return;
   for (const intent of journal.entries(options.t3BaseDir)) {
-    if (intent.retry_at > Date.now()) continue;
     try {
-    if (intent.phase !== "resumed") {
-      if (epoch === intent.epoch) continue;
-      if (!journal.pinEpoch(options.t3BaseDir, intent, epoch)) {
-        journal.phase(options.t3BaseDir, intent, "skipped"); continue;
-      }
-      const port = connection(options);
-      const p = await restartProjection(port, intent.thread, intent.run);
-      if (p?.continued) {
-        journal.phase(options.t3BaseDir, intent, "resumed");
-      } else if (p?.run && ["preparing", "starting", "running", "waiting"].includes(p.run.status) &&
-          p.thread.latestRunId === intent.run && !excluded(p.thread) && !p.blocked && !p.waitingForUser && !p.interrupted) {
-        journal.retry(options.t3BaseDir, intent, 500); continue;
-      } else if (!p?.run || excluded(p.thread) || p.blocked || p.waitingForUser || p.interrupted ||
-          p.run.status !== "cancelled" || p.thread.latestRunId !== intent.run ||
-          p.thread.activeRunId !== null || p.thread.lastErrorClass !== null ||
-          p.thread.providerInstanceId !== intent.provider) {
-        journal.phase(options.t3BaseDir, intent, "skipped");
-        continue;
-      } else {
-        // Persist dispatch intent before any network write. An ambiguous result
-        // leaves these exact bytes available for observer/startup replay.
-        journal.phase(options.t3BaseDir, intent, "dispatching");
-        await dispatchRestart(port, intent.payload);
-        const after = await restartProjection(port, intent.thread, intent.run);
-        // Dispatch can be an accepted no-op when Stop wins server serialization.
-        if (!after?.continued) {
+      if (intent.phase !== "resumed") {
+        // An absent observer must never revive a long-abandoned cancelled turn.
+        // Old journal versions without a deadline also fail closed.
+        if (!(intent.captured_at > 0) || Date.now() > intent.expires_at) {
+          journal.phase(options.t3BaseDir, intent, "skipped"); continue;
+        }
+        if (epoch === intent.epoch) continue;
+        if (!journal.pinEpoch(options.t3BaseDir, intent, epoch)) {
+          journal.phase(options.t3BaseDir, intent, "skipped"); continue;
+        }
+        if (intent.retry_at > Date.now()) continue;
+        const port = connection(options);
+        const p = await restartProjection(port, intent.thread, intent.run);
+        if (p?.continued) {
+          journal.phase(options.t3BaseDir, intent, "resumed");
+        } else if (p?.run && ["preparing", "starting", "running", "waiting"].includes(p.run.status) &&
+            p.thread.latestRunId === intent.run && !excluded(p.thread) && !p.blocked && !p.waitingForUser && !p.interrupted) {
+          journal.retry(options.t3BaseDir, intent, 500); continue;
+        } else if (!p?.run || excluded(p.thread) || p.blocked || p.waitingForUser || p.interrupted ||
+            p.run.status !== "cancelled" || p.thread.latestRunId !== intent.run ||
+            p.thread.activeRunId !== null || p.thread.lastErrorClass !== null ||
+            p.thread.providerInstanceId !== intent.provider) {
           journal.phase(options.t3BaseDir, intent, "skipped");
           continue;
+        } else {
+          // Persist dispatch intent before any network write. An ambiguous result
+          // leaves these exact bytes available for observer/startup replay.
+          const catalog = await switchPort(port).catalog();
+          const provider = catalog.providers.find(p => p.instanceId === intent.provider);
+          if (!provider || !provider.enabled || !provider.installed) {
+            journal.phase(options.t3BaseDir, intent, "skipped"); continue;
+          }
+          journal.phase(options.t3BaseDir, intent, "dispatching");
+          await dispatchRestart(port, intent.payload);
+          const after = await restartProjection(port, intent.thread, intent.run);
+          // Dispatch can be an accepted no-op when Stop wins server serialization.
+          if (!after?.continued) {
+            journal.phase(options.t3BaseDir, intent, "skipped");
+            continue;
+          }
+          journal.phase(options.t3BaseDir, intent, "resumed");
         }
-        journal.phase(options.t3BaseDir, intent, "resumed");
       }
-    }
-    if (process.env.AKASHA_URL === undefined && process.env.AKASHA_TOKEN_HELPER === undefined &&
-        !journal.claimLegacyFeed(options.t3BaseDir, intent)) continue;
-    poster.enqueue({
-      kind: "restart_resumed", severity: "info", threadId: intent.thread,
-      runId: intent.run, provider: intent.provider, fromModel: intent.model,
-      resetAt: null, subagent: intent.subagent === 1,
-    }, () => { journal.posted(options.t3BaseDir, intent); return true; });
+      if (process.env.AKASHA_URL === undefined && process.env.AKASHA_TOKEN_HELPER === undefined &&
+          !journal.claimLegacyFeed(options.t3BaseDir, intent)) continue;
+      poster.enqueue({
+        kind: "restart_resumed", severity: "info", threadId: intent.thread,
+        runId: intent.run, provider: intent.provider, fromModel: intent.model,
+        resetAt: null, subagent: intent.subagent === 1,
+      }, () => { journal.posted(options.t3BaseDir, intent); return true; });
     } catch (error) {
       journal.retry(options.t3BaseDir, intent, error instanceof AuthenticationError ? 120_000 : 5_000);
       options.logger.warn("planned restart continuation deferred", {
@@ -255,7 +270,7 @@ export async function restartT3(options: RestartOptions): Promise<void> {
     await waitForRestart(options, epoch);
     await recoverPlannedRestarts(options, journal, poster);
     await poster.idle();
-    if (journal.entries(options.t3BaseDir).some(intent => intent.phase !== "resumed"))
+    if (journal.entries(options.t3BaseDir).some(intent => intent.invocation === invocation && intent.phase !== "resumed"))
       throw new Error("Planned continuations remain pending; the observer will retry without interrupting quota observation");
   } catch (error) {
     if (invocation && runtimeEpoch(options.t3BaseDir) === epoch) journal.abortInvocation(invocation);
