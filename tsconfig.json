@@ -2,15 +2,28 @@
   "compilerOptions": {
     "target": "ESNext",
     "module": "NodeNext",
-    "strict": true,
+    "moduleResolution": "NodeNext",
     "noEmit": true,
     "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "useDefineForClassFields": true,
+    "skipLibCheck": true,
     "types": [
       "node"
     ]
   },
   "include": [
-    "src/exec/**/*.ts",
-    "test/exec/**/*.ts"
+    "src",
+    "test",
+    "vendor/t3-contracts/src"
+  ],
+  "exclude": [
+    "src/exec",
+    "test/exec"
   ]
 }

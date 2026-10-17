@@ -1,0 +1,8 @@
+#!/bin/sh
+# Runs a command with TMPDIR and the test scratch root on disk, never /tmp.
+set -eu
+CHALDEA_TEST_SCRATCH=${CHALDEA_TEST_SCRATCH:-$HOME/.cache/chaldea-test}
+mkdir -p "$CHALDEA_TEST_SCRATCH/tmp"
+export CHALDEA_TEST_SCRATCH
+export TMPDIR="$CHALDEA_TEST_SCRATCH/tmp"
+exec "$@"

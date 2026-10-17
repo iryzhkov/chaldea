@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # GitHub-hosted runners are unavailable to this account; agent-a hosts this one.
+    runs-on: [self-hosted, chaldea]
+    env:
+      CHALDEA_REQUIRE_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Locate the pinned t3
+        # The end-to-end tests start disposable loopback servers from this
+        # executable with their own base directories; the host's T3 is not touched.
+        run: |
+          bin="$HOME/.t3/runtime/versions/0.1.0/t3"
+          expected=$(grep 'T3 executable SHA-256' vendor/t3-contracts/PROVENANCE.md | grep -oE '[0-9a-f]{64}')
+          actual=$(sha256sum "$bin" | cut -d' ' -f1)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::$bin does not match the pinned T3 executable"
+            exit 1
+          fi
+          echo "CHALDEA_T3_BIN=$bin" >> "$GITHUB_ENV"
+          # Fixtures and TMPDIR stay in the runner's own temporary directory.
+          echo "CHALDEA_TEST_SCRATCH=$RUNNER_TEMP/chaldea-test" >> "$GITHUB_ENV"
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

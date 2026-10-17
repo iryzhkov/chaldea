@@ -1,2 +1,6 @@
 #!/usr/bin/env node
-import('../src/exec/cli.ts');
+if (process.argv[2] === 'exec') await import('../src/exec/cli.ts');
+else {
+  const { main } = await import('../src/cli.ts');
+  process.exitCode = await main(process.argv.slice(2));
+}
