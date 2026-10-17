@@ -13,7 +13,7 @@ export interface Item {
   outcome: string | null; created: number; terminal: number | null;
 }
 export interface Delivery {
-  id: string; item: string; channel: "wake" | "native"; payload: string;
+  id: string; item: string; batch_id: string | null; channel: "wake" | "native"; payload: string;
   state: "pending" | "sending" | "sent" | "suppressed" | "blocked" | "uncertain"; disposition: string | null; attempts: number; next_at: number; expires: number | null;
 }
 export interface NativePolicy { item: string; request_id: string | null; bind_until: number; baseline: string; questions: string|null; turn_item:string|null; created?:number }
@@ -61,6 +61,8 @@ export class WakeStore {
       this.db.exec("ALTER TABLE native_decisions ADD COLUMN questions TEXT");
     if (!(this.db.prepare("PRAGMA table_info(native_decisions)").all() as Array<{name:string}>).some(c=>c.name==="turn_item"))
       this.db.exec("ALTER TABLE native_decisions ADD COLUMN turn_item TEXT");
+    if (!(this.db.prepare("PRAGMA table_info(outbox)").all() as Array<{name:string}>).some(c=>c.name==="batch_id"))
+      this.db.exec("ALTER TABLE outbox ADD COLUMN batch_id TEXT");
     const env = this.meta("environment");
     if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
@@ -125,18 +127,22 @@ export class WakeStore {
         if (nativeBaseline.length > 128 || Buffer.byteLength(JSON.stringify(nativeBaseline))>4096)
           throw new Error("Recent native request baseline exceeds cap");
       }
-      if (reg.kind === "wait" && this.active().some(i => i.kind === "wait" && i.parent === reg.input.threadId))
-        throw new Error("One active wait per thread");
+      const waits = this.active().filter(i => i.kind === "wait");
+      if (reg.kind === "wait" && waits.filter(i => i.parent === reg.input.threadId).length >= 8)
+        throw new Error("Active wait limit (8) per thread; cancel or resolve a wait before registering another");
       if ("condition" in reg.input && reg.input.condition.kind === "thread") {
-        let target = reg.input.condition.threadId; const visited = new Set([reg.input.threadId]);
-        for (;;) {
-          if (visited.has(target)) throw new Error("Dependency cycle");
+        const edges = new Map<string,string[]>();
+        for (const wait of waits) {
+          const c = (JSON.parse(wait.input) as {condition: {kind:string; threadId?:string}}).condition;
+          if (c.kind === "thread" && c.threadId) edges.set(wait.parent,[...(edges.get(wait.parent) ?? []),c.threadId]);
+        }
+        const pending = [reg.input.condition.threadId], visited = new Set<string>();
+        while (pending.length) {
+          const target = pending.pop()!;
+          if (target === reg.input.threadId) throw new Error("Dependency cycle");
+          if (visited.has(target)) continue;
           visited.add(target);
-          const next = this.active().find(i => i.kind === "wait" && i.parent === target);
-          if (!next) break;
-          const c = (JSON.parse(next.input) as {condition?: {kind:string; threadId?:string}}).condition;
-          if (c?.kind !== "thread" || !c.threadId) break;
-          target = c.threadId;
+          pending.push(...(edges.get(target) ?? []));
         }
       }
       this.db.prepare("INSERT INTO items(id,kind,parent,project,request_key,request_at,hash,input,deadline,target_run,state,created) VALUES(?,?,?,?,?,?,?,?,?,?,'parked',?)")
@@ -276,25 +282,65 @@ export class WakeStore {
   }
   orphan(id: string, reason: string, now = Date.now()): void {
     this.transaction(() => {
-      this.db.prepare("UPDATE items SET state='orphaned',disposition=?,terminal=? WHERE id=?").run(reason,now,id);
-      this.db.prepare("UPDATE outbox SET state='uncertain',disposition=? WHERE item=? AND channel IN ('wake','native') AND attempts>0 AND state IN ('pending','sending')").run(reason,id);
-      this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND state IN ('pending','blocked')").run(id);
+      const batch=(this.db.prepare("SELECT batch_id FROM outbox WHERE item=? AND channel='wake'").get(id) as {batch_id:string|null}|undefined)?.batch_id;
+      const ids=batch
+        ? (this.db.prepare("SELECT item FROM outbox WHERE batch_id=?").all(batch) as Array<{item:string}>).map(r=>r.item)
+        : [id];
+      for (const item of ids) {
+        this.db.prepare("UPDATE items SET state='orphaned',disposition=?,terminal=? WHERE id=?").run(reason,now,item);
+        this.db.prepare("UPDATE outbox SET state='uncertain',disposition=? WHERE item=? AND channel IN ('wake','native') AND attempts>0 AND state IN ('pending','sending')").run(reason,item);
+        this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND state IN ('pending','blocked')").run(item);
+      }
     });
+  }
+  /** Only a batch leader may send; ambiguous batches precede new wakes on a thread. */
+  dispatchable(): Delivery[] {
+    const parents = new Set<string>();
+    return this.deliveries().filter(d => d.state === "pending" && (!d.batch_id || d.batch_id === d.id))
+      .sort((a,b) => Number(b.attempts > 0)-Number(a.attempts > 0) || a.next_at-b.next_at || a.id.localeCompare(b.id))
+      .filter(d => {
+        const item=this.get(d.item);
+        if (d.channel !== "wake" || item.kind !== "wait") return true;
+        if (parents.has(item.parent)) return false;
+        parents.add(item.parent); return true;
+      });
   }
   claim(id: string): Delivery | undefined {
     return this.transaction(() => {
-      const row = this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE id=? AND state='pending' RETURNING *").get(id) as Delivery|undefined;
-      return row;
+      const row=this.db.prepare("SELECT * FROM outbox WHERE id=? AND state='pending'").get(id) as Delivery|undefined;
+      if (!row || (row.batch_id && row.batch_id !== id)) return;
+      const item=this.get(row.item);
+      if (row.channel === "wake" && item.kind === "wait" && !row.batch_id && row.attempts === 0) {
+        const members=this.db.prepare(`SELECT o.* FROM outbox o JOIN items i ON i.id=o.item
+          WHERE i.kind='wait' AND i.parent=? AND i.project=? AND o.channel='wake'
+          AND o.state='pending' AND o.attempts=0 AND o.batch_id IS NULL ORDER BY o.id`)
+          .all(item.parent,item.project) as unknown as Delivery[];
+        // Persist membership and the final wire bytes before any RPC. An attempted
+        // batch is immutable, including after a lost ACK or process restart.
+        let payload=row.payload;
+        if (members.length > 1) {
+          const command=JSON.parse(payload);
+          command.text="Chaldea wake (waits):\n"+members.map(d => {
+            const wait=this.get(d.item);
+            return wait.id+": "+wait.outcome;
+          }).join("\n")+"\nchaldea wait status <id>";
+          payload=JSON.stringify(command);
+        }
+        const freeze=this.db.prepare("UPDATE outbox SET batch_id=?,payload=? WHERE id=?");
+        for (const member of members) freeze.run(id,payload,member.id);
+      }
+      this.db.prepare("UPDATE outbox SET state='sending',attempts=attempts+1 WHERE (id=? OR batch_id=?) AND state='pending'").run(id,id);
+      return this.db.prepare("SELECT * FROM outbox WHERE id=?").get(id) as unknown as Delivery;
     });
   }
   block(id: string): void {
     this.transaction(() => {
-      this.db.prepare("UPDATE outbox SET state='blocked' WHERE id=? AND state='sending'").run(id);
-      this.db.prepare("UPDATE items SET disposition='delivery_rejected' WHERE id=(SELECT item FROM outbox WHERE id=?)").run(id);
+      this.db.prepare("UPDATE outbox SET state='blocked' WHERE (id=? OR batch_id=?) AND state='sending'").run(id,id);
+      this.db.prepare("UPDATE items SET disposition='delivery_rejected' WHERE id IN (SELECT item FROM outbox WHERE id=? OR batch_id=?)").run(id,id);
     });
   }
-  sent(id: string): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='sent' WHERE id=?").run(id); }); }
-  retry(id: string, at: number): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='pending',next_at=? WHERE id=? AND state IN ('pending','sending')").run(at,id); }); }
+  sent(id: string): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='sent' WHERE id=? OR batch_id=?").run(id,id); }); }
+  retry(id: string, at: number): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='pending',next_at=? WHERE (id=? OR batch_id=?) AND state IN ('pending','sending')").run(at,id,id); }); }
   suppress(id: string): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='suppressed' WHERE id=? AND state='pending'").run(id); }); }
   maintain(now: number): void {
     this.transaction(() => {

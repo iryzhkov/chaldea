@@ -19,6 +19,7 @@ export class WaitEngine {
   private snapshots = new Map<string,WaitSnapshot|null>();
   private cursors = new Map<string,number>();
   private observers = new Map<string,{abort:AbortController; retry?:NodeJS.Timeout}>();
+  private wakeParents = new Set<string>();
   private inflight = new Map<string,Delivery["channel"]>();
   private hasSlot(channel: Delivery["channel"]): boolean {
     return [...this.inflight.values()].filter(c=>c===channel).length < 8;
@@ -195,10 +196,16 @@ export class WaitEngine {
         entry.abort.abort(); clearTimeout(entry.retry); this.observers.delete(id); this.snapshots.delete(id); this.cursors.delete(id);
       }
       for (const id of needed) this.watch(id);
-      for (const d of this.store.deliveries()) {
+      for (const d of this.store.dispatchable()) {
         if (d.state !== "pending") continue;
         if (d.next_at <= now && this.hasSlot(d.channel) && !this.inflight.has(d.id)) {
-          this.inflight.set(d.id,d.channel); void this.deliver(d).finally(() => { this.inflight.delete(d.id); this.poke(); });
+          const item=this.store.get(d.item);
+          const parent=d.channel === "wake" && item.kind === "wait" ? item.parent : undefined;
+          if (parent && this.wakeParents.has(parent)) continue;
+          if (parent) this.wakeParents.add(parent);
+          this.inflight.set(d.id,d.channel); void this.deliver(d).finally(() => {
+            this.inflight.delete(d.id); if (parent) this.wakeParents.delete(parent); this.poke();
+          });
         }
       }
       if (this.storageRetry) return; // A delivery claim may have armed storage backoff.
@@ -216,7 +223,9 @@ export class WaitEngine {
         const input=JSON.parse(i.input) as WaitInput;
         if (input.condition?.kind === "time") times.push(Date.parse(input.condition.at));
       }
-      for (const d of this.store.deliveries()) if (d.state === "pending" && !this.inflight.has(d.id)) {
+      for (const d of this.store.dispatchable()) if (!this.inflight.has(d.id)) {
+        const item=this.store.get(d.item);
+        if (d.channel === "wake" && item.kind === "wait" && this.wakeParents.has(item.parent)) continue;
         // Completion of an in-flight request triggers the next drain; no busy timer loop.
         if (d.next_at > now || this.hasSlot(d.channel)) times.push(d.next_at);
         if (d.expires !== null) times.push(d.expires);
