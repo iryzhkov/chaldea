@@ -332,6 +332,113 @@ parent may already have been told the child failed; whether that is wanted is a
 review question, not something Chaldea changes. The observer marks such records
 with `"subagent": true`.
 
+## Cached headroom and credits
+
+`chaldea quota status` reads the observer's latest durable snapshot without contacting
+T3 or starting a provider. `chaldea quota status --json` preserves exact decimal credit
+strings, nulls and units. Use `--state-file PATH` for an isolated snapshot. A missing
+snapshot reports unknown. There is no implicit collection/refresh action in this command.
+
+The report separates three advisory lanes: included-usage windows, credit-funded
+continuation, and manual-reset inventory. Each metric includes its source,
+successful observation time, age and `fresh|stale|unknown|unsupported|error` state.
+A reading becomes stale at 15 minutes. Failed balance reads keep the last good value
+and timestamp with a sanitized error class; a window update cannot refresh the
+wallet or an omitted reset count. Empty/missing data never means zero. Future
+reset times, percentages and positive credit balances do not prove provider recovery.
+
+Advisory config failures, including contract drift, pause headroom collection and
+retry with independent backoff; they never stop or reconnect the shell observer.
+The observer reads cached `server.getConfig` and subscribes to
+`subscribeServerConfig` snapshots/provider statuses. It retains window IDs,
+kind, used/remaining percentage, duration in minutes, ISO reset time, checkedAt,
+manual-reset count and optional expiry. It excludes redemption IDs, auth labels,
+account/workspace IDs and credential fingerprints from reports and feed payloads.
+Claude resets carry source `t3-internal-claude-reset-read`; they remain dependent
+on T3's internal upstream read. No new private HTTP client is added.
+
+Codex aggregate credits come from a separate short-lived **installed** Codex
+app-server. They are credits, not dollars or a purchased-only ledger, and are never
+summed across aliases/buckets. The wallet's decimal string, hasCredits/unlimited
+flags, manual-reset count, ordinaryUsageAllowed and spendControlReached each retain
+their own successful observation time. The only account RPC is
+`account/rateLimits/read`, with `excludeResetCreditDetails:true` and
+`supportsLunaReserve:false`, after initialize/initialized. No model thread or turn,
+purchase, reset redemption, login change or explicit credential refresh is requested.
+Normal provider-managed credential renewal during a read is distinct from these actions.
+This exchange was designed against codex-cli 0.163.0; optional fields are tolerated
+and incompatible responses degrade to unknown/error rather than inventing a balance.
+
+Credential matching is deliberately explicit. Add `--quota-config PATH` to
+`quota observe` with a local JSON file, for example:
+
+```json
+{
+  "contexts": [{
+    "providers": ["codex", "codex_personal"],
+    "home": "/home/example",
+    "codexHome": "/home/example/.codex",
+    "command": "/absolute/path/to/installed/codex"
+  }],
+  "lowHeadroomPercent": 10
+}
+```
+
+The operator binds the provider aliases to that HOME/auth context. The observer
+also requires a loopback T3 URL, an enabled/installed/authenticated Codex provider,
+a confirmed ChatGPT auth type, and an exact normalized match between codexHome and the published effective runtime
+home (shadowHomePath when present, otherwise homePath). Missing runtime paths,
+instance environment overrides, a remote server or an unmatched context leave the
+balance unknown. If T3 supplies a workspace identity, its private hash must also
+match the read response; no identity or hash is persisted or reported. There is no fallback to the invoking shell's account. The collector
+sets HOME/CODEX_HOME explicitly and excludes inherited auth tokens and endpoint
+overrides. Instances requiring custom auth environment need a future context adapter.
+Equal HOME/CODEX_HOME/executable tuples share one collector across aliases; paths and
+context keys are internal and never appear in status/feed output. Reconfiguration
+invalidates the wallet before a new context can report it. Without a quota config,
+T3 windows/reset counts still work and Codex money remains unknown.
+
+Collection happens once when the observer receives its startup catalog, then every
+five minutes with ±10% jitter while connected to T3. A ten-second scheduler checks
+due work; reads are single-flight across the collector, sequential across contexts,
+have a ten-second deadline and a 1 MiB stdout bound, and terminate their process
+group. Failures/429 back off exponentially to at most 160 minutes plus jitter.
+Shutdown aborts in-flight work. Reconnects do not reset the due time or create a
+second polling loop. This path never asks T3 to refresh a provider.
+
+Claude extra-usage spend/cap remains **unknown** in this initial implementation:
+the experimental CLI control read is not enabled. There is no verified supported
+Claude prepaid wallet. If a future feature-detected control read succeeds, its spend
+and cap must retain currency **minor units**; cap remainder is not prepaid cash.
+Unsupported money metrics are distinguished from an unknown observation.
+
+The existing durable feed queue/poster carries `quota_headroom_snapshot` once per
+15-minute UTC bucket while connected (including startup), plus
+`quota_headroom_changed` for metric availability, wallet availability, permission
+or reset-count changes and `quota_headroom_low` when the set of providers below
+the configured included-window remaining-percent threshold changes. Periodic records
+also age stale observations while idle inference is absent. Records are bounded,
+one provider per payload, with at most 32 windows and 64 provider aliases. Claims,
+snapshot slot and pending delivery are saved together before enqueue,
+with at most the newest pending headroom intent per provider/kind (192 total);
+headroom intents are evicted before a transition can be rejected for capacity, so observer
+restarts replay durable delivery intents through the existing poster path.
+Legacy feed attempts retain their existing at-most-once semantics; scoped Akasha
+delivery retains its receipt/retry behavior. Status does not post feed records.
+
+Routing receives these three lanes as read-only inputs. Credit-funded admission
+and automatic reset redemption are always disabled in this design. Inventory
+cannot admit a provider switch; a fresh ordinary-usage denial blocks the included
+lane, while spend controls remain separate in the credit-funded lane. A future paid-routing policy would need an explicit budget, adequate
+**fresh** balance, spend-control checks and actual provider acceptance. Existing
+usage-limit stop/resume behavior remains in place.
+
+The fake Codex stdio fixture verifies the exact allowlisted request sequence,
+redaction, null/zero handling and bounded failure behavior without any provider
+account. Cadence/backoff/threshold tests inject time and randomness rather than
+asserting elapsed wall-clock time. The status CLI is exercised against a fake
+persisted snapshot with provider executables unavailable on PATH.
+
 ## The observer
 
 `chaldea quota observe` connects to local T3 at
@@ -375,8 +482,8 @@ otherwise `other` (for example a person sent a message first). If a reset
 arrives later for a `quota_reset_unknown` stop, a `quota_parked` follows.
 
 Feed records use `feed post <title> --severity <s> --source chaldea-quota
---host <short hostname> --tag "quota chaldea" --body-file -`. Bodies hold
-identifiers, provider instance names and timestamps only: never transcript
+--host <short hostname> --tag "quota chaldea" --body-file -`. Transition bodies hold thread/run identifiers, provider instance names and timestamps;
+headroom bodies contain the sanitized metrics described above: never transcript
 text, error messages, account details, tokens or URLs carrying secrets. The
 end-to-end test checks the feed bodies and the observer's log for the tokens
 and the transcript.
@@ -411,7 +518,7 @@ afresh and repeating records). The unit does not restart on 78. HTTP 401/403 (ex
 token) is retried every two minutes, re-reading the token file each time, so a
 replaced token is picked up without a restart. Other connection failures,
 including T3 not running or not listening yet, back off from 1 s to 60 s and
-never exit. There is no periodic scan.
+never exit. The shell transition observer has no periodic scan; headroom collection follows the separate bounded cadence above.
 
 ## Reboots and restarts
 
@@ -463,6 +570,11 @@ five seconds while events arrive; there is no separate retention timer. Feed-ser
 the feed's own concern.
 
 ## Installing on a host
+
+This change writes observer state format 5 (and reads formats 2–4). An older binary
+will reject a format-5 state file after rollback. Preserve a pre-upgrade state
+backup for a coordinated rollback; do not delete state to bypass that refusal.
+Malformed headroom state is refused once on load, preserving existing delivery claims.
 
 Not done by this change; the orchestrator installs after review. Run as the
 user that owns the T3 service (`igor`). Each step assumes the previous one
@@ -548,14 +660,12 @@ while a thread is parked still yields exactly one continuation and one
 `quota_parked` and `quota_resumed`. The scenarios that start T3 with the key
 already in `settings.json` exercise the stopped-server fallback.
 
-CI runs on the self-hosted runner on agent-a (labels `self-hosted, chaldea`),
-because GitHub-hosted runners are unavailable to this account. The workflow
-points `CHALDEA_T3_BIN` at agent-a's `~/.t3/runtime/versions/0.1.0/t3` after
-checking its SHA-256 against `vendor/t3-contracts/PROVENANCE.md`, and keeps
-`TMPDIR` and fixtures under the runner's temporary directory.
+CI runs on GitHub-hosted Ubuntu 24.04. It downloads the checksum-pinned T3
+from `vendor/t3-contracts/PROVENANCE.md` and keeps HOME, TMPDIR and fixtures
+in the job's isolated scratch directories.
 
-A fake Codex provider is not included; Codex stops reach the observer through
-the same shell fields.
+Codex stops reach the observer through the same shell fields. The separate
+`fake-codex-balance.mjs` fixture covers only the no-turn balance protocol.
 
 ## Evidence
 
