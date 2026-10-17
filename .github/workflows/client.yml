@@ -1,0 +1,73 @@
+name: client artifact
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['client-*']
+
+permissions:
+  contents: read
+
+jobs:
+  client:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a versioned release commit on main
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          COMMIT: ${{ github.sha }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          printf '%s\n' "$VERSION" | grep -Ex 'client-v[0-9]+\.[0-9]+\.[0-9]+'
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          sh scripts/check-host-release "$COMMIT"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26.10.0
+      - name: Isolate build and smoke-test state
+        run: |
+          mkdir -p "$RUNNER_TEMP/client/home" "$RUNNER_TEMP/client/tmp"
+          echo "HOME=$RUNNER_TEMP/client/home" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP/client/tmp" >> "$GITHUB_ENV"
+      - name: Build twice and check reproducibility
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('client-{0}', github.sha) }}
+        run: |
+          test "$HOME" = "$RUNNER_TEMP/client/home"
+          python3 scripts/package-client.py "$VERSION" "$TMPDIR/release"
+          python3 scripts/package-client.py "$VERSION" "$TMPDIR/repeat"
+          cmp "$TMPDIR/release/chaldea-client.tar.gz" "$TMPDIR/repeat/chaldea-client.tar.gz"
+          cmp "$TMPDIR/release/manifest.json" "$TMPDIR/repeat/manifest.json"
+      - name: Verify the archive and run installed entry points
+        run: python3 scripts/test-client-artifact.py "$TMPDIR/release"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chaldea-client
+          path: |
+            ${{ runner.temp }}/client/tmp/release/chaldea-client.tar.gz
+            ${{ runner.temp }}/client/tmp/release/manifest.json
+          retention-days: 14
+  release:
+    if: startsWith(github.ref, 'refs/tags/client-v')
+    needs: client
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: chaldea-client
+          path: release
+      - name: Publish immutable client release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          gh release create "$VERSION" --target "$COMMIT" --title "$VERSION" --notes "Node 26 client with locked production dependencies. Verify the inventory SHA-256 and manifest.json." release/chaldea-client.tar.gz release/manifest.json
