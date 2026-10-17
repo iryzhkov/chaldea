@@ -1,5 +1,7 @@
 // Single writer, transactional journal shared by waits and decisions.
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { openDb, tx, meta, migrate } from "../store/sqlite.ts";
+import { recoverOutbox } from "../store/outbox.ts";
 import { ownDatabase } from "./owner.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
@@ -31,14 +33,14 @@ export class WakeStore {
     this.path = path; this.environment = environment;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.releaseOwner=ownDatabase(path);
-    try { this.db = new DatabaseSync(path); } catch(error) { this.releaseOwner();throw error; }
+    try { this.db = openDb(path); } catch(error) { this.releaseOwner();throw error; }
     try {
     chmodSync(path, 0o600);
     this.db.exec("PRAGMA busy_timeout=5000");
-    this.db.exec(`
-      PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
-      PRAGMA busy_timeout=5000; PRAGMA max_page_count=7936; PRAGMA cache_spill=OFF; PRAGMA journal_size_limit=0;
-      CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+    this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
+      PRAGMA busy_timeout=5000; PRAGMA max_page_count=7936; PRAGMA cache_spill=OFF; PRAGMA journal_size_limit=0;`);
+    migrate(this.db, [() => {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS items(
         id TEXT PRIMARY KEY, kind TEXT NOT NULL, parent TEXT NOT NULL, project TEXT NOT NULL,
         request_key TEXT UNIQUE NOT NULL, request_at INTEGER NOT NULL, hash TEXT NOT NULL,
@@ -63,6 +65,7 @@ export class WakeStore {
       this.db.exec("ALTER TABLE native_decisions ADD COLUMN turn_item TEXT");
     if (!(this.db.prepare("PRAGMA table_info(outbox)").all() as Array<{name:string}>).some(c=>c.name==="batch_id"))
       this.db.exec("ALTER TABLE outbox ADD COLUMN batch_id TEXT");
+    }]);
     const env = this.meta("environment");
     if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
@@ -71,19 +74,17 @@ export class WakeStore {
     // The outbox uses unconstrained TEXT channels, so no table rebuild is needed.
     this.db.prepare("DELETE FROM outbox WHERE channel='phone'").run();
     // 'sending' means an ambiguous RPC after restart. Retry the identical stored payload.
-    this.db.prepare("UPDATE outbox SET state='pending' WHERE state='sending'").run();
+    recoverOutbox(this.db, "resend");
     try { this.maintain(Date.now()); } catch(error) { if (!(error instanceof CheckpointBlockedError)) throw error; }
     } catch(error) { this.db.close(); this.releaseOwner(); throw error; }
   }
-  meta(key: string): string | undefined { return (this.db.prepare("SELECT value FROM meta WHERE key=?").get(key) as {value:string}|undefined)?.value; }
+  meta(key: string): string | undefined { return meta(this.db, "meta", "key").get(key); }
   transaction<T>(body: () => T): T {
     // Refuse another write if an external reader prevents truncation. Disabling
     // cache spill bounds a transaction to one WAL frame per dirty page; 31 MiB
     // main + WAL frame headers fits below the shared 64 MiB physical cap.
     if (!this.checkpoint()) throw new CheckpointBlockedError();
-    this.db.exec("BEGIN IMMEDIATE");
-    try { const result = body(); this.db.exec("COMMIT"); return result; }
-    catch (e) { this.db.exec("ROLLBACK"); throw e; }
+    try { return tx(this.db, body); }
     finally { this.checkpoint(); }
   }
   private checkpoint(): boolean {

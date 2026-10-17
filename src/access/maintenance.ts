@@ -1,7 +1,8 @@
 import { clockHealth } from "./clock.ts";
-import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, writeFileSync, fsyncSync, renameSync, unlinkSync, readSync, fchmodSync } from "node:fs";
+import { atomicWrite } from "../fs/atomic.ts";
+import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, readSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
-import { randomUUID, createPublicKey } from "node:crypto";
+import { createPublicKey } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { AccessState, Clock, TrustStore, signTrustBundle, validateBundle, TRUST_FRESH_SECONDS } from "./trust.ts";
@@ -27,14 +28,7 @@ export function atomicPublicFile(path: string, bytes: string): void {
   const dir = dirname(path), s = lstatSync(dir);
   requireAccess(s.isDirectory() && !s.isSymbolicLink() && s.uid === process.geteuid!() &&
     (s.mode & 0o022) === 0, "unsafe_output_directory");
-  const tmp = join(dir, ".trust-" + randomUUID());
-  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
-  try {
-    try { fchmodSync(fd, 0o644); writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
-    renameSync(tmp, path);
-    const d = openSync(dir, constants.O_RDONLY | constants.O_DIRECTORY);
-    try { fsyncSync(d); } finally { closeSync(d); }
-  } finally { try { unlinkSync(tmp); } catch { /* already renamed */ } }
+  atomicWrite(path, bytes, 0o644);
 }
 export function healthClock(state: AccessState, path: string): Clock {
   return clockHealth(state, () => trustedBytes(path, 1024));

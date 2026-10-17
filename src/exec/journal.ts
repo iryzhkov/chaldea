@@ -1,5 +1,6 @@
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
+import { atomicWrite, syncDirectory } from '../fs/atomic.ts';
 import { removeArtifacts, active as liveIntent } from './artifacts.ts';
 import { removeLog } from './logs.ts';
 
@@ -7,17 +8,15 @@ export type Intent = { jobId: string; host: string; argv: string[]; started: str
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 
-async function syncDirectory(dir: string) {
-  const fd = await fs.open(dir, 'r'); try { await fd.sync(); } finally { await fd.close(); }
-}
 export async function record(dir: string, entry: Intent, initial = true) {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
   const target = join(dir, entry.jobId + '.json');
-  const path = initial ? target : target + '.new';
-  const fd = await fs.open(path, initial ? 'wx' : 'w', 0o600);
-  try { await fd.writeFile(JSON.stringify(entry) + '\n'); await fd.sync(); } finally { await fd.close(); }
-  if (!initial) await fs.rename(path, target);
-  await syncDirectory(dir);
+  const bytes = JSON.stringify(entry) + '\n';
+  if (!initial) { atomicWrite(target, bytes); return; }
+  // An initial intent must refuse an existing job ID, before any remote action.
+  const fd = await fs.open(target, 'wx', 0o600);
+  try { await fd.writeFile(bytes); await fd.sync(); } finally { await fd.close(); }
+  syncDirectory(dir);
 }
 export async function prune(dir: string, age = DAYS, keep = KEEP) {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });

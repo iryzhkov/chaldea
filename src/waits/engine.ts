@@ -1,3 +1,4 @@
+import { backoff } from "../retry.ts";
 import { WakeStore, CheckpointBlockedError, type Item, type Delivery } from "../wake/store.ts";
 import type { WaitT3, WaitSnapshot } from "../t3/waits.ts";
 import { NativeDecisions, questionSchema } from "../decisions/native.ts";
@@ -47,7 +48,7 @@ export class WaitEngine {
     this.clock.clear();
     this.storageRetry=setTimeout(() => {
       this.storageRetry=undefined;this.poke();
-    },Math.min(30_000,250 * 2 ** Math.min(this.storageAttempts++,7)));
+    },backoff(this.storageAttempts++));
   }
   private persistDelivery(id: string, operation: () => void): void {
     try { operation(); }
@@ -141,7 +142,7 @@ export class WaitEngine {
       }
       if (!this.stopped && !entry.abort.signal.aborted) {
         this.snapshots.delete(id);
-        entry.retry=setTimeout(connect,Math.min(30_000,250 * 2 ** Math.min(attempts++,7)));
+        entry.retry=setTimeout(connect,backoff(attempts++));
       }
     };
     void connect();
@@ -281,7 +282,7 @@ export class WaitEngine {
         this.fatal=true; this.options.report?.("watcher_needs_attention");
       }
       // Persist retry timing too; neither wire payload nor identity changes.
-      this.persistDelivery(delivery.id,() => this.store.retry(delivery.id,Date.now()+Math.min(30_000,250*2**Math.min(delivery.attempts,7))));
+      this.persistDelivery(delivery.id,() => this.store.retry(delivery.id,Date.now()+backoff(delivery.attempts)));
       this.options.report?.("delivery_retry");
     }
   }

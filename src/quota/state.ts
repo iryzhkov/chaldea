@@ -12,7 +12,8 @@
 // raises `evictedThrough` to the stop time of the evicted key, and stops at or
 // before that time are never reported. Eviction therefore errs towards losing
 // a record, never towards repeating one.
-import { statSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { statSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { atomicWrite } from "../fs/atomic.ts";
 import { dirname } from "node:path";
 import type { QuotaRecord } from "./observer.ts";
 import { emptyHeadroom, validateHeadroom, type HeadroomState } from "./headroom.ts";
@@ -140,15 +141,6 @@ export function loadState(path: string, nowMs: number): ObserverState {
   return state;
 }
 
-function writeAll(fd: number, data: Buffer): void {
-  let offset = 0;
-  while (offset < data.length) {
-    const written = writeSync(fd, data, offset, data.length - offset);
-    if (written <= 0) throw new Error("state file write made no progress");
-    offset += written;
-  }
-}
-
 export function saveState(path: string, state: ObserverState, nowMs: number): void {
   prune(state, nowMs);
   const directory = dirname(path);
@@ -165,20 +157,5 @@ export function saveState(path: string, state: ObserverState, nowMs: number): vo
     deliveryDropped: state.deliveryDropped,
   }));
   if (body.length > MAX_STATE_BYTES) throw new Error("observer_state_capacity");
-  const temporary = `${path}.tmp`;
-  const fd = openSync(temporary, "w", 0o600);
-  try {
-    writeAll(fd, body);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(temporary, path);
-  // Make the rename itself durable.
-  const directoryFd = openSync(directory, "r");
-  try {
-    fsyncSync(directoryFd);
-  } finally {
-    closeSync(directoryFd);
-  }
+  atomicWrite(path, body);
 }
