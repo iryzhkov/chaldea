@@ -23,5 +23,5 @@ test('paths and CLI options cannot introduce SSH flags or traversal', () => {
   assert.throws(() => argumentsFor(['exec', '--host', '-F', '--', 'true']));
   assert.throws(() => argumentsFor(['exec', '--host', 'host', 'true']));
   assert.deepEqual(argumentsFor(['exec', '--host', 'agent-a', '--gpu', '--artifact', 'out', '--', 'echo', '$HOME']),
-    { host: 'agent-a', gpu: true, artifacts: ['out'], argv: ['echo', '$HOME'] });
+    { host: 'agent-a', gpu: true, artifacts: ['out'], argv: ['echo', '$HOME'], noQueue: false, queueTimeout: 3600 });
 });

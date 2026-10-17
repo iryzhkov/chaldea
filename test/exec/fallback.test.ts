@@ -12,6 +12,16 @@ test('host is optional, but an explicit host and command must be valid', () => {
   ]) assert.throws(() => argumentsFor(args));
 });
 
+test('queue defaults, duration units and bounds', () => {
+  for (const [text, seconds] of [['250ms', .25], ['2s', 2], ['3m', 180], ['1h', 3600], ['12', 12]] as const) {
+    assert.equal(argumentsFor(['exec', '--queue-timeout', text, '--', 'true']).queueTimeout, seconds);
+  }
+  assert.equal(argumentsFor(['exec', '--no-queue', '--', 'true']).noQueue, true);
+  for (const text of ['', '0', '-1', 'NaN', 'Infinity', '25h', '5x']) {
+    assert.throws(() => argumentsFor(['exec', '--queue-timeout', text, '--', 'true']));
+  }
+});
+
 test('fleet order is preserved, duplicates removed, and self matches the short hostname only', () => {
   const hosts = hostsFor('# fleet\r\n agent-a \r\nagent-b\nomarchy-pc\nlaptop\nAGENT-A\n\n');
   assert.deepEqual(hosts, ['agent-a', 'agent-b', 'omarchy-pc', 'laptop']);
