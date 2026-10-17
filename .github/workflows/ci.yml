@@ -36,3 +36,12 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check access v1 vectors independently in Python
+        run: |
+          export TMPDIR="$RUNNER_TEMP"
+          python -m venv "$RUNNER_TEMP/chaldea-access-python"
+          "$RUNNER_TEMP/chaldea-access-python/bin/python" -m pip install -r test/fixtures/access/requirements.txt
+          "$RUNNER_TEMP/chaldea-access-python/bin/python" test/fixtures/access/verify.py
