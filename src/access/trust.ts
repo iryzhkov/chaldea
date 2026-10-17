@@ -10,7 +10,7 @@ import {
 import type { Audience, Grant } from "./token.ts";
 
 export const TRUST_TYPE = "chaldea-trust+jws";
-export const TRUST_FRESH_SECONDS = 600;
+export const TRUST_FRESH_SECONDS = 24 * 60 * 60;
 export const TRUST_POLL_SECONDS = 120;
 export interface PublicKey { kty: "OKP"; crv: "Ed25519"; x: string }
 export interface Ceiling { audience: Audience; profile: string; project: string; grants: Grant[]; source?: string }

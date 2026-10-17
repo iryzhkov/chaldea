@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
 import { readFileSync, chmodSync, writeFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { AccessState, Clock, TrustStore, signTrustBundle } from "../../src/access/trust.ts";
+import { AccessState, Clock, TrustStore, signTrustBundle, TRUST_FRESH_SECONDS, TRUST_POLL_SECONDS } from "../../src/access/trust.ts";
 import { verifyToken } from "../../src/access/token.ts";
 import { HostIssuer, loadHostSigningKey } from "../../src/access/issuer.ts";
 import { scratchDir } from "../helpers/scratch.ts";
@@ -11,8 +11,9 @@ import { vectorSets, rig, operation, admission, N } from "../helpers/access.ts";
 
 test("access v1 vectors remain frozen", () => {
   for (const [name, hash] of [
-    ["v1.json", "bc93bb56150c271b1f81cdb3b347c27a89e97bb8b9d3e939d09728b757eafc13"],
+    ["v1.json", "5d49ee7b2c8a8e36b25e8f440295b158b4fb8c7fbd73e0c5c252f43f746aee88"],
     ["v1-encoding.json", "1732273d8d109e4f877ffdb9075d0e6591ff44900f9a52b189885d1fb267436f"],
+    ["v1-freshness.json", "f29c45a95b9a42e199ec0b5214f7caa6ad9b278cb34d8ae7986c2b85fccb4845"],
   ]) {
     const bytes = readFileSync(new URL("../fixtures/access/" + name, import.meta.url));
     assert.equal(createHash("sha256").update(bytes).digest("hex"), hash);
@@ -140,5 +141,32 @@ test("deployment signer cannot be an issuer key", async () => {
     await assert.rejects(async () => r.trust.install(await r.sign(collision)), /issuer_is_trust_anchor/);
     const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 });
     await assert.rejects(() => signTrustBundle(r.bundle, "deployment-1", rsa.privateKey), /invalid_signer/);
+  } finally { r.remove(); }
+});
+test("24-hour cached trust survives restart but expires without refresh", async () => {
+  assert.equal(TRUST_FRESH_SECONDS, 86400);
+  assert.ok(TRUST_POLL_SECONDS > 0 && TRUST_POLL_SECONDS <= 120);
+  const r = await rig();
+  try {
+    const bundle = { ...r.bundle, sequence: 2, published_at: N - 23 * 3600, expires_at: N + 3600 };
+    const envelope = await r.sign(bundle);
+    await r.trust.install(envelope);
+    r.restart();
+    assert.equal((await r.trust.snapshot()).expires_at, bundle.expires_at);
+    const request = { ...admission().services[0]!, profile: "daily-health", project: "homelab", runId: "run-24h", expiresAt: N + 5000 };
+    r.sample = { ...r.sample, unixSeconds: N + 3500, monotonicSeconds: 3600 };
+    const token = await r.issuer().mint(request);
+    const session = await verifyToken(token, operation, r.trust, r.clock);
+    assert.equal(session.validUntil, bundle.expires_at);
+    await r.trust.install(envelope);
+    r.sample = { ...r.sample, unixSeconds: N + 3599, monotonicSeconds: 3699 };
+    await session.recheck();
+    r.sample = { ...r.sample, unixSeconds: N + 3600, monotonicSeconds: 3700 };
+    await assert.rejects(() => r.trust.snapshot(), /stale_trust/);
+    await assert.rejects(() => r.trust.install(envelope), /stale_trust/);
+    await assert.rejects(() => session.recheck(), /stale_trust/);
+    await assert.rejects(() => r.issuer().mint(request), /stale_trust/);
+    r.restart();
+    await assert.rejects(() => r.trust.snapshot(), /stale_trust/);
   } finally { r.remove(); }
 });
