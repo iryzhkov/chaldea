@@ -10,6 +10,7 @@ import net from 'node:net';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { frame, frames, json, VERSION } from '../../src/exec/protocol.ts';
+import { testSocketPath } from '../helpers/socket.ts';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
 const server = process.env.CHALDEA_JOB_SERVER;
@@ -58,7 +59,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
   port = (listener.address() as net.AddressInfo).port;
   await new Promise<void>(r => listener.close(() => r()));
   const hostKey = join(scratch, 'host_key'); const clientKey = join(scratch, 'client_key');
-  const controls = join(state, 'mux');
+  const controls = testSocketPath(join(state, 'mux'));
   function ssh(args: string[], overrides: NodeJS.ProcessEnv = {}) {
     return spawn('ssh', ['-F', sshConfig, '-o', 'BatchMode=yes', '-o', 'IdentityAgent=' + (overrides.SSH_AUTH_SOCK ?? 'none'), ...args], { env: { ...env, ...overrides }, stdio: ['pipe', 'pipe', 'pipe'] });
   }
@@ -165,7 +166,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
       // Request an agent explicitly with a disposable listening socket. The
       // forced server rejects any SSH_AUTH_SOCK before its protocol handshake.
       const fakeAgent = net.createServer(socket => socket.destroy());
-      const sock = join(scratch, 'agent.sock');
+      const sock = testSocketPath(join(scratch, 'agent.sock'));
       await new Promise<void>(r => fakeAgent.listen(sock, r));
       try {
         const child = ssh(['-S', 'none', '-o', 'ControlMaster=no', '-o', 'ControlPersist=no', '-A', 'chaldea-job-test', 'chaldea-exec-v0'], { SSH_AUTH_SOCK: sock });
@@ -266,7 +267,7 @@ print('isolation-ok')
       const tcpPort = (tcp.address() as net.AddressInfo).port;
       const abstractName = 'chaldea-host-only-' + randomUUID();
       const abstract = net.createServer(socket => socket.end('host-only'));
-      await new Promise<void>(r => abstract.listen('\0' + abstractName, r));
+      await new Promise<void>(r => abstract.listen(testSocketPath('\0' + abstractName), r));
       try {
         const addresses = JSON.parse(execFileSync('ip', ['-j', 'address', 'show']).toString())
           .flatMap((row: any) => row.addr_info.map((a: any) => a.local));

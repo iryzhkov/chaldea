@@ -11,7 +11,8 @@ import { scratchDir } from "../helpers/scratch.ts";
 // CI and remote runs must establish an isolated home before any fixture is created.
 assert.ok(process.env.HOME && process.env.HOME !== "/home/igor");
 assert.equal(process.env.HOME, process.env.CHALDEA_TRUST_TEST_HOME);
-assert.ok(process.env.CHALDEA_TEST_SCRATCH?.startsWith(process.env.HOME + "/"));
+assert.ok(process.env.CHALDEA_TEST_SCRATCH);
+assert.equal(process.env.HOME, process.env.CHALDEA_TEST_SCRATCH + "-home");
 
 const tracking = (offset = "0.01", ref = N) => [
   "Reference ID    : C0000201 (192.0.2.1)", "Stratum         : 3",

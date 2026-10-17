@@ -8,7 +8,8 @@ import { scratchDir } from "../helpers/scratch.ts";
 
 assert.ok(process.env.HOME && process.env.HOME !== "/home/igor");
 assert.equal(process.env.HOME, process.env.CHALDEA_TRUST_TEST_HOME);
-assert.ok(process.env.CHALDEA_TEST_SCRATCH?.startsWith(process.env.HOME + "/"));
+assert.ok(process.env.CHALDEA_TEST_SCRATCH);
+assert.equal(process.env.HOME, process.env.CHALDEA_TEST_SCRATCH + "-home");
 
 test("health file rejects stale, future, unknown, malformed and excessive-offset samples", () => {
   const s = scratchDir("trust-health");

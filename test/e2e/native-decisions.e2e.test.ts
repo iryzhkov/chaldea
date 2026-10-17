@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import * as Effect from "effect/Effect";
 import { startDisposableT3,t3Version } from "../helpers/disposable-t3.ts";
 import { scratchDir } from "../helpers/scratch.ts";
+import { testSocketPath } from "../helpers/socket.ts";
 import { ShellWatcher,waitFor,dispatchMessage,writePrivateFile,sleep,runCli } from "../helpers/e2e.ts";
 import { withClient } from "../../src/t3/adapter.ts";
 import { startWaitService,callService } from "../../src/waits/service.ts";
@@ -48,7 +49,7 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       return threadId;
     };
     const config:WaitConfig={environment,t3BaseDir:t3.baseDir,tokenFile:join(dir.path,"token"),database:join(dir.path,"state/wakes.sqlite"),
-      socket:join(dir.path,"service.sock"),listenAddress:"127.0.0.1",port:0,answerBaseUrl:"http://127.0.0.1:7385",
+      socket:testSocketPath(join(dir.path,"service.sock")),listenAddress:"127.0.0.1",port:0,answerBaseUrl:"http://127.0.0.1:7385",
       answerTokenFile:join(dir.path,"answer-token"),logFile:join(dir.path,"state/waits.log")};
     mkdirSync(join(dir.path,"state"));writePrivateFile(config.tokenFile,token);writePrivateFile(config.answerTokenFile,"native-answer-token");
     const configPath=join(dir.path,"config.json");writeFileSync(configPath,JSON.stringify(config));

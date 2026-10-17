@@ -2,11 +2,12 @@
 # Runs a command with TMPDIR and the test scratch root on disk, never /tmp.
 set -eu
 CHALDEA_TEST_SCRATCH=${CHALDEA_TEST_SCRATCH:-$HOME/.cache/chaldea-test}
-mkdir -p "$CHALDEA_TEST_SCRATCH/home/fixtures/tmp"
-export HOME="$CHALDEA_TEST_SCRATCH/home"
+# HOME stays isolated beside fixtures, without lengthening Unix socket paths.
+export HOME="${CHALDEA_TEST_SCRATCH}-home"
 export CHALDEA_TRUST_TEST_HOME="$HOME"
-export CHALDEA_TEST_SCRATCH="$HOME/fixtures"
+export CHALDEA_TEST_SCRATCH
 export TMPDIR="$CHALDEA_TEST_SCRATCH/tmp"
 test "$HOME" = "$CHALDEA_TRUST_TEST_HOME"
 test "$HOME" != /home/igor
+mkdir -p "$HOME" "$TMPDIR"
 exec "$@"

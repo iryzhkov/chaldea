@@ -6,6 +6,7 @@ import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import * as Effect from "effect/Effect";
 import { startDisposableT3,t3Version } from "../helpers/disposable-t3.ts";
 import { scratchDir } from "../helpers/scratch.ts";
+import { testSocketPath } from "../helpers/socket.ts";
 import { ShellWatcher, waitFor,dispatchMessage,writePrivateFile,sleep,runCli } from "../helpers/e2e.ts";
 import { withClient } from "../../src/t3/adapter.ts";
 import { startWaitService,callService } from "../../src/waits/service.ts";
@@ -43,7 +44,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
     const snapshot=()=>withClient({serverUrl:t3.serverUrl,token},c=>c["orchestration.getThreadProjection"]({threadId:parent} as never));
     const wakeCount=async(id:string)=>(await snapshot()).messages.filter(m=>["chaldea-wait:"+id+":wake","chaldea-decision:"+id+":wake"].includes(m.id)).length;
     const config:WaitConfig={environment,t3BaseDir:t3.baseDir,tokenFile:join(dir.path,"t3-token"),database:join(dir.path,"state/wakes.sqlite"),
-      socket:join(dir.path,"service.sock"),listenAddress:"127.0.0.1",port:0,answerBaseUrl:"http://127.0.0.1:7385",
+      socket:testSocketPath(join(dir.path,"service.sock")),listenAddress:"127.0.0.1",port:0,answerBaseUrl:"http://127.0.0.1:7385",
       answerTokenFile:join(dir.path,"answer-token"),logFile:join(dir.path,"state/waits.log")};
     mkdirSync(join(dir.path,"state"));
     writePrivateFile(config.tokenFile,token);writePrivateFile(config.answerTokenFile,"fake-answer-token");
@@ -54,7 +55,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       dependentAction:"run the dependent step",defaultAction:"defer",deadline:iso(Date.now()+ms)});
     service=await startWaitService(config);
     await t.test("same database refuses a second service even with a different IPC socket",async()=>{
-      await assert.rejects(startWaitService({...config,socket:join(dir.path,"second.sock")}),/already owned/);
+      await assert.rejects(startWaitService({...config,socket:testSocketPath(join(dir.path,"second.sock"))}),/already owned/);
       assert.equal(service!.store.meta("environment"),environment);
     });
 
