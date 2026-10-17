@@ -32,10 +32,9 @@ export function nativeResponse(item: Item, request: NativeRequest): string | nul
 }
 export class NativeDecisions {
   private store:WakeStore;
-  private phone:(item:Item)=>string;
   private boundary:((name:string,id:string)=>void)|undefined;
-  constructor(store:WakeStore,phone:(item:Item)=>string,boundary?: (name:string,id:string)=>void){
-    this.store=store;this.phone=phone;this.boundary=boundary;
+  constructor(store:WakeStore,boundary?: (name:string,id:string)=>void){
+    this.store=store;this.boundary=boundary;
   }
   private delivery(id:string):Delivery|undefined{return this.store.deliveries().find(d=>d.item===id&&d.channel==="native");}
   private savedRequest(item:Item,request:NativeRequest):NativeRequest{
@@ -66,7 +65,7 @@ export class NativeDecisions {
       const request=(snapshot.requests??[]).filter(r=>r.kind==="user_input" && !baseline.has(r.id) &&
         r.created>=item.created && r.created<=policy.bind_until).sort((a,b)=>a.created-b.created||a.id.localeCompare(b.id))[0];
       if(request){
-        if(!this.store.bindNative(item.id,request.id,this.phone(item),now,questionSchema(request.questions),request.itemId??null))return;
+        if(!this.store.bindNative(item.id,request.id,now,questionSchema(request.questions),request.itemId??null))return;
         this.boundary?.("native_bound",item.id);policy=this.store.native(item.id);
       }else{
         if(now>=policy.bind_until)this.store.finishNative(item.id,{reason:"preparation_expired"});
@@ -86,7 +85,6 @@ export class NativeDecisions {
     if(!policy.questions || (!policy.turn_item && request.itemId)){
       const schema=questionSchema(request.questions);if(schema || request.itemId)this.store.captureNative(item.id,schema,request.itemId??null);
     }
-    if(!this.store.deliveries().some(d=>d.item===item.id&&d.channel==="phone"))this.store.nativePhone(item.id,this.phone(item));
     if(now>=item.deadline && !delivery){
       const payload=nativeResponse(item,this.savedRequest(item,request));
       if(!payload){this.attention(item,"no_safe_answer_for_question_schema");return;}

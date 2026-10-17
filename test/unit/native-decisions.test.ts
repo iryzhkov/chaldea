@@ -18,8 +18,8 @@ const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
 async function until(probe:()=>boolean){const end=Date.now()+5000;while(!probe()){if(Date.now()>end)throw new Error("Timed out");await sleep(10);}}
 function fixture(){
   const dir=scratchDir("native-unit"),store=new WakeStore(join(dir.path,"db"),"env");
-  const lifecycle=new NativeDecisions(store,()=>JSON.stringify({id:"phone",url:"https://t3.invalid/env/parent"}));
-  const register=(value=input(),baseline:string[]=[])=>store.register(store.prepare("native",value),"project",null,undefined,Date.now(),baseline);
+  const lifecycle=new NativeDecisions(store);
+  const register=(value=input(),baseline:string[]=[])=>store.register(store.prepare("native",value),"project",null,Date.now(),baseline);
   return {store,lifecycle,register,close(){store.close();dir.remove();}};
 }
 test("prepare binds only the next new user_input, expires unbound, and does not bind existing requests",()=>{
@@ -30,9 +30,9 @@ test("prepare binds only the next new user_input, expires unbound, and does not 
     assert.throws(()=>f.register(),/preparation is already waiting/);
     const first=request("first",row.created+2),later=request("later",row.created+3);
     f.lifecycle.reconcile(row,snapshot([later,permission,old,first]),row.created+5);
-    assert.equal(f.store.native(row.id).request_id,"first");assert.equal(f.store.deliveries().filter(d=>d.channel==="phone").length,1);
+    assert.equal(f.store.native(row.id).request_id,"first");assert.equal(f.store.deliveries().length,0);
     for(let n=0;n<5;n++)f.lifecycle.reconcile(f.store.get(row.id),snapshot([first,later]),row.created+10);
-    assert.equal(f.store.deliveries().length,1);
+    assert.equal(f.store.deliveries().length,0);
     const second=f.register(input("other"));const window=f.store.native(second.id).bind_until;
     f.lifecycle.reconcile(second,snapshot(),window);
     assert.deepEqual(JSON.parse(f.store.get(second.id).outcome!),{reason:"preparation_expired"});
@@ -50,7 +50,7 @@ test("10 minute binding window is durable; observed human answer during downtime
     f.lifecycle.reconcile(row,snapshot([answered,request("unrelated",row.created+200)]),row.created+11*60_000);
     assert.equal(f.store.native(row.id).request_id,"answered");
     assert.deepEqual(JSON.parse(f.store.get(row.id).outcome!),{reason:"native_answered",defaulted:false,source:"t3",runtimeRequestId:"answered"});
-    assert.ok(f.store.deliveries().every(d=>d.channel==="phone"&&d.state==="suppressed"));
+    assert.equal(f.store.deliveries().length,0);
     f.lifecycle.reconcile(f.store.get(row.id),snapshot([answered]),row.deadline+1);
     assert.equal(f.store.deliveries().filter(d=>d.channel==="wake"||d.channel==="native").length,0);
   }finally{f.close();}
@@ -115,7 +115,7 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
           if(mode==="lost_ack" || mode==="lost_ack_rpc_error")throw new Error("Lost native receipt after commit");
           return true;
         }};
-      engine=new WaitEngine(f.store,port,{answerBaseUrl:"http://127.0.0.1:7385",threadUrl:id=>"https://t3.invalid/env/"+id});
+      engine=new WaitEngine(f.store,port,{});
       engine.start();
       const row=await engine.registerNative({...input("parent",100),runtimeRequestId:q.id},true);
       await until(()=>f.store.get(row.id).outcome!==null);
@@ -125,9 +125,6 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
       assert.equal(receipts.size,1);assert.equal(payloads.length,mode==="lost_ack_rpc_error"?3:retried?2:1);
       for(const payload of payloads)assert.equal(payload,payloads[0]);
       assert.equal(f.store.deliveries().filter(d=>d.channel==="wake").length,0);
-      const phone=f.store.deliveries().find(d=>d.channel==="phone")!;
-      assert.equal(JSON.parse(phone.payload).url,"https://t3.invalid/env/parent");
-      assert.equal(phone.state,"undeliverable");assert.equal(phone.attempts,0);
       assert.equal(f.store.deliveries().find(d=>d.channel==="native")!.state,humanWon?"suppressed":"sent");
     }finally{await engine?.stop();f.close();}
   }
@@ -138,10 +135,10 @@ test("minimal native answer schema survives restart and a missing history item; 
     const reg=store.prepare("native",input()),row=store.register(reg,"project",null);
     const q={...request("persisted",row.created+1),questions:[{id:"q",header:"private header",question:"private question prose",
       options:[{label:"Approve",description:"private option description"}]}]};
-    let lifecycle=new NativeDecisions(store,()=>"{}");lifecycle.reconcile(row,snapshot([q]),row.created+2);
+    let lifecycle=new NativeDecisions(store);lifecycle.reconcile(row,snapshot([q]),row.created+2);
     const saved=store.native(row.id).questions!;assert.ok(saved);
     assert.ok(!saved.includes("private"));assert.deepEqual(JSON.parse(saved),[{id:"q",allowCustomAnswer:true,multiSelect:false,options:[]}]);
-    store.close();store=new WakeStore(path,"env");lifecycle=new NativeDecisions(store,()=>"{}");
+    store.close();store=new WakeStore(path,"env");lifecycle=new NativeDecisions(store);
     const omitted={...q,questions:[]};lifecycle.reconcile(store.get(row.id),snapshot([omitted]),row.deadline+1);
     const delivery=store.deliveries().find(d=>d.channel==="native")!;
     assert.ok(delivery);assert.deepEqual(JSON.parse(delivery.payload).answers,{q:"No answer by the deadline: defer deploy"});
@@ -170,7 +167,7 @@ test("native registration validates explicit runtime identity and refuses permis
     const q=request();const port:WaitT3={async environment(){return "env";},async snapshot(){return snapshot([q]);},
       async observe(_id,signal){await new Promise<void>(r=>signal.addEventListener("abort",()=>r(),{once:true}));},
       async dispatch(){},async respond(){return true;}};
-    engine=new WaitEngine(f.store,port,{answerBaseUrl:"http://127.0.0.1:7385"});
+    engine=new WaitEngine(f.store,port,{});
     await assert.rejects(engine.registerNative(input(),true),/runtimeRequestId required/);
     await assert.rejects(engine.registerNative({...input(),runtimeRequestId:q.id}),/Use decision track/);
     await assert.rejects(engine.registerNative({...input(),runtimeRequestId:"missing"},true),/does not exist/);

@@ -22,7 +22,7 @@ if(mode==="receipt"){
   store.sent=fault;
 }else if(mode==="tracking")store.nativeTracking=fault;
 else store.maintain=fault;
-const engine=new WaitEngine(store,t3,{answerBaseUrl:"http://127.0.0.1:7385",report(event){
+const engine=new WaitEngine(store,t3,{report(event){
   if(event!=="watcher_needs_attention")return;
   // Must refuse another registration during the moment before the scheduled exit.
   void engine.register("wait",{}).then(()=>process.exit(9),error=>writeSync(1,error.message+"\n"));
