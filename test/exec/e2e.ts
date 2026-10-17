@@ -221,13 +221,29 @@ print('isolation-ok')
       const processList = execFileSync('ps', ['-u', userInfo().username, '-o', 'pid=,args=']).toString();
       const pids = processList.split('\n').filter(line => line.includes(marker)).map(line => Number(line.trim().split(/\s/)[0]));
       assert.ok(pids.length > 0);
+      // Field 22 of /proc/<pid>/stat is the start time; it identifies the process
+      // across PID reuse. Fields are counted after the parenthesised command name.
+      const startTime = (stat: string) => stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
+      const started = new Map<number, string>();
+      for (const pid of pids) started.set(pid, startTime(await fs.readFile('/proc/' + pid + '/stat', 'utf8')));
       await new Promise(resolve => setTimeout(resolve, 100)); // pipes have closed, process still runs
       const deleted = disappearance(jobroot, id);
       const closed = once(child, 'close');
       child.kill('SIGKILL'); await deleted; await closed;
       for (const pid of pids) {
-        try { const status = await fs.readFile('/proc/' + pid + '/stat', 'utf8'); assert.match(status, /\) Z /); }
-        catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+        // The server kills the job group before the workspace is removed, but on a
+        // loaded host the signalled processes can take a moment to exit. A process
+        // that is still alive after the bound is a real leak.
+        let status = '';
+        for (let attempt = 0; attempt < 100; attempt++) {
+          try { status = await fs.readFile('/proc/' + pid + '/stat', 'utf8'); }
+          catch (e: any) { if (e.code !== 'ENOENT') throw e; status = ''; break; }
+          // A different start time means the original process is gone and the PID was reused.
+          if (startTime(status) !== started.get(pid)) { status = ''; break; }
+          if (/\) Z /.test(status)) break;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        if (status) assert.match(status, /\) Z /);
       }
       const intent = JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8'));
       assert.equal(intent.outcome, 'uncertain');
