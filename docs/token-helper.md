@@ -14,14 +14,15 @@ failure writes no bearer and a generic denial to stderr. The lifetime is at most
 run ID, lifetime, key, trust, or state paths.
 
 The root-owned launcher calls sudo noninteractively as chaldea-issuer. sudo must set
-SUDO_UID and deny SETENV. The root-owned issuer-command drops every inherited
+SUDO_UID and deny SETENV. The root-owned issuer wrapper drops every inherited
 environment variable except sudo's caller UID and a fixed PATH before starting the
-pinned Node executable. The command requires the effective UID from protected config. Running the Node
+pinned Node executable. The command requires the effective UID from protected
+config. Running the Node
 command directly as a producer fails before opening state or a key. Do not grant
 producers a shell, Node, env, arbitrary chaldea commands, or direct issuer login.
 
-The root-owned /etc/chaldea/token-helper.json contains this shape. The UID below
-is illustrative, not a deployment grant.
+The root-owned /etc/chaldea/token-helper.json contains this shape. Producer UID
+1000 is illustrative, not a deployment grant.
 
 ```json
 {
@@ -61,6 +62,10 @@ invocation, retaining durable rollback and key-removal history. It never creates
 missing state or keys. The updater remains responsible for fetching and authenticating
 trust bundles signed by Normandy's deployment-2026-10b anchor. This change does not
 alter the existing trust freshness policy.
+
+The legacy packaging/token-helper/issuer-command is an uninstalled example for
+older manual layouts. The fleet role renders the fixed issuer wrapper described
+below; do not install the legacy example as a sudoers target.
 
 ## Deployment prerequisites, not performed by this change
 

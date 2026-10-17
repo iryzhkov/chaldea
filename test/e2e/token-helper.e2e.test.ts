@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { SignJWT, decodeJwt } from "jose";
 import { AccessState, TrustStore, signTrustBundle } from "../../src/access/trust.ts";
@@ -35,7 +35,7 @@ test("real helper process mints a scratch Ed25519 bearer accepted by the existin
   writeFileSync(health, JSON.stringify({ healthy: true, offsetSeconds: 0, checked_at: now }));
   writeFileSync(bundlePath, envelope); writeFileSync(anchorPath, JSON.stringify(anchors));
   const fixture = join(dir, "fixture.json");
-  writeFileSync(fixture, JSON.stringify({ caller: "1000", config: {
+  writeFileSync(fixture, JSON.stringify({ uid: 1234, caller: "1000", config: {
     issuer: { uid: 1234, key_file: key, name: "chaldea:agent-b", kid: "agent-b-2026-10" }, state_file: statePath,
     bundle_file: bundlePath, anchor_file: anchorPath, clock_health_file: health, grants: [{
       uid: 1000, audience: "akasha", action: "append", source: "quota", host: "agent-b",
@@ -66,6 +66,13 @@ test("real helper process mints a scratch Ed25519 bearer accepted by the existin
     await assert.rejects(verifyToken(await sign({ ...claims, exp: Number(claims.iat) + 781 }), operation, trust, clock));
     for (const bad of [{ ...event, source: "other" }, { ...event, host: "other" },
       { ...event, payload: { kind: "report" } }]) await assert.rejects(helperToken(helper, bad));
+    // Valid state/key/trust isolate effective-UID admission from later failures.
+    const fixtureData = JSON.parse(readFileSync(fixture, "utf8"));
+    fixtureData.uid = 995;
+    writeFileSync(fixture, JSON.stringify(fixtureData));
+    await assert.rejects(helperToken(helper, event));
+    fixtureData.uid = 1234;
+    writeFileSync(fixture, JSON.stringify(fixtureData));
     // Missing current trust/health and removal of the UID grant fail closed on the next invocation.
     writeFileSync(health, JSON.stringify({ healthy: false, offsetSeconds: 0, checked_at: now }));
     await assert.rejects(helperToken(helper, event));

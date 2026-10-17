@@ -51,7 +51,7 @@ test("producer grants bind UID and all five selectors, including read vs append"
     await assert.rejects(verifyToken(token, { audience: "akasha", resource: "quota", action: "read" }, r.trust, r.clock));
   } finally { r.remove(); }
 });
-test("helper denies direct calls before opening config or any signing key and redacts errors", async () => {
+test("helper denies calls without a sudo caller before opening config and redacts errors", async () => {
   let opened = false, out = "", err = "";
   const code = await tokenHelperCli(flags, { out: s => { out += s; }, err: s => { err += s; } },
     { uid: 1000, caller: undefined, config: () => { opened = true; throw new Error("SECRET"); } });

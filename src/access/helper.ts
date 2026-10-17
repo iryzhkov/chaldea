@@ -5,7 +5,7 @@ import { HostIssuer, loadHostSigningKey } from "./issuer.ts";
 import { AccessState, TrustStore } from "./trust.ts";
 import type { TrustAnchor } from "./trust.ts";
 import { healthClock, trustedBytes } from "./maintenance.ts";
-import { exact, identifier, object, requireAccess, seconds, strictJson, MAX_TOKEN_SECONDS } from "./token.ts";
+import { exact, identifier, issuerName, object, requireAccess, seconds, strictJson, MAX_TOKEN_SECONDS } from "./token.ts";
 
 export const TOKEN_FLAGS = ["audience", "action", "source", "host", "kind"] as const;
 export interface TokenRequest { audience: "akasha"; action: "append" | "read"; source: string; host: string; kind: string }
@@ -33,8 +33,7 @@ export function helperConfig(value: unknown): HelperConfig {
   const i = object(c.issuer); exact(i, ["uid", "key_file", "name", "kid"]);
   seconds(i.uid); requireAccess(Number(i.uid) > 0 && Number(i.uid) < 4294967295, "invalid_issuer_uid");
   requireAccess(typeof i.key_file === "string" && i.key_file.startsWith("/"), "absolute_path_required");
-  identifier(i.name); identifier(i.kid);
-  requireAccess((i.name as string).startsWith("chaldea:"), "invalid_issuer_name");
+  issuerName(i.name); identifier(i.kid);
   for (const field of ["state_file", "bundle_file", "anchor_file", "clock_health_file"])
     requireAccess(typeof c[field] === "string" && (c[field] as string).startsWith("/"), "absolute_path_required");
   requireAccess(Array.isArray(c.grants) && c.grants.length > 0 && c.grants.length <= 128, "invalid_producer_grants");
