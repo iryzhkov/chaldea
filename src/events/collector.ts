@@ -1,6 +1,6 @@
 // One collector per host; instrumentation never performs network I/O.
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, openSync, readSync, fstatSync, readdirSync, lstatSync, unlinkSync } from "node:fs";
+import { closeSync, openSync, readSync, fstatSync, lstatSync, unlinkSync, opendirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { hostname, homedir } from "node:os";
 import { pathToFileURL } from "node:url";
@@ -51,25 +51,29 @@ export function toolPayload(raw: Record<string, unknown>, line: Buffer, toolSour
   return { v: 1, kind: "tool_call", source: host + ".toolfeedback", host,
     occurred_at: data.ts, severity: raw.ok ? "info" : "warn", data };
 }
-function files(root: string, timer = false): string[] {
-  const result: string[] = [];
-  let entries;
-  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return result; }
-  for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-    if (result.length >= 5000) break;
+function* files(root: string, timer = false, onError: () => void = () => {}): Generator<string> {
+  function* entries(path: string): Generator<import("node:fs").Dirent> {
+    let dir;
+    try { dir = opendirSync(path); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") onError();
+      return;
+    }
+    try { for (let entry; (entry = dir.readSync()) !== null;) yield entry; }
+    catch { onError(); }
+    finally { dir.closeSync(); }
+  }
+  // Stream the exact spool layout without a global file cap. In particular,
+  // pruning must eventually reach every file, even after a fleet backfill.
+  for (const e of entries(root)) {
     if (timer) {
-      if (e.isFile() && e.name.endsWith(".jsonl")) result.push(join(root, e.name));
+      if (e.isFile() && e.name.endsWith(".jsonl")) yield join(root, e.name);
     } else if (e.isDirectory()) {
-      // Existing toolfeedback input is exactly TOOL/FILE.jsonl. In particular,
-      // root transcripts.jsonl and transcript trees are local analysis indexes.
-      for (const child of readdirSync(join(root, e.name), { withFileTypes: true })) {
-        if (result.length >= 5000) break;
+      for (const child of entries(join(root, e.name))) {
         if (child.isFile() && child.name.endsWith(".jsonl") && child.name !== "transcripts.jsonl")
-          result.push(join(root, e.name, child.name));
+          yield join(root, e.name, child.name);
       }
     }
   }
-  return result.sort();
 }
 
 function cursorAt(fd: number, base: Cursor, offset: number): Cursor {
@@ -79,8 +83,9 @@ function cursorAt(fd: number, base: Cursor, offset: number): Cursor {
 }
 function generation(fd: number, old: Cursor | null): Cursor {
   const st = fstatSync(fd, { bigint: true }), size = Number(st.size);
+  // A metadata-only touch is not a new logical generation. Inode, size and
+  // prefix/tail evidence detect replacement and observable truncation/rewrite.
   if (old && old.dev === String(st.dev) && old.ino === String(st.ino) && size >= (old.size ?? old.offset) &&
-    !(size === old.size && old.modified !== undefined && old.modified !== String(st.mtimeNs)) &&
     sha(bytes(fd, 0, old.prefixLength)) === old.prefix &&
     sha(bytes(fd, Math.max(0, old.offset - 128), Math.min(old.offset, 128))) === old.tail) return old;
   const prefixLength = Math.min(size, 128);
@@ -122,7 +127,7 @@ export async function collect(options: CollectorOptions): Promise<void> {
   }
   // Pruning is independent of delivery health: an outage cannot disable retention.
   for (const [root, timer] of [[options.spool, false], ...(options.timers ? [[options.timers, true]] : [])] as [string, boolean][]) {
-    for (const path of files(root, timer)) {
+    for (const path of files(root, timer, () => outbox.count("scan_errors"))) {
       const st = lstatSync(path); if (now - st.mtimeMs <= 90 * DAY) continue;
       const file = (timer ? "timer/" : "tool/") + relative(root, path), fd = openSync(path, "r");
       try {
@@ -136,7 +141,7 @@ export async function collect(options: CollectorOptions): Promise<void> {
   }
   if (!await drain()) return;
   for (const [root, timer] of [[options.spool, false], ...(options.timers ? [[options.timers, true]] : [])] as [string, boolean][]) {
-    for (const path of files(root, timer)) {
+    for (const path of files(root, timer, () => outbox.count("scan_errors"))) {
       if (budget <= 0) return;
       const rel = relative(root, path), file = (timer ? "timer/" : "tool/") + rel;
       const st = lstatSync(path);
