@@ -171,7 +171,11 @@ lines.on("line", (line) => {
     return;
   }
   if (message.type === "control_request") answerControl(message);
-  else if (message.type === "user") answerUser(message);
+  else if (message.type === "user") {
+    const delay = /chaldea-waits-delay:(\d+)/.exec(messageText(message));
+    if (delay) setTimeout(() => answerUser(message), Number(delay[1]));
+    else answerUser(message);
+  }
   else log({ kind: "ignored", type: message.type });
 });
 lines.on("close", () => {
