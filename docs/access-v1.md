@@ -47,7 +47,10 @@ Payload fields (all required except source/host):
 
 ## Time and offline request verification
 
-Timestamps are nonnegative safe integer Unix seconds, not floats/strings/bools.
+Timestamps are nonnegative safe integer Unix seconds, not fractional values/strings/bools.
+All numbers in signed token/trust JSON MUST use decimal integer literals (0 or a
+nonzero digit followed by digits), without sign, decimal point or exponent. Reject
+UTF-8 BOMs; field order, whitespace and JSON string escapes remain unrestricted.
 Require iat <= nbf < exp and exp - iat <= **780 seconds (13 minutes)**.
 Verifier skew is explicitly 0–30 seconds (default 30): iat/nbf <= now + skew,
 and now < exp + skew; equality at the expiry limit rejects. Negative/excessive
@@ -60,7 +63,13 @@ water mark, monotonic regression on the same boot, or wall time lagging monotoni
 elapsed time by over 30 seconds parks access. A reboot/restart retains wall high
 water and requires fresh externally established health; unknown health fails closed.
 A caller cannot assert health on behalf of a sandbox. The package does not implement
-an NTP monitor. State creation/reset and clock recovery are operator operations.
+an NTP monitor. State creation/reset and clock recovery are operator operations. Missing state fails
+closed; create it once with the explicit initialize option, which never overwrites an
+existing file. Reopening requires the durable format marker; empty, truncated or
+uninitialized databases fail closed instead of silently recreating their schema.
+An incorrectly healthy forward time jump also parks access after time
+corrects; preserve revocations during operator clock recovery rather than resetting
+the database.
 
 A copied bearer lasts at most 780 + 30 leeway + 60 seconds of opposite bounded clock
 offsets = **870 seconds (<15 minutes)** after real issuance. Ordinary cancellation
@@ -72,6 +81,10 @@ Verify every HTTP/MCP request, replayed receipt, stream operation and reconnect.
 `recheck()`. Service integration MUST cancel sessions/streams and running operations
 at validUntil, using a monotonic deadline, and recheck before each operation/chunk and
 after waits. Never authorize an unbounded connection at initialization alone.
+A concurrent trust installation can return trust_changed; services may retry the
+whole verification once against the new bundle, without using the old result.
+SQLite waits up to five seconds for shared-state writers. A service may retry once
+on SQLITE_BUSY; sustained contention parks access rather than skipping durable checks.
 A newly installed bundle or key removal affects the next recheck. The package supplies
 the check/deadline; each service owns transport cancellation and bounded work.
 
@@ -112,7 +125,8 @@ and verification now < verify_until, without retirement leeway. The issuer clamp
 to verify_until-30. Even a stolen retired signer backdating iat cannot extend authority
 past its original window. Under a reused issuer/kid, key bytes and activation are
 immutable, issuance/verification deadlines can only decrease, and a removed key can
-never reappear. Rotation must use a new kid. Durable history is capped at 4096 IDs;
+never reappear. Rotation must use a new kid and new key material. A public key cannot
+be shared across host/kid identities or reused from durable history under a new name. Durable history is capped at 4096 IDs;
 at capacity, park for an operator-controlled epoch/state migration, never drop tombstones.
 
 Rotation: publish new public key, confirm updater receipts, activate new kid, stop old
@@ -134,7 +148,8 @@ FDs and model-accessible endpoints. This package cannot establish OS isolation.
 
 `RunLeases.admit` takes a trusted fleet-config/run record with an immutable run ID,
 profile, project, deadline and per-audience grants/source. Deadline is at most 24h;
-the first report uses 10 minutes, concurrency one, and no renewal endpoint in the
+package 3 owns the first report's 10-minute deadline and concurrency-one lifecycle;
+this general lease library permits multiple admitted runs. There is no renewal endpoint in the
 sandbox. Host code calls renew only for an active lifecycle lease. Each renewal
 requires current external admission/profile authorization, may narrow its deadline
 and grants, never increase them, and uses fresh trust and clock checks. Denial
@@ -143,7 +158,10 @@ persists cancellation. Successful narrowing is durable before releasing the toke
 Cancellation/end is an atomic synchronous FULL SQLite commit before acknowledgment,
 works even when clock/trust is unhealthy, and is terminal. Renewal checks the durable
 revision after asynchronous authorization/signing; concurrent cancellation or renewal
-discards the result. Unknown, expired or cancelled runs never renew after restart.
+discards the result. Host callers serialize renewals across a run's audiences or retry
+run_changed after reauthorization. Admission must commit before the host exposes the
+run's cancellation path; cancelling an unknown run fails without acknowledgment.
+Unknown, expired or cancelled runs never renew after restart.
 No background task recreates admission; the host drives renewal until lifecycle end.
 State failure/corruption, disk full or unsafe permissions parks issuance.
 All state lives in a private issuer/service directory, with no WAL or token log.
@@ -151,9 +169,22 @@ Prune grant payloads after 14 days; retain one-use run ID tombstones. Total capa
 10000 admissions; reaching it parks admissions for an operator epoch migration.
 Do not restore an old database backup or reset state to bypass revocation.
 
+## Operator diagnostic CLI
+
+`chaldea access verify --help` describes the offline verifier. It requires explicit
+token, signed bundle, deployment anchor, private durable state and clock-health files.
+It cannot admit a run or mint a token. The operator uses --initialize-state once to
+create new state; later calls require the existing file and cannot recreate it.
+Health is read on every clock check, with
+checked_at no more than 30 seconds old; Linux boot ID and monotonic time come from
+the host. Files must be owned by the operator/root and protected from other writers;
+the bearer file must be private. The command outputs only verified identity/deadline,
+never the bearer. This diagnostic is not a service endpoint or a sandbox admission API.
+
 ## Shared vectors and validation
 
-`test/fixtures/access/v1.json` is frozen input, containing public fixture keys, signed
+`test/fixtures/access/v1.json` and the separately frozen `v1-encoding.json` addendum
+are immutable inputs, containing public fixture keys, signed
 bundles, compact tokens, fixed clock samples/operation and expected accept/reject.
 Private fixture keys are not shipped. It includes request vectors and ordered scenarios
 for trust freshness, removal, rotation, rollback and restart. Consumers must use the
