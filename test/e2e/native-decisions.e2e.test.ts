@@ -26,7 +26,7 @@ async function processService(config:string,crash?:string){
   return {child,async stop(){if(child.exitCode!==null||child.signalCode!==null)return;
     const end=new Promise<void>(r=>child.once("exit",()=>r()));child.kill("SIGTERM");await end;}};
 }
-test("native decisions stay in disposable T3; fallback and deadline policy survive restarts",{skip,timeout:240_000},async t=>{
+test("native decisions stay in disposable T3; fallback and deadline policy survive restarts",{skip,timeout:480_000},async t=>{
   const dir=scratchDir("native-decisions");
   const t3=await startDisposableT3({scratchRoot:dir.path,scenario:"no-reset",autoResume:false,codex:"available"});
   let service:Awaited<ReturnType<typeof startWaitService>>|undefined;
@@ -73,10 +73,10 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       catch(error){const p=await projection(thread);t.diagnostic(JSON.stringify({runs:p.runs.map(r=>r.status),requests:p.runtimeRequests}));throw error;}
       return id;
     };
-    const human=async(threadId:string,requestId:string)=>{
+    const human=async(threadId:string,requestId:string,commandId=key())=>{
       const p=await projection(threadId);const item=p.turnItems.find(i=>i.type==="user_input_request"&&i.requestId===requestId);
       assert.equal(item?.type,"user_input_request");if(item?.type!=="user_input_request")throw new Error("No question");
-      await rpc(c=>c["orchestration.dispatchCommand"]({type:"runtime-request.respond",commandId:key(),threadId,requestId,
+      await rpc(c=>c["orchestration.dispatchCommand"]({type:"runtime-request.respond",commandId,threadId,requestId,
         answers:Object.fromEntries(item.questions.map(q=>[q.id,"Hold"]))} as never));
     };
     const settled=async(row:Item,timeout=15_000)=>until("native outcome",async()=>(await invoke("chaldea_decision_status",{id:row.id})).outcome!==null,timeout);
@@ -96,8 +96,9 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       assert.equal(await wakeCount(thread,row.id),0);
     });
     await t.test("deadline answers every native question with safe text and continues the Claude turn",async()=>{
-      const thread=await create();const row=await prepare(thread,2200);
+      const thread=await create();
       await dispatchMessage(t3,token,thread,"chaldea-native-question",key());const requestId=await pending(thread);
+      const row=await invoke("chaldea_decision_track",{...policy(thread,2200),runtimeRequestId:requestId});
       await settled(row);const p=await projection(thread),request=p.runtimeRequests.find(r=>r.id===requestId)!;
       assert.equal(request.status,"resolved");assert.equal(Object.keys(request.answers!).length,2);
       assert.ok(Object.values(request.answers!).every(a=>a==="No answer by the deadline: defer deploy the fixture"));
@@ -112,10 +113,13 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       // projection to exercise this public contract state through real T3 reads.
       const db=new DatabaseSync(join(t3.baseDir,"userdata/statev2.sqlite"));
       try{
+        // T3 is a separate writer; wait for its durable write lock before seeding.
+        db.exec("PRAGMA busy_timeout=5000; BEGIN IMMEDIATE");
         const rows=db.prepare("SELECT turn_item_id,payload_json FROM orchestration_v2_projection_turn_items WHERE thread_id=? AND type='user_input_request'").all(thread) as Array<{turn_item_id:string;payload_json:string}>;
         assert.equal(rows.length,1);const item=JSON.parse(rows[0]!.payload_json);
         for(const q of item.questions)q.allowCustomAnswer=false;
         db.prepare("UPDATE orchestration_v2_projection_turn_items SET payload_json=? WHERE turn_item_id=?").run(JSON.stringify(item),rows[0]!.turn_item_id);
+        db.exec("COMMIT");
       }finally{db.close();}
       const p=await projection(thread),q=p.turnItems.find(i=>i.type==="user_input_request");
       assert.equal(q?.type==="user_input_request"&&q.questions[0]!.allowCustomAnswer,false);
@@ -127,18 +131,38 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       await human(thread,requestId);await sleep(100);assert.equal(await wakeCount(thread,row.id),1);
     });
     await t.test("native human-versus-deadline commands race in T3 and record exactly one winner",async()=>{
-      for(const offset of [-10,10]){
-        const thread=await create(),input=policy(thread,1800),row=await mcp("chaldea_decision_prepare",input);
+      const winners=new Set<boolean>();
+      for(const offset of ["human",-10,10,"deadline"] as const){
+        const thread=await create();
         await dispatchMessage(t3,token,thread,"chaldea-native-question",key());const requestId=await pending(thread);
-        await sleep(Math.max(0,Date.parse(input.deadline)+offset-Date.now()));
-        const humanWon=await human(thread,requestId).then(()=>true,()=>false);
-        await settled(row);const outcome=JSON.parse((await invoke("chaldea_decision_status",{id:row.id})).outcome!);
-        assert.equal(outcome.defaulted,!humanWon);
-        const request=(await projection(thread)).runtimeRequests.find(r=>r.id===requestId)!;
+        // Start the deadline after the question exists. MCP startup and provider
+        // startup must not turn this arbitration test into preparation expiry.
+        const input=policy(thread,offset==="human"?15_000:1800);
+        const row=await invoke("chaldea_decision_track",{...input,runtimeRequestId:requestId});
+        await until("tracked race question",async()=>service!.store.native(row.id).request_id===requestId);
+        if(offset==="deadline")await settled(row);
+        else if(typeof offset==="number")await sleep(Math.max(0,Date.parse(input.deadline)+offset-Date.now()));
+        const commandId=key();
+        const humanWon=await human(thread,requestId,commandId).then(()=>true,()=>false);
+        await settled(row);
+        const outcome=JSON.parse((await invoke("chaldea_decision_status",{id:row.id})).outcome!);
+        const p=await projection(thread),requests=p.runtimeRequests.filter(r=>r.id===requestId);
+        assert.equal(requests.length,1);const request=requests[0]!;
         assert.equal(request.status,"resolved");
-        assert.ok(Object.values(request.answers!).every(a=>a===(humanWon?"Hold":"No answer by the deadline: defer deploy the fixture")));
-        assert.equal(await wakeCount(thread,row.id),0);
+        const humanKept=Object.values(request.answers!).every(a=>a==="Hold");
+        assert.equal(humanWon,humanKept,JSON.stringify({outcome,request}));
+        assert.equal(outcome.defaulted,!humanKept,JSON.stringify({outcome,request}));
+        assert.equal(outcome.reason,humanKept?"native_answered":"native_default");
+        assert.equal(outcome.source,humanKept?"t3":"chaldea");
+        assert.ok(Object.values(request.answers!).every(a=>a===(humanKept?"Hold":"No answer by the deadline: defer deploy the fixture")));
+        // A replay preserves the durable winner; a new command cannot answer twice.
+        if(humanWon)await human(thread,requestId,commandId);
+        else await assert.rejects(human(thread,requestId,commandId));
+        await assert.rejects(human(thread,requestId));
+        assert.deepEqual((await projection(thread)).runtimeRequests.find(r=>r.id===requestId)!.answers,request.answers);
+        assert.equal(await wakeCount(thread,row.id),0);winners.add(humanKept);
       }
+      assert.deepEqual(winners,new Set([true,false]));
     });
     await t.test("permissions cannot bind a preparation and explicit tracking is refused",async()=>{
       const thread=await create("claudeAgent",true),row=await prepare(thread,1000);
@@ -153,21 +177,45 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
     });
     await t.test("watcher crash at every native durable/send boundary replays one response without a wake",async()=>{
       await service!.stop();service=undefined;
-      for(const boundary of ["registered","native_bound","native_queued","before_send","after_send","delivered","resolved"]){
-        const thread=await create(),input=policy(thread,1600);let row:Item|undefined;
-        childService=await processService(configPath,boundary);
-        try{row=await invoke("chaldea_decision_prepare",input);}catch{assert.equal(boundary,"registered");}
-        await dispatchMessage(t3,token,thread,"chaldea-native-question",key());
-        await waitFor("native crash "+boundary,()=>childService!.child.signalCode==="SIGKILL",15_000);
-        const db=new WakeStore(config.database,environment);row??=db.existing(db.prepare("native",input));assert.ok(row);db.close();
-        childService=await processService(configPath);await settled(row);
-        const result=JSON.parse((await invoke("chaldea_decision_status",{id:row.id})).outcome!);assert.equal(result.defaulted,true,boundary);
-        const p=await projection(thread),request=p.runtimeRequests.find(r=>r.kind==="user_input")!;
-        assert.equal(request.status,"resolved");assert.ok(Object.values(request.answers!).every(a=>a==="No answer by the deadline: defer deploy the fixture"));
-        assert.equal(await wakeCount(thread,row.id),0);
-        await childService.stop();childService=undefined;
+      try{
+        for(const boundary of ["registered","native_bound","native_queued","before_send","after_send","delivered","resolved"]){
+          const thread=await create();let requestId="";
+          // Only native_bound needs a preparation. Other boundaries track a
+          // durable question so process/provider startup cannot exhaust binding.
+          if(boundary!=="native_bound"){
+            await dispatchMessage(t3,token,thread,"chaldea-native-question",key());requestId=await pending(thread);
+          }
+          childService=await processService(configPath,boundary);
+          const input=policy(thread,boundary==="native_bound"?15_000:1600);
+          // Any crash boundary can lose the IPC reply. The committed row and
+          // SIGKILL below, rather than reply timing, prove registration/crash.
+          try{await invoke(boundary==="native_bound"?"chaldea_decision_prepare":"chaldea_decision_track",
+            {...input,...(requestId?{runtimeRequestId:requestId}:{})});}catch{}
+          if(boundary==="native_bound"){
+            await dispatchMessage(t3,token,thread,"chaldea-native-question",key());requestId=await pending(thread);
+          }
+          await waitFor("native crash "+boundary,()=>childService!.child.signalCode==="SIGKILL",15_000);
+          const db=new WakeStore(config.database,environment);
+          let row:Item;
+          try{
+            const saved=db.existing(db.prepare("native",{...input,...(boundary==="native_bound"?{}:{runtimeRequestId:requestId})}));
+            assert.ok(saved,"committed registration at "+boundary);row=saved;
+            assert.equal(db.native(row.id).request_id,requestId,"durable binding at "+boundary);
+          }finally{db.close();}
+          childService=await processService(configPath);await settled(row);
+          const result=JSON.parse((await invoke("chaldea_decision_status",{id:row.id})).outcome!);
+          const p=await projection(thread),requests=p.runtimeRequests.filter(r=>r.id===requestId);
+          assert.equal(result.defaulted,true,JSON.stringify({boundary,result,requests}));
+          assert.equal(requests.length,1);const request=requests[0]!;
+          assert.equal(request.status,"resolved");
+          assert.ok(Object.values(request.answers!).every(a=>a==="No answer by the deadline: defer deploy the fixture"));
+          assert.equal(await wakeCount(thread,row.id),0);
+          await childService.stop();childService=undefined;
+        }
+      }finally{
+        await childService?.stop();childService=undefined;
+        service=await startWaitService(config);
       }
-      service=await startWaitService(config);
     });
     await t.test("known Codex async request survives watcher and T3 restart; native answer continues exactly once",async()=>{
       const thread=await create("codex");await dispatchMessage(t3,token,thread,"chaldea-native-async",key());const requestId=await pending(thread);
@@ -196,15 +244,20 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
         });
       }
       await until("schema captured",async()=>!!service!.store.native(row.id).questions);
-      // More than ten subsequent user turns and 90 activity items move every
-      // original question outside pinned T3's bounded projection window.
-      for(let n=0;n<12;n++){
-        const messageKey=key();await dispatchMessage(t3,token,thread,n===11?"chaldea-native-burst":"continue unrelated fixture work",messageKey);
-        await until("background turn "+n,async()=>(await projection(thread)).runs.some(r=>r.userMessageId==="e2e-message-"+messageKey&&r.status==="completed"));
-      }
-      const bounded=await projection(thread);
-      assert.ok(ids.every(id=>bounded.runtimeRequests.some(r=>r.id===id&&r.status==="pending")));
-      assert.ok(!bounded.turnItems.some(i=>i.type==="user_input_request"&&ids.includes(i.requestId)),"questions actually left the history window");
+      // Pause delivery after the schema is durable. History construction can
+      // outlast the deadline on a loaded host; recovery must see old questions.
+      await service!.stop();service=undefined;
+      try{
+        // More than ten subsequent user turns and 90 activity items move every
+        // original question outside pinned T3's bounded projection window.
+        for(let n=0;n<12;n++){
+          const messageKey=key();await dispatchMessage(t3,token,thread,n===11?"chaldea-native-burst":"continue unrelated fixture work",messageKey);
+          await until("background turn "+n,async()=>(await projection(thread)).runs.some(r=>r.userMessageId==="e2e-message-"+messageKey&&r.status==="completed"));
+        }
+        const bounded=await projection(thread);
+        assert.ok(ids.every(id=>bounded.runtimeRequests.some(r=>r.id===id&&r.status==="pending")));
+        assert.ok(!bounded.turnItems.some(i=>i.type==="user_input_request"&&ids.includes(i.requestId)),"questions actually left the history window");
+      }finally{service=await startWaitService(config);}
       const old=await invoke("chaldea_decision_track",{...policy(thread,15_000),runtimeRequestId:ids[1]});
       const answered=await invoke("chaldea_decision_track",{...policy(thread,30_000),runtimeRequestId:ids[2]});
       await service!.stop();service=await startWaitService(config);
