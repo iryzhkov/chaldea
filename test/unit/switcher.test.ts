@@ -17,9 +17,9 @@ function provider(instanceId = "codex", model = "gpt-6.1-sol", effort = "reasoni
       optionDescriptors: [{ id: effort, type: "select", options: [{ id: "high" }] }],
     } }], usageLimits: { checkedAt: new Date().toISOString(), windows: [{ usedPercent: 0 }, { usedPercent: 99 }] } };
 }
-function harness(state: ObserverState = emptyState()) {
+function harness(state: ObserverState = emptyState(), clock: () => number = Date.now) {
   let offset = 0;
-  const now = () => Date.now() + offset;
+  const now = () => clock() + offset;
   let current: ShellThread | undefined = limited("run-a", now(), new Date(now() + 60_000).toISOString(), { modelSelection: from });
   const calls: Array<{ kind: string; input: any }> = [], records: QuotaRecord[] = [], logs: string[] = [];
   let durable = true, acceptDispatch = true, acceptRelease = true, delivered = false, catalogCalls = 0, autoResume = true;
@@ -203,7 +203,8 @@ test("lost operate scope attempts cleanup once per active intent per drain", asy
   assert.equal(h.logs.length, 1);
 });
 test("transient disable retries with capped backoff, one warning and one re-enabled log", async () => {
-  const h = harness();
+  // Exact one-millisecond boundaries need a clock advanced only by this test.
+  const started = Date.now(), h = harness(emptyState(), () => started);
   h.current = { ...h.current!, usageLimitResetAt: new Date(h.now() + 3_600_000).toISOString() };
   let probes = 0;
   h.port.catalog = async () => {
