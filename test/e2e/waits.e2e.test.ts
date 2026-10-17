@@ -191,7 +191,8 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       child.stdin.write(JSON.stringify({jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"chaldea_decision_ask",arguments:q}})+"\n");
       try{
         await until("MCP ask",async()=>lines().some(r=>r.id===3));
-        assert.equal(lines().find(r=>r.id===2).result.tools.length,8);
+        assert.equal(lines().find(r=>r.id===2).result.tools.length,9);
+        assert.ok(lines().find(r=>r.id===2).result.tools.some((tool:{name:string})=>tool.name==="chaldea_route"));
         const result=lines().find(r=>r.id===3).result;
         assert.equal(result.isError,undefined,err);
         const row=JSON.parse(result.content[0].text);

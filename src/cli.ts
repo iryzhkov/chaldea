@@ -2,6 +2,8 @@
 import { description, discoveryHelp } from "./describe.ts";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
+import { classifyCapacities } from "./quota/capacity.ts";
+import { loadCapacityConfig } from "./quota/capacity-config.ts";
 import { loadHeadroomConfig } from "./quota/codex-balance.ts";
 import { humanStatus, statusSnapshot } from "./quota/headroom.ts";
 import { loadState } from "./quota/state.ts";
@@ -15,8 +17,9 @@ import { ConfigurationError, EXIT_CONFIG, readToken, runObserver } from "./quota
 import { ProtocolIncompatibleError, discoverServerUrl, setAutoResumeLimitedThreads } from "./t3/adapter.ts";
 
 const USAGE = `Usage:
+  chaldea route --role builder|critical-review|bulk-read|general [options]
   chaldea quota observe [options]
-  chaldea quota status [--json] [--state-file PATH]
+  chaldea quota status [--json] [--state-file PATH] [--capacity-config PATH]
   chaldea access --help
   chaldea t3 restart [options]\n  chaldea t3 set-auto-resume on|off [options]\n  chaldea wait|decision|waits|mcp --help
 
@@ -156,13 +159,16 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
 
 async function quotaStatus(rest: ReadonlyArray<string>): Promise<number> {
   const { values, positionals } = parseArgs({ args: [...rest], strict: true, allowPositionals: true,
-    options: { json: { type: "boolean" }, "state-file": { type: "string" }, help: { type: "boolean", short: "h" } } });
+    options: { json: { type: "boolean" }, "state-file": { type: "string" }, "capacity-config": { type: "string" }, help: { type: "boolean", short: "h" } } });
   if (values.help) { process.stdout.write(USAGE); return 0; }
   if (positionals.length) return 64;
   try {
     const now = Date.now();
     const state = loadState(values["state-file"] ?? join(homedir(), ".local", "state", "chaldea", "quota-observer.json"), now);
-    process.stdout.write(values.json ? JSON.stringify(statusSnapshot(state.headroom, now), null, 2) + "\n" : humanStatus(state.headroom, now));
+    const capacity = classifyCapacities(state, now, loadCapacityConfig(homedir(), values["capacity-config"]));
+    process.stdout.write(values.json ? JSON.stringify({ ...statusSnapshot(state.headroom, now), capacity }, null, 2) + "\n"
+      : humanStatus(state.headroom, now) + Object.entries(capacity).map(([id, c]) =>
+        `${id} capacity: ${c.class}; ${c.reasons.join("; ")}; burn target ${c.burnTargetPerHour === null ? "unknown" : (c.burnTargetPerHour * 100).toFixed(2) + "%/hour"}\n`).join(""));
     return 0;
   } catch {
     process.stderr.write("chaldea: quota snapshot could not be read\n");
@@ -189,6 +195,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
       const { waitsCli } = await import("./waits/cli.ts");
       return await waitsCli(argv);
     }
+    if (group === "route") return await (await import("./route/cli.ts")).routeCli(argv.slice(1));
     if (group === "access") {
       const { accessCli } = await import("./access/cli.ts");
       return await accessCli(argv.slice(1));
