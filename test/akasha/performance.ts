@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { rig, N } from "./helpers.ts";
 import { NEW_FEED_ID } from "../../src/akasha/schema.ts";
-import { feedRows } from "../../src/akasha/compat.ts";
+import { eventPage, feedRows } from "../../src/akasha/compat.ts";
 import { httpServer } from "../../src/akasha/http.ts";
 import { Ingress } from "../../src/akasha/ingress.ts";
 import { Authorization } from "../../src/akasha/auth.ts";
@@ -50,7 +50,22 @@ try {
       assert.equal(result.status, 200, path); const body = await result.json(); assert.ok(Array.isArray(body));
     }
   } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
-  const result = { rows: 100000, expiryMaxBatchMs: Math.max(...times), pressureBatchMs: pressureMs, expiredPlan, pressurePlan,
+  // Exercise the previously quadratic default window on 60,000 matching rows.
+  r.store.db.prepare("UPDATE events SET occurred_at=? WHERE seq IN (SELECT seq FROM events ORDER BY seq DESC LIMIT 60000)").run(recent);
+  const eventPageTimings: Record<string, number> = {};
+  for (const count of [100, 1000]) {
+    const started = performance.now(), page = eventPage(r.store, new URLSearchParams("limit=" + count), scope, N);
+    assert.equal([...page.rows].length, count); assert.ok(page.next());
+    eventPageTimings[String(count)] = performance.now() - started;
+    assert.ok(eventPageTimings[String(count)]! < 500, "60k default event page <=500ms at limit " + count);
+  }
+  const first = eventPage(r.store, new URLSearchParams("limit=100"), scope, N);
+  assert.equal([...first.rows].length, 100);
+  const cursor = first.next()!;
+  const second = eventPage(r.store, new URLSearchParams("limit=100&cursor=" + cursor), scope, N);
+  assert.equal([...second.rows].length, 100);
+  assert.equal([...eventPage(r.store, new URLSearchParams("limit=0"), scope, N).rows].length, 0);
+  const result = { rows: 100000, defaultEventWindowRows: 60000, eventPageTimings, expiryMaxBatchMs: Math.max(...times), pressureBatchMs: pressureMs, expiredPlan, pressurePlan,
     sparseHttp: "pass, >10000 older feed rows and source-scoped reader", walBytes: r.store.walBytes() };
   if (process.env.AKASHA_RESULTS) writeFileSync(process.env.AKASHA_RESULTS.replace("results.json", "performance.json"), JSON.stringify(result, null, 2));
   process.stdout.write(JSON.stringify(result) + "\n");

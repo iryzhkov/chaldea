@@ -78,16 +78,20 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
     const value = q.get(key);
     if (value) { ensure(value.length <= 512, "invalid_filter"); parts.push(key + "=?"); params.push(value); }
   }
-  let yielded = 0;
+  // Select a bounded page of IDs once: repeating LIMIT 1 can sort the entire
+  // time window for every row. No envelope or live SQLite reader crosses a yield.
+  const ids = count ? store.db.prepare("SELECT seq FROM events WHERE " + parts.join(" AND ") + " AND seq>? ORDER BY seq LIMIT ?")
+    .all(...params, seq, count + 1) as { seq: number }[] : [];
+  const read = store.db.prepare("SELECT envelope FROM events WHERE seq=? AND " + parts.join(" AND "));
   function* rows(): Generator<Envelope> {
-    for (; yielded < count; yielded++) {
-      const r = store.db.prepare("SELECT seq,envelope FROM events WHERE " + parts.join(" AND ") + " AND seq>? ORDER BY seq LIMIT 1")
-        .get(...params, seq) as { seq: number; envelope: string } | undefined;
-      if (!r) return; seq = r.seq; yield JSON.parse(r.envelope) as Envelope;
+    for (const id of ids.slice(0, count)) {
+      seq = id.seq;
+      const r = read.get(seq, ...params) as { envelope: string } | undefined;
+      if (r) yield JSON.parse(r.envelope) as Envelope;
     }
   }
   return { rows: rows(), next: () => {
-    if (!count || !store.db.prepare("SELECT 1 FROM events WHERE " + parts.join(" AND ") + " AND seq>? LIMIT 1").get(...params, seq)) return null;
+    if (ids.length <= count) return null;
     const c: Cursor = { v: 1, epoch: store.get("epoch")!, seq, binding };
     return Buffer.from(JSON.stringify(c)).toString("base64url");
   } };
