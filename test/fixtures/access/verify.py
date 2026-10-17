@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+TRUST_FRESH_SECONDS = 24 * 60 * 60
+
 AUD = {"homelab", "feed", "akasha", "jocasta", "ov", "huyang", "github-broker"}
 
 
@@ -151,7 +153,7 @@ class Verifier:
         need(type(b["v"]) is int and b["v"] == 1)
         for name in ("sequence", "published_at", "expires_at"):
             sec(b[name])
-        need(b["sequence"] > 0 and 0 < b["expires_at"] - b["published_at"] <= 600
+        need(b["sequence"] > 0 and 0 < b["expires_at"] - b["published_at"] <= TRUST_FRESH_SECONDS
              and isinstance(b["keys"], list) and len(b["keys"]) <= 128)
         ids = set()
         for k in b["keys"]:
@@ -290,7 +292,7 @@ def run(path):
 
 
 def main():
-    paths = sys.argv[1:] or [Path(__file__).with_name(name) for name in ("v1.json", "v1-encoding.json")]
+    paths = sys.argv[1:] or [Path(__file__).with_name(name) for name in ("v1.json", "v1-encoding.json", "v1-freshness.json")]
     total = sum(run(path) for path in paths)
     print("Python: " + str(total) + " frozen vector checks passed")
 
