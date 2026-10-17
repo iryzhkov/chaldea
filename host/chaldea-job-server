@@ -11,6 +11,8 @@ import os
 from pathlib import Path
 import re
 import resource
+import runpy
+from types import SimpleNamespace
 import selectors
 import shutil
 import signal
@@ -37,6 +39,8 @@ MAX_OUTPUT = LIMITS["maxOutput"]
 CAP = 20 * 1024 ** 3
 RESERVE = 256 * 1024 * 1024
 CHUNK = LIMITS["chunk"]
+retention = SimpleNamespace(**runpy.run_path(str(Path(__file__).with_name("job_retention.py"))))
+RECOVERY = None
 
 
 def safe_path(name):
@@ -56,6 +60,8 @@ def encode(value):
 def send(kind, data=b""):
     if kind not in FRAME_TYPES or len(data) > MAX_FRAME:
         raise ValueError("frame too large")
+    if RECOVERY is not None and kind in ("O", "S"):
+        RECOVERY.output(kind, data)
     sys.stdout.buffer.write(kind.encode() + struct.pack("!I", len(data)) + data)
     sys.stdout.buffer.flush()
 
@@ -214,7 +220,7 @@ def cleanup(root):
         if time.monotonic() > deadline:
             print("chaldea: cleanup budget exhausted; leftovers remain bounded", file=sys.stderr)
             break
-        if (path.name in ("admission.lock", "lost+found")
+        if (path.name in ("admission.lock", "lost+found", ".retained", ".retention.lock")
                 or re.fullmatch(r"admission-[0-9]+\.lock|slot-[0-9]+", path.name)):
             continue
         try:
@@ -229,6 +235,7 @@ def cleanup(root):
 def admission(root, config):
     if config.get("require_mount", True) and not os.path.ismount(root):
         raise Refused("job storage unavailable: image is not mounted; host remains available")
+    retention.prune(root, config)
     cap = int(config.get("state_cap_bytes", CAP))
     reserve = max(int(config.get("min_free_bytes", RESERVE)), 0)
     usage = shutil.disk_usage(root)
@@ -830,6 +837,21 @@ def execute(request, workspace, config):
         JOB_STARTED = JOB_STARTED or launched(launch)
         job_signal(launch, signal.SIGKILL, process.pid)
         kill_group(process)
+        if RECOVERY is not None:
+            # After killing the entire guest, preserve output still buffered in
+            # pipes even when the client has already closed its transport.
+            for pipe, kind in ((process.stdout, "O"), (process.stderr, "S")):
+                os.set_blocking(pipe.fileno(), False)
+                remaining = MAX_OUTPUT
+                while remaining:
+                    try:
+                        data = os.read(pipe.fileno(), min(CHUNK, remaining))
+                    except BlockingIOError:
+                        break
+                    if not data:
+                        break
+                    RECOVERY.output(kind, data)
+                    remaining -= len(data)
         process.stdout.close()
         process.stderr.close()
         launch.unlink(missing_ok=True)
@@ -863,6 +885,75 @@ def artifacts(request, workspace):
             send("A", encode({"path": name, "size": size}))
             while data := file.read(CHUNK):
                 send("B", data)
+
+
+def run_job(root, slot_root, request, workspace, config):
+    global RECOVERY
+    saved = retention.RetainedJob(root, request, config)
+    RECOVERY = saved
+    code = None
+    outcome = "uncertain"
+    keep = True
+    try:
+        try:
+            code = execute(request, workspace, config)
+            outcome = "finished"
+            artifacts(request, workspace)
+        except Preempted:
+            outcome = "preempted"
+            raise
+        finally:
+            RECOVERY = None
+            # A closing SSH session often delivers several HUP/TERM signals.
+            # Complete the bounded recovery write before honoring more signals.
+            handlers = {sig: signal.signal(sig, signal.SIG_IGN)
+                        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)}
+            signal.alarm(120)
+            try:
+                try:
+                    saved.finish(workspace, artifact_file, outcome, code)
+                finally:
+                    cleanup(slot_root)
+            finally:
+                for sig, handler in handlers.items():
+                    signal.signal(sig, handler)
+        send("X", encode({"exitCode": code}))
+        keep = code != 0
+    finally:
+        RECOVERY = None
+        saved.close(keep)
+        retention.prune(root, config)
+
+
+def fetch_job(root, config):
+    send("H", encode({"version": VERSION, "fetchVersion": PROTOCOL["fetchVersion"]}))
+    kind, body = receive()
+    if kind != "F":
+        raise ValueError("expected versioned exec fetch request")
+    with retention.fetch(root, json.loads(body), config) as (path, meta):
+        send("M", encode(meta))
+        with (path / "output.log").open("rb") as log:
+            remaining = MAX_OUTPUT
+            while remaining:
+                data = log.read(min(CHUNK, remaining))
+                if not data:
+                    break
+                send("L", data)
+                remaining -= len(data)
+        total = 0
+        for item in meta["artifacts"]:
+            safe_path(item["path"])
+            size = item["size"]
+            total += size
+            if type(size) is not int or size < 0 or total > MAX_ARTIFACT:
+                raise ValueError("invalid retained artifacts")
+            with (path / ("artifact-" + str(item["index"]))).open("rb") as file:
+                if os.fstat(file.fileno()).st_size != size:
+                    raise ValueError("incomplete retained artifact")
+                send("A", encode({"path": item["path"], "size": size}))
+                while data := file.read(CHUNK):
+                    send("B", data)
+        send("X", encode({"retrieved": True}))
 
 
 def interrupted(_signum, _frame):
@@ -911,6 +1002,11 @@ def main():
     if config.get("require_mount", True) and not os.path.ismount(root):
         raise Refused("job storage unavailable: image is not mounted; host remains available")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    retention.prune(root, config)
+    if os.environ.get("SSH_ORIGINAL_COMMAND") == PROTOCOL["commands"]["fetch"]:
+        signal.alarm(120)
+        fetch_job(root, config)
+        return
     with job_admission(root, config, queued) as slot_root:
         cleanup(slot_root)
         signal.alarm(120)
@@ -930,12 +1026,10 @@ def main():
             resource.setrlimit(resource.RLIMIT_FSIZE, (CAP, CAP))
             resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
             signal.alarm(21720)
-            code = execute(request, workspace, config)
-            artifacts(request, workspace)
+            run_job(root, slot_root, request, workspace, config)
         finally:
             cleanup(slot_root)
-        # Result follows bounded cleanup; unremovable leftovers stay image-bounded.
-        send("X", encode({"exitCode": code}))
+        # run_job sends the result only after bounded cleanup and recovery writes.
 
 
 JOB_STARTED = False

@@ -5,6 +5,7 @@ import definition from '../../host/exec-protocol.json' with { type: 'json' };
 
 export const VERSION = definition.version;
 export const QUEUE_VERSION = definition.queueVersion;
+export const FETCH_VERSION = definition.fetchVersion;
 export const COMMANDS = definition.commands;
 export const LIMITS = definition.limits;
 export const PATHS = definition.paths;
