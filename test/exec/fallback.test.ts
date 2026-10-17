@@ -4,7 +4,7 @@ import { argumentsFor, hostsFor, isLocalHost, fallbackAllowed } from '../../src/
 
 test('host is optional, but an explicit host and command must be valid', () => {
   assert.deepEqual(argumentsFor(['exec', '--gpu', '--artifact', 'out', '--', 'echo', '$HOME']),
-    { host: undefined, gpu: true, artifacts: ['out'], argv: ['echo', '$HOME'] });
+    { host: undefined, gpu: true, artifacts: ['out'], argv: ['echo', '$HOME'], noQueue: false, queueTimeout: 3600 });
   for (const args of [
     ['exec', '--host'], ['exec', '--host', '', '--', 'true'],
     ['exec', '--host', '--', 'true'], ['exec', '--host', '-x', '--', 'true'],

@@ -28,9 +28,7 @@ the job request. SSH connection setup times out after 10 seconds.
 Server-refusal fallback relies on the server never sending `refused` once a job has launched.
 After any request write, connection loss stays uncertain and is never retried;
 preemption and protocol errors also stop the invocation. Every attempted host
-has its own journal entry. All targets unavailable exits **69**, with a one-line
-host/reason summary, without waiting or queuing. An explicit `--host H` attempts
-only H and keeps the existing status/error behavior. If the list file is missing,
+has its own journal entry. All targets unreachable exits **69** with a one-line host/reason summary; busy reachable hosts instead queue concurrently through chaldea-exec-queue-v1 (W version 1/timeoutSeconds, Y ready, G go or C cancel before Q), with one winner, disconnect cancellation, a default one-hour --queue-timeout (ms/s/m/h or seconds), and --no-queue for immediate refusal. An explicit `--host H` attempts only H and queues there when busy (or preserves immediate refusal with `--no-queue`). If the list file is missing,
 use `--host H` to target a host without it.
 
 

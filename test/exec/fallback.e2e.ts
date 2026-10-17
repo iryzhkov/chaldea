@@ -88,7 +88,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   return {
     state, hostFile,
     run: (host?: string, code: number | 'hold' = 0) => spawn(process.execPath,
-      [cli, 'exec', ...(host ? ['--host', host] : []), '--', process.execPath, '-e', 'console.log("ran");process.exit(' + (code === 'hold' ? 0 : code) + ')', ...(code === 'hold' ? ['hold'] : [])],
+      [cli, 'exec', '--no-queue', ...(host ? ['--host', host] : []), '--', process.execPath, '-e', 'console.log("ran");process.exit(' + (code === 'hold' ? 0 : code) + ')', ...(code === 'hold' ? ['hold'] : [])],
       { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] }),
     events: async () => (await fs.readFile(log, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(x => JSON.parse(x)),
     intents: async () => Promise.all((await fs.readdir(join(state, 'journal'))).filter(x => x.endsWith('.json')).map(async x =>
