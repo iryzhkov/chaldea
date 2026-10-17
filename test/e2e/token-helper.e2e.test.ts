@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeyPairSync } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { SignJWT, decodeJwt } from "jose";
 import { AccessState, TrustStore, signTrustBundle } from "../../src/access/trust.ts";
@@ -25,7 +25,7 @@ test("real helper process mints a scratch Ed25519 bearer accepted by the existin
   writeFileSync(key, issuer.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
   const anchors: TrustAnchor[] = [{ kid: "deployment-2026-10b", public_key: publicKey(anchor.publicKey) }];
   const bundle: TrustBundle = { v: 1, sequence: 1, published_at: now - 10, expires_at: now + 3600, keys: [{
-    issuer: "chaldea:agent-a", kid: "agent-a-2026-10", public_key: publicKey(issuer.publicKey),
+    issuer: "chaldea:agent-b", kid: "agent-b-2026-10", public_key: publicKey(issuer.publicKey),
     not_before: now - 3600, issue_until: now + 3600, verify_until: now + 4410,
     ceilings: [{ audience: "akasha", profile: "quota-service", project: "chaldea", source: "quota",
       grants: [{ resource: "quota", actions: ["append"] }] }],
@@ -35,9 +35,10 @@ test("real helper process mints a scratch Ed25519 bearer accepted by the existin
   writeFileSync(health, JSON.stringify({ healthy: true, offsetSeconds: 0, checked_at: now }));
   writeFileSync(bundlePath, envelope); writeFileSync(anchorPath, JSON.stringify(anchors));
   const fixture = join(dir, "fixture.json");
-  writeFileSync(fixture, JSON.stringify({ key, caller: "1000", config: { state_file: statePath,
+  writeFileSync(fixture, JSON.stringify({ uid: 1234, caller: "1000", config: {
+    issuer: { uid: 1234, key_file: key, name: "chaldea:agent-b", kid: "agent-b-2026-10" }, state_file: statePath,
     bundle_file: bundlePath, anchor_file: anchorPath, clock_health_file: health, grants: [{
-      uid: 1000, audience: "akasha", action: "append", source: "quota", host: "agent-a",
+      uid: 1000, audience: "akasha", action: "append", source: "quota", host: "agent-b",
       kind: "quota_parked", profile: "quota-service", project: "chaldea",
     }] } }));
   const helper = join(dir, "helper");
@@ -49,16 +50,16 @@ test("real helper process mints a scratch Ed25519 bearer accepted by the existin
   try {
     const clock = healthClock(state, health), trust = new TrustStore(state, clock, anchors);
     await trust.install(envelope);
-    const event = { key: "test", source: "quota", host: "agent-a", payload: { kind: "quota_parked" } };
+    const event = { key: "test", source: "quota", host: "agent-b", payload: { kind: "quota_parked" } };
     const token = await helperToken(helper, event);
     const operation = { audience: "akasha" as const, resource: "quota", action: "append" };
     const verified = await verifyToken(token, operation, trust, clock);
-    assert.equal(verified.claims.iss, "chaldea:agent-a");
+    assert.equal(verified.claims.iss, "chaldea:agent-b");
     // The producer deadline is sampled before the issuer rechecks its clock.
     assert.ok(verified.claims.exp > verified.claims.iat && verified.claims.exp - verified.claims.iat <= 780);
-    assert.equal(verified.claims.source, "quota"); assert.equal(verified.claims.host, "agent-a");
+    assert.equal(verified.claims.source, "quota"); assert.equal(verified.claims.host, "agent-b");
     const claims = decodeJwt(token);
-    const sign = (payload: object, kid = "agent-a-2026-10") => new SignJWT({ ...payload })
+    const sign = (payload: object, kid = "agent-b-2026-10") => new SignJWT({ ...payload })
       .setProtectedHeader({ alg: "EdDSA", typ: TOKEN_TYPE, kid }).sign(issuer.privateKey);
     await assert.rejects(verifyToken(await sign({ ...claims, iat: now - 1000, nbf: now - 1000, exp: now - 100 }), operation, trust, clock));
     await assert.rejects(verifyToken(await sign(claims, "wrong-kid"), operation, trust, clock));
@@ -66,6 +67,13 @@ test("real helper process mints a scratch Ed25519 bearer accepted by the existin
     await assert.rejects(verifyToken(await sign({ ...claims, exp: Number(claims.iat) + 781 }), operation, trust, clock));
     for (const bad of [{ ...event, source: "other" }, { ...event, host: "other" },
       { ...event, payload: { kind: "report" } }]) await assert.rejects(helperToken(helper, bad));
+    // Valid state/key/trust isolate effective-UID admission from later failures.
+    const fixtureData = JSON.parse(readFileSync(fixture, "utf8"));
+    fixtureData.uid = 995;
+    writeFileSync(fixture, JSON.stringify(fixtureData));
+    await assert.rejects(helperToken(helper, event));
+    fixtureData.uid = 1234;
+    writeFileSync(fixture, JSON.stringify(fixtureData));
     // Missing current trust/health and removal of the UID grant fail closed on the next invocation.
     writeFileSync(health, JSON.stringify({ healthy: false, offsetSeconds: 0, checked_at: now }));
     await assert.rejects(helperToken(helper, event));
