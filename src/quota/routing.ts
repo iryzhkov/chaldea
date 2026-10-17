@@ -39,7 +39,8 @@ export function hasQuota(provider: SwitchProvider | undefined, nowMs = Date.now(
     provider.availability !== "unavailable" && provider.status === "ready" &&
     provider.auth.status === "authenticated" && limits !== undefined &&
     // Only the included lane can admit an included-usage switch. Paid controls/inventory cannot.
-    !(provider.headroom?.included.ordinaryUsageAllowed.state === "fresh" &&
+    !(provider.headroom?.binding !== "asserted" &&
+      provider.headroom?.included.ordinaryUsageAllowed.state === "fresh" &&
       provider.headroom.included.ordinaryUsageAllowed.value === false) &&
     limits.unavailable === undefined && limits.windows.length > 0 &&
     Number.isFinite(Date.parse(limits.checkedAt)) && Date.parse(limits.checkedAt) <= nowMs &&

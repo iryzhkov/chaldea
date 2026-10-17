@@ -410,6 +410,8 @@ Human and JSON status label this binding `asserted`, and the startup collector
 log includes `binding: asserted`. A matching published path is labeled `verified`.
 An assertion cannot confirm which account T3 actually uses. The worst case is
 displaying another account's balance. Nothing spends or acts on that figure.
+Asserted observations also cannot affect provider switching; routing uses T3's
+included-usage windows instead.
 
 Equal HOME/CODEX_HOME/executable tuples share one collector across aliases even
 when their assertion settings differ; each alias keeps its own opt-in. Paths and

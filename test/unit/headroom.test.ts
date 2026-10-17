@@ -10,7 +10,7 @@ import { emptyState, loadState, saveState } from "../../src/quota/state.ts";
 import { EventSink } from "../../src/quota/run.ts";
 import { body, quotaPublication } from "../../src/feed/poster.ts";
 import { normalize } from "../../src/akasha/schema.ts";
-import { hasQuota } from "../../src/quota/routing.ts";
+import { equivalentTarget, hasQuota, switchConfig } from "../../src/quota/routing.ts";
 import { toSwitchProvider, type SwitchProvider } from "../../src/t3/adapter.ts";
 import type { QuotaRecord } from "../../src/quota/observer.ts";
 import { scratchDir } from "../helpers/scratch.ts";
@@ -270,6 +270,24 @@ test("operator assertion is explicit, visible, and cannot override published hom
   }
 });
 
+test("operator-asserted observations cannot suppress or admit an included provider switch", () => {
+  const row = newProvider("codex", "codex");
+  applyCodex(row, response, AT); // The asserted account says ordinary usage is forbidden.
+  const target = { ...provider(), models: [{ slug: "gpt-6.1-sol", capabilities: null }],
+    usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] } };
+  const source = { instanceId: "claudeAgent", model: "claude-opus-5-5" };
+  const config = switchConfig({ enabled: true });
+  for (const binding of ["verified", "asserted"] as const) {
+    row.binding = binding;
+    const p = { ...target, headroom: routingLanes(row, START) };
+    assert.equal(p.headroom.included.ordinaryUsageAllowed.value, false);
+    assert.deepEqual(equivalentTarget(source, [p], config, START),
+      binding === "asserted" ? { instanceId: "codex", model: "gpt-6.1-sol" } : null);
+    assert.equal(equivalentTarget(source, [{ ...p, usageLimits: { checkedAt: AT, windows: [{ usedPercent: 100 }] } }], config, START), null);
+    assert.equal(equivalentTarget(source, [p], config, START + COLLECT_EVERY_MS + 1), null);
+  }
+});
+
 test("mixed assertion policies share one read without opting other aliases in", async () => {
   const entry = { home: "/scratch/home", codexHome: "/scratch/codex" };
   for (const reverse of [false, true]) {
@@ -332,10 +350,14 @@ test("every rejected binding has a stable status reason without a read or repeat
 
 test("catalog rejection recovery preserves normal cadence and rate-limit backoff", async () => {
   const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
-  for (const rateLimited of [false, true]) {
+  for (const balance of [response.rateLimitsByLimitId.codex.credits.balance, null]) for (const rateLimited of [false, true]) {
     let now = START, reads = 0;
+    const records: QuotaRecord[] = [];
+    const result = { ...response, rateLimitsByLimitId: { codex: { ...response.rateLimitsByLimitId.codex,
+      credits: { ...response.rateLimitsByLimitId.codex.credits, balance } } } };
     const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => now, random: () => 0.5,
-      save() {}, read: async () => { reads++; if (rateLimited) throw new BalanceReadError("rate_limited"); return response; } });
+      save: batch => records.push(...batch),
+      read: async () => { reads++; if (rateLimited) throw new BalanceReadError("rate_limited"); return result; } });
     try {
       m.update([provider()]); await m.tick(); assert.equal(reads, 1);
       now += 1_000;
@@ -358,9 +380,10 @@ test("catalog rejection recovery preserves normal cadence and rate-limit backoff
           assert.equal(json.error, "read_scheduled");
           assert.match(human, /reason read_scheduled/);
         } else {
-          assert.equal(json.value?.balance, response.rateLimitsByLimitId.codex.credits.balance);
+          assert.equal(json.value?.balance, balance);
+          assert.equal(json.state, balance === null ? "unknown" : "fresh");
           assert.equal(json.observedAt, AT); assert.equal(json.error, null);
-          assert.match(human, /61951\.0098125000 credits/);
+          assert.match(human, balance === null ? /unknown credits; hasCredits=true; unlimited=false \[unknown/ : /61951\.0098125000 credits/);
           assert.match(human, /observed 2026-10-17T17:57:35\.000Z/);
           assert.equal(row.ordinaryUsageAllowed.value, false);
           assert.equal(row.spendControlReached.value, false);
@@ -370,7 +393,10 @@ test("catalog rejection recovery preserves normal cadence and rate-limit backoff
       }
       now = START + COLLECT_EVERY_MS * (rateLimited ? 2 : 1) - 1;
       await m.tick(); assert.equal(reads, 1);
+      const transitions = records.filter(r => r.kind === "quota_headroom_changed").length;
       now++; await m.tick(); assert.equal(reads, 2);
+      if (!rateLimited) assert.equal(records.filter(r => r.kind === "quota_headroom_changed").length, transitions,
+        "the due read must not correct an invented fresh wallet state");
     } finally { await m.close(); }
   }
 });

@@ -156,6 +156,7 @@ export function failCodex(row: ProviderHeadroom, error: string): void {
 /** Public, identity-free lanes: reporting inputs only; paid admission stays false without a future policy. */
 export function routingLanes(row: ProviderHeadroom, nowMs: number) {
   return {
+    ...(row.binding ? { binding: row.binding } : {}),
     included: { windows: metricNow(row.included, nowMs), ordinaryUsageAllowed: metricNow(row.ordinaryUsageAllowed, nowMs) },
     creditFunded: { credits: metricNow(row.credits, nowMs), spendControlReached: metricNow(row.spendControlReached, nowMs),
       extraUsage: metricNow(row.extraUsage, nowMs), admissionAllowed: false as const },
@@ -164,7 +165,7 @@ export function routingLanes(row: ProviderHeadroom, nowMs: number) {
 }
 export function statusSnapshot(state: HeadroomState, nowMs: number) {
   return { version: 1, generatedAt: new Date(nowMs).toISOString(), providers: state.providers.map(row => ({
-    alias: row.alias, driver: row.driver, ...(row.binding ? { binding: row.binding } : {}), plan: metricNow(row.plan, nowMs),
+    alias: row.alias, driver: row.driver, plan: metricNow(row.plan, nowMs),
     ...routingLanes(row, nowMs),
   })) };
 }
@@ -311,10 +312,11 @@ export class HeadroomMonitor {
         this.#report(row.alias, reason);
       } else {
         // Identity changes are cleared in update(). Eligibility flaps keep the same observations.
-        const resume = <T>(m: Metric<T>): Metric<T> => SKIP_REASONS.some(r => r === m.error) ||
+        const resume = <T>(m: Metric<T>, observedState: MetricState = "fresh"): Metric<T> => SKIP_REASONS.some(r => r === m.error) ||
           m.value === null && m.error === null ? { ...m,
-            state: m.value === null ? "unknown" : "fresh", error: m.value === null ? "read_scheduled" : null } : m;
-        row.credits = resume(row.credits); row.ordinaryUsageAllowed = resume(row.ordinaryUsageAllowed);
+            state: m.value === null ? "unknown" : observedState, error: m.value === null ? "read_scheduled" : null } : m;
+        row.credits = resume(row.credits, row.credits.value?.balance === null && !row.credits.value.unlimited ? "unknown" : "fresh");
+        row.ordinaryUsageAllowed = resume(row.ordinaryUsageAllowed);
         row.spendControlReached = resume(row.spendControlReached); row.plan = resume(row.plan);
         if (row.manualResets.source === "codex-app-server") row.manualResets = resume(row.manualResets);
       }
