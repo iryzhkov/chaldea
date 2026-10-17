@@ -13,7 +13,17 @@
     "noImplicitOverride": true,
     "useDefineForClassFields": true,
     "skipLibCheck": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src", "test", "vendor/t3-contracts/src"]
+  "include": [
+    "src",
+    "test",
+    "vendor/t3-contracts/src"
+  ],
+  "exclude": [
+    "src/exec",
+    "test/exec"
+  ]
 }
