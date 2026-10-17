@@ -50,8 +50,11 @@ The session passes its own `orchestrator_capabilities.parentThreadId` explicitly
 This field names the calling thread, despite its name. The service validates the
 configured local T3 environment, thread and project. It never infers identity from
 cwd, provider session IDs, or parent lineage. Wrong environment fails closed;
-deleted/archived/settled parents suppress undelivered wakes and become orphaned,
-with an explicit disposition. Items are never rebound.
+deleted/archived/explicitly-settled parents become orphaned with an explicit
+disposition. Unattempted wakes are suppressed; a wake attempted before an
+ambiguous response remains `uncertain`, including after restart, rather than
+claiming it never reached T3. Uncertain wakes are retained for operator attention
+and are not retried to inactive parents. Items are never rebound.
 
 ```sh
 # Save a retry key before invoking; reuse both key and arguments after ambiguity.
@@ -144,6 +147,10 @@ after ambiguity. It never creates notification rows on reconnect, scans or
 deadline. Unaccepted notifications stop after the question resolves, at its
 deadline, or after 24 hours. An already-queued relay card may arrive later; its
 tap shows current state. A slow/offline relay cannot block the deadline or wake.
+If relay URL/env-file configuration is absent, the phone row becomes
+`undeliverable` with disposition `relay_unprovisioned`, zero send attempts and
+no retry timer. Provisioning later affects new questions; scans/restarts do not
+re-notify old ones. A configured relay retains capped backoff and expiry.
 
 This is one logical card identity, not a qualified exactly-once audible alert.
 Existing relay ID replacement may re-alert; phone/relay ACK-loss, dismissal and
@@ -161,7 +168,8 @@ explicit deployment decision. Default bind is `127.0.0.1`, not LAN/WAN.
 
 ## Deployment provisioning (not performed by this change)
 
-Install Node 26.10.0, Python 3 on Linux, dependencies with `npm ci`, and the reviewed
+Install Node 26.10.0, Python 3 and Linux `flock` (util-linux), dependencies with
+`npm ci`, and the reviewed
 checkout at `~/.local/share/chaldea/app` (the existing quota-service convention).
 Install/link the CLI separately. Create `~/.config/chaldea/waits.json`:
 
@@ -201,8 +209,9 @@ The deployment operator must provision:
    `NOTIFY_RELAY_TOKEN` and an optional `export ` prefix are also accepted. The parser does not source shell code.
    omarchy-pc has no such file yet. Resolve the credential through the existing
    SOPS/notify deployment; this PR neither fetches nor copies a real secret.
-   Missing relay config/credential leaves a bounded retrying phone row until
-   resolution/expiry; it does not stop questions.
+   Missing relay configuration creates one `undeliverable` phone row with a
+   clear disposition and no retries. Configured relay/credential failures use
+   bounded backoff until resolution/expiry; they do not stop questions.
 4. The local service unit and MCP registration in every desired provider.
    Precreate the state/cache/config directories with private permissions.
    Install `packaging/systemd/chaldea-waits.service` in the user's systemd
@@ -211,7 +220,10 @@ The deployment operator must provision:
    Do not restart or change the existing quota service.
 
 The unit runs one watcher/outbox/store/page process; stdio MCP processes are
-clients. The socket prevents a second service instance from opening the DB.
+clients. An exclusive OS owner lock is held on the database's inode, independent
+of the socket path. A second service using the same database is refused before
+it can reset in-flight delivery. Linux releases ownership on exit/SIGKILL; there
+is no stale lease to reclaim and no lock-file deletion race.
 State survives watcher/T3 restart and host reboot. This PR installs/enables
 nothing on any host: omarchy-pc, agent-a, agent-b and laptop are all undeployed.
 
@@ -221,8 +233,13 @@ SQLite uses WAL and FULL synchronous transactions, with a 31 MiB main-file page
 ceiling, cache spill disabled, and a truncate checkpoint before and after each
 transaction. Disabling spill bounds each transaction to one WAL frame per dirty
 page; the extra MiB leaves room for WAL frame headers under the shared 64 MiB cap.
-A blocked checkpoint refuses another write until the reader releases it. New work
-is rejected under disk pressure. No unresolved/ambiguous/blocked wake is pruned.
+A blocked checkpoint refuses another write until the reader releases it. The
+watcher logs once per blocked episode and retries with capped 250 ms–30 s backoff;
+it keeps running through deadline, delivery and startup maintenance failures.
+Confirmed receipts waiting to be journalled are retained in memory without
+re-dispatch; a crash still replays the immutable command/receipt protocol.
+New work is rejected under disk pressure. No unresolved/uncertain/blocked wake
+is pruned.
 
 Defaults: 128 active waits (one per thread), 128 pending decisions, at most 10,000
 terminal tombstones and 42 days; wake/phone payload 4 KiB, normalized registration
@@ -260,9 +277,12 @@ npm run typecheck
 CHALDEA_T3_BIN="$HOME/.t3/runtime/versions/0.1.0/t3" CHALDEA_REQUIRE_E2E=1 npm test
 ```
 
-Unit tests cover transaction/retry-key invariants, multi-process answer/deadline
-arbitration, cancellation, retention/fences/caps, quota/continuation/child
-completion, lost wake ACKs, deleted parents and credential modes. E2E uses
+Unit tests cover transaction/retry-key invariants, concurrent answer/deadline
+arbitration, the approval-labelled-default reproduction, source/self-answer
+checks, cancellation, retention/fences/caps, quota/continuation/child completion,
+lost wake ACKs, archived-parent ambiguity, unconfigured/configured relay handling,
+real SQLite readers blocking deadlines/receipt persistence, database-owner
+exclusion/SIGKILL recovery, deleted parents and credential modes. E2E uses
 `test/helpers/disposable-t3.ts`, fake Claude/Codex and a loopback relay, with
 isolated HOME/base directories. It exercises one wake per time/target run/question,
 already-true/cancel cases, CLI/MCP/page answers, default races, relay ACK loss,

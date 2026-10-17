@@ -66,6 +66,10 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
     const ask=(ms=3000)=>({threadId:parent,requestId:key(),question:"Run the dependent step?",options:["Defer","Run"],
       dependentAction:"run the dependent step",defaultAction:"defer",deadline:iso(Date.now()+ms)});
     service=await startWaitService(config);
+    await t.test("same database refuses a second service even with a different IPC socket",async()=>{
+      await assert.rejects(startWaitService({...config,socket:join(dir.path,"second.sock")}),/already owned/);
+      assert.equal(service!.store.meta("environment"),environment);
+    });
 
     await t.test("time and already-true waits commit one wake under two seconds",async()=>{
       for(const offset of [200,-1000]){
@@ -167,6 +171,11 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       await until("race wake",async()=>await wakeCount(row.id)===1);
       const outcome=(await invoke("chaldea_decision_status",{id:row.id})).outcome!;
       await sleep(100);assert.equal((await invoke("chaldea_decision_status",{id:row.id})).outcome,outcome);assert.equal(await wakeCount(row.id),1);
+      const concurrent=await invoke("chaldea_decision_ask",ask(10_000));
+      const answers=await Promise.all(Array.from({length:8},(_,i)=>invoke("chaldea_decision_answer_cli",{id:concurrent.id,answer:i%2?"Run":"Defer"})));
+      assert.equal(new Set(answers.map(a=>a.outcome)).size,1);
+      assert.equal(JSON.parse(answers[0]!.outcome!).source,"cli");
+      await until("one concurrent answer wake",async()=>await wakeCount(concurrent.id)===1);
     });
     await t.test("CLI and MCP use the same inbox and explicit caller identity",async()=>{
       const q=ask(10000);

@@ -1,5 +1,6 @@
 // Single writer, transactional journal shared by waits and decisions.
 import { DatabaseSync } from "node:sqlite";
+import { ownDatabase } from "./owner.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
@@ -13,18 +14,23 @@ export interface Item {
 }
 export interface Delivery {
   id: string; item: string; channel: "wake" | "phone"; payload: string;
-  state: "pending" | "sending" | "sent" | "suppressed" | "blocked"; attempts: number; next_at: number; expires: number | null;
+  state: "pending" | "sending" | "sent" | "suppressed" | "blocked" | "uncertain" | "undeliverable"; disposition: string | null; attempts: number; next_at: number; expires: number | null;
 }
 export interface Registration { id: string; kind: Item["kind"]; input: Input; deadline: number; requestAt: number; hash: string }
 const DB_LIMIT = 64 * 1024 * 1024;
+export class CheckpointBlockedError extends Error {
+  constructor() { super("WAL checkpoint blocked; work retained for retry"); this.name="CheckpointBlockedError"; }
+}
 export class WakeStore {
   readonly db: DatabaseSync;
   readonly path: string;
   readonly environment: string;
+  private releaseOwner: () => void;
   constructor(path: string, environment: string) {
     this.path = path; this.environment = environment;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(path);
+    this.releaseOwner=ownDatabase(path);
+    try { this.db = new DatabaseSync(path); } catch(error) { this.releaseOwner();throw error; }
     try {
     chmodSync(path, 0o600);
     this.db.exec("PRAGMA busy_timeout=5000");
@@ -40,31 +46,43 @@ export class WakeStore {
       CREATE TABLE IF NOT EXISTS outbox(
         id TEXT PRIMARY KEY, item TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,
         channel TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, expires INTEGER,
+        attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, expires INTEGER, disposition TEXT,
         UNIQUE(item,channel));
       CREATE INDEX IF NOT EXISTS items_state ON items(state,deadline);
       CREATE INDEX IF NOT EXISTS outbox_due ON outbox(state,next_at);
     `);
+    if (!(this.db.prepare("PRAGMA table_info(outbox)").all() as Array<{name:string}>).some(c=>c.name==="disposition"))
+      this.db.exec("ALTER TABLE outbox ADD COLUMN disposition TEXT");
     const env = this.meta("environment");
     if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('replay_fence','0')").run();
     // 'sending' means an ambiguous RPC after restart. Retry the identical stored payload.
     this.db.prepare("UPDATE outbox SET state='pending' WHERE state='sending'").run();
-    this.maintain(Date.now());
-    } catch(error) { this.db.close(); throw error; }
+    try { this.maintain(Date.now()); } catch(error) { if (!(error instanceof CheckpointBlockedError)) throw error; }
+    } catch(error) { this.db.close(); this.releaseOwner(); throw error; }
   }
   meta(key: string): string | undefined { return (this.db.prepare("SELECT value FROM meta WHERE key=?").get(key) as {value:string}|undefined)?.value; }
   transaction<T>(body: () => T): T {
     // Refuse another write if an external reader prevents truncation. Disabling
     // cache spill bounds a transaction to one WAL frame per dirty page; 31 MiB
     // main + WAL frame headers fits below the shared 64 MiB physical cap.
-    const checkpoint=this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as {busy:number};
-    if (checkpoint.busy !== 0) throw new Error("Disk pressure: WAL checkpoint blocked; work retained");
+    if (!this.checkpoint()) throw new CheckpointBlockedError();
     this.db.exec("BEGIN IMMEDIATE");
     try { const result = body(); this.db.exec("COMMIT"); return result; }
     catch (e) { this.db.exec("ROLLBACK"); throw e; }
-    finally { this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); }
+    finally { this.checkpoint(); }
+  }
+  private checkpoint(): boolean {
+    // A long-lived external reader must not stall the event loop for busy_timeout.
+    this.db.exec("PRAGMA busy_timeout=0");
+    try {
+      const result=this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as {busy:number};
+      return result.busy === 0;
+    } catch(error) {
+      if ([5,6].includes((error as {errcode:number}).errcode)) return false;
+      throw error;
+    } finally { this.db.exec("PRAGMA busy_timeout=5000"); }
   }
   bytes(): number {
     return [this.path, this.path + "-wal"].reduce((sum, p) => { try { return sum + statSync(p).size; } catch { return sum; } }, 0);
@@ -183,6 +201,7 @@ export class WakeStore {
   orphan(id: string, reason: string, now = Date.now()): void {
     this.transaction(() => {
       this.db.prepare("UPDATE items SET state='orphaned',disposition=?,terminal=? WHERE id=?").run(reason,now,id);
+      this.db.prepare("UPDATE outbox SET state='uncertain',disposition=? WHERE item=? AND channel='wake' AND attempts>0 AND state IN ('pending','sending')").run(reason,id);
       this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND state IN ('pending','blocked')").run(id);
     });
   }
@@ -198,6 +217,9 @@ export class WakeStore {
       this.db.prepare("UPDATE items SET disposition='delivery_rejected' WHERE id=(SELECT item FROM outbox WHERE id=?)").run(id);
     });
   }
+  undeliverable(id: string): void {
+    this.transaction(() => { this.db.prepare("UPDATE outbox SET state='undeliverable',disposition='relay_unprovisioned' WHERE id=? AND channel='phone' AND state='pending'").run(id); });
+  }
   sent(id: string): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='sent' WHERE id=?").run(id); }); }
   retry(id: string, at: number): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='pending',next_at=? WHERE id=? AND state IN ('pending','sending')").run(at,id); }); }
   suppress(id: string): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='suppressed' WHERE id=? AND state='pending'").run(id); }); }
@@ -205,7 +227,7 @@ export class WakeStore {
     this.transaction(() => {
       // Never prune unresolved or ambiguous delivery. Retire request keys before removing tombstones.
       const candidates = this.db.prepare(`SELECT id,request_at,terminal FROM items WHERE state<>'parked'
-        AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked'))
+        AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked','uncertain'))
         ORDER BY terminal DESC,id`).all() as unknown as Array<{id:string;request_at:number;terminal:number}>;
       const remove = candidates.filter((r,i) => i >= 10000 || r.terminal < now - MAX_AGE);
       if (remove.length) {
@@ -215,5 +237,5 @@ export class WakeStore {
       }
     });
   }
-  close(): void { this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)"); this.db.close(); }
+  close(): void { try { this.checkpoint(); } finally { try { this.db.close(); } finally { this.releaseOwner(); } } }
 }

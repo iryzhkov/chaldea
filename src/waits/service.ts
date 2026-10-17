@@ -63,7 +63,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       if (result && typeof result === "object" && "kind" in result && "id" in result) {
         const item=result as import("../wake/store.ts").Item;
         result={...item,...(item.kind === "wait" ? {waitId:item.id} : {questionId:item.id}),
-          delivery:engine.store.deliveries().filter(d=>d.item===item.id).map(d=>({channel:d.channel,state:d.state,attempts:d.attempts,nextAt:d.next_at}))};
+          delivery:engine.store.deliveries().filter(d=>d.item===item.id).map(d=>({channel:d.channel,state:d.state,disposition:d.disposition,attempts:d.attempts,nextAt:d.next_at}))};
       }
       send(res,200,result);
     }catch(error){send(res,400,{error:error instanceof Error?error.message.slice(0,512):"Request failed"});}
@@ -81,7 +81,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       if(!serverUrl)throw new Error("T3 is offline");
       return {serverUrl,token:privateFile(config.tokenFile),signal:AbortSignal.timeout(10_000)};
     },config.environment);
-    engine=new WaitEngine(store,t3,{answerBaseUrl:config.answerBaseUrl,notify:p=>notify(config,p),report,...extras});
+    engine=new WaitEngine(store,t3,{answerBaseUrl:config.answerBaseUrl,...(config.notifyUrl && config.notifyEnvFile ? {notify:(p:string)=>notify(config,p)} : {}),report,...extras});
     const running=engine;
     page=createServer(async(req,res)=>{
       res.setHeader("Cache-Control","no-store");

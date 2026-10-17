@@ -1,4 +1,4 @@
-import { WakeStore, type Item, type Registration, type Delivery } from "../wake/store.ts";
+import { WakeStore, CheckpointBlockedError, type Item, type Registration, type Delivery } from "../wake/store.ts";
 import type { WaitT3, WaitSnapshot } from "../t3/waits.ts";
 import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
@@ -26,6 +26,25 @@ export class WaitEngine {
   private stopped = false;
   private pumping = false;
   private fatal = false;
+  private storageRetry: NodeJS.Timeout | undefined;
+  private storageAttempts = 0;
+  private storageBlocked = false;
+  private pendingCommits = new Map<string,() => void>();
+  private backoffStorage(): void {
+    if (!this.storageBlocked) { this.storageBlocked=true;this.options.report?.("checkpoint_blocked"); }
+    if (this.stopped || this.storageRetry) return;
+    this.clock.clear();
+    this.storageRetry=setTimeout(() => {
+      this.storageRetry=undefined;this.poke();
+    },Math.min(30_000,250 * 2 ** Math.min(this.storageAttempts++,7)));
+  }
+  private persistDelivery(id: string, operation: () => void): void {
+    try { operation(); }
+    catch(error) {
+      if (error instanceof CheckpointBlockedError) { this.pendingCommits.set(id,operation);this.backoffStorage(); }
+      else { this.fatal=true;this.options.report?.("watcher_needs_attention"); }
+    }
+  }
   constructor(store: WakeStore, t3: WaitT3, options: EngineOptions) { this.store=store; this.t3=t3; this.options=options; }
   start(): void { this.poke(); }
   async register(kind: "wait" | "decision", value: unknown): Promise<Item> {
@@ -93,10 +112,13 @@ export class WaitEngine {
   }
   /** Event/transition driven. This is never installed as a periodic scan. */
   poke(): void {
-    if (this.stopped || this.pumping || this.fatal) return;
+    if (this.stopped || this.pumping || this.fatal || this.storageRetry) return;
     this.pumping=true;
     try {
+      for (const [id,commit] of this.pendingCommits) { commit();this.pendingCommits.delete(id); }
       const now=Date.now();
+      if (!this.options.notify) for (const d of this.store.deliveries())
+        if (d.channel === "phone" && d.state === "pending") this.store.undeliverable(d.id);
       for (const item of this.store.active()) {
         if (this.snapshots.has(item.parent)) {
           const p=this.snapshots.get(item.parent);
@@ -146,6 +168,7 @@ export class WaitEngine {
           this.inflight.set(d.id,d.channel); void this.deliver(d).finally(() => { this.inflight.delete(d.id); this.poke(); });
         }
       }
+      if (this.storageRetry) return; // A synchronous phone claim may have armed storage backoff.
       const times:number[]=[];
       for (const i of this.store.active()) {
         times.push(i.deadline);
@@ -158,10 +181,14 @@ export class WaitEngine {
         if (d.expires !== null) times.push(d.expires);
       }
       // Tombstone expiry also has a single next deadline, without model involvement.
-      const terminal = this.store.db.prepare("SELECT min(terminal) AS t FROM items WHERE state<>'parked' AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked'))").get() as {t:number|null};
+      const terminal = this.store.db.prepare("SELECT min(terminal) AS t FROM items WHERE state<>'parked' AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked','uncertain'))").get() as {t:number|null};
       if (terminal.t !== null) times.push(terminal.t + 42*86_400_000 + 1);
       this.clock.arm(times.length ? Math.max(now+1,Math.min(...times)) : undefined,() => this.poke(),
         () => { this.options.report?.("calendar_timer_retry"); });
+      this.storageAttempts=0;this.storageBlocked=false;
+    } catch(error) {
+      if (error instanceof CheckpointBlockedError) this.backoffStorage();
+      else { this.fatal=true;this.options.report?.("watcher_needs_attention"); }
     } finally { this.pumping=false; }
   }
   private async deliver(delivery: Delivery): Promise<void> {
@@ -170,7 +197,7 @@ export class WaitEngine {
       if (delivery.channel === "wake") {
         const parent=await this.t3.snapshot(item.parent);
         if (!parent || parent.deleted || parent.project !== item.project || parent.archived || parent.settled) {
-          this.store.orphan(item.id,!parent || parent.deleted ? "parent_deleted" : "parent_inactive"); return;
+          this.persistDelivery(delivery.id,() => this.store.orphan(item.id,!parent || parent.deleted ? "parent_deleted" : "parent_inactive")); return;
         }
       }
       // Recheck after async preflight: cancel/answer may have suppressed this row.
@@ -182,23 +209,25 @@ export class WaitEngine {
         await this.options.notify(claimed.payload);
       }
       this.options.boundary?.("after_send",delivery.item);
-      this.store.sent(claimed.id);
-      this.options.boundary?.("delivered",delivery.item);
+      this.persistDelivery(claimed.id,() => {
+        this.store.sent(claimed.id);this.options.boundary?.("delivered",delivery.item);
+      });
     } catch (error) {
       if (this.stopped) return; // crash/restart reconciles 'sending'
+      if (error instanceof CheckpointBlockedError) { this.backoffStorage();return; }
       if (error instanceof Error && error.name === "WakeRejectedError") {
-        this.store.block(delivery.id); this.options.report?.("wake_needs_attention"); return;
+        this.persistDelivery(delivery.id,() => this.store.block(delivery.id)); this.options.report?.("wake_needs_attention"); return;
       }
       if (error instanceof Error && (error.name === "ProtocolIncompatibleError" || error.message.includes("environment mismatch"))) {
         this.fatal=true; this.options.report?.("watcher_needs_attention");
       }
       // Persist retry timing too; neither wire payload nor identity changes.
-      this.store.retry(delivery.id,Date.now()+Math.min(30_000,250*2**Math.min(delivery.attempts,7)));
+      this.persistDelivery(delivery.id,() => this.store.retry(delivery.id,Date.now()+Math.min(30_000,250*2**Math.min(delivery.attempts,7))));
       this.options.report?.("delivery_retry");
     }
   }
   async stop(): Promise<void> {
-    this.stopped=true; this.clock.clear();
+    this.stopped=true; this.clock.clear();clearTimeout(this.storageRetry);
     for (const e of this.observers.values()) {e.abort.abort();clearTimeout(e.retry);}
     // Service shutdown waits for requests (each has a bounded timeout) before closing SQLite.
     while (this.inflight.size) await new Promise(r => setTimeout(r,10));

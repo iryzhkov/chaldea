@@ -46,21 +46,15 @@ test("transactional resolution, stable retry keys, cancel, payload limits, reope
     assert.throws(()=>f.store.prepare("decision",{...question(),defaultAction:"approve"}),/Default/);
     assert.throws(()=>f.store.prepare("decision",{...question(),default:"other"}),/defaults/);
     assert.throws(()=>f.store.prepare("decision",{...question(),question:"x".repeat(1025)}),/question/);
-    assert.throws(()=>new WakeStore(f.path,"changed-environment"),/another environment/);
+    assert.throws(()=>new WakeStore(f.path,"changed-environment"),/already owned/);
   }finally{f.close();}
 });
-test("answer/deadline serializations and concurrent processes latch exactly one immutable outcome",async()=>{
+test("answer/deadline serializations and concurrent requests latch exactly one immutable outcome",async()=>{
   const f=fixture();
   try{
     const now=Date.now();const q=question(now);q.deadline=iso(now+250);
     const row=f.store.register(f.store.prepare("decision",q),"project",null);
-    const children=Array.from({length:8},(_,i)=>new Promise<void>((resolveChild,reject)=>{
-      const child=spawn(process.execPath,[resolve("test/helpers/answer-racer.ts"),f.path,row.id,i%2?"Run":"Defer"],
-        {env:{...process.env,TMPDIR:process.env.TMPDIR!},stdio:"pipe"});
-      let err="";child.stderr.on("data",b=>err+=b);
-      child.once("exit",code=>code===0?resolveChild():reject(new Error(err)));
-    }));
-    await Promise.all(children);
+    await Promise.all(Array.from({length:8},async(_,i)=>f.store.answer(row.id,i%2?"Run":"Defer","cli")));
     const outcome=f.store.get(row.id).outcome;
     f.store.answer(row.id,"Run","cli",now+5000);
     assert.equal(f.store.get(row.id).outcome,outcome);
@@ -98,6 +92,35 @@ test("approval-labelled options cannot turn a deadline into approval; answer pro
     f.store.answer(row.id,"Approve deploy","page",now);
     assert.ok(JSON.parse(f.store.deliveries().find(d=>d.item===row.id)!.payload).text.includes('"source":"mcp:other"'));
   }finally{f.close();}
+});
+
+
+test("exclusive database ownership survives alternate connections and releases on process death", {timeout:10_000},async()=>{
+  const dir=scratchDir("wake-owner");const path=join(dir.path,"db");
+  const child=spawn(process.execPath,[resolve("test/helpers/store-owner.ts"),path],{stdio:["pipe","pipe","pipe"]});
+  let store:WakeStore|undefined;let err="";
+  child.stderr.on("data",b=>err+=b);
+  try{
+    await new Promise<void>((resolveReady,reject)=>{
+      child.stdout.once("data",b=>String(b).includes("owned")?resolveReady():reject(new Error("Owner not ready")));
+      child.once("error",reject);child.once("exit",code=>reject(new Error("Owner exited "+code+": "+err)));
+    });
+    assert.throws(()=>new WakeStore(path,"test-env"),/already owned/);
+    const ended=new Promise<void>(r=>child.once("exit",()=>r()));child.kill("SIGKILL");await ended;
+    assert.throws(()=>new WakeStore(path,"wrong-env"),/another environment/);
+    store=new WakeStore(path,"test-env");
+    const row=store.register(store.prepare("wait",wait()),"project",null);store.resolve(row.id,{reason:"time"});
+    const wake=store.deliveries()[0]!;store.claim(wake.id);
+    assert.throws(()=>new WakeStore(path,"test-env"),/already owned/);
+    assert.equal(store.deliveries()[0]!.state,"sending","second owner cannot reset an in-flight send");
+    store.close();store=new WakeStore(path,"test-env");
+    assert.equal(store.deliveries()[0]!.state,"pending");
+    store.orphan(row.id,"parent_inactive");
+    assert.equal(store.deliveries()[0]!.state,"uncertain","recovered ambiguity must survive orphaning");
+  }finally{
+    if(child.exitCode===null && child.signalCode===null){const ended=new Promise<void>(r=>child.once("exit",()=>r()));child.kill("SIGKILL");await ended;}
+    store?.close();dir.remove();
+  }
 });
 
 test("active bounds, cycle rejection, retention fence and protected pending delivery",()=>{
