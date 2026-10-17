@@ -157,7 +157,10 @@ event_id, expects AKASHA_EVENTS and awaits PubAck. Consumer commits event, proje
 receipt state and stream cursor atomically before ACK. Lost PubAck/ACK and redelivery
 are covered by SQL uniqueness, independently of broker dedup. A late consumer may
 complete an accepted event after the original bearer expires; caller access still
-requires a fresh valid bearer. A pending POST returns 503 with pending:true/event_id/
+requires a fresh valid bearer. Ingress waits up to 1800 ms for an in-process
+notification after the store commits projection or quarantine, then rechecks
+authorization and reads the scoped receipt again. It does not poll or hold a read
+transaction while waiting. A pending POST returns 503 with pending:true/event_id/
 state/feed_id, never a fabricated legacy success. Tombstones return 410.
 
 When homelab restarts, the durable outbox drains. NATS outage does not remove already

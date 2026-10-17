@@ -24,7 +24,13 @@ comments are allowed; duplicate names are tried once. Each skipped host prints
 its reason, and a confirmed job result prints the host used. Fall through only on a confirmed refusal before
 execution (busy, gaming gate, or unavailable sandbox), a local target lock held
 by another exec, a stuck SSH ControlMaster, or a connection closed before sending
-the job request. SSH connection setup times out after 10 seconds.
+the job request. Automatic selection probes all non-local hosts concurrently once,
+with a 10-second bound, using queue greetings without reserving a slot or sending
+job bytes. Unreachable probes are not connected again during dispatch; a set of
+powered-off hosts costs one probe timeout in total. Reachable hosts are tried in
+the configured preference order, and busy hosts retain the existing queue path.
+Explicit targets retain their single-host connection path. SSH connection setup
+times out after 10 seconds.
 Server-refusal fallback relies on the server never sending `refused` once a job has launched.
 After any request write, connection loss stays uncertain and is never retried;
 preemption and protocol errors also stop the invocation. Every attempted host
@@ -91,6 +97,10 @@ NVIDIA device nodes are mounted only for --gpu. The operator selects the RTX 409
 nodes and NVIDIA Vulkan ICD; the AMD iGPU (normally Vulkan device 0 on omarchy-pc)
 is not exposed. Nested user namespaces are disabled when supported. The isolated
 Python forced command ignores user-site/PYTHONPATH configuration.
+
+omarchy-pc's 5-second in-job game-gate check is an accepted exception to the
+no-polling rule. It runs only while a job runs on that host, so gaming can preempt
+that job; there is no idle background game-gate poll.
 
 ## Bounds and recovery
 

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Run after fetching origin/main with full history; accepts lightweight or annotated tags.
+set -eu
+commit=${1:?tagged commit required}
+if ! git merge-base --is-ancestor "$commit^{commit}" origin/main; then
+  echo "::error::Host release $commit is not reachable from origin/main; merge it before tagging." >&2
+  exit 1
+fi
