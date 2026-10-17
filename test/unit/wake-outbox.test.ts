@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { spawn } from "node:child_process";
 import { chmodSync, writeFileSync, symlinkSync } from "node:fs";
 import { WakeStore } from "../../src/wake/store.ts";
 import { WaitEngine } from "../../src/waits/engine.ts";
@@ -59,6 +60,48 @@ test("deleted parent parks a resolved wake; missing relay cannot delay the defau
     await until(()=>store.get(orphan.id).state==="orphaned");
     assert.equal(store.get(orphan.id).disposition,"parent_deleted");
     assert.ok(!t3.payloads.some(p=>JSON.parse(p).commandId.includes(orphan.id)));
+  }finally{await engine.stop();store.close();dir.remove();}
+});
+test("fatal storage errors log once, refuse registrations and exit non-zero for systemd recovery",{timeout:10_000},async()=>{
+  const dir=scratchDir("wake-storage-fatal");
+  try{
+    for(const mode of ["maintenance","receipt","logger"]){
+      const path=join(dir.path,mode+".sqlite");
+      const result=await new Promise<{code:number|null;signal:string|null;out:string;err:string}>((resolveChild,reject)=>{
+        const child=spawn(process.execPath,[resolve("test/helpers/waits-storage-failure.ts"),path,mode],{stdio:["ignore","pipe","pipe"],timeout:5000});
+        let out="",err="";child.stdout.on("data",b=>out+=b);child.stderr.on("data",b=>err+=b);
+        child.once("error",reject);child.once("exit",(code,signal)=>resolveChild({code,signal,out,err}));
+      });
+      assert.equal(result.signal,null,mode+": "+result.err);assert.equal(result.code,1,mode+": "+result.err);
+      assert.equal(result.out.split("Watcher needs attention").length-1,1);
+      assert.equal(result.out.split("storage_fault").length-1,mode==="receipt"?2:1);
+      if(mode==="logger"){
+        assert.equal(result.out.split("report_attempt").length-1,1);
+        assert.equal(result.err,"Chaldea waits: fatal storage error; restarting\n");
+      }else{
+        assert.equal(result.out.split("watcher_needs_attention").length-1,1);assert.equal(result.err,"");
+      }
+      const recovered=new WakeStore(path,"test-env");
+      try{if(mode==="receipt"){
+        assert.equal(recovered.deliveries().length,2);
+        assert.ok(recovered.deliveries().every(d=>d.state==="pending"&&d.attempts===1));
+      }}finally{recovered.close();}
+    }
+  }finally{dir.remove();}
+});
+test("legacy question phone payload falls back to the generic dependent action",async()=>{
+  const dir=scratchDir("wake-legacy-phone");const store=new WakeStore(join(dir.path,"db"),"test-env");
+  const prepare=store.prepare.bind(store);
+  // Emulate an older registration without dependentAction at the phone boundary.
+  store.prepare=(...args)=>{const reg=prepare(...args);Reflect.deleteProperty(reg.input,"dependentAction");return reg;};
+  const engine=new WaitEngine(store,fake().port,{answerBaseUrl:"http://127.0.0.1:7385",notify:async()=>{}});
+  try{
+    const row=await engine.register("decision",{threadId:"parent",requestId:Date.now()+":legacy",
+      question:"Deploy?",options:["Approve","Hold"],dependentAction:"deploy",defaultAction:"defer",deadline:iso(Date.now()+10_000)});
+    const phone=store.deliveries().find(d=>d.item===row.id && d.channel==="phone")!;
+    const payload=JSON.parse(phone.payload);
+    assert.ok(payload.content.includes("No answer: defer the dependent action"));
+    assert.ok(!payload.content.includes("undefined"));
   }finally{await engine.stop();store.close();dir.remove();}
 });
 test("calendar timer fires an overdue absolute deadline and rearming cancels the old one",async()=>{

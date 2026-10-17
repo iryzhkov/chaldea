@@ -235,7 +235,9 @@ transaction. Disabling spill bounds each transaction to one WAL frame per dirty
 page; the extra MiB leaves room for WAL frame headers under the shared 64 MiB cap.
 A blocked checkpoint refuses another write until the reader releases it. The
 watcher logs once per blocked episode and retries with capped 250 ms–30 s backoff;
-it keeps running through deadline, delivery and startup maintenance failures.
+it keeps running while checkpoints block deadlines, delivery or startup maintenance.
+Other fatal storage errors log once and exit non-zero so systemd's
+`Restart=on-failure` restarts the service; registrations are refused before exit.
 Confirmed receipts waiting to be journalled are retained in memory without
 re-dispatch; a crash still replays the immutable command/receipt protocol.
 New work is rejected under disk pressure. No unresolved/uncertain/blocked wake
