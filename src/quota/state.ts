@@ -15,6 +15,7 @@
 import { statSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import type { QuotaRecord } from "./observer.ts";
+import { emptyHeadroom, type HeadroomState } from "./headroom.ts";
 import type { SwitchIntent } from "./switcher.ts";
 export const MAX_ACTIVE_SWITCHES = 128;
 export const MAX_COMPLETED_SWITCHES = 1_000;
@@ -29,7 +30,8 @@ export const MAX_POSTED_KEYS = 10_000;
 /** At most this many parked threads are tracked; an evicted one loses its quota_resumed. */
 export const MAX_PARKED_THREADS = 1_000;
 
-export type RecordKind = "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched" | "provider_switch_failed";
+export type RecordKind = "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched" | "provider_switch_failed" |
+  "quota_headroom_snapshot" | "quota_headroom_changed" | "quota_headroom_low";
 
 export interface ParkedThread {
   readonly runId: string;
@@ -44,6 +46,7 @@ export interface ParkedThread {
 export interface ObserverState {
   /** Last shell sequence fully processed, or null before the first snapshot. */
   cursor: number | null;
+  headroom: HeadroomState;
   /** `kind|threadId|runId` mapped to the stop time of the stop it describes. */
   readonly posted: Map<string, number>;
   readonly pendingDelivery: Map<string, QuotaRecord>;
@@ -54,12 +57,12 @@ export interface ObserverState {
   evictedThrough: number | null;
 }
 
-const FORMAT_VERSION = 4;
+const FORMAT_VERSION = 5;
 export const MAX_PENDING_BYTES = 4 * 1024 * 1024;
 export const MAX_STATE_BYTES = 8 * 1024 * 1024;
 
 export function emptyState(): ObserverState {
-  return { cursor: null, posted: new Map(), pendingDelivery: new Map(), deliveryDropped: 0, parked: new Map(), switches: new Map(), evictedThrough: null };
+  return { cursor: null, headroom: emptyHeadroom(), posted: new Map(), pendingDelivery: new Map(), deliveryDropped: 0, parked: new Map(), switches: new Map(), evictedThrough: null };
 }
 
 export function recordKey(kind: RecordKind, threadId: string, runId: string): string {
@@ -108,9 +111,10 @@ export function loadState(path: string, nowMs: number): ObserverState {
   if (!existsSync(path)) return emptyState();
   if (statSync(path).size > MAX_STATE_BYTES) throw new Error("observer_state_too_large");
   const raw = JSON.parse(readFileSync(path, "utf8"));
-  if (raw?.version !== FORMAT_VERSION && raw?.version !== 3 && raw?.version !== 2) throw new Error(`Unsupported state file version in ${path}`);
+  if (raw?.version !== FORMAT_VERSION && raw?.version !== 4 && raw?.version !== 3 && raw?.version !== 2) throw new Error(`Unsupported state file version in ${path}`);
   const state: ObserverState = {
     cursor: typeof raw.cursor === "number" ? raw.cursor : null,
+    headroom: raw.headroom ?? emptyHeadroom(),
     posted: new Map(Object.entries(raw.posted ?? {}).filter((entry): entry is [string, number] => typeof entry[1] === "number")),
     parked: new Map(Object.entries(raw.parked ?? {}) as Array<[string, ParkedThread]>),
     pendingDelivery: new Map(Object.entries(raw.pendingDelivery ?? {}) as Array<[string, QuotaRecord]>),
@@ -152,6 +156,7 @@ export function saveState(path: string, state: ObserverState, nowMs: number): vo
   const body = Buffer.from(JSON.stringify({
     version: FORMAT_VERSION,
     cursor: state.cursor,
+    headroom: state.headroom,
     evictedThrough: state.evictedThrough,
     posted: Object.fromEntries(state.posted),
     parked: Object.fromEntries(state.parked),

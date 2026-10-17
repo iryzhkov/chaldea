@@ -38,6 +38,9 @@ export function hasQuota(provider: SwitchProvider | undefined, nowMs = Date.now(
   return provider !== undefined && provider.enabled && provider.installed &&
     provider.availability !== "unavailable" && provider.status === "ready" &&
     provider.auth.status === "authenticated" && limits !== undefined &&
+    // Advisory credits/reset inventory can never admit a switch. Known backend denials remain denials.
+    provider.headroom?.included.ordinaryUsageAllowed.value !== false &&
+    provider.headroom?.creditFunded.spendControlReached.value !== true &&
     limits.unavailable === undefined && limits.windows.length > 0 &&
     Number.isFinite(Date.parse(limits.checkedAt)) && Date.parse(limits.checkedAt) <= nowMs &&
     nowMs - Date.parse(limits.checkedAt) <= MAX_USAGE_AGE_MS &&

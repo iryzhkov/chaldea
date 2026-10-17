@@ -21,6 +21,10 @@ function shortId(id: string): string {
 export function title(record: QuotaRecord): string {
   const thread = shortId(record.threadId);
   switch (record.kind) {
+    case "quota_headroom_snapshot":
+    case "quota_headroom_changed":
+    case "quota_headroom_low":
+      return `${record.kind}: ${record.headroom?.providers.map(p => p.alias).join(", ") ?? "unknown"}`;
     case "quota_parked":
       return `quota_parked: ${record.provider} thread ${thread} until ${record.resetAt}`;
     case "quota_reset_unknown":
@@ -49,7 +53,7 @@ export function quotaKey(record: QuotaRecord): string {
 }
 export function quotaPublication(record: QuotaRecord, host: string): Publication {
   const transition = quotaKey(record);
-  const data: Record<string, unknown> = { thread_id: record.threadId, run_id: record.runId,
+  const data: Record<string, unknown> = record.headroom ? { transition_id: transition } : { thread_id: record.threadId, run_id: record.runId,
     provider: record.toProvider ?? record.provider, transition_id: transition };
   if (record.kind === "quota_parked" && record.resetAt) data.reset_at = record.resetAt;
   if (record.kind === "provider_switched" || record.kind === "provider_switch_failed") {

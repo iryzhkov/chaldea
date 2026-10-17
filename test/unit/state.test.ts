@@ -98,7 +98,7 @@ test("state v2 migrates to v4, preserving claims and releasing unsafe old switch
     assert.equal(state.switches.get("old")!.restoreAutoResume, null);
     assert.ok(state.switches.get("old")!.expiresAt <= T0 + 180_000);
     saveState(path, state, T0);
-    assert.equal(JSON.parse(readFileSync(path, "utf8")).version, 4);
+    assert.equal(JSON.parse(readFileSync(path, "utf8")).version, 5);
     assert.equal(loadState(path, T0).switches.get("old")!.phase, "releasing");
   } finally { dir.remove(); }
 });

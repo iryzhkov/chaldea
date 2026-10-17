@@ -16,11 +16,14 @@ import {
   AuthenticationError,
   ProtocolIncompatibleError,
   connectShell,
+  connectUsage,
   discoverServerUrl,
   switchPort,
 
   type ShellEvent,
 } from "../t3/adapter.ts";
+import { HeadroomMonitor, routingLanes } from "./headroom.ts";
+import { headroomConfig, type HeadroomConfig } from "./codex-balance.ts";
 import { observe, type QuotaRecord } from "./observer.ts";
 import { switchConfig, type SwitchConfig } from "./routing.ts";
 import { ProviderSwitcher } from "./switcher.ts";
@@ -35,6 +38,7 @@ const AUTH_BACKOFF_MS = 120_000;
 
 export interface ObserverOptions {
   readonly switching?: SwitchConfig;
+  readonly reporting?: HeadroomConfig;
   /** Explicit T3 URL; otherwise discovered from `t3BaseDir`. */
   readonly serverUrl?: string;
   readonly t3BaseDir: string;
@@ -227,6 +231,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
   sink.save(); // Recover durable pending payloads even when T3 is offline.
   logger.info("quota observer starting", { cursor: state.cursor, parked: state.parked.size, posted: state.posted.size });
 
+  let monitor: HeadroomMonitor | undefined;
   let switcher: ProviderSwitcher | undefined;
   let previousToken: string | undefined;
   let attempt = 0;
@@ -238,7 +243,23 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
       const token = readToken(options.tokenFile);
       const serverUrl = options.serverUrl ?? discoverServerUrl(options.t3BaseDir);
       if (serverUrl === null) throw new Error("T3 is not running (no server-runtime.json)");
-      const port = switchPort({ serverUrl, token, signal });
+      const connection = new AbortController();
+      const connectionSignal = AbortSignal.any([signal, connection.signal]);
+      const rawPort = switchPort({ serverUrl, token, signal: connectionSignal });
+      const local = ["127.0.0.1", "[::1]", "localhost"].includes(new URL(serverUrl).hostname);
+      monitor ??= new HeadroomMonitor({
+        state: state.headroom, config: options.reporting ?? headroomConfig(), local,
+        save: records => { sink.record(records); sink.save(); },
+      });
+      monitor.options.local = local;
+      monitor.start();
+      const port = { ...rawPort, catalog: async () => {
+        const catalog = await rawPort.catalog();
+        return { ...catalog, providers: catalog.providers.map(p => {
+          const row = state.headroom.providers.find(r => r.alias === p.instanceId);
+          return { ...p, ...(row ? { headroom: routingLanes(row, Date.now()) } : {}) };
+        }) };
+      } };
       if (switcher === undefined) {
         switcher = new ProviderSwitcher({
           state, port, config: options.switching ?? switchConfig(), logger,
@@ -257,11 +278,19 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
         }
         processObserverEvent(sink, switcher!, event);
       };
-      await connectShell(
-        { serverUrl, token, signal },
+      const usage = connectUsage({ serverUrl, token, signal: connectionSignal }, providers => monitor!.update(providers));
+      const shell = connectShell(
+        { serverUrl, token, signal: connectionSignal },
         // Switching needs current parked threads after catch-up, including on restarts.
         state.cursor === null || options.switching?.enabled || state.switches.size > 0 ? { onEvent } : { afterSequence: state.cursor, onEvent },
       );
+      try {
+        await Promise.race([usage, shell]);
+      } finally {
+        monitor.inactive();
+        connection.abort();
+        await Promise.allSettled([usage, shell]);
+      }
       logger.warn("T3 ended the shell stream; reconnecting");
       delay = BACKOFF_MS[0]!;
     } catch (error) {
@@ -278,6 +307,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
     await sleep(delay, signal);
   }
   // close() never throws, so a failed final write cannot change the exit status or skip the drain.
+  await monitor?.close();
   await switcher?.close();
   sink.close();
   await Promise.race([poster.idle(), new Promise((r) => setTimeout(r, 30_000).unref())]);

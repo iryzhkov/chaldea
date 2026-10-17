@@ -96,8 +96,12 @@ function assertNothingLeaked(h: Harness, transcript: string): void {
   }
 }
 
+function transitionFeed(feedLog: string) {
+  return readFeed(feedLog).filter(entry => !String(entry.body.kind).startsWith("quota_headroom_"));
+}
+
 function kinds(feedLog: string): Array<string> {
-  return readFeed(feedLog).map((entry) => String(entry.body.kind));
+  return transitionFeed(feedLog).map((entry) => String(entry.body.kind));
 }
 
 function turns(t3: DisposableT3, outcome: string, continuation?: boolean): number {
@@ -112,7 +116,7 @@ test("a known reset resumes natively once and the observer records park and resu
   await dispatchMessage(h.t3, h.operateToken, h.threadId, `Start the work. ${h.t3.trigger}`, "1");
 
   await waitFor("quota_parked", () => kinds(h.feedLog).includes("quota_parked"), 30_000);
-  const parked = readFeed(h.feedLog)[0]!;
+  const parked = transitionFeed(h.feedLog)[0]!;
   const resetAt = String(parked.body.resetAt);
   const resetMs = Date.parse(resetAt);
   assert.ok(resetMs > Date.now(), "the reset is still ahead when the park is recorded");
@@ -129,7 +133,8 @@ test("a known reset resumes natively once and the observer records park and resu
   await restarted.stop();
 
   assert.deepEqual(kinds(h.feedLog), ["quota_parked", "quota_resumed"]);
-  const [parkedEntry, resumedEntry] = readFeed(h.feedLog);
+  assert.ok(readFeed(h.feedLog).some(entry => entry.body.kind === "quota_headroom_snapshot"), "cached config subscription emits headroom through the feed poster");
+  const [parkedEntry, resumedEntry] = transitionFeed(h.feedLog);
   for (const entry of [parkedEntry!, resumedEntry!]) {
     const flag = (name: string) => entry.args[entry.args.indexOf(name) + 1];
     assert.equal(flag("--source"), "chaldea-quota");
@@ -171,7 +176,7 @@ test("a hard limit without a reset stays parked with exactly one quota_reset_unk
   await sleep(12_000);
 
   assert.deepEqual(kinds(h.feedLog), ["quota_reset_unknown"]);
-  assert.equal(readFeed(h.feedLog)[0]!.args[readFeed(h.feedLog)[0]!.args.indexOf("--severity") + 1], "warn");
+  assert.equal(transitionFeed(h.feedLog)[0]!.args[transitionFeed(h.feedLog)[0]!.args.indexOf("--severity") + 1], "warn");
   const thread = h.watcher.threads.get(h.threadId)!;
   assert.equal(thread.status, "failed");
   assert.equal(thread.lastErrorClass, "usage_limit");
@@ -265,7 +270,7 @@ test("the observer starts before T3, and a T3 restart while parked neither loses
   await sleep(7_000);
   await observer.stop();
   assert.deepEqual(kinds(feedLog), ["quota_parked", "quota_resumed"]);
-  const resumed = readFeed(feedLog)[1]!;
+  const resumed = transitionFeed(feedLog)[1]!;
   assert.equal(resumed.body.trigger, "auto_resume");
   assert.equal(turns(t3, "limited"), 1);
   assert.equal(turns(t3, "completed", true), 1);
