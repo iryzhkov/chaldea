@@ -16,6 +16,8 @@ for root in (Path("host"), Path(stage) / "host"):
     for path in sorted(root.rglob("*")):
         if path.is_symlink():
             raise ValueError("artifact refuses symlinks")
+        if ("tests" in path.relative_to(root).parts or path.name.startswith("requirements-test.")):
+            continue
         if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc":
             name = "host/" + path.relative_to(root).as_posix()
             files[name] = path.read_bytes()

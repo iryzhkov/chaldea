@@ -1,34 +1,15 @@
-"""Write a disposable, unprivileged SSH fixture for the in-tree job server."""
+"""Render frozen deployment SSH templates with disposable fixture paths."""
 import json
 from pathlib import Path
 import sys
+from jinja2 import Environment, StrictUndefined
 
 scratch, values = Path(sys.argv[1]), json.loads(sys.argv[2])
-v = {key.removeprefix("chaldea_job_host_"): value for key, value in values.items()}
-(scratch / "sshd.conf").write_text(f"""
-Port {v["port"]}
-ListenAddress 127.0.0.1
-HostKey {v["host_key"]}
-PidFile {v["pid_file"]}
-AuthorizedKeysFile {v["authorized_keys"]}
-StrictModes no
-UsePAM no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PubkeyAuthentication yes
-AuthenticationMethods publickey
-PermitRootLogin no
-AllowUsers {v["user"]}
-DisableForwarding yes
-MaxSessions 1
-PermitTTY no
-PermitUserRC no
-PermitUserEnvironment no
-X11Forwarding no
-LogLevel {v["log_level"]}
-ForceCommand {v["command"]}
-""")
-(scratch / "authorized_keys").write_text("".join(
-    f'restrict,from="{source["ip"]}" {source["public_key"]}\n'
-    for source in v["sources"]
-))
+fixtures = Path(__file__).resolve().parents[2] / "host/tests/fixtures"
+env = Environment(undefined=StrictUndefined)
+for source, name in (("chaldea-job-sshd.conf.j2", "sshd.conf"), ("authorized_keys.j2", "authorized_keys")):
+    rendered = env.from_string((fixtures / source).read_text()).render(values)
+    if name == "sshd.conf":
+        # The runner's disposable scratch has ancestors owned by its runner user.
+        rendered = rendered.replace("StrictModes yes", "StrictModes no")
+    (scratch / name).write_text(rendered)

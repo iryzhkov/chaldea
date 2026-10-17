@@ -27,6 +27,15 @@ def load_script(node_version=NODE_VERSION):
 retention = load_script()
 
 
+def test_missing_runtime_version_prevents_mise_pruning(monkeypatch):
+    monkeypatch.setattr(retention, "CHALDEA_NODE_VERSION", "")
+    monkeypatch.setattr(retention.subprocess, "run", lambda *a, **k: pytest.fail("must not prune"))
+    args = retention.parse_args([])
+    retention.prune_mise(args, set())
+    assert any("CHALDEA_NODE_VERSION must be configured" in message for message in retention.problems)
+
+
+
 def git(*args, cwd):
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 

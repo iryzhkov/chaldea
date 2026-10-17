@@ -197,16 +197,22 @@ def record_outcome(job, invocation, status, fallback_reason="", checkout=None):
         record["task"] = str(record["task"])[:160]
         record["reason"] = str(record["reason"])[:160]
         records = records[-(MAX_RECORDS - 1):] + [record]
-        # Make the immutable input durable before the status claim. A crash
-        # retries the same job/invocation key, never a fresh network operation.
-        try:
-            record["delivery"] = queue_delivery(record) if delivery_mode() == "queue" else feed_delivery(record)
-        except OSError:
-            record["delivery"] = "queue-failed"
+        mode = delivery_mode()
+        if mode == "queue":
+            # Durable immutable input first; a crash reuses this queue key.
+            try:
+                record["delivery"] = queue_delivery(record)
+            except OSError:
+                record["delivery"] = "queue-failed"
         while len(json.dumps(records).encode()) > MAX_BYTES and len(records) > 1:
             records.pop(0)
+        # Feed mode claims the invocation before any ambiguous network POST.
+        # OnFailure must never retry that operation after a crash.
         write_json(path, records)
         print(json.dumps(record, separators=(",", ":")), flush=True)
+        if mode == "feed":
+            record["delivery"] = feed_delivery(record)
+            write_json(path, records)
 
 
 

@@ -8,13 +8,15 @@ Build with `npm ci --ignore-scripts`, then
 `npm run host:build -- VERSION OUTPUT`. The build takes no Git metadata, stages
 self-contained ESM trust-maintenance/signing and collector entry points, and writes
 `chaldea-host.tar.gz` plus `manifest.json`. The manifest records the version,
-archive SHA-256 and each member's SHA-256. Archive ordering, ownership, modes and
+archive SHA-256 and each member's SHA-256. Tests and their dependencies remain in
+source and are excluded from the runtime archive. Archive ordering, ownership, modes and
 timestamps are deterministic. Node 26.10.0 is the runtime baseline. All npm build
 dependencies, including esbuild, are locked with integrity hashes.
 
 The hosted `host artifact` workflow tests Python host programs, builds twice and
 compares bytes, smoke-tests both bundled entry points and uploads the candidate.
-On main or a `host-*` tag it attaches those exact bytes to a versioned GitHub release.
+On a `host-v*` tag it requires the real exec E2E workflow as well, then attaches
+those exact bytes to a versioned GitHub release. Main builds remain CI candidates.
 It does not replace an existing release's assets. Fleet inventory pins the release
 and archive SHA-256; downloads come from the public release, never the private
 configuration repository or an executable fetched by the trust updater.
@@ -40,7 +42,9 @@ Image creation, toolchain management, byte-only trust fetching and callback sour
 are byte-preserving moves. The image helper was formerly transferred temporarily
 by Ansible's script module; it is now installed before execution. The server reads
 its shared `exec-protocol.json` alongside the installed program. The client reads
-the same source JSON. Request limits, frame names, versions and safe-path policy
+the same source JSON. Safe-path preflight consistently reserves `.chaldea-*`
+components for cwd and artifact paths too; those names were already reserved in
+server snapshot entries. Request limits, frame names, versions and safe-path policy
 are defined there; refusal `busy` is a boolean, independent of message text.
 
 Retention reads its former template variable from `CHALDEA_NODE_VERSION`, rendered
@@ -83,8 +87,9 @@ archive with moved source. The image helper, toolchain manager, byte-only trust
 fetcher and Ansible callback were byte-identical. Retention's AST was identical
 after normalizing its configured Node version and the missing-configuration
 prune guard. The merged reporter retained both original delivery functions
-exactly, the safer fsynced writer, and all common functions; only sink selection
-changed in outcome recording. The server is covered by the shared-protocol
+exactly, the safer fsynced writer, and all common functions. Outcome recording
+preserves each original ordering: feed persists its pending claim before posting;
+queue persists its immutable spool input before claiming it. The server is covered by the shared-protocol
 contract and real-server tests.
 
 ## Acceptance boundary

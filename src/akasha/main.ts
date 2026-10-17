@@ -1,4 +1,4 @@
-import { clockHealth } from "../access/clock.ts";
+import { clockHealth, HEALTH_FIELDS } from "../access/clock.ts";
 import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { AccessState, Clock, TrustStore, TRUST_POLL_SECONDS } from "../access/trust.ts";
@@ -50,7 +50,9 @@ export async function main(args: string[]): Promise<number> {
       process.stdout.write(JSON.stringify({ ok: true, rows: result }) + "\n"); return 0;
     }
     state = new AccessState(string("access_state"));
-    const clock = clockHealth(state, () => trustedFile(string("clock_health_file"), 1024));
+    const clock = clockHealth(state, () => trustedFile(string("clock_health_file"), 1024), {
+      decode: parse, fields: h => fields(h, HEALTH_FIELDS), check: ensure,
+    });
     ensure(Array.isArray(c.anchors), "anchors_required");
     const trust = new TrustStore(state, clock, c.anchors as TrustAnchor[]);
     const refresh = async () => { await trust.install(trustedFile(string("bundle_file"), 262145).toString("utf8").trim()); };

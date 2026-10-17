@@ -30,7 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends e2fsprogs
           python3 -m venv "$TMPDIR/venv"
-          "$TMPDIR/venv/bin/pip" install -r host/requirements-test.txt
+          "$TMPDIR/venv/bin/pip" install --require-hashes --only-binary=:all: -r host/requirements-test.txt
       - name: Host behaviour tests
         run: |
           test "$HOME" = "$RUNNER_TEMP/ch/home"
@@ -47,7 +47,7 @@ jobs:
         run: |
           mkdir "$TMPDIR/unpack"
           tar -xzf "$TMPDIR/release/chaldea-host.tar.gz" -C "$TMPDIR/unpack"
-          node "$TMPDIR/unpack/host/access-maintenance.mjs" --help
+          node "$TMPDIR/unpack/host/access-maintenance.mjs" --help | grep -F "Usage: chaldea access"
           AKASHA_STATE_FILE="$TMPDIR/collector.db" AKASHA_SPOOL="$TMPDIR/empty" AKASHA_TIMER_SPOOL="$TMPDIR/empty-timers" node "$TMPDIR/unpack/host/akasha-collector.mjs"
       - name: Upload candidate artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -57,14 +57,17 @@ jobs:
             ${{ runner.temp }}/ch/tmp/release/chaldea-host.tar.gz
             ${{ runner.temp }}/ch/tmp/release/manifest.json
           retention-days: 14
+  exec:
+    if: startsWith(github.ref, 'refs/tags/host-v')
+    uses: ./.github/workflows/exec.yml
   release:
-    if: github.event_name == 'push'
-    needs: host
+    if: startsWith(github.ref, 'refs/tags/host-v')
+    needs: [host, exec]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093a # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: chaldea-host
           path: release

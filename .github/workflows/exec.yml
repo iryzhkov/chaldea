@@ -1,6 +1,7 @@
 name: exec
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -33,7 +34,7 @@ jobs:
           trap 'reason="Real exec E2E prerequisites failed at line $LINENO; see this step log."; echo "::error::$reason"; echo "$reason" >> "$GITHUB_STEP_SUMMARY"' ERR
           test "$HOME" = "$RUNNER_TEMP/chaldea/home"
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap passt openssh-server iproute2 build-essential curl xz-utils
+          sudo apt-get install --yes --no-install-recommends bubblewrap passt openssh-server iproute2 build-essential curl xz-utils python3-jinja2
           sudo mkdir -p /run/sshd
           # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor.
           # This disposable runner must exercise the same userns launch as hosts.
@@ -64,6 +65,7 @@ jobs:
           "$pasta" --version
           echo "CHALDEA_PASTA=$pasta" >> "$GITHUB_ENV"
           echo "CHALDEA_SSHD=/usr/sbin/sshd" >> "$GITHUB_ENV"
+          echo "CHALDEA_TEST_PYTHON=/usr/bin/python3" >> "$GITHUB_ENV"
       - run: npm ci --ignore-scripts
       - run: npm run exec:check
       - run: npm run exec:test
