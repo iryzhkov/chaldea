@@ -21,6 +21,7 @@ import {
   writePrivateFile,
 } from "../helpers/e2e.ts";
 import { SCRATCH_ROOT, scratchDir } from "../helpers/scratch.ts";
+import type { statusSnapshot } from "../../src/quota/headroom.ts";
 
 const PINNED_VERSION = "t3 v0.1.0";
 const version = t3Version();
@@ -51,7 +52,7 @@ interface Harness {
   startObserver(): Promise<ObserverProcess>;
 }
 
-async function harness(options: { scenario: "reset" | "no-reset"; autoResume: boolean; resetDelaySeconds?: number }): Promise<Harness> {
+async function harness(options: { scenario: "reset" | "no-reset"; autoResume: boolean; resetDelaySeconds?: number; codex?: "available" }): Promise<Harness> {
   const dir = scratchDir("e2e");
   cleanups.push(dir.remove);
   const t3 = await startDisposableT3({ scratchRoot: SCRATCH_ROOT, ...options });
@@ -111,8 +112,18 @@ function turns(t3: DisposableT3, outcome: string, continuation?: boolean): numbe
 }
 
 test("a known reset resumes natively once and the observer records park and resume once", { skip, timeout: 180_000 }, async () => {
-  const h = await harness({ scenario: "reset", autoResume: true, resetDelaySeconds: 10 });
+  // Claude's fixture has no usage metrics. The existing fake Codex supplies fresh
+  // windows, so the startup snapshot has one eligible provider and skips the rest.
+  const h = await harness({ scenario: "reset", autoResume: true, resetDelaySeconds: 10, codex: "available" });
   const first = await h.startObserver();
+  await waitFor("combined startup headroom snapshot", () =>
+    readFeed(h.feedLog).some(entry => entry.body.kind === "quota_headroom_snapshot"), 30_000);
+  const startup = readFeed(h.feedLog).filter(entry => String(entry.body.kind).startsWith("quota_headroom_"));
+  assert.deepEqual(startup.map(entry => entry.body.kind), ["quota_headroom_snapshot"]);
+  assert.equal(startup[0]!.body.provider, "all");
+  const headroom = startup[0]!.body.headroom as ReturnType<typeof statusSnapshot>;
+  assert.deepEqual(headroom.providers.map(p => p.alias), ["codex"]);
+  assert.equal(headroom.providers[0]!.included.windows.state, "fresh");
   await dispatchMessage(h.t3, h.operateToken, h.threadId, `Start the work. ${h.t3.trigger}`, "1");
 
   await waitFor("quota_parked", () => kinds(h.feedLog).includes("quota_parked"), 30_000);
@@ -133,7 +144,6 @@ test("a known reset resumes natively once and the observer records park and resu
   await restarted.stop();
 
   assert.deepEqual(kinds(h.feedLog), ["quota_parked", "quota_resumed"]);
-  assert.ok(readFeed(h.feedLog).some(entry => entry.body.kind === "quota_headroom_snapshot"), "cached config subscription emits headroom through the feed poster");
   const [parkedEntry, resumedEntry] = transitionFeed(h.feedLog);
   for (const entry of [parkedEntry!, resumedEntry!]) {
     const flag = (name: string) => entry.args[entry.args.indexOf(name) + 1];
