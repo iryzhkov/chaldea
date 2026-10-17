@@ -41,6 +41,9 @@ function disappearance(root: string, jobId: string) {
 test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, async t => {
   assert.notEqual(tmpdir(), '/tmp', 'set TMPDIR to a disk-backed scratch directory');
   assert.notEqual(userInfo().uid, 0, 'must run without root');
+  const pasta = process.env.CHALDEA_PASTA ?? '/usr/bin/pasta';
+  await fs.access(pasta).catch(() => { throw new Error('System pasta is absent: install passt through approved provisioning, or explicitly set CHALDEA_PASTA to an extracted distro package for compatibility testing'); });
+  t.diagnostic('pasta binary: ' + pasta + (process.env.CHALDEA_PASTA ? ' (explicit override)' : ' (system)'));
   const scratch = await fs.mkdtemp(join(tmpdir(), 'chaldea-e2e-'));
   // Unix-domain socket paths are limited to 108 bytes, including %C's hash.
   const state = await fs.mkdtemp(join(tmpdir(), 's-')); const jobroot = join(scratch, 'jobs');
@@ -61,7 +64,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
   }
   const run = (args: string[]) => spawn(process.execPath, [cli, 'exec', '--host', 'test', ...args], { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] });
   async function configure(extra: object = {}) {
-    await fs.writeFile(config, JSON.stringify({ state_root: jobroot, require_mount: false, pasta_binary: process.env.CHALDEA_PASTA ?? '/usr/bin/pasta', ...extra }));
+    await fs.writeFile(config, JSON.stringify({ state_root: jobroot, require_mount: false, pasta_binary: pasta, ...extra }));
   }
   try {
     await fs.mkdir(work); await fs.mkdir(jobroot);
@@ -106,6 +109,12 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
       daemon!.once('exit', () => { clearTimeout(timeout); reject(new Error('sshd exited: ' + daemonLog)); });
     });
 
+    await t.test('apply-time smoke uses the exact installed pasta/bwrap launch', async () => {
+      const result = execFileSync('/usr/bin/python3', ['-I', server, '--config', config, '--smoke-test'], { encoding: 'utf8', timeout: 20000 });
+      assert.equal(result.trim(), 'sandbox-smoke-ok');
+      assert.deepEqual(await fs.readdir(jobroot), []);
+    });
+
     await t.test('live stdout/stderr, exit status, artifacts, cleanup, multiplexed start under 2 seconds', async () => {
       const first = run(['--artifact', 'out/result', '--', 'python3', '-c',
         'import pathlib,sys,time; print("live",flush=True); print("stderr-live",file=sys.stderr,flush=True); time.sleep(.6); pathlib.Path("out").mkdir(); pathlib.Path("out/result").write_text(pathlib.Path("input").read_text()); sys.exit(7)']);
@@ -126,6 +135,21 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
       const master = await collected(ssh(['-O', 'check', 'chaldea-job-test']));
       assert.equal(master.code, 0, master.err);
       assert.equal(JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8')).exitCode, 7);
+    });
+
+    await t.test('concurrent local call reports and journals a refusal without dispatch', async () => {
+      const first = run(['--', 'python3', '-c', 'import time; print("locked",flush=True); time.sleep(100)']);
+      let stderr = ''; first.stderr!.on('data', x => { stderr += x; });
+      await Promise.race([once(first.stdout!, 'data'), once(first, 'close').then(() => { throw new Error(stderr); })]);
+      const result = await collected(run(['--', 'printf', 'must-not-run']));
+      assert.equal(result.code, 255); assert.equal(result.out, '');
+      assert.match(result.err, /refused: another local chaldea exec.*nothing dispatched/);
+      const entries = await Promise.all((await fs.readdir(join(state, 'journal'))).filter(x => x.endsWith('.json')).map(async x => JSON.parse(await fs.readFile(join(state, 'journal', x), 'utf8'))));
+      assert.ok(entries.some(x => x.outcome === 'refused' && x.argv.includes('must-not-run')));
+      const id = /chaldea job ([0-9a-f-]+)/.exec(stderr)![1];
+      const removed = disappearance(jobroot, id);
+      const exited = once(first, 'close'); first.kill('SIGKILL');
+      await exited; await removed;
     });
 
     await t.test('SSH shell, command injection, PTY, remote/local forwarding and agent are refused', async () => {

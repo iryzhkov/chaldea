@@ -53,6 +53,17 @@ export async function staleControl(config: string, host: string) {
   }
 }
 
+export async function refuseConcurrent(args: string[]): Promise<never> {
+  const options = argumentsFor(args);
+  const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
+  const journal = join(state, 'journal');
+  const intent: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
+    started: new Date().toISOString(), outcome: 'refused' };
+  await record(journal, intent);
+  await prune(journal);
+  throw new Error('host ' + options.host + ' refused: another local chaldea exec is running; nothing dispatched; journal ' + join(journal, intent.jobId + '.json'));
+}
+
 export async function run(args: string[]): Promise<number> {
   const options = argumentsFor(args);
   const snapshot = await manifest();

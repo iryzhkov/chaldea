@@ -7,7 +7,7 @@ jobs:
     runs-on: [self-hosted, chaldea]
     env:
       TMPDIR: /home/igor/.cache/chaldea-scratch/laneC/ci-${{ github.run_id }}
-      CHALDEA_FLEET_REF: e5bc7243f85d173f9a86fc885d926cf1a330401a
+      CHALDEA_FLEET_REF: f74dee8d38b6ea59ba5fbd636fb955ed3e201201
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020

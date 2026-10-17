@@ -50,7 +50,10 @@ configuration are mounted. All subprocess environment variables are rebuilt.
 
 **Outbound networking is on through pasta in a private network namespace.**
 Host-loopback/gateway mapping and forwarding are disabled, and nftables rejects
-all non-loopback host interface addresses. Host abstract sockets are isolated.
+all non-loopback host interface addresses and connected subnets of interfaces
+outside the default routes (including Docker bridges and overlay peers). These
+lists are captured at job start; dynamic changes remain follow-up N2. Host
+abstract sockets are isolated.
 There is no general internet/LAN egress allowlist. Network authorization for
 services remains their responsibility. This v0 does not offer job credentials.
 
@@ -76,7 +79,9 @@ Python forced command ignores user-site/PYTHONPATH configuration.
 - Local artifacts: 14 days and 20 GiB per destination across worktrees, accounted
   through the journal. Old completed artifacts are evicted under size pressure.
   Journal eviction also removes the referenced artifacts. Kernel flock protects
-  per-host accounting and requires no stale-lock cleanup after reboot.
+  per-host accounting and requires no stale-lock cleanup after reboot. A second
+  local call for that host reports a busy refusal and journals refused without
+  contacting SSH.
 - Local client journal: mode 0600, fsynced before SSH dispatch and atomically
   replaced after confirmed completion; 14 days / 1,000 entries, no output logs.
 
@@ -121,8 +126,14 @@ and fault-injected disk-full/over-cap admission. It reports spawn-to-first-stdou
 latency on the second multiplexed invocation and asserts under two seconds.
 Image mounting/cgroup enforcement, actual reboot behavior, real GPU execution and real-host desktop policy
 are not exercised by this rootless test. Rendering uses an existing Python with
-Jinja2 (CHALDEA_TEST_PYTHON overrides python3); CHALDEA_PASTA and CHALDEA_SSHD
-can point to existing test binaries. CI uses the same E2E and a pinned companion
+Jinja2 (CHALDEA_TEST_PYTHON overrides python3). The default pasta is the system
+/usr/bin/pasta; CHALDEA_PASTA is an explicit override for an extracted distro
+package, and the test reports its path. Do not substitute a newer fixture for
+host package compatibility validation. CHALDEA_SSHD can select an existing sshd.
+Round 2 exercises system bubblewrap 0.12.0 with the exact extracted Arch
+2026_07_28 and Debian 20250503 passt packages because local passt is absent and
+this lane does not install packages on real hosts. The suite also runs the role's
+apply-time smoke command; actual enrollment must pass with installed packages. CI uses the same E2E and a pinned companion
 commit through the existing read-only github-chaldea-fleet-config alias. It installs
 no host packages and reports a notice when required tools or unprivileged SSH/
 bubblewrap are unavailable. Unit tests in the fleet repository cover
