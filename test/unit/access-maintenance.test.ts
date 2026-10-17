@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, lstatSync, readFileSync, writeFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { generateKeyPairSync } from "node:crypto";
-import { chronyHealth, trustedBytes, atomicPublicFile, installBundle, maintenanceCli } from "../../src/access/maintenance.ts";
+import { chronyHealth, trustedBytes, atomicPublicFile, installBundle, maintenanceCli, sampleChrony } from "../../src/access/maintenance.ts";
 import { AccessState, Clock, TrustStore } from "../../src/access/trust.ts";
 import { rig, N } from "../helpers/access.ts";
 import { scratchDir } from "../helpers/scratch.ts";
@@ -15,7 +15,7 @@ assert.ok(process.env.CHALDEA_TEST_SCRATCH?.startsWith(process.env.HOME + "/"));
 
 const tracking = (offset = "0.01", ref = N) => [
   "Reference ID    : C0000201 (192.0.2.1)", "Stratum         : 3",
-  "Ref time (UTC)  : " + new Date(ref * 1000).toUTCString().replace("GMT", "").trim(),
+  "Ref time (UTC)  : " + new Date(ref * 1000).toUTCString().replace(/^(\w{3}), (\d{2}) (\w{3}) (\d{4}) ([\d:]+) GMT$/, "$1 $3 $2 $5 $4"),
   "System time     : " + offset + " seconds slow of NTP time",
   "Last offset     : -0.001 seconds", "RMS offset      : 0.001 seconds",
   "Frequency       : 1.0 ppm slow", "Residual freq   : 0.001 ppm", "Skew            : 0.01 ppm",
@@ -38,6 +38,22 @@ test("chrony health fails closed for unknown, unsynchronised, local and stale cl
     tracking() + "\nLeap status : Normal",
   ]) assert.equal(chronyHealth(report, N).healthy, false, report);
   assert.equal(chronyHealth(tracking("29.97"), N).healthy, true);
+});
+
+test("clock-health CLI publishes healthy and unknown samples with correct exit status", async () => {
+  const s = scratchDir("trust-clock-cli");
+  const mask = process.umask();
+  try {
+    const path = join(s.path, "health.json"), args = ["clock-health", "--output", path];
+    assert.equal(sampleChrony(() => { throw new Error("unavailable"); }).healthy, false);
+    const now = Math.floor(Date.now() / 1000);
+    assert.equal(sampleChrony(() => tracking("0.01", now)).healthy, true);
+    for (const healthy of [true, false]) {
+      const h = { healthy, offsetSeconds: 0, checked_at: now };
+      assert.equal(await maintenanceCli(args, () => h), healthy ? 0 : 1);
+      assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), h);
+    }
+  } finally { process.umask(mask); s.remove(); }
 });
 
 test("trusted file boundaries, public mode, and atomic replacement", () => {
@@ -113,8 +129,14 @@ test("operator CLI initializes exclusively, signs fleet grants and verifies inst
     const keyPath = join(s.path, "deployment.pem"), grants = join(s.path, "grants.json"),
       health = join(s.path, "health.json"), output = join(s.path, "bundle.jws"), state = join(s.path, "signer.sqlite");
     writeFileSync(keyPath, key.privateKey.export({ format: "pem", type: "pkcs8" }), { mode: 0o600 });
-    writeFileSync(grants, "[]", { mode: 0o600 });
     const now = Math.floor(Date.now() / 1000);
+    const issuer = generateKeyPairSync("ed25519").publicKey.export({ format: "jwk" });
+    writeFileSync(grants, JSON.stringify([{
+      issuer: "chaldea:agent-a", kid: "issuer-1", public_key: { kty: "OKP", crv: "Ed25519", x: issuer.x! },
+      not_before: now - 60, issue_until: now + 3600, verify_until: now + 4410,
+      ceilings: [{ audience: "akasha", profile: "daily-health", project: "homelab", source: "daily-health",
+        grants: [{ resource: "daily-health", actions: ["append"] }] }],
+    }]), { mode: 0o600 });
     writeFileSync(health, JSON.stringify({ healthy: true, offsetSeconds: 0, checked_at: now }), { mode: 0o600 });
     assert.equal(await maintenanceCli(["initialize-state", "--state-file", state]), 0);
     assert.equal(await maintenanceCli(["initialize-state", "--state-file", state]), 1);
@@ -130,6 +152,22 @@ test("operator CLI initializes exclusively, signs fleet grants and verifies inst
       await t.install(first);
       assert.equal((await t.snapshot()).expires_at, now + 86400);
     } finally { a.close(); }
+    // Healthy clock plus valid lifetime isolates same-sequence equivocation.
+    assert.equal(await maintenanceCli([...args, "--lifetime", "86399"]), 1);
+    const anchors = join(s.path, "anchors.json"), candidate = join(s.path, "candidate.jws"),
+      installed = join(s.path, "installed.jws"), verifierState = join(s.path, "verifier.sqlite");
+    const pub = key.publicKey.export({ format: "jwk" });
+    writeFileSync(anchors, JSON.stringify([{ kid: "deployment-1",
+      public_key: { kty: "OKP", crv: "Ed25519", x: pub.x! } }]));
+    writeFileSync(candidate, first + "\n");
+    assert.equal(await maintenanceCli(["initialize-state", "--state-file", verifierState]), 0);
+    const install = ["install-bundle", "--state-file", verifierState, "--clock-health-file", health,
+      "--anchor-file", anchors, "--bundle-file", candidate, "--output", installed];
+    assert.equal(await maintenanceCli(install), 0);
+    assert.equal(readFileSync(installed, "utf8"), first);
+    writeFileSync(candidate, first.slice(0, -10) + "tampered");
+    assert.equal(await maintenanceCli(install), 1);
+    assert.equal(readFileSync(installed, "utf8"), first);
     assert.equal(await maintenanceCli([...args, "--lifetime", "86401"]), 1);
     writeFileSync(health, JSON.stringify({ healthy: false, offsetSeconds: 0, checked_at: now }));
     assert.equal(await maintenanceCli(args), 1);

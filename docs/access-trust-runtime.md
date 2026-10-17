@@ -21,7 +21,9 @@ pinned Ed25519 deployment anchor; transport credentials cannot grant authority.
 
 install-bundle requires explicitly initialized private state and fresh host clock
 evidence. It calls TrustStore.install then atomically replaces the public file.
-A crash after the state commit is recovered by retrying the identical envelope.
+An updater crash after the state commit is recovered by retrying the identical envelope.
+If sign-bundle loses its output after committing state, re-sign with a higher sequence;
+its new publication timestamp cannot reuse the committed sequence.
 Tamper, rollback/equivocation, removed/reused keys and clock rollback fail closed.
 The updater and each verifier retain separate durable state; never restore/erase
 their high-water history during application recovery. Serialize publisher signing
@@ -37,9 +39,9 @@ ordinary cancellation retain package C's bound.
 
 ## Clock adapter
 
-Read-only /usr/bin/chronyc -n -h 127.0.0.1 tracking runs with C locale, a 3s
+Read-only /usr/bin/chronyc -n -h /run/chrony/chronyd.sock tracking runs as root with C locale, a 3s
 timeout and 8 KiB output cap. Provision chrony with independent external sources
-and localhost monitoring separately; no time service is configured by this task.
+and a root-protected Unix monitoring socket separately (no UDP fallback or local/orphan mode); no time service is configured by this task.
 Hosts with only timesyncd must provision chrony before activation.
 
 The adapter atomically writes exactly {healthy,offsetSeconds,checked_at} every

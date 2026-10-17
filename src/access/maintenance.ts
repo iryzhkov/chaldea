@@ -80,11 +80,12 @@ export function chronyHealth(report: string, now: number): Health {
     return { healthy: Math.abs(offsetSeconds) + dispersion + delay / 2 <= 30, offsetSeconds, checked_at: now };
   } catch { return bad; }
 }
-export function sampleChrony(): Health {
+export function sampleChrony(readTracking: () => string = () =>
+  execFileSync("/usr/bin/chronyc", ["-n", "-h", "/run/chrony/chronyd.sock", "tracking"],
+    { encoding: "utf8", timeout: 3000, maxBuffer: 8192, env: { ...process.env, LC_ALL: "C" }, stdio: ["ignore", "pipe", "pipe"] })): Health {
   const now = Math.floor(Date.now() / 1000);
   try {
-    const report = execFileSync("/usr/bin/chronyc", ["-n", "-h", "127.0.0.1", "tracking"],
-      { encoding: "utf8", timeout: 3000, maxBuffer: 8192, env: { ...process.env, LC_ALL: "C" }, stdio: ["ignore", "pipe", "pipe"] });
+    const report = readTracking();
     return chronyHealth(report, now);
   } catch { return { healthy: false, offsetSeconds: 0, checked_at: now }; }
 }
@@ -108,7 +109,7 @@ Grants file: JSON array of operator-owned TrustedKey records (public keys only).
 Sign on omarchy-pc only; private deployment key must never be on a run host.
 State initialization is explicit and exclusive. Never reset/restore high-water state.
 `;
-export async function maintenanceCli(args: readonly string[]): Promise<number> {
+export async function maintenanceCli(args: readonly string[], healthSample: () => Health = sampleChrony): Promise<number> {
   let state: AccessState | undefined;
   try {
     process.umask(0o077);
@@ -125,7 +126,7 @@ export async function maintenanceCli(args: readonly string[]): Promise<number> {
     };
     const command = positionals[0];
     if (command === "clock-health") {
-      const health = sampleChrony(); atomicPublicFile(required("output"), JSON.stringify(health) + "\n");
+      const health = healthSample(); atomicPublicFile(required("output"), JSON.stringify(health) + "\n");
       return health.healthy ? 0 : 1;
     }
     requireAccess(["initialize-state", "install-bundle", "sign-bundle"].includes(command!), "usage");
