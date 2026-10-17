@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Frozen synthetic JWT test vectors, independently checked by verify.py"
+paths = [
+  '''^test/fixtures/access/v1\.json$''',
+  '''^test/fixtures/access/v1-encoding\.json$''',
+  '''^test/fixtures/access/v1-freshness\.json$''',
+]
