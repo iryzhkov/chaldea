@@ -1,7 +1,7 @@
 import { spawn, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { manifest } from './manifest.ts';
@@ -10,22 +10,44 @@ import { record, prune, DAYS, type Intent } from './journal.ts';
 import { frames, send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, type Request } from './protocol.ts';
 
 export function argumentsFor(args: string[]) {
-  let host = ''; let gpu = false; const artifacts: string[] = [];
+  let host: string | undefined; let gpu = false; const artifacts: string[] = [];
   let i = args[0] === 'exec' ? 1 : -1;
-  if (i < 0) throw new Error('usage: chaldea exec --host H [--artifact PATH] [--gpu] -- CMD...');
+  if (i < 0) throw new Error('usage: chaldea exec [--host H] [--artifact PATH] [--gpu] -- CMD...');
   while (i < args.length && args[i] !== '--') {
     const flag = args[i++];
-    if (flag === '--host') host = args[i++] ?? '';
+    if (flag === '--host') { host = args[i++]; if (!host) throw new Error('invalid exec arguments'); }
     else if (flag === '--artifact') { const path = args[i++]; safePath(path); artifacts.push(path); }
     else if (flag === '--gpu') gpu = true;
     else throw new Error('unknown option: ' + flag);
   }
   const argv = args.slice(i + 1);
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(host) || args[i] !== '--' || !argv.length ||
+  if ((host !== undefined && !validHost(host)) || args[i] !== '--' || !argv.length ||
       argv.length > 256 || argv.some(x => x.includes('\0')) || Buffer.byteLength(JSON.stringify(argv)) > 16384 ||
       artifacts.length > 32 || new Set(artifacts).size !== artifacts.length) throw new Error('invalid exec arguments');
   return { host, gpu, artifacts, argv };
 }
+
+const validHost = (host: string) => /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(host);
+export const EXIT_UNAVAILABLE = 69;
+
+// Entries are fleet inventory names with existing chaldea-job-NAME aliases.
+export function hostsFor(text: string) {
+  const hosts = text.split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('#'));
+  if (hosts.some(x => !validHost(x))) throw new Error('invalid host in exec-hosts');
+  return hosts.filter((x, i) => hosts.findIndex(h => h.toLowerCase() === x.toLowerCase()) === i);
+}
+// Fleet config omits this host's inventory name; hostname matching is a backstop.
+export function isLocalHost(host: string, local = hostname()) {
+  return host.toLowerCase() === local.split('.')[0].toLowerCase();
+}
+class RetryableFailure extends Error {
+  reason: string;
+  constructor(message: string, reason = message) { super(message); this.reason = reason; }
+}
+export function fallbackAllowed(outcome: Intent['outcome'] | 'connection-failed', requestSent: boolean, started: boolean, interrupted = false) {
+  return !interrupted && ((outcome === 'connection-failed' && !requestSent) || (outcome === 'refused' && !started));
+}
+const oneLine = (text: string) => text.replace(/[\r\n]+/g, ' ');
 
 class RemoteFailure extends Error {
   outcome: Intent['outcome'];
@@ -45,7 +67,7 @@ export async function staleControl(config: string, host: string) {
   if (!before.isSocket()) throw new Error('SSH control path is not a socket');
   try { execFileSync('ssh', ['-F', config, '-O', 'check', host], { timeout: 1000, stdio: 'pipe' }); }
   catch (e: any) {
-    if (e.status !== 255) throw new Error('SSH control master did not answer; no job dispatched');
+    if (e.status !== 255) throw new RetryableFailure('SSH control master did not answer; no job dispatched');
     try {
       const after = await fs.lstat(path);
       if (after.ino === before.ino && after.dev === before.dev) await fs.unlink(path);
@@ -53,19 +75,70 @@ export async function staleControl(config: string, host: string) {
   }
 }
 
-export async function refuseConcurrent(args: string[]): Promise<never> {
-  const options = argumentsFor(args);
+async function refuseConcurrent(options: ReturnType<typeof argumentsFor> & { host: string }): Promise<never> {
   const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
   const journal = join(state, 'journal');
   const intent: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
     started: new Date().toISOString(), outcome: 'refused' };
   await record(journal, intent);
   await prune(journal);
-  throw new Error('host ' + options.host + ' refused: another local chaldea exec is running; nothing dispatched; journal ' + join(journal, intent.jobId + '.json'));
+  throw new RetryableFailure('host ' + options.host + ' refused: another local chaldea exec is running; nothing dispatched; journal ' + join(journal, intent.jobId + '.json'), 'another local chaldea exec is running');
+}
+
+async function configuredHosts() {
+  const path = process.env.CHALDEA_EXEC_HOSTS ?? join(homedir(), '.config/chaldea/exec-hosts');
+  try { return hostsFor(await fs.readFile(path, 'utf8')); }
+  catch (e: any) {
+    if (e.code === 'ENOENT') throw new Error(oneLine('missing exec host list ' + path + '; --host H works without it'));
+    throw e;
+  }
 }
 
 export async function run(args: string[]): Promise<number> {
   const options = argumentsFor(args);
+  const automatic = options.host === undefined;
+  const hosts = automatic ? await configuredHosts() : [options.host!];
+  const failures: string[] = [];
+  for (const host of hosts) {
+    let reason: string;
+    if (automatic && isLocalHost(host)) reason = 'local host';
+    else {
+      try {
+        const code = await lockedRun({ ...options, host }, automatic);
+        if (automatic) process.stderr.write('chaldea ran on ' + host + '\n');
+        return code;
+      } catch (e) {
+        if (!automatic || !(e instanceof RetryableFailure)) throw e;
+        reason = oneLine(e.reason);
+      }
+    }
+    failures.push(host + ' (' + reason + ')');
+    process.stderr.write('chaldea skipped ' + host + ': ' + reason + '\n');
+  }
+  process.stderr.write('chaldea: no available exec host: ' + (failures.join('; ') || 'empty host list') + '\n');
+  return EXIT_UNAVAILABLE;
+}
+
+async function lockedRun(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean) {
+  const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
+  await fs.mkdir(state, { recursive: true, mode: 0o700 });
+  let lock: fs.FileHandle;
+  try { lock = await fs.open(join(state, 'artifacts-' + options.host.toLowerCase() + '.lock'), 'a', 0o600); }
+  catch { throw new Error('cannot open local host lock'); }
+  try {
+    try {
+      // flock locks the inherited open file description. Our FileHandle keeps
+      // it held after flock exits; closing it (or a crash/reboot) releases it.
+      execFileSync('/usr/bin/flock', ['-n', '-E', '75', '3'], { stdio: ['ignore', 'pipe', 'pipe', lock.fd] });
+    } catch (e: any) {
+      if (e.status === 75) return await refuseConcurrent(options);
+      throw new Error('local host lock failed (flock exit ' + e.status + ')');
+    }
+    return await runOnHost(options, automatic);
+  } finally { await lock.close(); }
+}
+
+async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean): Promise<number> {
   const snapshot = await manifest();
   const artifactRoot = join(snapshot.root, '.chaldea/artifacts');
   const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
@@ -77,7 +150,14 @@ export async function run(args: string[]): Promise<number> {
   const controls = join(state, 'ssh');
   await fs.mkdir(controls, { recursive: true, mode: 0o700 });
   const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
-  await staleControl(config, 'chaldea-job-' + options.host);
+  try { await staleControl(config, 'chaldea-job-' + options.host); }
+  catch (e) {
+    if (!automatic || !(e instanceof RetryableFailure)) throw e;
+    const refused: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
+      started: new Date().toISOString(), outcome: 'refused' };
+    await record(journal, refused);
+    throw new RetryableFailure(e.message + '; inspect journal ' + join(journal, refused.jobId + '.json'), e.reason);
+  }
   const jobId = randomUUID();
   const intent: Intent = { jobId, host: options.host, argv: options.argv,
     started: new Date().toISOString(), pid: process.pid, bootId: BOOT_ID, outcome: 'uncertain',
@@ -89,23 +169,31 @@ export async function run(args: string[]): Promise<number> {
   const ssh = spawn('ssh', ['-F', config, '-T', '-a', '-x',
     '-o', 'BatchMode=yes', '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
     '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'RequestTTY=no',
-    '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60',
+    '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60', '-o', 'ConnectTimeout=10',
     'chaldea-job-' + options.host, 'chaldea-exec-v0'], { stdio: ['pipe', 'pipe', 'pipe'] });
   const exit = new Promise<number | null>((resolve, reject) => { ssh.once('error', reject); ssh.once('close', resolve); });
+  void exit.catch(() => {}); // spawn errors can precede the first protocol read
   // Attach error handlers immediately: a host can refuse while input is uploading.
   let writeError: Error | undefined;
   ssh.stdin.on('error', e => { writeError = e; });
   ssh.stderr.pipe(process.stderr, { end: false });
   const stop = () => { ssh.stdin.destroy(); ssh.kill('SIGTERM'); };
-  process.on('SIGINT', stop); process.on('SIGTERM', stop);
+  let interrupted = false;
+  const interrupt = () => { interrupted = true; stop(); };
+  process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
   let artifact: fs.FileHandle | undefined;
   let artifactRemaining = 0; let received = 0; const seen = new Set<string>();
   let result: number | undefined;
   let upload: Promise<void> | undefined;
+  let requestSent = false; let started = false;
   const destination = join(artifactRoot, jobId);
   try {
     const incoming = frames(ssh.stdout)[Symbol.asyncIterator]();
     const hello = await incoming.next();
+    if (hello.done && automatic) {
+      await exit.catch(() => {});
+      throw new RetryableFailure('connection closed before job request');
+    }
     if (!hello.done && hello.value.type === 'R') throw new RemoteFailure(hello.value.data);
     if (hello.done || hello.value.type !== 'H' || JSON.parse(hello.value.data.toString()).version !== VERSION) {
       throw new Error('unsupported job protocol');
@@ -113,6 +201,7 @@ export async function run(args: string[]): Promise<number> {
     const request: Request = { version: VERSION, jobId, argv: options.argv, gpu: options.gpu,
       cwd: snapshot.cwd, artifacts: options.artifacts, files: snapshot.files.map(({ data, ...entry }) => entry) };
     upload = (async () => {
+      requestSent = true; // any write attempt is uncertain, even if it fails
       await send(ssh.stdin, 'Q', json(request));
       for (const file of snapshot.files) for (let offset = 0; offset < file.size; offset += CHUNK) {
         if (writeError) throw writeError;
@@ -127,6 +216,7 @@ export async function run(args: string[]): Promise<number> {
       const item = await incoming.next(); if (item.done) break;
       const { type, data } = item.value;
       if (result !== undefined) throw new Error('frame after result');
+      if (['O', 'S', 'A', 'B', 'X'].includes(type)) started = true;
       if (type === 'O' || type === 'S') {
         if (artifactRemaining) throw new Error('interrupted artifact');
         const output = type === 'O' ? process.stdout : process.stderr;
@@ -173,13 +263,17 @@ export async function run(args: string[]): Promise<number> {
   } catch (e) {
     stop();
     await exit.catch(() => {});
-    if (e instanceof RemoteFailure && e.outcome !== 'uncertain') {
-      intent.outcome = e.outcome;
+    const retry = automatic && fallbackAllowed(e instanceof RemoteFailure ? e.outcome :
+      e instanceof RetryableFailure ? 'connection-failed' : 'uncertain', requestSent, started, interrupted);
+    if (retry || (e instanceof RemoteFailure && e.outcome !== 'uncertain' && (!automatic || e.outcome === 'preempted'))) {
+      intent.outcome = retry ? 'refused' : (e as RemoteFailure).outcome;
       await record(journal, intent, false);
     }
-    throw new Error((e as Error).message + '; outcome ' + intent.outcome + '; inspect journal ' + join(journal, jobId + '.json'));
+    const message = (e as Error).message + '; outcome ' + intent.outcome + '; inspect journal ' + join(journal, jobId + '.json');
+    if (retry) throw new RetryableFailure(message, (e as Error).message);
+    throw new Error(message);
   } finally {
-    process.off('SIGINT', stop); process.off('SIGTERM', stop);
+    process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
     if (artifact) await artifact.close();
     await prune(journal);
     await cleanArtifacts(journal, options.host);

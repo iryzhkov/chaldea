@@ -19,6 +19,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run exec:check
       - run: npm run exec:test
+      - name: Run ordered fallback against two fake job hosts
+        run: node --test test/exec/fallback.e2e.ts
       - name: Check existing host capabilities without installing packages
         id: capabilities
         shell: bash
