@@ -415,7 +415,7 @@ print('dns-config-ok')
       }
       await configure();
     });
-    await t.test('four channels reuse one master; excess mux sessions fall back quietly', async () => {
+    await t.test('four channels reuse one master; excess mux sessions fall back quietly', { timeout: 15000 }, async () => {
       const held: ChildProcess[] = [];
       const finished: Promise<Awaited<ReturnType<typeof collected>>>[] = [];
       const authentications = () => (daemonLog.match(/Accepted publickey/g) ?? []).length;
@@ -424,10 +424,13 @@ print('dns-config-ok')
         // Three running-slot channels plus one queued-admission channel.
         // Hold at the hello rather than launching jobs, isolating SSH capacity.
         for (let i = 0; i < 4; i++) {
-          const child = ssh(['chaldea-job-test', 'chaldea-exec-v0']);
+          const child = ssh(['chaldea-job-test', 'chaldea-exec-queue-v1']);
+          const hello = once(child.stdout!, 'data');
           held.push(child); finished.push(collected(child));
-          const hello = await frames(child.stdout!)[Symbol.asyncIterator]().next();
-          assert.equal(hello.value?.type, 'H');
+          const [data] = await Promise.race([hello, finished.at(-1)!.then(r => {
+            throw new Error('channel exited before hello: ' + r.err);
+          })]);
+          assert.equal(data[0], 'H'.charCodeAt(0));
         }
         assert.equal(authentications(), before, 'normal channels must reuse the existing connection');
         // Saturate MaxSessions deliberately: OpenSSH must use its own safe
@@ -435,6 +438,7 @@ print('dns-config-ok')
         const overflow = await collected(run(['--', 'printf', 'fallback-once']));
         assert.equal(overflow.code, 0, overflow.err);
         assert.equal(overflow.out, 'fallback-once');
+        assert.ok(authentications() > before, 'overflow must authenticate a fresh connection');
         assert.doesNotMatch(overflow.err, /mux_client_request_session|ControlSocket .* already exists/);
         assert.match(overflow.err, /chaldea job /);
       } finally {
