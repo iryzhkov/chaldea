@@ -1,0 +1,15 @@
+#!/bin/sh
+# Official Linux x64 T3 v0.1.0, verified before extraction and execution.
+set -eu
+destination=${1:?usage: install-t3 DIRECTORY}
+mkdir -p "$destination"
+archive="$destination/t3-0.1.0-linux-x64.tar.gz"
+curl --fail --location --retry 3 \
+  https://github.com/pingdotgg/t3code/releases/download/v0.1.0/t3-0.1.0-linux-x64.tar.gz \
+  --output "$archive"
+# Archive digest published with the official v0.1.0 release.
+echo "f7703ff1bb8f6243580058b3ccf2c02abb62eba4b991e26bbb1da22f4b56d9b1  $archive" | sha256sum --check
+tar --no-same-owner --strip-components=1 -xzf "$archive" -C "$destination"
+# Same executable digest previously verified on agent-a; see PROVENANCE.md.
+echo "4baaddb56353e7fe0e356ec587e2546082933b6b1c0445756d4a02ef5e0f1929  $destination/t3" | sha256sum --check
+"$destination/t3" --version

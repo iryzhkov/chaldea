@@ -1,75 +1,52 @@
 name: exec
-on: [push, pull_request]
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
 permissions:
   contents: read
+
 jobs:
   client:
-    runs-on: [self-hosted, chaldea]
-    env:
-      TMPDIR: /home/igor/.cache/chaldea-scratch/laneC/ci-${{ github.run_id }}
-      # Debian nft path, pasta parent-death supervisor and loopback-stub DNS warning fix.
-      CHALDEA_FLEET_REF: 435985308b84c1ad5ee0f3756100b9326a36a604
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
-          node-version-file: .node-version
-          cache: npm
-      - run: mkdir -p "$TMPDIR"
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26.10.0
+      - name: Prepare isolated test directories
+        run: |
+          mkdir -p "$RUNNER_TEMP/chaldea/home" "$RUNNER_TEMP/chaldea/tmp"
+          {
+            echo "HOME=$RUNNER_TEMP/chaldea/home"
+            echo "TMPDIR=$RUNNER_TEMP/chaldea/tmp"
+            echo "CHALDEA_TEST_SCRATCH=$RUNNER_TEMP/chaldea/tests"
+          } >> "$GITHUB_ENV"
+      - name: Install sandbox tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap passt
+          bwrap --version
+          pasta --version
+          # Same help probe as the reviewed job server: older pasta does not
+          # reliably flush --help. The intentionally unknown option exits nonzero.
+          pasta --chaldea-option-probe > "$TMPDIR/pasta-help" 2>&1 || true
+          for option in --foreground --dns --config-net --no-map-gw --map-host-loopback --no-splice; do
+            if ! grep -q -- "$option" "$TMPDIR/pasta-help"; then
+              reason="Exec SSH/sandbox E2E unavailable: Ubuntu apt pasta lacks required option $option."
+              echo "::notice::$reason"
+              echo "$reason" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
       - run: npm ci --ignore-scripts
       - run: npm run exec:check
       - run: npm run exec:test
-      - name: Check existing host capabilities without installing packages
-        id: capabilities
-        shell: bash
+      - name: Explain exec SSH and sandbox E2E skip
         run: |
-          set -eu
-          for tool in bwrap pasta nft sshd; do
-            if ! command -v "$tool" >/dev/null; then
-              echo "::notice::exec E2E remains local: $tool is unavailable on this runner; no packages installed"
-              echo "usable=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          if ! bwrap --unshare-user --unshare-net --ro-bind / / -- /usr/bin/true; then
-            echo "::notice::exec E2E remains local: unprivileged bubblewrap is unavailable; no host changes made"
-            echo "usable=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          for python in /usr/bin/python3.13 /usr/bin/python3 /home/igor/.local/share/chaldea/ansible-core-2.19.14/bin/python; do
-            if "$python" -I -c 'import jinja2' 2>/dev/null; then
-              echo "CHALDEA_TEST_PYTHON=$python" >> "$GITHUB_ENV"
-              echo "CHALDEA_SSHD=$(command -v sshd)" >> "$GITHUB_ENV"
-              echo "usable=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          echo "::error::No existing Python with Jinja2 is available to render the shipped SSH templates"
-          exit 1
-      - name: Fetch the exact reviewed companion fixture using the existing read-only alias
-        if: steps.capabilities.outputs.usable == 'true'
-        env:
-          GIT_SSH_COMMAND: ssh -o IdentityAgent=none -o BatchMode=yes
-        run: |
-          git init "$TMPDIR/fleet"
-          git -C "$TMPDIR/fleet" remote add origin git@github-chaldea-fleet-config:iryzhkov/chaldea-fleet-config.git
-          git -C "$TMPDIR/fleet" fetch --depth=1 origin "$CHALDEA_FLEET_REF"
-          git -C "$TMPDIR/fleet" checkout --detach FETCH_HEAD
-      - name: Run shipped-config unprivileged SSH and sandbox E2E
-        if: steps.capabilities.outputs.usable == 'true'
-        shell: bash
-        run: |
-          export CHALDEA_JOB_SERVER="$TMPDIR/fleet/roles/chaldea_job_host/files/chaldea-job-server"
-          set +e
-          npm run exec:e2e > "$TMPDIR/e2e.log" 2>&1
-          result=$?
-          cat "$TMPDIR/e2e.log"
-          if [ "$result" != 0 ] && grep -Eq 'Missing privilege separation directory|bwrap:.*(Operation not permitted|No permissions)' "$TMPDIR/e2e.log"; then
-            echo "::notice::exec E2E remains local: unprivileged sshd/bubblewrap is unsupported; no host changes made"
-            exit 0
-          fi
-          exit "$result"
-      - name: Remove this run's scratch files
-        if: always()
-        run: |
-          if [ -d "$TMPDIR" ]; then rm -r -- "$TMPDIR"; fi
+          reason="Exec SSH/sandbox E2E skipped: its reviewed chaldea-job-server and SSH templates are pinned to private chaldea-fleet-config commit 435985308b84c1ad5ee0f3756100b9326a36a604. Hosted fork PR jobs have no deploy key. Exec typecheck/unit tests and the real-T3 E2E suite still run."
+          echo "::notice::$reason"
+          echo "$reason" >> "$GITHUB_STEP_SUMMARY"

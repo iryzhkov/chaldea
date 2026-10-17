@@ -2,7 +2,7 @@
 
 Fleet compute v0: `node bin/chaldea exec --host H -- CMD...`. See [setup, protocol, bounds and tests](docs/exec-v0.md).
 
-Chaldea is the agent platform that extends official T3 with what it does not provide: quota resilience, fleet compute, review loops, role routing and agent access control.
+Chaldea is a personal project extending T3 Code with quota resilience, fleet compute, durable waits, a decision inbox and agent access control. It targets the pinned T3 Code stable release v0.1.0 (commit `81493ef`); see [the vendored contracts and runtime provenance](vendor/t3-contracts/PROVENANCE.md).
 
 Quota resilience (plan step 3): `chaldea quota observe` records T3 usage-limit stops and T3's native auto-resumes in the fleet feed. See [docs/quota.md](docs/quota.md) for how auto-resume is enabled, what the observer records, retention bounds, installation and tests.
 
