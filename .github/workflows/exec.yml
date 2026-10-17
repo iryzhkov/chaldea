@@ -7,20 +7,20 @@ jobs:
     runs-on: [self-hosted, chaldea]
     env:
       TMPDIR: /home/igor/.cache/chaldea-scratch/laneC/ci-${{ github.run_id }}
-      # Debian nft path, pasta parent-death supervisor and loopback-stub DNS warning fix.
-      CHALDEA_FLEET_REF: 435985308b84c1ad5ee0f3756100b9326a36a604
+      # Exact companion with bounded host slots and isolated per-slot workspaces.
+      CHALDEA_FLEET_REF: 946aa54d298fc47c635c0748bbffe27662e8c7a2
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: .node-version
           cache: npm
-      - run: mkdir -p "$TMPDIR"
+      - run: mkdir -p "$TMPDIR/test-home"
       - run: npm ci --ignore-scripts
       - run: npm run exec:check
-      - run: npm run exec:test
+      - run: HOME="$TMPDIR/test-home" npm run exec:test
       - name: Run ordered fallback against two fake job hosts
-        run: node --test test/exec/fallback.e2e.ts
+        run: HOME="$TMPDIR/test-home" node --test test/exec/fallback.e2e.ts
       - name: Check existing host capabilities without installing packages
         id: capabilities
         shell: bash
@@ -63,7 +63,7 @@ jobs:
         run: |
           export CHALDEA_JOB_SERVER="$TMPDIR/fleet/roles/chaldea_job_host/files/chaldea-job-server"
           set +e
-          npm run exec:e2e > "$TMPDIR/e2e.log" 2>&1
+          HOME="$TMPDIR/test-home" npm run exec:e2e > "$TMPDIR/e2e.log" 2>&1
           result=$?
           cat "$TMPDIR/e2e.log"
           if [ "$result" != 0 ] && grep -Eq 'Missing privilege separation directory|bwrap:.*(Operation not permitted|No permissions)' "$TMPDIR/e2e.log"; then

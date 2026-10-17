@@ -38,7 +38,7 @@ function disappearance(root: string, jobId: string) {
   });
 }
 
-test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, async t => {
+test('unprivileged SSH forced command + real bubblewrap', { timeout: 65000 }, async t => {
   assert.notEqual(tmpdir(), '/tmp', 'set TMPDIR to a disk-backed scratch directory');
   assert.notEqual(userInfo().uid, 0, 'must run without root');
   const pasta = process.env.CHALDEA_PASTA ?? '/usr/bin/pasta';
@@ -51,7 +51,9 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
   const sshConfig = join(scratch, 'ssh.conf');
   let daemon: ChildProcess | undefined;
   let daemonLog = '';
-  const env = { ...process.env, CHALDEA_STATE_DIR: state, CHALDEA_SSH_CONFIG: sshConfig };
+  const home = join(scratch, 'home');
+  assert.ok(home.startsWith(scratch + '/'), 'fixture HOME must be scratch');
+  const env = { ...process.env, HOME: home, CHALDEA_STATE_DIR: state, CHALDEA_SSH_CONFIG: sshConfig };
   let port: number;
   const listener = net.createServer();
   await new Promise<void>(r => listener.listen(0, '127.0.0.1', r));
@@ -67,7 +69,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
     await fs.writeFile(config, JSON.stringify({ state_root: jobroot, require_mount: false, pasta_binary: pasta, ...extra }));
   }
   try {
-    await fs.mkdir(work); await fs.mkdir(jobroot);
+    await fs.mkdir(home); await fs.mkdir(work); await fs.mkdir(jobroot);
     execFileSync('git', ['-C', work, 'init', '-q']);
     await fs.writeFile(join(work, 'input'), 'dirty worktree');
     // Ephemeral fixture keys only; never touch ~/.ssh or the user's agent.
@@ -137,13 +139,13 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
       assert.equal(JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8')).exitCode, 7);
     });
 
-    await t.test('concurrent local call reports and journals a refusal without dispatch', async () => {
+    await t.test('full single-slot server reports a durable refusal', async () => {
       const first = run(['--', 'python3', '-c', 'import time; print("locked",flush=True); time.sleep(100)']);
       let stderr = ''; first.stderr!.on('data', x => { stderr += x; });
       await Promise.race([once(first.stdout!, 'data'), once(first, 'close').then(() => { throw new Error(stderr); })]);
       const result = await collected(run(['--', 'printf', 'must-not-run']));
       assert.equal(result.code, 255); assert.equal(result.out, '');
-      assert.match(result.err, /refused: another local chaldea exec.*nothing dispatched/);
+      assert.match(result.err, /host refused: host busy/);
       const entries = await Promise.all((await fs.readdir(join(state, 'journal'))).filter(x => x.endsWith('.json')).map(async x => JSON.parse(await fs.readFile(join(state, 'journal', x), 'utf8'))));
       assert.ok(entries.some(x => x.outcome === 'refused' && x.argv.includes('must-not-run')));
       const id = /chaldea job ([0-9a-f-]+)/.exec(stderr)![1];
@@ -397,6 +399,41 @@ print('dns-config-ok')
         assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
       }
       await configure();
+    });
+    await t.test('two server slots run concurrently, third refuses, artifacts and cleanup stay isolated', { timeout: 15000 }, async () => {
+      await configure({ slots: 2 });
+      const children: ChildProcess[] = [];
+      const results: Promise<Awaited<ReturnType<typeof collected>>>[] = [];
+      try {
+        for (const name of ['first', 'second']) {
+          const child = run(['--artifact', 'result', '--', 'python3', '-c',
+            'import pathlib,time; pathlib.Path("result").write_text("' + name + '"); print("ready",flush=True); time.sleep(5)']);
+          children.push(child);
+          const ready = once(child.stdout!, 'data');
+          results.push(collected(child, 12000));
+          await Promise.race([ready, results.at(-1)!.then(r => { throw new Error('job exited before ready: ' + r.err); })]);
+        }
+        const third = await collected(run(['--', 'printf', 'must-not-run']));
+        assert.equal(third.code, 255, third.err);
+        assert.match(third.err, /all job slots/);
+        assert.equal(third.out, '');
+        const smoke = await collected(spawn('/usr/bin/python3', ['-I', server!, '--config', config, '--smoke-test'],
+          { env, stdio: ['ignore', 'pipe', 'pipe'] }));
+        assert.equal(smoke.code, 0, smoke.err); assert.match(smoke.err, /deferred/);
+        const finished = await Promise.all(results);
+        for (const [index, result] of finished.entries()) {
+          assert.equal(result.code, 0, result.err);
+          const id = /chaldea job ([0-9a-f-]+)/.exec(result.err)![1];
+          assert.equal(await fs.readFile(join(work, '.chaldea/artifacts', id, 'result'), 'utf8'),
+            ['first', 'second'][index]);
+        }
+        for (const slot of [0, 1]) assert.deepEqual(await fs.readdir(join(jobroot, 'slot-' + slot)), []);
+        const refusedId = /chaldea job ([0-9a-f-]+)/.exec(third.err)![1];
+        assert.equal(JSON.parse(await fs.readFile(join(state, 'journal', refusedId + '.json'), 'utf8')).outcome, 'refused');
+      } finally {
+        for (const child of children) child.kill('SIGTERM');
+        await Promise.all(results);
+      }
     });
   } finally {
     await collected(ssh(['-O', 'exit', 'chaldea-job-test'])).catch(() => {});

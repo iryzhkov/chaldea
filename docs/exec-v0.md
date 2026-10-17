@@ -106,9 +106,12 @@ Python forced command ignores user-site/PYTHONPATH configuration.
 - Local artifacts: 14 days and 20 GiB per destination across worktrees, accounted
   through the journal. Old completed artifacts are evicted under size pressure.
   Journal eviction also removes the referenced artifacts. Kernel flock protects
-  per-host accounting and requires no stale-lock cleanup after reboot. Calls to different targets may run concurrently. A second
-  local call for that host reports a busy refusal and journals refused without
-  contacting SSH.
+  accounting and requires no stale-lock cleanup after reboot. A short state-wide
+  lock protects journal changes, pruning and artifact reservations across targets
+  and worktrees. It is released before SSH dispatch: calls to the same host may
+  overlap, and the server's configured slots decide admission. Active jobs reserve
+  up to 64 MiB each before dispatch, so parallel artifact writers cannot overbook
+  the cap. A full server returns the existing refused outcome.
 - Local client journal: mode 0600, fsynced before SSH dispatch and atomically
   replaced after confirmed completion; 14 days / 1,000 entries, no output logs.
 

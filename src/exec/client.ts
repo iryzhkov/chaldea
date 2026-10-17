@@ -75,16 +75,6 @@ export async function staleControl(config: string, host: string) {
   }
 }
 
-async function refuseConcurrent(options: ReturnType<typeof argumentsFor> & { host: string }): Promise<never> {
-  const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
-  const journal = join(state, 'journal');
-  const intent: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
-    started: new Date().toISOString(), outcome: 'refused' };
-  await record(journal, intent);
-  await prune(journal);
-  throw new RetryableFailure('host ' + options.host + ' refused: another local chaldea exec is running; nothing dispatched; journal ' + join(journal, intent.jobId + '.json'), 'another local chaldea exec is running');
-}
-
 async function configuredHosts() {
   const path = process.env.CHALDEA_EXEC_HOSTS ?? join(homedir(), '.config/chaldea/exec-hosts');
   try { return hostsFor(await fs.readFile(path, 'utf8')); }
@@ -104,7 +94,7 @@ export async function run(args: string[]): Promise<number> {
     if (automatic && isLocalHost(host)) reason = 'local host';
     else {
       try {
-        const code = await lockedRun({ ...options, host }, automatic);
+        const code = await runOnHost({ ...options, host }, automatic);
         if (automatic) process.stderr.write('chaldea ran on ' + host + '\n');
         return code;
       } catch (e) {
@@ -119,22 +109,18 @@ export async function run(args: string[]): Promise<number> {
   return EXIT_UNAVAILABLE;
 }
 
-async function lockedRun(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean) {
-  const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
+// Only local accounting is serialized. The remote server owns job admission.
+async function withStateLock<T>(state: string, action: () => Promise<T>): Promise<T> {
   await fs.mkdir(state, { recursive: true, mode: 0o700 });
-  let lock: fs.FileHandle;
-  try { lock = await fs.open(join(state, 'artifacts-' + options.host.toLowerCase() + '.lock'), 'a', 0o600); }
-  catch { throw new Error('cannot open local host lock'); }
+  const lock = await fs.open(join(state, 'accounting.lock'), 'a', 0o600);
   try {
-    try {
-      // flock locks the inherited open file description. Our FileHandle keeps
-      // it held after flock exits; closing it (or a crash/reboot) releases it.
-      execFileSync('/usr/bin/flock', ['-n', '-E', '75', '3'], { stdio: ['ignore', 'pipe', 'pipe', lock.fd] });
-    } catch (e: any) {
-      if (e.status === 75) return await refuseConcurrent(options);
-      throw new Error('local host lock failed (flock exit ' + e.status + ')');
-    }
-    return await runOnHost(options, automatic);
+    // Async wait also works for concurrent run() calls within one process.
+    const child = spawn('/usr/bin/flock', ['-x', '3'], { stdio: ['ignore', 'ignore', 'pipe', lock.fd] });
+    const code = await new Promise<number | null>((resolve, reject) => {
+      child.once('error', reject); child.once('close', resolve);
+    });
+    if (code !== 0) throw new Error('local accounting lock failed (flock exit ' + code + ')');
+    return await action();
   } finally { await lock.close(); }
 }
 
@@ -143,10 +129,6 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   const artifactRoot = join(snapshot.root, '.chaldea/artifacts');
   const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
   const journal = join(state, 'journal');
-  await fs.mkdir(journal, { recursive: true, mode: 0o700 });
-  await cleanArtifacts(journal, options.host, options.artifacts.length ? MAX_ARTIFACT : 0);
-  await prune(journal, DAYS, 999);
-  if ((await fs.readdir(journal)).length >= 1000) throw new Error('journal at its 1000-entry cap; inspect retained outcomes before dispatch');
   const controls = join(state, 'ssh');
   await fs.mkdir(controls, { recursive: true, mode: 0o700 });
   const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
@@ -155,16 +137,27 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
     if (!automatic || !(e instanceof RetryableFailure)) throw e;
     const refused: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
       started: new Date().toISOString(), outcome: 'refused' };
-    await record(journal, refused);
+    await withStateLock(state, async () => {
+      await prune(journal, DAYS, 999);
+      if ((await fs.readdir(journal)).filter(x => x.endsWith('.json')).length >= 1000) throw new Error('journal at its 1000-entry cap; inspect retained outcomes before dispatch');
+      await record(journal, refused);
+    });
     throw new RetryableFailure(e.message + '; inspect journal ' + join(journal, refused.jobId + '.json'), e.reason);
   }
   const jobId = randomUUID();
   const intent: Intent = { jobId, host: options.host, argv: options.argv,
     started: new Date().toISOString(), pid: process.pid, bootId: BOOT_ID, outcome: 'uncertain',
-    worktree: snapshot.root, artifactDir: join(artifactRoot, jobId) };
+    worktree: snapshot.root, artifactDir: join(artifactRoot, jobId),
+    artifactReserve: options.artifacts.length ? MAX_ARTIFACT : 0 };
   // This fsync completes before the first possible remote side effect. Nothing
   // ever automatically retries an uncertain intent, including on a later invocation.
-  await record(journal, intent);
+  await withStateLock(state, async () => {
+    await fs.mkdir(journal, { recursive: true, mode: 0o700 });
+    await cleanArtifacts(journal, options.host, intent.artifactReserve);
+    await prune(journal, DAYS, 999);
+    if ((await fs.readdir(journal)).filter(x => x.endsWith('.json')).length >= 1000) throw new Error('journal at its 1000-entry cap; inspect retained outcomes before dispatch');
+    await record(journal, intent);
+  });
   process.stderr.write('chaldea job ' + jobId + '\n');
   const ssh = spawn('ssh', ['-F', config, '-T', '-a', '-x',
     '-o', 'BatchMode=yes', '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
@@ -258,7 +251,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
     if (result === undefined || sshCode !== 0) throw new Error('connection lost before a confirmed result');
     if (artifact) { await artifact.sync(); await artifact.close(); artifact = undefined; }
     intent.outcome = 'finished'; intent.exitCode = result;
-    await record(journal, intent, false);
+    await withStateLock(state, () => record(journal, intent, false));
     return result;
   } catch (e) {
     stop();
@@ -267,7 +260,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       e instanceof RetryableFailure ? 'connection-failed' : 'uncertain', requestSent, started, interrupted);
     if (retry || (e instanceof RemoteFailure && e.outcome !== 'uncertain' && (!automatic || e.outcome === 'preempted'))) {
       intent.outcome = retry ? 'refused' : (e as RemoteFailure).outcome;
-      await record(journal, intent, false);
+      await withStateLock(state, () => record(journal, intent, false));
     }
     const message = (e as Error).message + '; outcome ' + intent.outcome + '; inspect journal ' + join(journal, jobId + '.json');
     if (retry) throw new RetryableFailure(message, (e as Error).message);
@@ -275,7 +268,9 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   } finally {
     process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
     if (artifact) await artifact.close();
-    await prune(journal);
-    await cleanArtifacts(journal, options.host);
+    await withStateLock(state, async () => {
+      await prune(journal);
+      await cleanArtifacts(journal, options.host);
+    });
   }
 }
