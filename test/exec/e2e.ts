@@ -226,8 +226,17 @@ print('isolation-ok')
       const closed = once(child, 'close');
       child.kill('SIGKILL'); await deleted; await closed;
       for (const pid of pids) {
-        try { const status = await fs.readFile('/proc/' + pid + '/stat', 'utf8'); assert.match(status, /\) Z /); }
-        catch (e: any) { if (e.code !== 'ENOENT') throw e; }
+        // The server kills the job group before the workspace is removed, but on a
+        // loaded host the signalled processes can take a moment to exit. A process
+        // that is still alive after the bound is a real leak.
+        let status = '';
+        for (let attempt = 0; attempt < 100; attempt++) {
+          try { status = await fs.readFile('/proc/' + pid + '/stat', 'utf8'); }
+          catch (e: any) { if (e.code !== 'ENOENT') throw e; status = ''; break; }
+          if (/\) Z /.test(status)) break;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        if (status) assert.match(status, /\) Z /);
       }
       const intent = JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8'));
       assert.equal(intent.outcome, 'uncertain');
