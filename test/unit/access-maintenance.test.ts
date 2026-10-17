@@ -151,7 +151,8 @@ test("operator CLI initializes exclusively, signs fleet grants and verifies inst
       const pub = key.publicKey.export({ format: "jwk" });
       const t = new TrustStore(a, c, [{ kid: "deployment-1", public_key: { kty: "OKP", crv: "Ed25519", x: pub.x! } }]);
       await t.install(first);
-      assert.equal((await t.snapshot()).expires_at, now + 86400);
+      const signed = await t.snapshot();
+      assert.equal(signed.expires_at, signed.published_at + 86400);
     } finally { a.close(); }
     // Healthy clock plus valid lifetime isolates same-sequence equivocation.
     assert.equal(await maintenanceCli([...args, "--lifetime", "86399"]), 1);

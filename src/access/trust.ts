@@ -1,6 +1,6 @@
-import { DatabaseSync } from "node:sqlite";
-import { mkdirSync, lstatSync, openSync, closeSync, constants } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { openPrivateDb, tx, meta, migrate } from "../store/sqlite.ts";
+import { isAbsolute } from "node:path";
 import { compactVerify, CompactSign, importJWK } from "jose";
 import type { KeyObject } from "node:crypto";
 import {
@@ -27,26 +27,19 @@ export class AccessState {
   readonly db: DatabaseSync;
   constructor(path: string, options: { initialize?: boolean } = {}) {
     requireAccess(isAbsolute(path), "absolute_state_path_required");
-    if (options.initialize === true) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const dir = lstatSync(dirname(path));
-    requireAccess(dir.isDirectory() && !dir.isSymbolicLink() && dir.uid === process.geteuid!() &&
-      (dir.mode & 0o077) === 0, "unsafe_state_directory");
-    const create = options.initialize === true ? constants.O_CREAT | constants.O_EXCL : 0;
-    const fd = openSync(path, create | constants.O_RDWR | constants.O_NOFOLLOW, 0o600);
-    closeSync(fd);
-    const stat = lstatSync(path);
-    requireAccess(stat.isFile() && stat.uid === process.geteuid!() && (stat.mode & 0o077) === 0, "unsafe_state");
-    requireAccess(options.initialize === true || stat.size > 0, "uninitialized_state");
-    this.db = new DatabaseSync(path);
+    this.db = openPrivateDb(path, {
+      initialize: options.initialize === true, directoryError: "unsafe_state_directory",
+      fileError: "unsafe_state", emptyError: "uninitialized_state",
+    }, requireAccess);
     try {
       // Set the busy handler before any statement that can encounter another writer.
       this.db.exec("PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;");
       if (options.initialize === true) {
         this.db.exec("PRAGMA journal_mode=DELETE");
-        this.transaction(() => {
+        migrate(this.db, [() => {
           this.db.exec("CREATE TABLE access_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL)");
           this.put("format", "chaldea-access-state-v1");
-        });
+        }]);
       } else {
         // Reopening never creates a schema or repairs erased state. Acquire the write
         // lock before schema reads, avoiding SQLite's non-waiting read-to-write upgrade.
@@ -56,18 +49,17 @@ export class AccessState {
           requireAccess(mode.journal_mode === "delete", "invalid_journal_mode");
         });
       }
+      migrate(this.db, [() => {}]);
     } catch (error) { this.db.close(); throw error; }
   }
   get(name: string): string | undefined {
-    return (this.db.prepare("SELECT value FROM access_meta WHERE name=?").get(name) as { value: string } | undefined)?.value;
+    return meta(this.db, "access_meta").get(name);
   }
   put(name: string, value: string): void {
-    this.db.prepare("INSERT INTO access_meta VALUES (?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value").run(name, value);
+    meta(this.db, "access_meta").put(name, value);
   }
   transaction<T>(fn: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
-    try { const result = fn(); this.db.exec("COMMIT"); return result; }
-    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return tx(this.db, fn);
   }
   close(): void { this.db.close(); }
 }

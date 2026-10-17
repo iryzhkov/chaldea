@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { backoff } from "../retry.ts";
 import { fileURLToPath } from "node:url";
 
 /** One host calendar timer, reconstructed from SQLite on every transition/restart. */
@@ -20,7 +21,7 @@ export class Deadlines {
       const failed=() => {
         if (this.child !== child) return;
         this.child=undefined; failure();
-        this.retry=setTimeout(() => { this.retry=undefined; launch(); },Math.min(30_000,250*2**Math.min(this.failures++,7)));
+        this.retry=setTimeout(() => { this.retry=undefined; launch(); },backoff(this.failures++));
       };
       child.once("error",failed);
       child.once("exit",(code) => {

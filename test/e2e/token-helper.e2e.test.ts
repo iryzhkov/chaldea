@@ -54,7 +54,8 @@ test("real helper process mints a scratch Ed25519 bearer accepted by the existin
     const operation = { audience: "akasha" as const, resource: "quota", action: "append" };
     const verified = await verifyToken(token, operation, trust, clock);
     assert.equal(verified.claims.iss, "chaldea:agent-a");
-    assert.equal(verified.claims.exp - verified.claims.iat, 780);
+    // The producer deadline is sampled before the issuer rechecks its clock.
+    assert.ok(verified.claims.exp > verified.claims.iat && verified.claims.exp - verified.claims.iat <= 780);
     assert.equal(verified.claims.source, "quota"); assert.equal(verified.claims.host, "agent-a");
     const claims = decodeJwt(token);
     const sign = (payload: object, kid = "agent-a-2026-10") => new SignJWT({ ...payload })

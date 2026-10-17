@@ -100,7 +100,7 @@ test("legacy outbox migration replays attempted bytes before batching new wakes"
     const old=f.store.deliveries().find(d=>d.item===a.id)!;
     // Reproduce the pre-multiwait schema and a crash during an ambiguous send.
     f.store.db.prepare("UPDATE outbox SET state='sending',attempts=1 WHERE id=?").run(old.id);
-    f.store.db.exec("ALTER TABLE outbox DROP COLUMN batch_id");
+    f.store.db.exec("ALTER TABLE outbox DROP COLUMN batch_id; PRAGMA user_version=0");
     f.reopen();
     const recovered=f.store.dispatchable();
     assert.equal(recovered.length,1);assert.equal(recovered[0]!.id,old.id);
