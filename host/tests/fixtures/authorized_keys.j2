@@ -1,0 +1,3 @@
+{% for source in chaldea_job_host_sources %}
+restrict,from="{{ source.ip }}",command="{{ chaldea_job_host_command }}" {{ source.public_key }}
+{% endfor %}

@@ -11,6 +11,7 @@ permissions:
 jobs:
   client:
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -26,29 +27,51 @@ jobs:
             echo "TMPDIR=$RUNNER_TEMP/chaldea/tmp"
             echo "CHALDEA_TEST_SCRATCH=$RUNNER_TEMP/chaldea/tests"
           } >> "$GITHUB_ENV"
-      - name: Install sandbox tools
+      - name: Install real SSH and sandbox tools
         run: |
+          set -euo pipefail
+          trap 'reason="Real exec E2E prerequisites failed at line $LINENO; see this step log."; echo "::error::$reason"; echo "$reason" >> "$GITHUB_STEP_SUMMARY"' ERR
+          test "$HOME" = "$RUNNER_TEMP/chaldea/home"
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap passt
+          sudo apt-get install --yes --no-install-recommends bubblewrap passt openssh-server iproute2 build-essential curl xz-utils
+          sudo mkdir -p /run/sshd
+          # Ubuntu 24.04 restricts unprivileged user namespaces with AppArmor.
+          # This disposable runner must exercise the same userns launch as hosts.
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
           bwrap --version
-          pasta --version
-          # Same help probe as the reviewed job server: older pasta does not
-          # reliably flush --help. The intentionally unknown option exits nonzero.
-          pasta --chaldea-option-probe > "$TMPDIR/pasta-help" 2>&1 || true
-          for option in --foreground --dns --config-net --no-map-gw --map-host-loopback --no-splice; do
-            if ! grep -q -- "$option" "$TMPDIR/pasta-help"; then
-              reason="Exec SSH/sandbox E2E unavailable: Ubuntu apt pasta lacks required option $option."
-              echo "::notice::$reason"
-              echo "$reason" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
+          pasta=/usr/bin/pasta
+          compatible() {
+            "$1" --chaldea-option-probe > "$TMPDIR/pasta-help" 2>&1 || true
+            for option in --foreground --dns --config-net --no-map-gw --map-host-loopback --no-splice -t -u -T -U; do
+              grep -Eq -- "(^|[[:space:],])$option([[:space:],=]|$)" "$TMPDIR/pasta-help" || return 1
+            done
+          }
+          if ! compatible "$pasta"; then
+            # Upstream release archive, downloaded and SHA-256 checked at update time.
+            # https://passt.top/passt/tag/?h=2025_05_03.587980c
+            source="$RUNNER_TEMP/chaldea/passt"
+            archive="$TMPDIR/passt.tar.xz"
+            curl --fail --location --retry 3 https://passt.top/passt/snapshot/passt-2025_05_03.587980c.tar.xz -o "$archive"
+            echo "69d5eb843f7d648c2cc60bfbca6ea7b5014c6b6f07cdee362c2a8cf490515a49  $archive" | sha256sum --check
+            mkdir -p "$source"
+            tar --extract --xz --file "$archive" --directory "$source" --strip-components=1 --no-same-owner
+            make -C "$source" -j2 pasta
+            pasta="$source/pasta"
+            compatible "$pasta"
+          fi
+          "$pasta" --version
+          echo "CHALDEA_PASTA=$pasta" >> "$GITHUB_ENV"
+          echo "CHALDEA_SSHD=/usr/sbin/sshd" >> "$GITHUB_ENV"
       - run: npm ci --ignore-scripts
       - run: npm run exec:check
       - run: npm run exec:test
       - name: Run ordered fallback against two fake job hosts
         run: node --test test/exec/fallback.e2e.ts test/exec/queue.e2e.ts
-      - name: Explain exec SSH and sandbox E2E skip
+      - name: Run real SSH, bubblewrap and pasta against the in-tree server
         run: |
-          reason="Exec SSH/sandbox E2E skipped: its reviewed chaldea-job-server and SSH templates are pinned to private chaldea-fleet-config commit 435985308b84c1ad5ee0f3756100b9326a36a604. Hosted fork PR jobs have no deploy key. Exec typecheck/unit tests and the real-T3 E2E suite still run."
-          echo "::notice::$reason"
-          echo "$reason" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          test "$HOME" = "$RUNNER_TEMP/chaldea/home"
+          trap 'echo "Real exec SSH/sandbox E2E failed; see the test log (no skip)." >> "$GITHUB_STEP_SUMMARY"' ERR
+          node --test test/exec/e2e.ts

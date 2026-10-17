@@ -1,0 +1,496 @@
+#!/usr/bin/env python3
+"""Bounded cleanup of agent caches and T3 worktrees on one host.
+
+Runs from the chaldea-retention user timer, and by hand with --dry-run to see
+what a run would remove. Every pass has an explicit bound, and anything that
+looks in use is kept: a path is in use when a process of this user holds it as
+its working directory, root, executable, an open file or an absolute argument,
+or when anything under it changed within the protection window.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+DAY = 86400
+GIB = 1024**3
+CHALDEA_NODE_VERSION = os.environ.get("CHALDEA_NODE_VERSION", "")
+# Worktrees are moved here, on the same filesystem, before they are deleted.
+TRASH = ".chaldea-retention-trash"
+# Ignored directories that only hold regenerable output. A worktree whose
+# ignored paths all carry one of these names may go; any other ignored path,
+# such as an .env file or an output directory, keeps the worktree.
+DISPOSABLE_IGNORED = "node_modules,target,.venv,__pycache__,dist,build,.cache,.gradle,.pytest_cache,.mypy_cache,.ruff_cache,.tox"
+
+problems = []
+outcome = {"changed": 0, "releases": [], "task": "retention startup", "reason": ""}
+
+
+def summary(**fields):
+    """A private machine summary; never pass log messages or paths here."""
+    outcome.update(fields)
+    location = os.environ.get("CHALDEA_RUN_STATE")
+    if not location:
+        return
+    path = Path(location)
+    try:
+        data = json.loads(path.read_text())
+        data.update(outcome)
+        temporary = path.with_suffix(".new")
+        with open(temporary, "w", opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
+            json.dump(data, stream)
+        temporary.replace(path)
+    except (OSError, ValueError):
+        pass
+
+
+def changed(release=None):
+    outcome["changed"] += 1
+    if release:
+        outcome["release_count"] = outcome.get("release_count", 0) + 1
+        outcome["releases"] = (outcome["releases"] + [release])[-12:]
+    summary()
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def problem(message):
+    problems.append(message)
+    summary(reason="retention operation failed")
+    log(f"warning: {message}")
+
+
+def held_paths():
+    """Return the paths this user's processes hold or were started with."""
+    held = set()
+    me, self_pid = os.getuid(), str(os.getpid())
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or pid == self_pid:
+            continue
+        base = f"/proc/{pid}"
+        try:
+            if os.stat(base).st_uid != me:
+                continue
+            fds = [f"fd/{fd}" for fd in os.listdir(f"{base}/fd")]
+            with open(f"{base}/cmdline", "rb") as cmdline:
+                argv = cmdline.read().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        for name in ["cwd", "root", "exe", *fds]:
+            try:
+                held.add(os.readlink(f"{base}/{name}"))
+            except OSError:
+                pass
+        # A launcher path such as installs/claude/latest/claude resolves to the
+        # version it runs.
+        held.update(os.path.realpath(arg) for arg in argv if arg.startswith("/"))
+    held.discard("/")
+    return held
+
+
+def in_use(path, held):
+    prefix = str(path)
+    return any(h == prefix or h.startswith(prefix + "/") for h in held)
+
+
+def touched_since(path, cutoff):
+    """True when path or anything under it was modified after cutoff."""
+    try:
+        if os.lstat(path).st_mtime > cutoff:
+            return True
+    except FileNotFoundError:
+        return False
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            try:
+                if os.lstat(os.path.join(dirpath, name)).st_mtime > cutoff:
+                    return True
+            except OSError:
+                pass
+    return False
+
+
+def size_of(path):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        for name in dirnames + filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
+def gib(size):
+    return f"{size / GIB:.1f}G"
+
+
+def git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def find_worktrees(root, max_depth=3):
+    """Directories under root that hold a .git entry, without descending into them."""
+    found = []
+
+    def visit(directory, depth):
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            return
+        if any(entry.name == ".git" for entry in entries):
+            found.append(Path(directory))
+            return
+        if depth < max_depth:
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False) and not (depth == 0 and entry.name == TRASH):
+                    visit(entry.path, depth + 1)
+
+    visit(root, 0)
+    return [wt for wt in found if wt != root]
+
+
+def keep_reason(wt, disposable):
+    """Why removing the worktree could lose work, or None when it cannot."""
+    status = git("status", "--porcelain=v1", "-z", "--ignored", cwd=wt)
+    if status.returncode != 0:
+        return f"git status failed: {status.stderr.strip()}"
+    for record in status.stdout.split("\0"):
+        if not record:
+            continue
+        if not record.startswith("!! "):
+            return "uncommitted changes"
+        ignored = record[3:].rstrip("/")
+        if Path(ignored).name not in disposable:
+            return f"ignored path {ignored} is not in the disposable list"
+    if git("symbolic-ref", "-q", "HEAD", cwd=wt).returncode != 0:
+        contains = git("for-each-ref", "--contains", "HEAD", "--format=%(refname)", "refs/heads", "refs/remotes", cwd=wt)
+        if contains.returncode != 0 or not contains.stdout.strip():
+            return "detached HEAD not on any branch"
+    return None
+
+
+def changed_while_moved(moved, cutoff):
+    """touched_since for a worktree git has just moved, which rewrites its
+    .git file and the mtime of its top directory."""
+    return any(touched_since(entry.path, cutoff) for entry in os.scandir(moved) if entry.name != ".git")
+
+
+def common_dir(wt):
+    result = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=wt)
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def restore(moved, origin, common):
+    """Move a quarantined worktree back to where it was."""
+    if os.path.lexists(origin):
+        result = None
+    else:
+        result = git("--git-dir", common, "worktree", "move", str(moved), str(origin))
+    if result is None or result.returncode != 0:
+        detail = "the original path exists again" if result is None else result.stderr.strip()
+        problem(f"could not restore {origin} from {moved}: {detail}")
+        return False
+    return True
+
+
+def remove_worktree(wt, root, args, cutoff):
+    """Remove a clean linked worktree; keep anything that would lose work.
+
+    The worktree is first moved into the trash directory, which no session
+    opens, and checked again there: a session that started using it between
+    the first check and the move is still seen, and the worktree goes back.
+    """
+    reason = keep_reason(wt, args.disposable)
+    common = common_dir(wt)
+    if reason is None and common is None:
+        reason = "no git common dir"
+    if reason:
+        log(f"keep {wt}: {reason}")
+        return False
+    if args.dry_run:
+        log(f"would remove worktree {wt} ({size_of(wt)} bytes)")
+        return True
+    trash = root / TRASH
+    trash.mkdir(mode=0o700, exist_ok=True)
+    slot = Path(tempfile.mkdtemp(prefix="wt-", dir=trash))
+    (slot / "origin").write_text(f"{wt}\n")
+    moved = slot / "worktree"
+    result = git("--git-dir", common, "worktree", "move", str(wt), str(moved))
+    if result.returncode != 0:
+        shutil.rmtree(slot, ignore_errors=True)
+        log(f"keep {wt}: {result.stderr.strip()}")
+        return False
+    doubt = None
+    if in_use(moved, held_paths()):
+        doubt = "a process started using it"
+    elif changed_while_moved(moved, cutoff):
+        doubt = "it changed during the check"
+    else:
+        doubt = keep_reason(moved, args.disposable)
+    if doubt:
+        if restore(moved, wt, common):
+            shutil.rmtree(slot, ignore_errors=True)
+        log(f"keep {wt}: {doubt}")
+        return False
+    result = git("--git-dir", common, "worktree", "remove", str(moved))
+    if result.returncode != 0:
+        if restore(moved, wt, common):
+            shutil.rmtree(slot, ignore_errors=True)
+        log(f"keep {wt}: {result.stderr.strip()}")
+        return False
+    shutil.rmtree(slot, ignore_errors=True)
+    changed()
+    log(f"removed worktree {wt}")
+    return True
+
+
+def recover_trash(root):
+    """Put back worktrees an interrupted run left in the trash directory."""
+    trash = root / TRASH
+    if not trash.is_dir():
+        return
+    for slot in trash.iterdir():
+        moved = slot / "worktree"
+        if not moved.exists():
+            shutil.rmtree(slot, ignore_errors=True)
+            continue
+        try:
+            origin = Path((slot / "origin").read_text().strip())
+        except OSError:
+            problem(f"{moved} has no recorded origin; restore it by hand")
+            continue
+        common = common_dir(moved)
+        if common is None:
+            problem(f"{moved} is no longer a git worktree; restore it to {origin} by hand")
+        elif restore(moved, origin, common):
+            shutil.rmtree(slot, ignore_errors=True)
+            changed()
+            log(f"restored {origin} from an interrupted run")
+
+
+def prune_worktrees(root, args, held, now):
+    if not root.is_dir():
+        log(f"worktrees: {root} absent, skipped")
+        return 0
+    root = root.resolve()
+    if not args.dry_run:
+        recover_trash(root)
+    candidates = sorted(find_worktrees(root), key=lambda wt: wt.stat().st_mtime)
+    total, freed, removed = size_of(root), 0, set()
+
+    def sweep(age_days, stop_at=None):
+        nonlocal freed
+        cutoff = now - max(age_days * DAY, args.protect_hours * 3600)
+        for wt in candidates:
+            if stop_at is not None and total - freed <= stop_at:
+                return
+            if wt in removed or in_use(wt, held) or touched_since(wt, cutoff):
+                continue
+            size = size_of(wt)
+            if remove_worktree(wt, root, args, cutoff):
+                removed.add(wt)
+                freed += size
+
+    sweep(args.worktree_max_age_days)
+    budget = args.worktree_budget_gb * GIB
+    if total - freed > budget:
+        log(f"worktrees: {gib(total - freed)} over the {gib(budget)} budget; removing clean worktrees untouched for {args.worktree_pressure_age_days} days")
+        sweep(args.worktree_pressure_age_days, stop_at=budget)
+    used = total - freed
+    log(f"worktrees: {len(removed)} removed, {gib(freed)} freed, {gib(used)} in use of {gib(budget)}")
+    if used > budget:
+        summary(reason="worktree budget exceeded")
+        log(f"warning: worktrees still over budget ({gib(used)} > {gib(budget)})")
+        return 1
+    return 0
+
+
+def prune_tmp(root, args, held, now):
+    if not root.is_dir():
+        log(f"tmp: {root} absent, skipped")
+        return
+    root = root.resolve()
+    cutoff = now - max(args.tmp_max_age_days * DAY, args.protect_hours * 3600)
+    count, freed, leftovers = 0, 0, 0
+    for entry in os.scandir(root):
+        path = Path(entry.path)
+        try:
+            if in_use(path, held) or touched_since(path, cutoff):
+                continue
+            is_directory = entry.is_dir(follow_symlinks=False)
+            size = size_of(path) if is_directory else path.lstat().st_blocks * 512
+        except OSError:
+            # Entries can disappear or become inaccessible during inspection.
+            continue
+        if args.dry_run:
+            log(f"would remove {path} ({size} bytes)")
+        else:
+            try:
+                if is_directory:
+                    # Read-only module trees can contain removable siblings:
+                    # continue through errors just as the original cleanup did.
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if os.path.lexists(path):
+                leftovers += 1
+                continue
+            changed()
+        count += 1
+        freed += size
+    summary(tmp_leftovers=leftovers)
+    if leftovers:
+        log(f"note: tmp: {leftovers} entries remain after best-effort cleanup")
+    log(f"tmp: {count} entries older than {args.tmp_max_age_days} days {'would be ' if args.dry_run else ''}removed ({freed} bytes)")
+
+
+
+def prune_go_cache(args, held):
+    go = shutil.which("go")
+    if not go:
+        log("go cache: go not installed, skipped")
+        return
+    result = subprocess.run([go, "env", "GOCACHE"], capture_output=True, text=True)
+    cache = Path(result.stdout.strip())
+    if result.returncode != 0 or not cache.is_dir():
+        log("go cache: none, skipped")
+        return
+    size, limit = size_of(cache), args.go_cache_max_gb * GIB
+    if size <= limit:
+        log(f"go cache: {gib(size)} within {gib(limit)}")
+    elif in_use(cache.resolve(), held):
+        log(f"go cache: {gib(size)} over {gib(limit)} but a build is using it; kept")
+    elif args.dry_run:
+        log(f"go cache: {gib(size)} over {gib(limit)}; would run go clean -cache ({size} bytes)")
+    else:
+        result = subprocess.run([go, "clean", "-cache"], check=False)
+        if result.returncode:
+            problem("go clean -cache failed")
+        else:
+            changed()
+            log(f"go cache: {gib(size)} over {gib(limit)}; cleaned")
+
+
+
+PRUNABLE = re.compile(r"^mise (\S+)@(\S+) is prunable")
+PRUNE_REMOVES = re.compile(r"^mise (\S+)@(\S+) \[dryrun\]\s+remove ([^,\s]+)")
+
+
+def parse_prune_plan(output):
+    """The (tool, version, install path) triples a mise prune dry run lists."""
+    versions, paths = [], {}
+    for line in output.splitlines():
+        if match := PRUNABLE.match(line):
+            versions.append(match.groups())
+        elif match := PRUNE_REMOVES.match(line):
+            paths[match.group(1, 2)] = os.path.expanduser(match.group(3))
+    return [(tool, version, paths.get((tool, version))) for tool, version in versions]
+
+
+def prune_reason(path, held):
+    """Why an install mise would prune has to stay, or None."""
+    if path is None:
+        return "install path not known"
+    real = os.path.realpath(path)
+    chaldea_node = Path.home() / ".local/share/mise/installs/node" / CHALDEA_NODE_VERSION
+    if real == os.path.realpath(chaldea_node):
+        return "the pinned Chaldea runtime"
+    latest = os.path.join(os.path.dirname(path), "latest")
+    # T3 launches providers through installs/<tool>/latest, whatever the
+    # configured version resolves to.
+    if os.path.islink(latest) and os.path.realpath(latest) == real:
+        return "the latest link points at it"
+    if in_use(real, held) or in_use(path, held):
+        return "a process uses it"
+    return None
+
+
+def prune_mise(args, held):
+    if not args.no_mise_prune and not CHALDEA_NODE_VERSION:
+        problem("CHALDEA_NODE_VERSION must be configured before pruning mise installs")
+        return
+    mise = shutil.which("mise")
+    if args.no_mise_prune or not mise:
+        log("mise: prune skipped")
+        return
+    plan = subprocess.run([mise, "prune", "--tools", "--dry-run"], capture_output=True, text=True)
+    if plan.returncode != 0:
+        problem(f"mise prune --dry-run failed: {plan.stderr.strip()}")
+        return
+    for tool, version, path in parse_prune_plan(plan.stdout + plan.stderr):
+        reason = prune_reason(path, held)
+        if reason:
+            log(f"mise: keep {tool}@{version}: {reason}")
+        elif args.dry_run:
+            log(f"mise: would uninstall {tool}@{version} ({size_of(path)} bytes in install; download cache excluded)")
+        else:
+            result = subprocess.run([mise, "uninstall", f"{tool}@{version}"], capture_output=True, text=True)
+            if result.returncode == 0:
+                changed(f"{tool}@{version}")
+                log(f"mise: uninstalled {tool}@{version}")
+            else:
+                problem(f"mise uninstall {tool}@{version} failed: {result.stderr.strip()}")
+
+
+def parse_args(argv):
+    home = Path.home()
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--dry-run", action="store_true", help="report what would be removed")
+    parser.add_argument("--protect-hours", type=float, default=24)
+    parser.add_argument("--worktree-root", type=Path, default=home / ".t3/worktrees")
+    parser.add_argument("--worktree-max-age-days", type=float, default=14)
+    parser.add_argument("--worktree-pressure-age-days", type=float, default=3)
+    parser.add_argument("--worktree-budget-gb", type=float, default=20)
+    parser.add_argument("--disposable-ignored", default=DISPOSABLE_IGNORED, help="comma-separated names of ignored directories a removable worktree may hold")
+    parser.add_argument("--tmp-dir", type=Path, default=home / ".cache/tmp")
+    parser.add_argument("--tmp-max-age-days", type=float, default=3)
+    parser.add_argument("--go-cache-max-gb", type=float, default=10)
+    parser.add_argument("--no-mise-prune", action="store_true")
+    args = parser.parse_args(argv)
+    args.disposable = {name for name in args.disposable_ignored.split(",") if name}
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    now, held = time.time(), held_paths()
+    problems.clear()
+    summary(changed=0, releases=[], release_count=0, tmp_leftovers=0, complete=False,
+            task="retention startup", reason="")
+    failed_task, failed_reason = "", ""
+    stages = [
+        ("prune worktrees", prune_worktrees, (args.worktree_root, args, held, now)),
+        ("prune temporary files", prune_tmp, (args.tmp_dir, args, held, now)),
+        ("prune Go cache", prune_go_cache, (args, held)),
+        ("prune mise installs", prune_mise, (args, held)),
+    ]
+    for name, stage, arguments in stages:
+        summary(task=name, reason="")
+        before = len(problems)
+        try:
+            status = stage(*arguments)
+        except Exception:
+            # Keep stages independent and never copy exception text/values to
+            # unattended records. The stage name identifies what failed.
+            problem(f"{name}: stage failed")
+            status = 1
+        if not failed_task and (status or len(problems) > before):
+            failed_task, failed_reason = name, outcome["reason"] or "retention stage failed"
+    summary(task=failed_task, reason=failed_reason, complete=True)
+    return 1 if failed_task else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

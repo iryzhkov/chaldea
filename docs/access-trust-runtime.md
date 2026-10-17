@@ -4,6 +4,12 @@ Source only; no deployment or real keys. The [access contract](access-v1.md)
 remains authoritative. Commands: chaldea access initialize-state, sign-bundle,
 install-bundle, clock-health (each accepts --help). Fleet packaging and exact
 future rollout steps: chaldea-fleet-config docs/access-trust.md.
+The deployment path contract is `chaldea_access_paths` in
+[chaldea-fleet-config inventory](https://github.com/iryzhkov/chaldea-fleet-config/blob/main/inventory/group_vars/all.yml).
+The updater config, clock unit and verifier config use its `bundle`, `clock_health`,
+`updater_state` and `verifier_state` values. The two databases are distinct;
+verifier state is owned by its service in a separate private directory. CLI examples
+must use rendered values from this mapping.
 
 The operator signs operator-reviewed public TrustedKey records from fleet-config
 access-trust/issuer-grants.json on omarchy-pc. sign-bundle creates published_at
@@ -45,7 +51,7 @@ and a root-protected Unix monitoring socket separately (no UDP fallback or local
 Hosts with only timesyncd must provision chrony before activation.
 
 The adapter atomically writes exactly {healthy,offsetSeconds,checked_at} every
-10s into root-owned 0644 /run/chaldea-access-trust/clock-health.json. /run removes
+10s into the root-owned 0644 `clock_health` path from that mapping. /run removes
 previous-boot evidence; Akasha requires freshness within 30s on every clock check.
 Unknown/malformed output, local fallback/no reference, invalid stratum,
 non-normal leap status, stale measurements and command failure write unhealthy.

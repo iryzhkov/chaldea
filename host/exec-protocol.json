@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "queueVersion": 1,
+  "commands": {
+    "exec": "chaldea-exec-v0",
+    "queue": "chaldea-exec-queue-v1"
+  },
+  "limits": {
+    "maxFrame": 1048576,
+    "maxSnapshot": 67108864,
+    "maxArtifact": 67108864,
+    "maxOutput": 67108864,
+    "chunk": 65536,
+    "maxFiles": 10000,
+    "maxArgv": 256,
+    "maxArgvBytes": 16384,
+    "maxArtifacts": 32,
+    "maxQueueSeconds": 86400,
+    "maxPathBytes": 4096
+  },
+  "fileModes": {
+    "regular": 420,
+    "executable": 493
+  },
+  "frames": {
+    "H": "hello",
+    "Q": "request",
+    "B": "bytes",
+    "E": "uploadEnd",
+    "O": "stdout",
+    "S": "stderr",
+    "A": "artifact",
+    "X": "result",
+    "R": "refusal",
+    "W": "wait",
+    "Y": "ready",
+    "G": "go",
+    "C": "cancel"
+  },
+  "paths": {
+    "forbiddenCharacters": [
+      "\\",
+      "\u0000"
+    ],
+    "forbiddenComponents": [
+      "",
+      ".",
+      "..",
+      ".git",
+      ".chaldea"
+    ],
+    "reservedPrefixes": [
+      ".chaldea-"
+    ],
+    "snapshotExclude": "/.chaldea/"
+  }
+}

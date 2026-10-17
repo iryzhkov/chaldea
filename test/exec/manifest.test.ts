@@ -35,6 +35,10 @@ test('reject symlinks, directory entries (submodules), FIFOs, and oversized inpu
   const root = await fs.mkdtemp(join(tmpdir(), 'manifest-reject-'));
   execFileSync('git', ['-C', root, 'init', '-q']);
   try {
+    await fs.mkdir(join(root, '.chaldea-home'));
+    await fs.writeFile(join(root, '.chaldea-home/key'), 'must not reach server internals');
+    await assert.rejects(manifest(root), /unsafe relative path/);
+    await fs.rm(join(root, '.chaldea-home'), { recursive: true });
     await fs.symlink('/etc/passwd', join(root, 'link'));
     await assert.rejects(manifest(root), /ELOOP/);
     await fs.unlink(join(root, 'link'));

@@ -1,0 +1,33 @@
+Port {{ chaldea_job_host_port }}
+{% for address in chaldea_job_host_listen %}
+ListenAddress {{ address }}
+{% endfor %}
+PidFile {{ chaldea_job_host_pid_file }}
+AllowUsers {{ chaldea_job_host_user }}
+HostKey {{ chaldea_job_host_host_key }}
+AuthorizedKeysFile {{ chaldea_job_host_authorized_keys }}
+StrictModes yes
+UsePAM no
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+PermitEmptyPasswords no
+PermitUserEnvironment no
+ClientAliveInterval 15
+ClientAliveCountMax 2
+LoginGraceTime 30
+MaxAuthTries 2
+MaxSessions 1
+LogLevel {{ chaldea_job_host_log_level }}
+Match User {{ chaldea_job_host_user }}
+    ForceCommand {{ chaldea_job_host_command }}
+    DisableForwarding yes
+    AllowTcpForwarding no
+    AllowStreamLocalForwarding no
+    AllowAgentForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    PermitTTY no
+    PermitUserRC no
