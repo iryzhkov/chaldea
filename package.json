@@ -5,14 +5,17 @@
   "description": "Chaldea: extensions to official T3 (quota observer first).",
   "type": "module",
   "bin": {
-    "chaldea": "./bin/chaldea"
+    "chaldea": "./bin/chaldea",
+    "akasha": "./bin/akasha"
   },
   "engines": {
     "node": "26.10.0"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "test": "npm run test:unit && npm run test:e2e",
+    "akasha:test": "scripts/with-scratch node --test 'test/akasha/*.test.ts'",
+
+    "test": "npm run test:unit && npm run akasha:test && npm run test:e2e",
     "test:unit": "scripts/with-scratch node --test 'test/unit/*.test.ts'",
     "test:e2e": "scripts/with-scratch node --test --test-concurrency=1 'test/e2e/*.test.ts'",
     "exec:check": "tsc -p tsconfig.exec.json",
@@ -20,6 +23,8 @@
     "exec:e2e": "node --test test/exec/e2e.ts"
   },
   "dependencies": {
+    "@nats-io/jetstream": "3.4.0",
+    "@nats-io/transport-node": "3.4.0",
     "effect": "4.0.4",
     "jose": "6.2.12",
     "ws": "8.22.0"
