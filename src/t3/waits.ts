@@ -53,7 +53,12 @@ export function readProjection(client: WsClient, id: string) {
         const first=items[0];
         if (first?.kind !== "snapshot") return Effect.fail(original);
         const exists=[...first.snapshot.threads,...first.snapshot.archivedThreads].some(t=>t.id===id && t.deletedAt===null);
-        return exists ? Effect.fail(original) : Effect.succeed(null);
+        if (exists) return Effect.fail(original);
+        // 0.1.0's active stream always has archivedThreads:[]; absence there
+        // alone cannot establish deletion. Verify the separate archived view.
+        return client["orchestration.getArchivedShellSnapshot"]({}).pipe(
+          Effect.flatMap(archived=>archived.threads.some(t=>t.id===id && t.deletedAt===null)
+            ? Effect.fail(original) : Effect.succeed(null)));
       }))));
 }
 export function createWaitT3(options: () => ConnectOptions, expectedEnvironment: string): WaitT3 {

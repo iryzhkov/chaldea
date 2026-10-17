@@ -7,13 +7,15 @@ import { OrchestrationV2GetThreadProjectionError } from "../../vendor/t3-contrac
 
 test("projection errors need positive shell evidence before classifying deletion",async()=>{
   const failure=new OrchestrationV2GetThreadProjectionError({threadId:"parent" as never,message:"Temporary projection read failed"});
-  const client=(threads:unknown[],shellFails=false)=>({
+  const client=(threads:unknown[],shellFails=false,archived:unknown[]=[])=>({
+    "orchestration.getArchivedShellSnapshot":()=>Effect.succeed({threads:archived}),
     "orchestration.getThreadProjection":()=>Effect.fail(failure),
     "orchestration.subscribeShell":()=>shellFails?Stream.fail(new Error("Shell unavailable")):
       Stream.make({kind:"snapshot",snapshot:{threads,archivedThreads:[]}}),
   }) as never;
   await assert.rejects(Effect.runPromise(readProjection(client([{id:"parent",deletedAt:null}]),"parent")),/Temporary/);
   await assert.rejects(Effect.runPromise(readProjection(client([],true),"parent")),/Shell unavailable/);
+  await assert.rejects(Effect.runPromise(readProjection(client([],false,[{id:"parent",deletedAt:null}]),"parent")),/Temporary/);
   assert.equal(await Effect.runPromise(readProjection(client([]),"parent")),null);
   assert.equal(await Effect.runPromise(readProjection(client([{id:"parent",deletedAt:{}}]),"parent")),null);
 });
