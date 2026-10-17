@@ -83,6 +83,9 @@ for (const scenario of ["available", "exhausted", "crash", "crash-before-reset",
           // threads; the production expiry path must clear the owned hold.
           for (let attempt = 0; attempt < 100 && (await port().thread(threadId))?.limitRecovery; attempt++) await sleep(100);
           assert.equal((await port().thread(threadId))!.limitRecovery, null);
+          // Clearing the remote hold precedes the local final checkpoint.
+          await waitFor("expired archived switch final local phase", () =>
+            [...loadState(statePath, Date.now()).switches.values()][0]?.phase === "cancelled", 10_000);
           assert.equal([...loadState(statePath, Date.now()).switches.values()][0]!.phase, "cancelled");
           await withClient({ serverUrl: t3.serverUrl, token }, (client) => client["orchestration.dispatchCommand"]({
             type: "thread.unarchive", commandId: "unarchive-cleaned-stop", threadId,
