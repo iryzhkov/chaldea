@@ -8,9 +8,13 @@ export interface DecisionInput {
   threadId: string; requestId: string; question: string; options: string[];
   dependentAction: string; defaultAction: "skip" | "defer"; deadline: string;
 }
-export type Input = WaitInput | DecisionInput;
+export interface NativeDecisionInput {
+  threadId: string; requestId: string; dependentAction: string; defaultAction: "skip" | "defer"; deadline: string;
+  runtimeRequestId?: string;
+}
+export type Input = WaitInput | DecisionInput | NativeDecisionInput;
 export type AnswerSource = "page" | "cli" | `mcp:${string}`;
-export type Outcome = { reason: string; answer?: string; defaulted?: boolean; action?: "skip" | "defer"; source?: AnswerSource; runId?: string };
+export type Outcome = { reason: string; answer?: string; defaulted?: boolean; action?: "skip" | "defer"; source?: AnswerSource | "t3" | "chaldea"; runId?: string; runtimeRequestId?: string; detail?: string };
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected an object");
   return value as Record<string, unknown>;
@@ -30,7 +34,7 @@ export function requestTime(key: unknown): number {
   if (!/^\d{13}:[A-Za-z0-9_-]{1,128}$/.test(s)) throw new Error("requestId must be <epoch milliseconds>:<unique key>");
   return Number(s.slice(0, 13));
 }
-export function validate(kind: "wait" | "decision", value: unknown, now: number): { input: Input; deadline: number; requestAt: number } {
+export function validate(kind: "wait" | "decision" | "native", value: unknown, now: number): { input: Input; deadline: number; requestAt: number } {
   const v = object(value);
   text(v.threadId, "threadId"); const requestAt = requestTime(v.requestId);
   if (requestAt > now + 300_000 || requestAt < now - MAX_AGE) throw new Error("requestId outside replay age");
@@ -50,6 +54,13 @@ export function validate(kind: "wait" | "decision", value: unknown, now: number)
       deadline = v.deadline === undefined ? requestAt + DAY : timestamp(v.deadline);
     } else throw new Error("Unsupported condition (only time and same-host thread waits)");
     input = { threadId: v.threadId as string, requestId: v.requestId as string, condition, deadline: new Date(deadline).toISOString() };
+  } else if (kind === "native") {
+    if (v.defaultAction !== "skip" && v.defaultAction !== "defer") throw new Error("Default action must only skip or defer");
+    deadline = timestamp(v.deadline);
+    input = {threadId:v.threadId as string,requestId:v.requestId as string,
+      dependentAction:text(v.dependentAction,"dependentAction",512),defaultAction:v.defaultAction,
+      deadline:new Date(deadline).toISOString(),
+      ...(v.runtimeRequestId === undefined ? {} : {runtimeRequestId:text(v.runtimeRequestId,"runtimeRequestId",2048)})};
   } else {
     if (!Array.isArray(v.options) || v.options.length < 2 || v.options.length > 8) throw new Error("Provide 2–8 options");
     const options = v.options.map(o => text(o, "option", 256));

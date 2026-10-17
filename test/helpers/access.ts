@@ -21,7 +21,7 @@ interface VectorSet {
   format: string; anchors: TrustAnchor[]; clock: ClockSample; operation: Operation; bundle: string;
   cases: VectorCase[]; scenarios: Array<{ name: string; steps: VectorStep[] }>;
 }
-export const vectorSets = ["v1.json", "v1-encoding.json"].map(name =>
+export const vectorSets = ["v1.json", "v1-encoding.json", "v1-freshness.json"].map(name =>
   JSON.parse(readFileSync(new URL("../fixtures/access/" + name, import.meta.url), "utf8")) as VectorSet);
 export const vectors = vectorSets[0]!;
 export async function rig() {
