@@ -30,9 +30,10 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   const script = join(root, 'fake-ssh.mjs'); const log = join(root, 'attempts');
   const control = join(root, 'control');
   const sockets = new Set<net.Socket>();
+  let receivedBanner = '';
   const listener = net.createServer(socket => {
     sockets.add(socket);
-    socket.on('data', () => {}); // Consume the banner, but never answer SSH setup.
+    socket.on('data', data => { receivedBanner += data.toString(); }); // Never answer SSH setup.
     socket.on('close', () => sockets.delete(socket));
   });
   let port = 0;
@@ -52,7 +53,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     'const args = process.argv.slice(2);',
     'const host = (args.includes("-G") || args.includes("-O") ? args.at(-1) : args.at(-2)).replace("chaldea-job-", "");',
     'const mode = JSON.parse(process.env.FAKE_MODES)[host] ?? "ok";',
-    'const log = event => fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({host,event})+"\\n");',
+    'const log = event => fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({host,event,args})+"\\n");',
     'const send = (type, value) => process.stdout.write(frame(type, json(value)));',
     'if (args.includes("-G")) { console.log("controlpath " + (mode === "stuck-control" ? process.env.FAKE_CONTROL : "none")); process.exit(0); }',
     'if (args.includes("-O") && mode === "stuck-control") { log("control-check"); await new Promise(r => setTimeout(r, 30000)); process.exit(0); }',
@@ -86,7 +87,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     CHALDEA_EXEC_HOSTS: hostFile, CHALDEA_SSH_CONFIG: sshConfig,
     FAKE_MODES: JSON.stringify(modes), FAKE_LOG: log, FAKE_CONTROL: control, FAKE_REAL_SSH: realSsh };
   return {
-    state, hostFile,
+    state, hostFile, banner: () => receivedBanner,
     run: (host?: string, code: number | 'hold' = 0) => spawn(process.execPath,
       [cli, 'exec', '--no-queue', ...(host ? ['--host', host] : []), '--', process.execPath, '-e', 'console.log("ran");process.exit(' + (code === 'hold' ? 0 : code) + ')', ...(code === 'hold' ? ['hold'] : [])],
       { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] }),
@@ -195,15 +196,18 @@ test('same target accepts overlapping local execs; accounting lock is released d
   }
 });
 
-test('SSH setup to a silent host times out in ten seconds and falls through', { timeout: 25000 }, async () => {
+test('SSH setup to a silent host honors ConnectTimeout and falls through', { timeout: 60000 }, async () => {
   const f = await fixture({ 'fake-a': 'connect-hang' });
   const child = f.run();
   try {
-    const start = performance.now();
     const r = await collected(child);
-    const elapsed = performance.now() - start;
     assert.equal(r.code, 0, r.err);
-    assert.ok(elapsed >= 9000 && elapsed < 16000, 'SSH setup elapsed ' + elapsed + ' ms: ' + r.err);
+    // Completion is driven by real OpenSSH's setup failure. Check its configured
+    // timeout directly; process startup and runner scheduling are not the contract.
+    const attempt = (await f.events()).find(e => e.host === 'fake-a' && e.event === 'connected');
+    assert.ok(attempt.args.includes('ConnectTimeout=10'));
+    assert.match(f.banner(), /^SSH-2\.0-OpenSSH/);
+    assert.match(r.err, /Connection timed out during banner exchange/);
     assert.match(r.err, /skipped fake-a: connection closed before job request/);
     assert.match(r.err, /ran on fake-b/);
     assert.deepEqual((await f.events()).filter(e => e.event === 'requested').map(e => e.host), ['fake-b']);
