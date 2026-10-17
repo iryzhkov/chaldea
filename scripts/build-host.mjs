@@ -14,6 +14,7 @@ try {
   for (const [source, name] of [
     ['src/access/maintenance.ts', 'access-maintenance.mjs'],
     ['src/events/collector.ts', 'akasha-collector.mjs'],
+    ['src/akasha/entry.ts', 'akasha-service.mjs'],
   ]) {
     await build({ entryPoints: [source], outfile: join(stage, 'host', name), bundle: true,
       platform: 'node', format: 'esm', target: 'node26', packages: 'bundle',

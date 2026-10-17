@@ -48,6 +48,7 @@ jobs:
           mkdir "$TMPDIR/unpack"
           tar -xzf "$TMPDIR/release/chaldea-host.tar.gz" -C "$TMPDIR/unpack"
           node "$TMPDIR/unpack/host/access-maintenance.mjs" --help | grep -F "Usage: chaldea access"
+          node "$TMPDIR/unpack/host/akasha-service.mjs" --help | grep -F "Usage: akasha"
           AKASHA_STATE_FILE="$TMPDIR/collector.db" AKASHA_SPOOL="$TMPDIR/empty" AKASHA_TIMER_SPOOL="$TMPDIR/empty-timers" node "$TMPDIR/unpack/host/akasha-collector.mjs"
       - name: Upload candidate artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

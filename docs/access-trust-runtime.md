@@ -45,10 +45,18 @@ ordinary cancellation retain package C's bound.
 
 ## Clock adapter
 
-Read-only /usr/bin/chronyc -n -h /run/chrony/chronyd.sock tracking runs as root with C locale, a 3s
-timeout and 8 KiB output cap. Provision chrony with independent external sources
-and a root-protected Unix monitoring socket separately (no UDP fallback or local/orphan mode); no time service is configured by this task.
-Hosts with only timesyncd must provision chrony before activation.
+The adapter supports systemd-timesyncd and chrony without changing time services.
+On active timesyncd hosts it reads NTPSynchronized from timedate1 and NTPMessage /
+PollIntervalUSec from timesync1 using bounded, read-only busctl calls on the system
+bus. The typed NTP timestamps give offset = ((receive-origin)+(transmit-destination))/2;
+each timestamp is in microseconds. It requires synchronization, a valid external
+reference, NTP server mode/stratum/leap, a non-ignored packet and a recent measurement.
+The layout follows [systemd's D-Bus implementation](https://github.com/systemd/systemd/blob/main/src/timesync/timesyncd-bus.c).
+Unknown state or any active-timesyncd query failure writes unhealthy and never falls
+back to another daemon. With timesyncd inactive, the retained chrony adapter reads
+/usr/bin/chronyc -n -h /run/chrony/chronyd.sock tracking, with no UDP fallback.
+Configure independent external sources separately; homelab, omarchy-pc and agent-a
+retain timesyncd. No migration or daemon configuration is part of this change.
 
 The adapter atomically writes exactly {healthy,offsetSeconds,checked_at} every
 10s into the root-owned 0644 `clock_health` path from that mapping. /run removes

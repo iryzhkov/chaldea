@@ -82,6 +82,61 @@ export function sampleChrony(readTracking: () => string = () =>
     return chronyHealth(report, now);
   } catch { return { healthy: false, offsetSeconds: 0, checked_at: now }; }
 }
+
+/** systemd's typed D-Bus NTPMessage: uuuuittayttttbtt, in microseconds.
+ * Reject unknown layouts rather than interpreting localized status prose. */
+export function timesyncdHealth(synchronized: string, report: string, poll: string, now: number): Health {
+  const bad = { healthy: false, offsetSeconds: 0, checked_at: now };
+  try {
+    requireAccess(synchronized.trim() === "b true", "unsynchronised");
+    const values = report.trim().split(/\s+/);
+    requireAccess(values.shift() === "(uuuuittayttttbtt)" && values.length === 19, "unknown_ntp_message");
+    const integer = (i: number) => {
+      requireAccess(/^-?[0-9]+$/.test(values[i]!), "bad_ntp_number");
+      const n = Number(values[i]); requireAccess(Number.isSafeInteger(n), "bad_ntp_number"); return n;
+    };
+    const [type, interval, ...rest] = poll.trim().split(/\s+/);
+    requireAccess(type === "t" && rest.length === 0 && /^[0-9]+$/.test(interval!), "unknown_poll");
+    const update = Number(interval) / 1e6;
+    const leap = integer(0), version = integer(1), mode = integer(2), stratum = integer(3);
+    integer(4);
+    const delay = integer(5) / 1e6, dispersion = integer(6) / 1e6;
+    requireAccess(integer(7) === 4, "unknown_reference");
+    const ref = [8, 9, 10, 11].map(integer);
+    requireAccess(ref.every(n => n >= 0 && n <= 255) && ref.some(n => n !== 0) &&
+      ref.join(".") !== "127.127.1.1" && ref.join(".") !== "76.79.67.76", "local_reference");
+    const origin = integer(12) / 1e6, receive = integer(13) / 1e6,
+      transmit = integer(14) / 1e6, destination = integer(15) / 1e6;
+    requireAccess(leap >= 0 && leap <= 2 && [3, 4].includes(version) && mode === 4 &&
+      stratum >= 1 && stratum <= 15 && delay >= 0 && dispersion >= 0 &&
+      Number.isFinite(update) && update > 0 && values[16] === "false" &&
+      integer(17) > 0 && integer(18) >= 0 && origin > 0 && receive > 0 &&
+      transmit >= receive && destination >= origin && destination <= now + 30 &&
+      now - destination <= Math.min(3600, Math.max(120, update * 3)), "unsynchronised");
+    const offsetSeconds = ((receive - origin) + (transmit - destination)) / 2;
+    return { healthy: Math.abs(offsetSeconds) + dispersion + delay / 2 <= 30, offsetSeconds, checked_at: now };
+  } catch { return bad; }
+}
+const clockCommand = (program: string, args: string[]): string =>
+  execFileSync(program, args, { encoding: "utf8", timeout: 1000, maxBuffer: 8192,
+    env: { ...process.env, LC_ALL: "C" }, stdio: ["ignore", "pipe", "pipe"] });
+export function sampleClock(run: (program: string, args: string[]) => string = clockCommand): Health {
+  const now = Math.floor(Date.now() / 1000), bad = { healthy: false, offsetSeconds: 0, checked_at: now };
+  try {
+    const active = run("/usr/bin/systemctl", ["show", "systemd-timesyncd.service", "--property=ActiveState", "--value"]).trim();
+    if (active === "inactive") return sampleChrony(() =>
+      run("/usr/bin/chronyc", ["-n", "-h", "/run/chrony/chronyd.sock", "tracking"]));
+    if (active !== "active") return bad;
+    const property = (service: string, iface: string, name: string) =>
+      run("/usr/bin/busctl", ["--system", "--no-pager", "get-property", service,
+        "/" + service.replaceAll(".", "/"), iface, name]);
+    return timesyncdHealth(
+      property("org.freedesktop.timedate1", "org.freedesktop.timedate1", "NTPSynchronized"),
+      property("org.freedesktop.timesync1", "org.freedesktop.timesync1.Manager", "NTPMessage"),
+      property("org.freedesktop.timesync1", "org.freedesktop.timesync1.Manager", "PollIntervalUSec"), now);
+  } catch { return bad; }
+}
+
 export async function installBundle(store: TrustStore, envelope: string, output: string): Promise<TrustBundle> {
   await store.install(envelope);
   const bundle = await store.snapshot();
@@ -102,7 +157,7 @@ Grants file: JSON array of operator-owned TrustedKey records (public keys only).
 Sign on omarchy-pc only; private deployment key must never be on a run host.
 State initialization is explicit and exclusive. Never reset/restore high-water state.
 `;
-export async function maintenanceCli(args: readonly string[], healthSample: () => Health = sampleChrony): Promise<number> {
+export async function maintenanceCli(args: readonly string[], healthSample: () => Health = sampleClock): Promise<number> {
   let state: AccessState | undefined;
   try {
     process.umask(0o077);
