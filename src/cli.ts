@@ -13,7 +13,7 @@ import { ProtocolIncompatibleError, discoverServerUrl, setAutoResumeLimitedThrea
 const USAGE = `Usage:
   chaldea quota observe [options]
   chaldea access --help
-  chaldea t3 set-auto-resume on|off [options]\n  chaldea wait|decision|waits|mcp --help
+  chaldea t3 restart [options]\n  chaldea t3 set-auto-resume on|off [options]\n  chaldea wait|decision|waits|mcp --help
 
 quota observe: records T3 usage-limit stops and native auto-resumes in the fleet feed.
   --server-url URL     T3 URL (default: origin in <t3-base-dir>/userdata/server-runtime.json)
@@ -23,13 +23,38 @@ quota observe: records T3 usage-limit stops and native auto-resumes in the fleet
   --feed-command PATH  Feed CLI to run (default: feed)
   --enable-provider-switch  Continue quota stops on an equivalent provider (default: off)
   --switch-config PATH  JSON { enabled, equivalences: [[Claude model, Codex model], ...] }
-  --host NAME          Host name for feed records (default: short hostname)
+  --restart-config PATH  Planned restart recovery config (enabled by default)\n  --host NAME          Host name for feed records (default: short hostname)
 
 t3 set-auto-resume: turns T3's autoResumeLimitedThreads on or off through server.updateSettings.
   --server-url URL     As above
   --t3-base-dir DIR    As above
   --token-file PATH    Short-lived settings:write token, mode 0600 (default: ~/.config/chaldea/t3-settings-token)
 `;
+
+async function restart(rest: ReadonlyArray<string>): Promise<number> {
+  const { values, positionals } = parseArgs({ args: [...rest], options: {
+    "server-url": { type: "string" }, "t3-base-dir": { type: "string" },
+    "token-file": { type: "string" }, "restart-config": { type: "string" },
+    "feed-command": { type: "string" },
+    help: { type: "boolean", short: "h" },
+  }, allowPositionals: true, strict: true });
+  if (values.help) { process.stdout.write("chaldea t3 restart [--t3-base-dir DIR] [--token-file PATH] [--restart-config PATH] [--server-url URL]\\n"); return 0; }
+  if (positionals.length) throw new Error("t3 restart takes no positional arguments");
+  const { restartConfig, restartT3 } = await import("./t3/restart.ts");
+  try {
+    await restartT3({
+      t3BaseDir: values["t3-base-dir"] ?? join(homedir(), ".t3"),
+      ...(values["server-url"] === undefined ? {} : { serverUrl: values["server-url"] }),
+      tokenFile: values["token-file"] ?? join(homedir(), ".config/chaldea/t3-token"),
+      ...(values["feed-command"] === undefined ? {} : { feedCommand: values["feed-command"] }),
+      config: restartConfig(values["restart-config"]), logger: createLogger(),
+    });
+    return 0;
+  } catch (error) {
+    process.stderr.write(`chaldea: ${error instanceof Error ? error.message : String(error)}\\n`);
+    return 1;
+  }
+}
 
 async function setAutoResume(rest: ReadonlyArray<string>): Promise<number> {
   const { values, positionals } = parseArgs({
@@ -80,6 +105,7 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
       "feed-command": { type: "string" },
       "enable-provider-switch": { type: "boolean" },
       "switch-config": { type: "string" },
+      "restart-config": { type: "string" },
       host: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
@@ -109,6 +135,7 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
         const config = switchConfig(values["switch-config"] ? JSON.parse(readFileSync(values["switch-config"], "utf8")) : {});
         return { ...config, enabled: values["enable-provider-switch"] === true || config.enabled };
       })(),
+      restart: (await import("./t3/restart.ts")).restartConfig(values["restart-config"]),
       host: values.host ?? shortHostname(),
       logger: createLogger(),
       signal: controller.signal,
@@ -131,6 +158,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
       return await accessCli(argv.slice(1));
     }
     if (group === "quota" && command === "observe") return await observe(rest);
+    if (group === "t3" && command === "restart") return await restart(rest);
     if (group === "t3" && command === "set-auto-resume") return await setAutoResume(rest);
   } catch (error) {
     // parseArgs rejects unknown options.

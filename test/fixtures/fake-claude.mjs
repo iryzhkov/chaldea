@@ -173,6 +173,15 @@ function answerUser(message) {
   if(text.includes("chaldea-native-question")||text.includes("chaldea-native-permission")){
     nativeQuestion(message,text.includes("chaldea-native-permission"));return;
   }
+  if (text.includes("chaldea-restart-hold")) {
+    log({ kind: "turn", outcome: "held" });
+    assistant("Working until the disposable server stops.");
+    return;
+  }
+  if (text.includes("chaldea-provider-crash")) {
+    log({ kind: "turn", outcome: "crashed" });
+    process.exit(17);
+  }
   const state = readState();
   if (!state.limited && text.includes(trigger)) {
     writeState({ ...state, limited: true });

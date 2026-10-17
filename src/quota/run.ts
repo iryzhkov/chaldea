@@ -21,6 +21,7 @@ import {
 
   type ShellEvent,
 } from "../t3/adapter.ts";
+import { RestartJournal, recoverPlannedRestarts, restartConfig, type RestartConfig } from "../t3/restart.ts";
 import { observe, type QuotaRecord } from "./observer.ts";
 import { switchConfig, type SwitchConfig } from "./routing.ts";
 import { ProviderSwitcher } from "./switcher.ts";
@@ -34,6 +35,7 @@ const BACKOFF_MS: ReadonlyArray<number> = [1_000, 2_000, 5_000, 10_000, 30_000, 
 const AUTH_BACKOFF_MS = 120_000;
 
 export interface ObserverOptions {
+  readonly restart?: RestartConfig;
   readonly switching?: SwitchConfig;
   /** Explicit T3 URL; otherwise discovered from `t3BaseDir`. */
   readonly serverUrl?: string;
@@ -221,6 +223,8 @@ export function processObserverEvent(
 
 export async function runObserver(options: ObserverOptions): Promise<number> {
   const { logger, signal } = options;
+  const restart = options.restart ?? restartConfig();
+  const journal = new RestartJournal(restart.journalPath);
   const state = loadState(options.statePath, Date.now());
   const poster = new FeedPoster({ command: options.feedCommand, host: options.host, logger });
   const sink = new EventSink(state, options.statePath, poster, logger);
@@ -256,6 +260,9 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
           logger.info("subscribed to T3 shell", { afterSequence: state.cursor });
         }
         processObserverEvent(sink, switcher!, event);
+        if (event.kind === "synchronized") await recoverPlannedRestarts({
+          ...options, config: restart,
+        }, journal, poster);
       };
       await connectShell(
         { serverUrl, token, signal },
@@ -282,6 +289,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
   sink.close();
   await Promise.race([poster.idle(), new Promise((r) => setTimeout(r, 30_000).unref())]);
   poster.close();
+  journal.close();
   logger.info("quota observer stopped", { exitCode });
   return exitCode;
 }
