@@ -10,6 +10,8 @@ Quota resilience (plan step 3): `chaldea quota observe` records T3 usage-limit s
 
 Durable waits and decision inbox (step 5): `chaldea wait`, `chaldea decision`, and `chaldea mcp`. See [docs/waits.md](docs/waits.md) for the one-wake contract, queued-message deviation, local service and deployment provisioning.
 
+Fleet-managed client installs use `client-vX.Y.Z` releases. See [the fleet client role, migration and rollout guide](https://github.com/iryzhkov/chaldea-fleet-config/blob/main/docs/chaldea-client.md). The client artifact contains the app and locked production dependencies; the host artifact contains only host programs. Separate client tags keep client updates independent of host releases. Both release workflows require a commit reachable from main.
+
 Requirements: Node 26.10.0 (`.nvmrc`, `mise.toml`), `npm ci`, then `npm run typecheck` and `npm test`.
 
 The plan of record is the Jocasta document `tooling/plans/chaldea-rebuild-plan-2026-10-16.md`. Execution state lives in `tooling/handoffs/chaldea-execution-checkpoint.md`.
