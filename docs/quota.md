@@ -347,6 +347,8 @@ and timestamp with a sanitized error class; a window update cannot refresh the
 wallet or an omitted reset count. Empty/missing data never means zero. Future
 reset times, percentages and positive credit balances do not prove provider recovery.
 
+Advisory config failures, including contract drift, pause headroom collection and
+retry with independent backoff; they never stop or reconnect the shell observer.
 The observer reads cached `server.getConfig` and subscribes to
 `subscribeServerConfig` snapshots/provider statuses. It retains window IDs,
 kind, used/remaining percentage, duration in minutes, ISO reset time, checkedAt,

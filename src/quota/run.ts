@@ -21,6 +21,7 @@ import {
   switchPort,
 
   type ShellEvent,
+  type ConnectOptions,
 } from "../t3/adapter.ts";
 import { HeadroomMonitor, routingLanes } from "./headroom.ts";
 import { headroomConfig, type HeadroomConfig } from "./codex-balance.ts";
@@ -79,6 +80,20 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
     }
     signal.addEventListener("abort", done, { once: true });
   });
+}
+
+/** Advisory config failures cannot stop or reconnect the authoritative shell stream. */
+async function followUsage(options: ConnectOptions & { signal: AbortSignal }, monitor: HeadroomMonitor, logger: Logger): Promise<void> {
+  let attempt = 0;
+  while (!options.signal.aborted) {
+    try { await connectUsage(options, providers => monitor.update(providers)); }
+    catch { /* Decode, auth and transport failures are all contained in this lane. */ }
+    finally { monitor.inactive(); }
+    if (options.signal.aborted) return;
+    const delay = BACKOFF_MS[Math.min(attempt++, BACKOFF_MS.length - 1)]!;
+    logger.warn("T3 quota reporting unavailable; shell observation continues", { retryInMs: delay });
+    await sleep(delay, options.signal);
+  }
 }
 
 /**
@@ -314,14 +329,14 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
         processObserverEvent(sink, switcher!, event);
         if (event.kind === "synchronized" || event.kind === "thread") restarts?.kick();
       };
-      const usage = connectUsage({ serverUrl, token, signal: connectionSignal }, providers => monitor!.update(providers));
+      const usage = followUsage({ serverUrl, token, signal: connectionSignal }, monitor, logger);
       const shell = connectShell(
         { serverUrl, token, signal: connectionSignal },
         // Switching needs current parked threads after catch-up, including on restarts.
         state.cursor === null || options.switching?.enabled || state.switches.size > 0 ? { onEvent } : { afterSequence: state.cursor, onEvent },
       );
       try {
-        await Promise.race([usage, shell]);
+        await shell;
       } finally {
         monitor.inactive();
         connection.abort();

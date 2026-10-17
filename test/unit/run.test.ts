@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { WebSocketServer } from "ws";
 
 import { MAX_QUEUED_RECORDS } from "../../src/feed/poster.ts";
 import type { Logger } from "../../src/log.ts";
 import type { QuotaRecord } from "../../src/quota/observer.ts";
 import { EventSink, processObserverEvent, runObserver } from "../../src/quota/run.ts";
-import { emptyState, loadState, type ObserverState } from "../../src/quota/state.ts";
+import { emptyState, loadState, saveState, type ObserverState } from "../../src/quota/state.ts";
 import { ProtocolIncompatibleError, type ShellEvent } from "../../src/t3/adapter.ts";
 import { scratchDir } from "../helpers/scratch.ts";
 import { iso, limited } from "../helpers/threads.ts";
@@ -173,6 +176,70 @@ test("a failed final save does not change a normal shutdown's exit status", asyn
   } finally {
     dir.remove();
   }
+});
+
+test("advisory config decode failure cannot stop shell stop/resume records or reconnect its socket", { timeout: 15_000 }, async () => {
+  const f = scratchDir("usage-isolation"), server = createServer(), wss = new WebSocketServer({ server });
+  const controller = new AbortController(), logger = memoryLogger();
+  const path = join(f.path, "state.json"), tokenFile = join(f.path, "token");
+  let shellRequests = 0, usageFailed = false, sendEvents: (() => void) | undefined;
+  const at = new Date().toISOString();
+  const raw = {
+    createdBy: "user", creationSource: "web", id: "isolated-thread", projectId: "p", title: "fixture",
+    providerInstanceId: "codex", modelSelection: { instanceId: "codex", model: "fixture" },
+    runtimeMode: "full-access", interactionMode: "default", branch: null, worktreePath: null,
+    lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "isolated-thread" },
+    forkedFrom: null, activeProviderThreadId: null, latestRunId: "run-1", activeRunId: null,
+    latestRunStartedAt: at, latestRunCompletedAt: at, status: "failed", lastErrorClass: "usage_limit",
+    usageLimitResetAt: at, pendingRuntimeRequest: null, latestVisibleMessage: null,
+    latestUserMessageAt: null, hasActionableProposedPlan: false, itemCount: 0, visibleItemCount: 0,
+    createdAt: at, updatedAt: at, archivedAt: null, settledOverride: null, settledAt: null, deletedAt: null,
+  };
+  const records: string[] = [];
+  const log: Logger = {
+    ...logger,
+    warn: message => {
+      logger.warn(message);
+      if (message === "T3 quota reporting unavailable; shell observation continues") { usageFailed = true; sendEvents?.(); }
+    },
+    info: (message, fields) => {
+      logger.info(message);
+      if (message === "quota record") records.push(String(fields?.kind));
+      if (fields?.kind === "quota_resumed") controller.abort();
+    },
+  };
+  wss.on("connection", socket => socket.on("message", data => {
+    const request = JSON.parse(String(data));
+    if (request._tag === "Ping") { socket.send(JSON.stringify({ _tag: "Pong" })); return; }
+    if (request._tag !== "Request") return;
+    if (request.tag === "server.getConfig") {
+      socket.send(JSON.stringify({ _tag: "Exit", requestId: request.id,
+        exit: { _tag: "Success", value: { unexpectedPrivateData: "PRIVATE_CONFIG" } } }));
+    } else if (request.tag === "orchestration.subscribeShell") {
+      shellRequests++;
+      let sent = false;
+      sendEvents = () => {
+        if (sent) return; sent = true;
+        socket.send(JSON.stringify({ _tag: "Chunk", requestId: request.id, values: [
+          { kind: "thread.updated", sequence: 1, location: "active", thread: raw },
+          { kind: "thread.updated", sequence: 2, location: "active",
+            thread: { ...raw, status: "completed", latestRunId: "run-2", lastErrorClass: null } },
+        ] }));
+      };
+      if (usageFailed) sendEvents();
+    }
+  }));
+  try {
+    writeFileSync(tokenFile, "fake-token", { mode: 0o600 }); saveState(path, started(), Date.now());
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const code = await runObserver({ serverUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+      t3BaseDir: join(f.path, "t3"), tokenFile, statePath: path, feedCommand: "/nonexistent/feed",
+      host: "fixture", logger: log, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) });
+    assert.equal(code, 0); assert.equal(usageFailed, true); assert.equal(shellRequests, 1);
+    assert.deepEqual(records, ["quota_parked", "quota_resumed"]);
+    assert.equal(loadState(path, Date.now()).cursor, 2);
+    assert.doesNotMatch(JSON.stringify(logger.lines), /PRIVATE_CONFIG|fail closed/);
+  } finally { controller.abort(); for (const socket of wss.clients) socket.terminate(); wss.close(); server.close(); f.remove(); }
 });
 
 test("the observer keeps retrying while T3 is not running, instead of failing closed", async () => {
