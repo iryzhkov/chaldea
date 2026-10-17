@@ -33,6 +33,8 @@ export function title(record: QuotaRecord): string {
       return `quota_parked: ${record.provider} thread ${thread} until ${record.resetAt}`;
     case "quota_reset_unknown":
       return `quota_reset_unknown: ${record.provider} thread ${thread} parked with no reset time`;
+    case "provider_switched":
+      return `provider_switched: ${record.fromProvider}/${record.fromModel} to ${record.toProvider}/${record.toModel} thread ${thread}`;
     case "quota_resumed":
       return `quota_resumed: ${record.provider} thread ${thread}${record.latenessSeconds == null ? "" : ` ${record.latenessSeconds}s after reset`}`;
   }

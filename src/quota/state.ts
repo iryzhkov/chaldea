@@ -14,6 +14,9 @@
 // a record, never towards repeating one.
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
+import type { SwitchIntent } from "./switcher.ts";
+export const MAX_ACTIVE_SWITCHES = 128;
+export const MAX_COMPLETED_SWITCHES = 1_000;
 
 export const DAY_MS = 24 * 60 * 60 * 1000;
 /** Posted-record keys and parked threads are forgotten after this long. */
@@ -25,7 +28,7 @@ export const MAX_POSTED_KEYS = 10_000;
 /** At most this many parked threads are tracked; an evicted one loses its quota_resumed. */
 export const MAX_PARKED_THREADS = 1_000;
 
-export type RecordKind = "quota_parked" | "quota_reset_unknown" | "quota_resumed";
+export type RecordKind = "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched";
 
 export interface ParkedThread {
   readonly runId: string;
@@ -43,6 +46,7 @@ export interface ObserverState {
   /** `kind|threadId|runId` mapped to the stop time of the stop it describes. */
   readonly posted: Map<string, number>;
   readonly parked: Map<string, ParkedThread>;
+  readonly switches: Map<string, SwitchIntent>;
   /** Newest stop time among evicted keys; stops at or before it are never reported. */
   evictedThrough: number | null;
 }
@@ -50,7 +54,7 @@ export interface ObserverState {
 const FORMAT_VERSION = 2;
 
 export function emptyState(): ObserverState {
-  return { cursor: null, posted: new Map(), parked: new Map(), evictedThrough: null };
+  return { cursor: null, posted: new Map(), parked: new Map(), switches: new Map(), evictedThrough: null };
 }
 
 export function recordKey(kind: RecordKind, threadId: string, runId: string): string {
@@ -69,6 +73,16 @@ function evictKey(state: ObserverState, key: string, stopAt: number): void {
 
 /** Drops expired entries and enforces the caps, oldest first. */
 export function prune(state: ObserverState, nowMs: number): void {
+  // Never evict an unresolved hold. Admission caps these at 128; reconnect resolves them.
+  const completed = [...state.switches.entries()]
+    .filter(([, intent]) => intent.phase === "switched" || intent.phase === "cancelled")
+    .sort((a, b) => a[1].createdAt - b[1].createdAt);
+  for (const [index, [key, intent]] of completed.entries()) {
+    if (nowMs - intent.createdAt > KEY_TTL_MS || index < completed.length - MAX_COMPLETED_SWITCHES) {
+      state.switches.delete(key);
+      state.evictedThrough = Math.max(state.evictedThrough ?? intent.stopAt, intent.stopAt);
+    }
+  }
   for (const [key, stopAt] of state.posted) {
     if (nowMs - stopAt > KEY_TTL_MS) evictKey(state, key, stopAt);
   }
@@ -93,6 +107,7 @@ export function loadState(path: string, nowMs: number): ObserverState {
     cursor: typeof raw.cursor === "number" ? raw.cursor : null,
     posted: new Map(Object.entries(raw.posted ?? {}).filter((entry): entry is [string, number] => typeof entry[1] === "number")),
     parked: new Map(Object.entries(raw.parked ?? {}) as Array<[string, ParkedThread]>),
+    switches: new Map(Object.entries(raw.switches ?? {}) as Array<[string, SwitchIntent]>),
     evictedThrough: typeof raw.evictedThrough === "number" ? raw.evictedThrough : null,
   };
   prune(state, nowMs);
@@ -118,6 +133,7 @@ export function saveState(path: string, state: ObserverState, nowMs: number): vo
     evictedThrough: state.evictedThrough,
     posted: Object.fromEntries(state.posted),
     parked: Object.fromEntries(state.parked),
+    switches: Object.fromEntries(state.switches),
   }));
   const temporary = `${path}.tmp`;
   const fd = openSync(temporary, "w", 0o600);

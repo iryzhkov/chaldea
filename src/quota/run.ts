@@ -18,9 +18,13 @@ import {
   ProtocolIncompatibleError,
   connectShell,
   discoverServerUrl,
+  switchPort,
+
   type ShellEvent,
 } from "../t3/adapter.ts";
 import { observe, type QuotaRecord } from "./observer.ts";
+import { switchConfig, type SwitchConfig } from "./routing.ts";
+import { ProviderSwitcher } from "./switcher.ts";
 import { loadState, saveState, type ObserverState } from "./state.ts";
 
 /** Exit status for a configuration or protocol problem a restart cannot fix (EX_CONFIG). */
@@ -31,6 +35,7 @@ const BACKOFF_MS: ReadonlyArray<number> = [1_000, 2_000, 5_000, 10_000, 30_000, 
 const AUTH_BACKOFF_MS = 120_000;
 
 export interface ObserverOptions {
+  readonly switching?: SwitchConfig;
   /** Explicit T3 URL; otherwise discovered from `t3BaseDir`. */
   readonly serverUrl?: string;
   readonly t3BaseDir: string;
@@ -159,6 +164,13 @@ export class EventSink {
 
   handle(event: ShellEvent): void {
     const records = observe(this.state, event, Date.now());
+    this.record(records);
+    if (records.length > 0 || this.#dirty || event.kind === "synchronized" || Date.now() - this.#lastSave > CURSOR_SAVE_INTERVAL_MS) {
+      this.save();
+    }
+  }
+
+  record(records: ReadonlyArray<QuotaRecord>): void {
     for (const record of records) {
       this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
       if (this.#pending.length >= MAX_QUEUED_RECORDS) {
@@ -166,9 +178,6 @@ export class EventSink {
         continue;
       }
       this.#pending.push(record);
-    }
-    if (records.length > 0 || this.#dirty || event.kind === "synchronized" || Date.now() - this.#lastSave > CURSOR_SAVE_INTERVAL_MS) {
-      this.save();
     }
   }
 
@@ -193,6 +202,8 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
   const sink = new EventSink(state, options.statePath, poster, logger);
   logger.info("quota observer starting", { cursor: state.cursor, parked: state.parked.size, posted: state.posted.size });
 
+  let switcher: ProviderSwitcher | undefined;
+  let previousToken: string | undefined;
   let attempt = 0;
   let exitCode = 0;
   while (!signal.aborted) {
@@ -202,17 +213,29 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
       const token = readToken(options.tokenFile);
       const serverUrl = options.serverUrl ?? discoverServerUrl(options.t3BaseDir);
       if (serverUrl === null) throw new Error("T3 is not running (no server-runtime.json)");
-      const onEvent = (event: ShellEvent) => {
+      const port = switchPort({ serverUrl, token, signal });
+      if (switcher === undefined) {
+        switcher = new ProviderSwitcher({
+          state, port, config: options.switching ?? switchConfig(), logger,
+          save: () => { sink.save(); return !sink.dirty; },
+          record: (record) => sink.record([record]),
+        });
+      }
+      switcher.reconnect(port, previousToken !== token);
+      previousToken = token;
+      const onEvent = async (event: ShellEvent) => {
         if (!connected) {
           connected = true;
           attempt = 0;
           logger.info("subscribed to T3 shell", { afterSequence: state.cursor });
         }
+        await switcher!.handle(event);
         sink.handle(event);
       };
       await connectShell(
         { serverUrl, token, signal },
-        state.cursor === null ? { onEvent } : { afterSequence: state.cursor, onEvent },
+        // Switching needs current parked threads after catch-up, including on restarts.
+        state.cursor === null || options.switching?.enabled || state.switches.size > 0 ? { onEvent } : { afterSequence: state.cursor, onEvent },
       );
       logger.warn("T3 ended the shell stream; reconnecting");
       delay = BACKOFF_MS[0]!;

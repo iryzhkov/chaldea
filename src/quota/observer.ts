@@ -39,6 +39,10 @@ export interface QuotaRecord {
   readonly subagent: boolean;
   /** Set when the record was reconstructed from a snapshot after the observer missed the events. */
   readonly reconciled?: true;
+  readonly fromProvider?: string;
+  readonly fromModel?: string;
+  readonly toProvider?: string;
+  readonly toModel?: string;
 }
 
 /**
@@ -54,8 +58,12 @@ export function stopTime(resetAt: string | null, completedAt: string | null, now
   return nowMs;
 }
 
-function claim(state: ObserverState, kind: RecordKind, threadId: string, runId: string, stopAt: number, nowMs: number): boolean {
+export function claim(state: ObserverState, kind: RecordKind, threadId: string, runId: string, stopAt: number, nowMs: number): boolean {
   if (nowMs - stopAt > MAX_STOP_AGE_MS || belowWatermark(state, stopAt)) return false;
+  // A switched stop has no reset lateness. Its switch claim survives reconnects.
+  if (kind === "quota_resumed" && [...state.switches.values()].some((intent) =>
+    intent.threadId === threadId && intent.runId === runId &&
+    (intent.phase === "switched" || intent.phase === "dispatching"))) return false;
   const key = recordKey(kind, threadId, runId);
   if (state.posted.has(key)) return false;
   state.posted.set(key, stopAt);
