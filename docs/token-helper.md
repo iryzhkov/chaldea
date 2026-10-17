@@ -87,8 +87,9 @@ below; do not install the legacy example as a sudoers target.
   NOPASSWD and NOSETENV, with env_reset and a fixed secure_path. Validate with visudo.
   The wrapper clears the environment and invokes the verified release's bin/chaldea
   through the root-pinned Node. It interprets no shell text; the app rejects unknown flags.
-- Set AKASHA_TOKEN_HELPER for publisher services, FEED_TOKEN_HELPER for feed and
-  toolfeedback. FEED_TOKEN_SOURCE and FEED_TOKEN_HOST name their configured identity;
+- Set `tokenHelper` in publisher services' `events.json`, and FEED_TOKEN_HELPER
+  for feed and toolfeedback. The old AKASHA_TOKEN_HELPER environment variable
+  remains accepted with a deprecation warning; see [configuration](configuration.md). FEED_TOKEN_SOURCE and FEED_TOKEN_HOST name their configured identity;
   read filters never broaden it. Feed posts use explicit --source/--host when given.
   Feed uses kind feed_post; toolfeedback reads use tool_call. Helpers target Akasha,
   including its legacy feed compatibility endpoint, not the old shared-key feedd.

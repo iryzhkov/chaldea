@@ -2,7 +2,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { closeSync, openSync, readSync, fstatSync, lstatSync, unlinkSync, opendirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { hostname, homedir } from "node:os";
+import { hostname } from "node:os";
+import { eventsConfig } from "../config/events.ts";
+import { createLogger } from "../config/log.ts";
+import { ConfigurationError } from "../config/files.ts";
+import { EXIT } from "../config/exit.ts";
 import { pathToFileURL } from "node:url";
 import { Outbox, type Cursor } from "./outbox.ts";
 import { publish, type Publication, type PublisherOptions } from "./publisher.ts";
@@ -183,12 +187,13 @@ export async function collect(options: CollectorOptions): Promise<void> {
   }
 }
 async function main(): Promise<void> {
-  const home = homedir(), outbox = new Outbox(process.env.AKASHA_STATE_FILE ?? join(home, ".local/state/chaldea/events/collector.db"));
+  const config = eventsConfig();
+  const outbox = new Outbox(config.stateFile);
   try {
-    await collect({ outbox, host: hostname().split(".")[0]!, spool: process.env.AKASHA_SPOOL ?? join(home, ".local/share/toolfeedback"),
-      timers: process.env.AKASHA_TIMER_SPOOL ?? join(home, ".local/state/chaldea/timer-spool") });
+    await collect({ outbox, host: hostname().split(".")[0]!, spool: config.spool,
+      timers: config.timerSpool });
     console.log(JSON.stringify({ counters: outbox.counters(), pending: outbox.next() !== null }));
   } finally { outbox.close(); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href)
-  main().catch(() => { console.error("akasha collector failed; state retained"); process.exitCode = 1; });
+  main().catch(error => { createLogger().error("akasha collector failed; state retained"); process.exitCode = error instanceof ConfigurationError ? EXIT.config : EXIT.failure; });

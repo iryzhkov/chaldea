@@ -5,6 +5,7 @@ import { backoff } from "../retry.ts";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import type { QuotaRecord } from "../quota/observer.ts";
+import { scopedEventsConfigured } from "../config/events.ts";
 import type { Logger } from "../log.ts";
 import { publish, type PublisherOptions, type Publication } from "../events/publisher.ts";
 export const FEED_SOURCE = "chaldea-quota";
@@ -118,7 +119,7 @@ export class FeedPoster {
     // queues on failure; no auth result can select the legacy command.
     this.#akasha = options.mode === "akasha" || (options.mode !== "legacy" &&
       (options.publisher !== undefined || options.deliver !== undefined ||
-       process.env.AKASHA_URL !== undefined || process.env.AKASHA_TOKEN_HELPER !== undefined));
+       scopedEventsConfigured()));
     this.#queue = new Outbox(new Map(), this.#akasha ? "resend" : "dedupe");
   }
   enqueue(record: QuotaRecord, ack?: () => boolean | void): void {

@@ -1,7 +1,10 @@
+import { execConfig, validHost } from '../config/exec.ts';
+import { readTrustedFile } from '../config/files.ts';
+import { EXIT } from '../config/exit.ts';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
-import { homedir, hostname } from 'node:os';
+import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { connect, queueHost, probeHost, probeHosts, ProbeUnavailable, type Transport } from './queue.ts';
@@ -37,8 +40,7 @@ export function argumentsFor(args: string[]) {
   return { host, gpu, artifacts, argv, noQueue, queueTimeout };
 }
 
-const validHost = (host: string) => /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(host);
-export const EXIT_UNAVAILABLE = 69;
+export const EXIT_UNAVAILABLE = EXIT.unavailable;
 
 // Entries are fleet inventory names with existing chaldea-job-NAME aliases.
 export function hostsFor(text: string) {
@@ -89,8 +91,10 @@ export async function staleControl(config: string, host: string) {
 }
 
 async function configuredHosts() {
-  const path = process.env.CHALDEA_EXEC_HOSTS ?? join(homedir(), '.config/chaldea/exec-hosts');
-  try { return hostsFor(await fs.readFile(path, 'utf8')); }
+  const c = execConfig();
+  if (c.hosts !== undefined && process.env.CHALDEA_EXEC_HOSTS === undefined) return hostsFor(c.hosts.join('\n'));
+  const path = c.hostsFile;
+  try { return hostsFor(readTrustedFile(path).toString('utf8')); }
   catch (e: any) {
     if (e.code === 'ENOENT') throw new Error(oneLine('missing exec host list ' + path + '; --host H works without it'));
     throw e;
@@ -104,7 +108,7 @@ export async function run(args: string[]): Promise<number> {
   const hosts = automatic ? await configuredHosts() : [options.host!];
   const failures: string[] = [];
   const busy: string[] = [];
-  const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
+  const config = execConfig().sshConfig;
   const probes = automatic ? await probeHosts(hosts.filter(host => !isLocalHost(host)), async host => {
     await staleControl(config, 'chaldea-job-' + host);
     try { await probeHost(config, host); }
@@ -128,7 +132,7 @@ export async function run(args: string[]): Promise<number> {
   }
   if (!options.noQueue && busy.length) {
     process.stderr.write('chaldea queued: all job slots busy on ' + busy.join(', ') + '\n');
-    const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
+    const config = execConfig().sshConfig;
     try {
       const selected = await queueHost(config, busy, options.queueTimeout, host => staleControl(config, 'chaldea-job-' + host));
       if (selected) {
@@ -155,7 +159,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   const journal = join(state, 'journal');
   const controls = join(state, 'ssh');
   await fs.mkdir(controls, { recursive: true, mode: 0o700 });
-  const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
+  const config = execConfig().sshConfig;
   try { if (probeFailure) throw probeFailure; await staleControl(config, 'chaldea-job-' + options.host); }
   catch (e) {
     if (!automatic || !(e instanceof RetryableFailure)) throw e;

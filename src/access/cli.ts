@@ -1,5 +1,5 @@
 import { clockHealth } from "./clock.ts";
-import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
+import { readTrustedFile } from "../config/files.ts";
 import { parseArgs } from "node:util";
 import { AccessState, Clock, TrustStore } from "./trust.ts";
 import type { TrustAnchor } from "./trust.ts";
@@ -18,13 +18,7 @@ refreshed within 30 seconds. Token helper requires the issuer UID and sudo calle
 see docs/token-helper.md. No key generation or general mint endpoint.
 `;
 function readTrusted(path: string, max: number, privateFile = false): Buffer {
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const stat = fstatSync(fd);
-    requireAccess(stat.isFile() && stat.size <= max && (stat.uid === 0 || stat.uid === process.geteuid!()) &&
-      (stat.mode & (privateFile ? 0o077 : 0o022)) === 0, "unsafe_input");
-    return readFileSync(fd);
-  } finally { closeSync(fd); }
+  return readTrustedFile(path, { maxBytes: max, secret: privateFile, owners: [0, process.geteuid!()] });
 }
 export async function accessCli(
   args: readonly string[],

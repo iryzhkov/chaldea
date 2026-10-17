@@ -1,7 +1,10 @@
 import { clockHealth, HEALTH_FIELDS } from "../access/clock.ts";
-import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
+import { configFailure, readTrustedFile, ConfigurationError } from "../config/files.ts";
+import { akashaConfig } from "../config/akasha.ts";
+import { createLogger } from "../config/log.ts";
+import { EXIT } from "../config/exit.ts";
 import { parseArgs } from "node:util";
-import { AccessState, Clock, TrustStore, TRUST_POLL_SECONDS } from "../access/trust.ts";
+import { AccessState, TrustStore, TRUST_POLL_SECONDS } from "../access/trust.ts";
 import type { TrustAnchor } from "../access/trust.ts";
 import { Authorization } from "./auth.ts";
 import type { Registration } from "./auth.ts";
@@ -14,15 +17,15 @@ import { bridge, parity, reverseExport } from "./migration/feed.ts";
 import { ensure, parse, fields } from "./schema.ts";
 
 export function trustedFile(path: string, max: number, privateFile = false): Buffer {
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const stat = fstatSync(fd);
-    ensure(stat.isFile() && stat.nlink === 1 && stat.size <= max && (stat.uid === 0 || stat.uid === process.geteuid!()) &&
-      (stat.mode & (privateFile ? 0o077 : 0o022)) === 0, "unsafe_input");
-    const bytes = readFileSync(fd); ensure(bytes.length <= max, "input_too_large"); return bytes;
-  } finally { closeSync(fd); }
+  try { return readTrustedFile(path, { maxBytes: max, secret: privateFile, owners: [0, process.geteuid!()] }); }
+  catch (error) {
+    // Keep the existing request-time adapter error contract.
+    if (error instanceof ConfigurationError && error.reason === "read_size") ensure(false, "input_too_large");
+    if (error instanceof ConfigurationError && ["type", "links", "owner", "mode", "size"].includes(error.reason)) ensure(false, "unsafe_input");
+    throw error;
+  }
 }
-const USAGE = `Usage: akasha <serve|init|import|parity|export|backup|replay> --config FILE
+const USAGE = `Usage: akasha <serve|init|import|parity|export|backup|replay> [--config FILE]
   import/parity --snapshot FILE       consistent read-only feedd snapshot; import is bounded to 100 rows/run
   export/backup --output FILE         private local output, never the live feedd database
   replay --from SEQ --to SEQ          bounded operator replay (at most 100 broker sequences)
@@ -37,10 +40,13 @@ export async function main(args: string[]): Promise<number> {
       from: { type: "string" }, to: { type: "string" }, help: { type: "boolean" },
     } });
     if (v.help) { process.stdout.write(USAGE); return 0; }
-    ensure(v.config && positionals.length === 1, "usage");
-    const c = parse(trustedFile(v.config, 256 * 1024));
-    fields(c, ["database", "access_state", "anchors", "bundle_file", "clock_health_file", "registry", "nats_url", "nats_seed_file", "bind", "port"]);
-    const string = (key: string): string => { ensure(typeof c[key] === "string" && c[key].length > 0, "missing_config_" + key); return c[key]; };
+    if (positionals.length !== 1) { process.stderr.write(USAGE); return EXIT.usage; }
+    const c = akashaConfig(v.config);
+    const string = (key: string): string => {
+      const value = c[key];
+      if (typeof value !== "string" || value.length === 0) throw new ConfigurationError("missing_config_" + key);
+      return value;
+    };
     const command = positionals[0]!;
     store = new EventStore(string("database"), { initialize: command === "init" });
     if (command === "init") { process.stdout.write("Akasha data initialized; provision independent access state/trust before serving.\n"); return 0; }
@@ -49,13 +55,13 @@ export async function main(args: string[]): Promise<number> {
       const result = command === "export" ? reverseExport(store, v.output) : await snapshot(store, v.output);
       process.stdout.write(JSON.stringify({ ok: true, rows: result }) + "\n"); return 0;
     }
-    state = new AccessState(string("access_state"));
-    const clock = clockHealth(state, () => trustedFile(string("clock_health_file"), 1024), {
+    state = new AccessState(string("accessState"));
+    const clock = clockHealth(state, () => trustedFile(string("clockHealthFile"), 1024), {
       decode: parse, fields: h => fields(h, HEALTH_FIELDS), check: ensure,
     });
-    ensure(Array.isArray(c.anchors), "anchors_required");
+    if (!Array.isArray(c.anchors)) throw new ConfigurationError("anchors_required");
     const trust = new TrustStore(state, clock, c.anchors as TrustAnchor[]);
-    const refresh = async () => { await trust.install(trustedFile(string("bundle_file"), 262145).toString("utf8").trim()); };
+    const refresh = async () => { await trust.install(trustedFile(string("bundleFile"), 262145).toString("utf8").trim()); };
     await refresh();
     if (command === "import" || command === "parity") {
       ensure(v.snapshot, "snapshot_required");
@@ -63,9 +69,9 @@ export async function main(args: string[]): Promise<number> {
       process.stdout.write(JSON.stringify(result) + "\n");
       return "missing" in result && (result.missing || result.extra || result.changed) ? 1 : 0;
     }
-    const seed = c.nats_seed_file ? trustedFile(string("nats_seed_file"), 256, true) : undefined;
-    const open = () => NatsBus.open(string("nats_url"), seed ? Buffer.from(seed.toString("utf8").trim()) : undefined);
-    ensure(Array.isArray(c.registry), "registry_required");
+    const seed = c.natsSeedFile ? trustedFile(string("natsSeedFile"), 256, true) : undefined;
+    const open = () => NatsBus.open(string("natsUrl"), seed ? Buffer.from(seed.toString("utf8").trim()) : undefined);
+    if (!Array.isArray(c.registry)) throw new ConfigurationError("registry_required");
     const auth = new Authorization(c.registry as Registration[], trust, clock);
     worker = new DeliveryWorker(store, () => clock.check(), open, e => auth.validateDelivery(e));
     if (command === "replay") {
@@ -78,8 +84,8 @@ export async function main(args: string[]): Promise<number> {
     }
     ensure(command === "serve", "unknown_command");
     const ingress = new Ingress(auth, store, () => worker!.wake()), server = httpServer(ingress);
-    ensure(c.bind === "127.0.0.1" || c.bind === "::1", "loopback_ingress_required");
-    ensure(Number.isInteger(c.port) && (c.port as number) > 0 && (c.port as number) < 65536, "invalid_port");
+    if (c.bind !== "127.0.0.1" && c.bind !== "::1") throw new ConfigurationError("loopback_ingress_required");
+    if (!Number.isInteger(c.port) || (c.port as number) <= 0 || (c.port as number) >= 65536) throw new ConfigurationError("invalid_port");
     let stopped = false, sweeping: Promise<void> | undefined, sweepRetry: ReturnType<typeof setTimeout> | undefined;
     const sweep = () => { if (!sweeping) sweeping = maintain(store!, clock.check(), () => stopped).finally(() => {
       sweeping = undefined;
@@ -98,8 +104,8 @@ export async function main(args: string[]): Promise<number> {
     } finally { stopped = true; clearInterval(update); clearInterval(maintenance); if (sweepRetry) clearTimeout(sweepRetry); await sweeping;
       process.off("SIGTERM", stop); process.off("SIGINT", stop); }
     return 0;
-  } catch {
-    process.stderr.write("akasha: operation failed; inspect configured adapters, authorization and capacity\n");
-    return 1;
+  } catch (error) {
+    createLogger().error("akasha operation failed; inspect configured adapters, authorization and capacity", configFailure(error));
+    return error instanceof ConfigurationError ? EXIT.config : EXIT.failure;
   } finally { await worker?.stop(); store?.close(); state?.close(); }
 }

@@ -1,7 +1,10 @@
 // `chaldea` command-line entry point.
 import { description, discoveryHelp } from "./describe.ts";
 import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
+import { configFailure, readJson } from "./config/files.ts";
+import { quotaConfig } from "./config/quota.ts";
+import { paths } from "./config/paths.ts";
+import { EXIT } from "./config/exit.ts";
 import { classifyCapacities } from "./quota/capacity.ts";
 import { loadCapacityConfig } from "./quota/capacity-config.ts";
 import { loadHeadroomConfig } from "./quota/codex-balance.ts";
@@ -54,14 +57,14 @@ async function restart(rest: ReadonlyArray<string>): Promise<number> {
     await restartT3({
       t3BaseDir: values["t3-base-dir"] ?? join(homedir(), ".t3"),
       ...(values["server-url"] === undefined ? {} : { serverUrl: values["server-url"] }),
-      tokenFile: values["token-file"] ?? join(homedir(), ".config/chaldea/t3-token"),
+      tokenFile: values["token-file"] ?? join(paths().config, "t3-token"),
       ...(values["feed-command"] === undefined ? {} : { feedCommand: values["feed-command"] }),
       config: restartConfig(values["restart-config"]), logger: createLogger(),
     });
     return 0;
   } catch (error) {
-    process.stderr.write(`chaldea: ${error instanceof Error ? error.message : String(error)}\n`);
-    return 1;
+    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
+    return error instanceof ConfigurationError ? EXIT.config : EXIT.failure;
   }
 }
 
@@ -93,12 +96,12 @@ async function setAutoResume(rest: ReadonlyArray<string>): Promise<number> {
     return 69;
   }
   try {
-    const token = readToken(values["token-file"] ?? join(home, ".config", "chaldea", "t3-settings-token"));
+    const token = readToken(values["token-file"] ?? join(paths().config, "t3-settings-token"));
     const now = await setAutoResumeLimitedThreads({ serverUrl, token }, mode === "on");
     process.stdout.write(`autoResumeLimitedThreads is ${now ? "on" : "off"}\n`);
     return now === (mode === "on") ? 0 : 1;
   } catch (error) {
-    process.stderr.write(`chaldea: ${error instanceof Error ? error.message : String(error)}\n`);
+    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
     return error instanceof ConfigurationError || error instanceof ProtocolIncompatibleError ? EXIT_CONFIG : 1;
   }
 }
@@ -130,29 +133,30 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
     process.stderr.write(USAGE);
     return 64;
   }
-  const home = homedir();
+  const home = homedir(), p = paths();
   const controller = new AbortController();
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => controller.abort());
   try {
-    const serverUrl = values["server-url"];
+    const config = quotaConfig(home, values["quota-config"]);
+    const serverUrl = values["server-url"] ?? config.serverUrl;
     return await runObserver({
       ...(serverUrl === undefined ? {} : { serverUrl }),
-      t3BaseDir: values["t3-base-dir"] ?? join(home, ".t3"),
-      tokenFile: values["token-file"] ?? join(home, ".config", "chaldea", "t3-token"),
-      statePath: values["state-file"] ?? join(home, ".local", "state", "chaldea", "quota-observer.json"),
-      feedCommand: values["feed-command"] ?? "feed",
+      t3BaseDir: values["t3-base-dir"] ?? config.t3BaseDir ?? join(home, ".t3"),
+      tokenFile: values["token-file"] ?? config.tokenFile ?? join(p.config, "t3-token"),
+      statePath: values["state-file"] ?? config.stateFile ?? join(p.state, "quota-observer.json"),
+      feedCommand: values["feed-command"] ?? config.feedCommand ?? "feed",
       reporting: loadHeadroomConfig(home, values["quota-config"]),
       switching: (() => {
-        const config = switchConfig(values["switch-config"] ? JSON.parse(readFileSync(values["switch-config"], "utf8")) : {});
-        return { ...config, enabled: values["enable-provider-switch"] === true || config.enabled };
+        const switching = switchConfig(values["switch-config"] || config.switchConfig ? readJson((values["switch-config"] ?? config.switchConfig)!) : {});
+        return { ...switching, enabled: values["enable-provider-switch"] === true || config.enableProviderSwitch || switching.enabled };
       })(),
-      restart: (await import("./t3/restart.ts")).restartConfig(values["restart-config"]),
-      host: values.host ?? shortHostname(),
+      restart: (await import("./t3/restart.ts")).restartConfig(values["restart-config"] ?? config.restartConfig),
+      host: values.host ?? config.host ?? shortHostname(),
       logger: createLogger(),
       signal: controller.signal,
     });
   } catch (error) {
-    process.stderr.write(`chaldea: ${error instanceof Error ? error.message : String(error)}\n`);
+    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
     return EXIT_CONFIG;
   }
 }
@@ -164,14 +168,14 @@ async function quotaStatus(rest: ReadonlyArray<string>): Promise<number> {
   if (positionals.length) return 64;
   try {
     const now = Date.now();
-    const state = loadState(values["state-file"] ?? join(homedir(), ".local", "state", "chaldea", "quota-observer.json"), now);
+    const state = loadState(values["state-file"] ?? quotaConfig().stateFile ?? join(paths().state, "quota-observer.json"), now);
     const capacity = classifyCapacities(state, now, loadCapacityConfig(homedir(), values["capacity-config"]));
     process.stdout.write(values.json ? JSON.stringify({ ...statusSnapshot(state.headroom, now), capacity }, null, 2) + "\n"
       : humanStatus(state.headroom, now) + Object.entries(capacity).map(([id, c]) =>
         `${id} capacity: ${c.class}; ${c.reasons.join("; ")}; burn target ${c.burnTargetPerHour === null ? "unknown" : (c.burnTargetPerHour * 100).toFixed(2) + "%/hour"}\n`).join(""));
     return 0;
   } catch {
-    process.stderr.write("chaldea: quota snapshot could not be read\n");
+    createLogger().error("chaldea: quota snapshot could not be read");
     return 78;
   }
 }
@@ -205,6 +209,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     if (group === "t3" && command === "restart") return await restart(rest);
     if (group === "t3" && command === "set-auto-resume") return await setAutoResume(rest);
   } catch (error) {
+    if (error instanceof ConfigurationError) { createLogger().error("configuration unavailable", { file: error.file, reason: error.reason }); return EXIT.config; }
     // parseArgs rejects unknown options.
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
     return 64;

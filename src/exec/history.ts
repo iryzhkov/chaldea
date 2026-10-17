@@ -1,6 +1,6 @@
 import * as fs from 'node:fs/promises';
 import { join, dirname } from 'node:path';
-import { homedir } from 'node:os';
+import { execConfig } from '../config/exec.ts';
 import { constants } from 'node:fs';
 import { once } from 'node:events';
 import { connect } from './queue.ts';
@@ -94,7 +94,7 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
   requested.forEach(safePath);
   await cleanLogs(state, LOG_CAP); // includes the temporary replacement log
   await cleanArtifacts(join(state, 'journal'), entry.host, MAX_ARTIFACT);
-  const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
+  const config = execConfig().sshConfig;
   const transport = connect(config, entry.host, COMMANDS.fetch);
   const { ssh, incoming, exit } = transport;
   const path = logPath(state, entry.jobId);

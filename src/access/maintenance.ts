@@ -1,6 +1,7 @@
+import { readTrustedFile } from "../config/files.ts";
 import { clockHealth } from "./clock.ts";
 import { atomicWrite } from "../fs/atomic.ts";
-import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, readSync } from "node:fs";
+import { constants, openSync, closeSync, lstatSync, readFileSync, writeFileSync, fsyncSync, renameSync, unlinkSync, fchmodSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { createPublicKey } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -12,16 +13,7 @@ import { exact, object, requireAccess, seconds, strictJson } from "./token.ts";
 
 export function trustedBytes(path: string, max: number): Buffer {
   requireAccess(isAbsolute(path), "absolute_path_required");
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const s = fstatSync(fd);
-    requireAccess(s.isFile() && s.nlink === 1 && s.size <= max &&
-      (s.uid === 0 || s.uid === process.geteuid!()) && (s.mode & 0o022) === 0, "unsafe_input");
-    const b = Buffer.alloc(max + 1);
-    let size = 0, n: number;
-    while (size < b.length && (n = readSync(fd, b, size, b.length - size, null)) > 0) size += n;
-    requireAccess(size <= max, "input_too_large"); return b.subarray(0, size);
-  } finally { closeSync(fd); }
+  return readTrustedFile(path, { maxBytes: max });
 }
 export function atomicPublicFile(path: string, bytes: string): void {
   requireAccess(isAbsolute(path), "absolute_path_required");

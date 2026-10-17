@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { constants, openSync, fstatSync, closeSync, readSync } from "node:fs";
+import { readTrustedFile } from "../config/files.ts";
 import { parseArgs } from "node:util";
 import { HostIssuer, loadHostSigningKey } from "./issuer.ts";
 import { AccessState, TrustStore } from "./trust.ts";
@@ -59,18 +59,7 @@ export interface HelperRuntime {
   uid: number; caller: string | undefined; config: () => unknown;
 }
 function rootConfig(): unknown {
-  const path = "/etc/chaldea/token-helper.json";
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const s = fstatSync(fd);
-    requireAccess(s.isFile() && s.uid === 0 && (s.mode & 0o022) === 0 && s.nlink === 1 && s.size <= 65536,
-      "unsafe_helper_config");
-    const bytes = Buffer.alloc(65537);
-    let size = 0, n: number;
-    while (size < bytes.length && (n = readSync(fd, bytes, size, bytes.length - size, null)) > 0) size += n;
-    requireAccess(size <= 65536, "helper_config_too_large");
-    return strictJson(bytes.subarray(0, size));
-  } finally { closeSync(fd); }
+  return strictJson(readTrustedFile("/etc/chaldea/token-helper.json", { maxBytes: 65536, owners: [0] }));
 }
 export async function tokenHelperCli(args: readonly string[], io = {
   out: (s: string) => { process.stdout.write(s); }, err: (s: string) => { process.stderr.write(s); },

@@ -1,3 +1,6 @@
+import { configFailure, ConfigurationError } from '../config/files.ts';
+import { EXIT } from '../config/exit.ts';
+import { createLogger } from '../config/log.ts';
 import { run } from './client.ts';
 
 // Remote statuses pass through; local failures use 255, auto exhaustion uses 69.
@@ -7,6 +10,6 @@ try {
       "       chaldea exec list | show JOB-ID [--full] | fetch JOB-ID\n");
   } else process.exitCode = await run(process.argv.slice(2));
 } catch (error) {
-  process.stderr.write('chaldea: ' + (error as Error).message + '\n');
-  process.exitCode = 255;
+  createLogger().error('exec failed', { ...configFailure(error), error: (error as Error).message });
+  process.exitCode = error instanceof ConfigurationError ? EXIT.config : EXIT.transport;
 }

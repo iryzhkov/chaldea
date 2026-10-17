@@ -190,7 +190,8 @@ The local journal lives in `~/.local/state/chaldea/exec/journal/<job-id>.json`.
 Its initial outcome is deliberately `uncertain`, and only a confirmed clean result
 changes it to `finished`. Definitive non-execution is `refused`; gaming that
 interrupts a running job is `preempted`. Remote exit 125 passes through; local
-Chaldea failures use 255. A remote 255 has a finished journal entry. Auto-mode exhaustion uses 69 (a remote 69 still has a finished journal entry).
+Chaldea transport failures use 255; config-read failures use 78. See the
+[shared exit-code table](configuration.md#exit-codes). A remote 255 has a finished journal entry. Auto-mode exhaustion uses 69 (a remote 69 still has a finished journal entry).
 A crash before dispatch, during upload/execution, after
 remote cleanup or before journal completion never triggers another run. Inspect
 it with `chaldea exec show <job-id>` or `fetch`; an explicit new invocation is a new job.
@@ -210,8 +211,11 @@ A silent network partition is detected by SSH keepalives (15 s, two missed repli
 Stale ControlMaster sockets are replaced before a new dispatch. There is no
 reconnect/replay path; source or target reboot leaves dispatched work uncertain.
 
-`CHALDEA_EXEC_HOSTS`, `CHALDEA_SSH_CONFIG` and `CHALDEA_STATE_DIR` override the host-list, SSH-config and state paths for
-isolated tests. They are local operator configuration, never remote job input.
+Use `exec.json` keys `hostsFile` or `hosts`, `sshConfig` and `stateDir` for local
+operator configuration; see [config precedence](configuration.md#config-keys-and-compatibility).
+`CHALDEA_EXEC_HOSTS`, `CHALDEA_SSH_CONFIG` and `CHALDEA_STATE_DIR` still override
+those values for compatibility and isolated tests, with deprecation warnings.
+They are never remote job input.
 
 ## Verification
 
