@@ -16,11 +16,15 @@ import {
   AuthenticationError,
   ProtocolIncompatibleError,
   connectShell,
+  connectUsage,
   discoverServerUrl,
   switchPort,
 
   type ShellEvent,
+  type ConnectOptions,
 } from "../t3/adapter.ts";
+import { HeadroomMonitor, routingLanes } from "./headroom.ts";
+import { headroomConfig, type HeadroomConfig } from "./codex-balance.ts";
 import { RestartRecoveryWorker } from "../t3/restart-worker.ts";
 import { RestartJournal, restartConfig, type RestartConfig } from "../t3/restart.ts";
 import { observe, type QuotaRecord } from "./observer.ts";
@@ -38,6 +42,7 @@ const AUTH_BACKOFF_MS = 120_000;
 export interface ObserverOptions {
   readonly restart?: RestartConfig;
   readonly switching?: SwitchConfig;
+  readonly reporting?: HeadroomConfig;
   /** Explicit T3 URL; otherwise discovered from `t3BaseDir`. */
   readonly serverUrl?: string;
   readonly t3BaseDir: string;
@@ -77,6 +82,20 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** Advisory config failures cannot stop or reconnect the authoritative shell stream. */
+async function followUsage(options: ConnectOptions & { signal: AbortSignal }, monitor: HeadroomMonitor, logger: Logger): Promise<void> {
+  let attempt = 0;
+  while (!options.signal.aborted) {
+    try { await connectUsage(options, providers => monitor.update(providers)); }
+    catch { /* Decode, auth and transport failures are all contained in this lane. */ }
+    finally { monitor.inactive(); }
+    if (options.signal.aborted) return;
+    const delay = BACKOFF_MS[Math.min(attempt++, BACKOFF_MS.length - 1)]!;
+    logger.warn("T3 quota reporting unavailable; shell observation continues", { retryInMs: delay });
+    await sleep(delay, options.signal);
+  }
+}
+
 /**
  * Applies shell events to the observer state, persists it, and queues new
  * records for the feed only once their claims are on disk. Saving never
@@ -93,17 +112,18 @@ export class EventSink {
   #retryTimer: NodeJS.Timeout | null = null;
   #retryAttempt = 0;
   readonly #pending: Array<QuotaRecord> = [];
+  readonly #discarded = new Set<string>();
 
   readonly state: ObserverState;
   readonly statePath: string;
-  readonly poster: Pick<FeedPoster, "enqueue">;
+  readonly poster: Pick<FeedPoster, "enqueue"> & Partial<Pick<FeedPoster, "discard">>;
   readonly logger: Logger;
   readonly retryDelaysMs: ReadonlyArray<number>;
 
   constructor(
     state: ObserverState,
     statePath: string,
-    poster: Pick<FeedPoster, "enqueue">,
+    poster: Pick<FeedPoster, "enqueue"> & Partial<Pick<FeedPoster, "discard">>,
     logger: Logger,
     retryDelaysMs: ReadonlyArray<number> = BACKOFF_MS,
   ) {
@@ -150,6 +170,9 @@ export class EventSink {
       this.#saveFailing = false;
       this.logger.info("state file written again", { path: this.statePath, pending: this.#pending.length });
     }
+    // Superseded advisory payloads are removed only after the new state is durable.
+    for (const key of this.#discarded) this.poster.discard?.(key);
+    this.#discarded.clear();
     // Their claims are durable now.
     for (const record of this.#pending.splice(0)) {
       this.poster.enqueue(record, () => {
@@ -179,13 +202,36 @@ export class EventSink {
     }
   }
 
+  #discardHeadroom(key: string): void {
+    this.state.pendingDelivery.delete(key);
+    const index = this.#pending.findIndex(r => quotaKey(r) === key);
+    if (index >= 0) this.#pending.splice(index, 1);
+    else this.#discarded.add(key); // Only already-enqueued keys need poster removal (bounded by its queue).
+  }
+
   record(records: ReadonlyArray<QuotaRecord>): void {
     for (const record of records) {
       this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
       const key = quotaKey(record);
       if (this.state.pendingDelivery.has(key)) continue;
-      if (this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
-          Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES) {
+      const advisory = [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
+      if (record.headroom) {
+        const alias = record.headroom.providers[0]?.alias;
+        for (const [oldKey, old] of advisory) {
+          if (old.kind === record.kind && old.headroom?.providers[0]?.alias === alias) this.#discardHeadroom(oldKey);
+        }
+      }
+      // Advisory reporting never consumes capacity needed by a transition. Keep at most
+      // 192 advisory intents (64 aliases × 3 kinds) and evict them first on either the count or byte bound.
+      const overflow = () => this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
+        Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES;
+      const headroom = () => [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
+      while (overflow() || record.headroom !== undefined && headroom().length >= 192) {
+        const oldest = headroom()[0];
+        if (!oldest) break;
+        this.#discardHeadroom(oldest[0]);
+      }
+      if (overflow()) {
         this.state.deliveryDropped++;
         this.logger.error("pending record dropped: durable delivery queue capacity exceeded", { kind: record.kind, thread: record.threadId, run: record.runId });
         continue;
@@ -235,6 +281,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
   sink.save(); // Recover durable pending payloads even when T3 is offline.
   logger.info("quota observer starting", { cursor: state.cursor, parked: state.parked.size, posted: state.posted.size });
 
+  let monitor: HeadroomMonitor | undefined;
   let switcher: ProviderSwitcher | undefined;
   let previousToken: string | undefined;
   let attempt = 0;
@@ -246,7 +293,23 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
       const token = readToken(options.tokenFile);
       const serverUrl = options.serverUrl ?? discoverServerUrl(options.t3BaseDir);
       if (serverUrl === null) throw new Error("T3 is not running (no server-runtime.json)");
-      const port = switchPort({ serverUrl, token, signal });
+      const connection = new AbortController();
+      const connectionSignal = AbortSignal.any([signal, connection.signal]);
+      const rawPort = switchPort({ serverUrl, token, signal: connectionSignal });
+      const local = ["127.0.0.1", "[::1]", "localhost"].includes(new URL(serverUrl).hostname);
+      monitor ??= new HeadroomMonitor({
+        state: state.headroom, config: options.reporting ?? headroomConfig(), local,
+        save: records => { sink.record(records); sink.save(); },
+      });
+      monitor.options.local = local;
+      monitor.start();
+      const port = { ...rawPort, catalog: async () => {
+        const catalog = await rawPort.catalog();
+        return { ...catalog, providers: catalog.providers.map(p => {
+          const row = state.headroom.providers.find(r => r.alias === p.instanceId);
+          return { ...p, ...(row ? { headroom: routingLanes(row, Date.now()) } : {}) };
+        }) };
+      } };
       if (switcher === undefined) {
         switcher = new ProviderSwitcher({
           state, port, config: options.switching ?? switchConfig(), logger,
@@ -266,11 +329,19 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
         processObserverEvent(sink, switcher!, event);
         if (event.kind === "synchronized" || event.kind === "thread") restarts?.kick();
       };
-      await connectShell(
-        { serverUrl, token, signal },
+      const usage = followUsage({ serverUrl, token, signal: connectionSignal }, monitor, logger);
+      const shell = connectShell(
+        { serverUrl, token, signal: connectionSignal },
         // Switching needs current parked threads after catch-up, including on restarts.
         state.cursor === null || options.switching?.enabled || state.switches.size > 0 ? { onEvent } : { afterSequence: state.cursor, onEvent },
       );
+      try {
+        await shell;
+      } finally {
+        monitor.inactive();
+        connection.abort();
+        await Promise.allSettled([usage, shell]);
+      }
       logger.warn("T3 ended the shell stream; reconnecting");
       delay = BACKOFF_MS[0]!;
     } catch (error) {
@@ -287,6 +358,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
     await sleep(delay, signal);
   }
   // close() never throws, so a failed final write cannot change the exit status or skip the drain.
+  await monitor?.close();
   await restarts?.close();
   await switcher?.close();
   sink.close();

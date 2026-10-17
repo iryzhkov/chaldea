@@ -2,6 +2,9 @@
 import { description, discoveryHelp } from "./describe.ts";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
+import { headroomConfig } from "./quota/codex-balance.ts";
+import { humanStatus, statusSnapshot } from "./quota/headroom.ts";
+import { loadState } from "./quota/state.ts";
 import { switchConfig } from "./quota/routing.ts";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
@@ -13,6 +16,7 @@ import { ProtocolIncompatibleError, discoverServerUrl, setAutoResumeLimitedThrea
 
 const USAGE = `Usage:
   chaldea quota observe [options]
+  chaldea quota status [--json] [--state-file PATH]
   chaldea access --help
   chaldea t3 restart [options]\n  chaldea t3 set-auto-resume on|off [options]\n  chaldea wait|decision|waits|mcp --help
 
@@ -22,6 +26,7 @@ quota observe: records T3 usage-limit stops and native auto-resumes in the fleet
   --token-file PATH    Bearer token, mode 0600 (default: ~/.config/chaldea/t3-token)
   --state-file PATH    Cursor and posted keys (default: ~/.local/state/chaldea/quota-observer.json)
   --feed-command PATH  Feed CLI to run (default: feed)
+  --quota-config PATH  Explicit Codex credential contexts and low-headroom threshold
   --enable-provider-switch  Continue quota stops on an equivalent provider (default: off)
   --switch-config PATH  JSON { enabled, equivalences: [[Claude model, Codex model], ...] }
   --restart-config PATH  Planned restart recovery config (enabled by default)\n  --host NAME          Host name for feed records (default: short hostname)
@@ -104,6 +109,7 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
       "token-file": { type: "string" },
       "state-file": { type: "string" },
       "feed-command": { type: "string" },
+      "quota-config": { type: "string" },
       "enable-provider-switch": { type: "boolean" },
       "switch-config": { type: "string" },
       "restart-config": { type: "string" },
@@ -132,6 +138,7 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
       tokenFile: values["token-file"] ?? join(home, ".config", "chaldea", "t3-token"),
       statePath: values["state-file"] ?? join(home, ".local", "state", "chaldea", "quota-observer.json"),
       feedCommand: values["feed-command"] ?? "feed",
+      reporting: headroomConfig(values["quota-config"] ? JSON.parse(readFileSync(values["quota-config"], "utf8")) : {}),
       switching: (() => {
         const config = switchConfig(values["switch-config"] ? JSON.parse(readFileSync(values["switch-config"], "utf8")) : {});
         return { ...config, enabled: values["enable-provider-switch"] === true || config.enabled };
@@ -144,6 +151,22 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
   } catch (error) {
     process.stderr.write(`chaldea: ${error instanceof Error ? error.message : String(error)}\n`);
     return EXIT_CONFIG;
+  }
+}
+
+async function quotaStatus(rest: ReadonlyArray<string>): Promise<number> {
+  const { values, positionals } = parseArgs({ args: [...rest], strict: true, allowPositionals: true,
+    options: { json: { type: "boolean" }, "state-file": { type: "string" }, help: { type: "boolean", short: "h" } } });
+  if (values.help) { process.stdout.write(USAGE); return 0; }
+  if (positionals.length) return 64;
+  try {
+    const now = Date.now();
+    const state = loadState(values["state-file"] ?? join(homedir(), ".local", "state", "chaldea", "quota-observer.json"), now);
+    process.stdout.write(values.json ? JSON.stringify(statusSnapshot(state.headroom, now), null, 2) + "\n" : humanStatus(state.headroom, now));
+    return 0;
+  } catch {
+    process.stderr.write("chaldea: quota snapshot could not be read\n");
+    return 78;
   }
 }
 
@@ -170,6 +193,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
       const { accessCli } = await import("./access/cli.ts");
       return await accessCli(argv.slice(1));
     }
+    if (group === "quota" && command === "status") return await quotaStatus(rest);
     if (group === "quota" && command === "observe") return await observe(rest);
     if (group === "t3" && command === "restart") return await restart(rest);
     if (group === "t3" && command === "set-auto-resume") return await setAutoResume(rest);

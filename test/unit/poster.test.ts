@@ -35,6 +35,21 @@ test("delivery does not block enqueue; a full worker retains the caller's durabl
   assert.equal(ack, 0); assert.ok(warnings > 0);
   poster.close(); finish(false); await poster.idle();
 });
+test("transitions preempt advisory backlog in the poster, including restart records admitted outside EventSink", async () => {
+  let finish!: (ok: boolean) => void;
+  const seen: string[] = [];
+  const poster = new FeedPoster({ command: "/must/not/run", host: "agent-a", logger,
+    deliver: async e => { seen.push(String(e.payload.kind)); if (seen.length === 1) return await new Promise(r => { finish = r; }); return true; } });
+  const advisory: QuotaRecord = { ...record, kind: "quota_headroom_snapshot",
+    headroom: { version: 1, generatedAt: "2026-10-17T00:00:00Z", providers: [] } };
+  try {
+    for (let i = 0; i < MAX_QUEUED_RECORDS; i++) poster.enqueue({ ...advisory, runId: "advisory-" + i });
+    poster.enqueue({ ...record, kind: "restart_resumed" });
+    finish(true); await poster.idle();
+    assert.equal(seen[1], "restart_resumed");
+  } finally { poster.close(); }
+});
+
 test("log output is rate limited", () => {
   const lines: string[] = [], l = createLogger(line => lines.push(line));
   for (let i = 0; i < MAX_LINES_PER_MINUTE + 50; i++) l.info("x", { i });

@@ -12,6 +12,7 @@ import { RpcClient } from "effect/rpc";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as Socket from "effect/socket/Socket";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import WebSocket from "ws";
 
@@ -115,7 +116,7 @@ export interface SwitchProvider {
   readonly installed: boolean;
   readonly status: string;
   readonly availability?: string;
-  readonly auth: { readonly status: string };
+  readonly auth: { readonly status: string; readonly type?: "chatgpt" | "apiKey" };
   readonly models: ReadonlyArray<{
     readonly slug: string;
     readonly capabilities: { readonly optionDescriptors?: ReadonlyArray<{
@@ -124,9 +125,17 @@ export interface SwitchProvider {
       readonly options?: ReadonlyArray<{ readonly id: string }>;
     }> } | null;
   }>;
+  /** Local runtime CODEX_HOME, internal matching only; never copied to reports. */
+  readonly runtimeHome?: string;
+  /** Any instance environment override needs a future explicit context adapter. */
+  readonly quotaContextBlocked?: boolean;
+  /** Private comparison only: never included in status, state or feed payloads. */
+  readonly quotaAccountKey?: string;
+  readonly headroom?: ReturnType<typeof import("../quota/headroom.ts").routingLanes>;
   readonly usageLimits?: {
     readonly checkedAt: string;
-    readonly windows: ReadonlyArray<{ readonly usedPercent: number }>;
+    readonly windows: ReadonlyArray<{ readonly usedPercent: number; readonly id?: string; readonly kind?: string; readonly windowDurationMins?: number; readonly resetsAt?: string }>;
+    readonly resetCredits?: { readonly availableCount: number; readonly nextExpiresAt?: string };
     readonly unavailable?: unknown;
   };
 }
@@ -137,6 +146,64 @@ export interface SwitchPort {
   clearRecovery(threadId: string, commandId: string): Promise<boolean>;
   delivered(threadId: string, messageId: string): Promise<boolean>;
   continue(input: { threadId: string; runId: string; commandId: string; target: ModelChoice }): Promise<boolean>;
+}
+
+/** Safe domain projection; auth labels, identities and reset redemption IDs stay in T3. */
+export function toSwitchProvider(p: import("../../vendor/t3-contracts/src/index.ts").ServerProvider): SwitchProvider {
+  return {
+    instanceId: p.instanceId, driver: p.driver, enabled: p.enabled, installed: p.installed,
+    status: p.status, auth: { status: p.auth.status,
+      ...(p.auth.type === "chatgpt" || p.auth.type === "apiKey" ? { type: p.auth.type } : {}) },
+    ...(p.auth.workspaceId ? { quotaAccountKey: createHash("sha256").update(p.auth.workspaceId).digest("hex") } : {}),
+    ...(p.runtimePaths === undefined ? {} : { runtimeHome: p.runtimePaths.shadowHomePath ?? p.runtimePaths.homePath }),
+    ...(p.availability === undefined ? {} : { availability: p.availability }),
+    models: p.models.map((m) => ({
+      slug: m.slug, capabilities: m.capabilities === null ? null : {
+        ...(m.capabilities.optionDescriptors === undefined ? {} : {
+          optionDescriptors: m.capabilities.optionDescriptors.map((d) => ({
+            id: d.id, type: d.type,
+            ...(d.type === "select" ? { options: d.options.map((o) => ({ id: o.id })) } : {}),
+          })),
+        }),
+      },
+    })),
+    ...(p.usageLimits === undefined ? {} : { usageLimits: {
+      checkedAt: p.usageLimits.checkedAt,
+      windows: p.usageLimits.windows.map((w) => ({
+        id: w.id, kind: w.kind, usedPercent: w.usedPercent,
+        ...(w.windowDurationMins === undefined ? {} : { windowDurationMins: w.windowDurationMins }),
+        ...(w.resetsAt === undefined ? {} : { resetsAt: w.resetsAt }),
+      })),
+      ...(p.usageLimits.resetCredits === undefined ? {} : { resetCredits: {
+        availableCount: p.usageLimits.resetCredits.availableCount,
+        ...(p.usageLimits.resetCredits.nextExpiresAt === undefined ? {} : { nextExpiresAt: p.usageLimits.resetCredits.nextExpiresAt }),
+      } }),
+      ...(p.usageLimits.unavailable === undefined ? {} : { unavailable: { reason: p.usageLimits.unavailable.reason } }),
+    } }),
+  };
+}
+
+/** Cached config read followed by provider-status notifications; never refreshes a provider. */
+export async function connectUsage(
+  options: ConnectOptions,
+  onProviders: (providers: ReadonlyArray<SwitchProvider>) => void,
+): Promise<void> {
+  await withClient(options, (client) => Effect.gen(function* () {
+    const config = yield* client["server.getConfig"]({}).pipe(Effect.timeout("5 seconds"));
+    let providers = config.providers, settings = config.settings;
+    const publish = () => onProviders(providers.map(p => ({
+      ...toSwitchProvider(p),
+      quotaContextBlocked: (settings.providerInstances[p.instanceId]?.environment?.length ?? 0) > 0,
+    })));
+    publish();
+    yield* client.subscribeServerConfig({}).pipe(Stream.runForEach((event) => Effect.sync(() => {
+      if (event.type === "snapshot") { providers = event.config.providers; settings = event.config.settings; }
+      else if (event.type === "providerStatuses") providers = event.payload.providers;
+      else if (event.type === "settingsUpdated") settings = event.payload.settings;
+      else return;
+      publish();
+    })));
+  }));
 }
 
 /** Each call is scoped; a failed transport can be retried using the identical command. */
@@ -151,26 +218,7 @@ export function switchPort(options: ConnectOptions): SwitchPort {
   return {
     catalog: () => request((client) => client["server.getConfig"]({}).pipe(
       Effect.map((config) => ({
-        providers: config.providers.map((p): SwitchProvider => ({
-          instanceId: p.instanceId, driver: p.driver, enabled: p.enabled, installed: p.installed,
-          status: p.status, auth: { status: p.auth.status },
-          ...(p.availability === undefined ? {} : { availability: p.availability }),
-          models: p.models.map((m) => ({
-            slug: m.slug, capabilities: m.capabilities === null ? null : {
-              ...(m.capabilities.optionDescriptors === undefined ? {} : {
-                optionDescriptors: m.capabilities.optionDescriptors.map((d) => ({
-                  id: d.id, type: d.type,
-                  ...(d.type === "select" ? { options: d.options.map((o) => ({ id: o.id })) } : {}),
-                })),
-              }),
-            },
-          })),
-          ...(p.usageLimits === undefined ? {} : { usageLimits: {
-            checkedAt: p.usageLimits.checkedAt,
-            windows: p.usageLimits.windows.map((w) => ({ usedPercent: w.usedPercent })),
-            ...(p.usageLimits.unavailable === undefined ? {} : { unavailable: true }),
-          } }),
-        })),
+        providers: config.providers.map(toSwitchProvider),
         autoResume: config.settings.autoResumeLimitedThreads,
       })),
     )),
