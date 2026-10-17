@@ -30,6 +30,7 @@ export interface ExtraUsage { readonly usedMinor: number | null; readonly capMin
 export interface ProviderHeadroom {
   readonly alias: string;
   readonly driver: string;
+  binding?: "asserted" | "verified";
   plan: Metric<string>;
   included: Metric<ReadonlyArray<Window>>;
   credits: Metric<Wallet>;
@@ -85,6 +86,7 @@ export function validateHeadroom(value: unknown): HeadroomState {
   }
   for (const p of s.providers) {
     if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
+        p.binding !== undefined && !["asserted", "verified"].includes(p.binding) ||
         !["plan", "included", "credits", "manualResets", "extraUsage", "ordinaryUsageAllowed", "spendControlReached"].every(k => metric(p[k])) ||
         p.included.value !== null && (!Array.isArray(p.included.value) || p.included.value.length > 32 ||
           !p.included.value.every((w: any) => object(w) && safeId(w.id) && percent(w.usedPercent) && percent(w.remainingPercent))) ||
@@ -154,6 +156,7 @@ export function failCodex(row: ProviderHeadroom, error: string): void {
 /** Public, identity-free lanes: reporting inputs only; paid admission stays false without a future policy. */
 export function routingLanes(row: ProviderHeadroom, nowMs: number) {
   return {
+    ...(row.binding ? { binding: row.binding } : {}),
     included: { windows: metricNow(row.included, nowMs), ordinaryUsageAllowed: metricNow(row.ordinaryUsageAllowed, nowMs) },
     creditFunded: { credits: metricNow(row.credits, nowMs), spendControlReached: metricNow(row.spendControlReached, nowMs),
       extraUsage: metricNow(row.extraUsage, nowMs), admissionAllowed: false as const },
@@ -170,10 +173,12 @@ export function humanStatus(state: HeadroomState, nowMs: number): string {
   if (state.providers.length === 0) return "Quota headroom unknown: no cached provider observations.\n";
   const describe = <T>(m: Metric<T>, value: (v: T) => string): string => {
     const current = metricNow(m, nowMs);
-    return `${m.value === null ? "unknown" : value(m.value)} [${current.state}; ${m.source}; observed ${m.observedAt ?? "never"}; age ${current.ageSeconds === null ? "unknown" : current.ageSeconds + "s"}${m.error ? "; " + m.error : ""}]`;
+    const observation = m.observedAt === null && m.error ? `reason ${m.error}` : `observed ${m.observedAt ?? "never"}`;
+    return `${m.value === null ? "unknown" : value(m.value)} [${current.state}; ${m.source}; ${observation}; age ${current.ageSeconds === null ? "unknown" : current.ageSeconds + "s"}${m.error && m.observedAt !== null ? "; " + m.error : ""}]`;
   };
   return state.providers.map(row => [
     `${row.alias}${row.plan.value ? " (" + row.plan.value + ")" : ""}:`,
+    ...(row.binding ? ["  binding: " + row.binding] : []),
     "  plan: " + describe(row.plan, String),
     "  included windows: " + describe(row.included, windows => windows.map(w =>
       `${w.id} ${w.usedPercent}% used / ${w.remainingPercent}% remaining; duration ${w.windowDurationMins ?? "unknown"} min; reset ${w.resetsAt ?? "unknown"}`).join("; ")),
@@ -185,12 +190,32 @@ export function humanStatus(state: HeadroomState, nowMs: number): string {
   ].join("\n")).join("\n") + "\n";
 }
 
+const SKIP_REASONS = ["context_not_configured", "remote_t3", "provider_not_found", "provider_driver_mismatch",
+  "provider_disabled", "provider_not_installed", "provider_unavailable", "auth_not_authenticated",
+  "auth_type_not_chatgpt", "instance_environment_unsupported", "runtime_home_unknown", "runtime_home_mismatch"] as const;
+type SkipReason = typeof SKIP_REASONS[number];
+type BalanceReason = SkipReason | BalanceReadError["code"] | "read_started" | "read_completed" | "read_failed" | "context_mismatch";
+function rejection(p: SwitchProvider | undefined, ctx: CodexContext, local: boolean): SkipReason | undefined {
+  if (!local) return "remote_t3";
+  if (!p) return "provider_not_found";
+  if (p.driver !== "codex") return "provider_driver_mismatch";
+  if (!p.enabled) return "provider_disabled";
+  if (!p.installed) return "provider_not_installed";
+  if (p.availability === "unavailable") return "provider_unavailable";
+  if (p.auth.status !== "authenticated") return "auth_not_authenticated";
+  if (p.auth.type !== "chatgpt") return "auth_type_not_chatgpt";
+  if (p.quotaContextBlocked) return "instance_environment_unsupported";
+  if (p.runtimeHome === undefined) return ctx.assertRuntimeHome ? undefined : "runtime_home_unknown";
+  if (resolve(p.runtimeHome) !== ctx.codexHome) return "runtime_home_mismatch";
+}
+
 export type BalanceReader = (context: CodexContext, signal: AbortSignal) => Promise<unknown>;
 /** Explicit clock/random seams make cadence tests deterministic, without wall-clock assertions. */
 export interface HeadroomMonitorOptions {
   state: HeadroomState; config: HeadroomConfig; local: boolean;
   save: (records: ReadonlyArray<QuotaRecord>) => void;
   read?: BalanceReader; now?: () => number; random?: () => number;
+  diagnostic?: (detail: { provider: string; reason: BalanceReason; binding?: "asserted" }) => void;
 }
 export class HeadroomMonitor {
   #providers: ReadonlyArray<SwitchProvider> = [];
@@ -201,6 +226,8 @@ export class HeadroomMonitor {
   #due = new Map<string, number>();
   #failures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
+  #reported = new Map<string, string>();
+  #started = new Set<string>();
   readonly #abort = new AbortController();
   readonly options: HeadroomMonitorOptions;
   constructor(options: HeadroomMonitorOptions) { this.options = options; }
@@ -231,6 +258,7 @@ export class HeadroomMonitor {
       applyT3(next, p);
       return next;
     });
+    this.#diagnose();
     this.#changed ||= before !== JSON.stringify(this.state.providers);
     this.#active = true;
     // Include the bounded startup balance read in the first snapshot/baseline.
@@ -248,38 +276,98 @@ export class HeadroomMonitor {
     this.#flight = this.#collect().finally(() => { this.#flight = null; });
     return this.#flight;
   }
+  #report(provider: string, reason: BalanceReason): void {
+    const binding = this.state.providers.find(p => p.alias === provider)?.binding;
+    const signature = JSON.stringify([reason, binding]);
+    if (this.#reported.get(provider) === signature) return;
+    this.#reported.set(provider, signature);
+    try { this.options.diagnostic?.({ provider, reason, ...(binding === "asserted" ? { binding } : {}) }); } catch { /* Logging cannot stop collection. */ }
+  }
+  #diagnose(): void {
+    const bindings = new Map(this.options.config.contexts.flatMap(ctx => ctx.providers.map(alias => [alias, ctx] as const)));
+    const before = JSON.stringify(this.state.providers);
+    for (const [alias, ctx] of bindings) {
+      const reason = rejection(this.#providers.find(p => p.instanceId === alias), ctx, this.options.local);
+      if (!this.state.providers.some(p => p.alias === alias)) {
+        if (this.state.providers.length < 64) this.state.providers.push(newProvider(alias, "codex"));
+        else if (reason) this.#report(alias, reason);
+      }
+    }
+    // Retain only current aliases and configured bindings, not historical catalog entries.
+    for (const alias of this.#reported.keys()) {
+      if (!bindings.has(alias) && !this.state.providers.some(p => p.alias === alias)) this.#reported.delete(alias);
+    }
+    for (const row of this.state.providers) {
+      const ctx = bindings.get(row.alias);
+      if (!ctx && row.driver !== "codex") continue;
+      const p = this.#providers.find(p => p.instanceId === row.alias);
+      const reason = ctx ? rejection(p, ctx, this.options.local) : "context_not_configured";
+      // Keep provenance visible even while a temporary rejection marks cached metrics as errors.
+      if (ctx && p?.driver === "codex" && p.runtimeHome === undefined && ctx.assertRuntimeHome) row.binding = "asserted";
+      else if (ctx && p?.runtimeHome !== undefined && resolve(p.runtimeHome) === ctx.codexHome) row.binding = "verified";
+      else delete row.binding;
+      if (reason) {
+        if (row.driver === "codex") failCodex(row, reason);
+        else row.credits = { ...row.credits, error: reason };
+        this.#report(row.alias, reason);
+      } else {
+        // Identity changes are cleared in update(). Eligibility flaps keep the same observations.
+        const resume = <T>(m: Metric<T>, observedState: MetricState = "fresh"): Metric<T> => SKIP_REASONS.some(r => r === m.error) ||
+          m.value === null && m.error === null ? { ...m,
+            state: m.value === null ? "unknown" : observedState, error: m.value === null ? "read_scheduled" : null } : m;
+        row.credits = resume(row.credits, row.credits.value?.balance === null && !row.credits.value.unlimited ? "unknown" : "fresh");
+        row.ordinaryUsageAllowed = resume(row.ordinaryUsageAllowed);
+        row.spendControlReached = resume(row.spendControlReached); row.plan = resume(row.plan);
+        if (row.manualResets.source === "codex-app-server") row.manualResets = resume(row.manualResets);
+      }
+    }
+    this.#changed ||= before !== JSON.stringify(this.state.providers);
+  }
+  #currentRow(p: SwitchProvider, ctx: CodexContext): ProviderHeadroom | undefined {
+    const current = this.#providers.find(v => v.instanceId === p.instanceId);
+    if (!current || rejection(current, ctx, this.options.local) !== undefined || current.runtimeHome !== p.runtimeHome ||
+        current.quotaAccountKey !== p.quotaAccountKey) return;
+    return this.state.providers.find(r => r.alias === p.instanceId);
+  }
   async #collect(): Promise<void> {
-    if (this.options.local) for (const ctx of this.options.config.contexts) {
-      const key = contextKey(ctx), now = this.now();
+    this.#diagnose();
+    // Policies may differ across aliases sharing one executable/HOME tuple.
+    const contexts = new Map(this.options.config.contexts.map(ctx => [contextKey(ctx), ctx]));
+    if (this.options.local) for (const [key, ctx] of contexts) {
+      const now = this.now();
       if ((this.#due.get(key) ?? 0) > now || this.#abort.signal.aborted || !this.#active) continue;
-      const matching = this.#providers.filter(p => ctx.providers.includes(p.instanceId) && p.driver === "codex" &&
-        p.enabled && p.installed && p.auth.status === "authenticated" && p.auth.type === "chatgpt" && p.availability !== "unavailable" && !p.quotaContextBlocked &&
-        p.runtimeHome !== undefined && resolve(p.runtimeHome) === ctx.codexHome);
+      const matching = this.options.config.contexts.filter(c => contextKey(c) === key).flatMap(binding =>
+        this.#providers.filter(p => binding.providers.includes(p.instanceId) && rejection(p, binding, this.options.local) === undefined)
+          .map(p => ({ p, binding })));
       if (matching.length === 0) continue; // unknown context never falls back to this shell's login
       try {
+        if (!this.#started.has(key)) {
+          this.#started.add(key);
+          for (const { p } of matching) this.#report(p.instanceId, "read_started");
+        }
         const raw = await (this.options.read ?? readCodexBalance)(ctx, this.#abort.signal);
         if (this.#abort.signal.aborted) return;
         const at = new Date(this.now()).toISOString();
         // Match again after await: aliases can be reconfigured during a read.
-        for (const p of matching) {
-          const current = this.#providers.find(v => v.instanceId === p.instanceId);
-          if (!current || current.runtimeHome !== p.runtimeHome || current.quotaContextBlocked ||
-              current.quotaAccountKey !== p.quotaAccountKey || current.auth.type !== "chatgpt" || current.auth.status !== "authenticated") continue;
-          const row = this.state.providers.find(r => r.alias === p.instanceId);
+        for (const { p, binding } of matching) {
+          const row = this.#currentRow(p, binding);
           if (!row) continue;
           const accountId = object(raw)?.accountId;
           if (p.quotaAccountKey && (typeof accountId !== "string" ||
               createHash("sha256").update(accountId).digest("hex") !== p.quotaAccountKey)) {
-            failCodex(row, "context_mismatch");
-          } else applyCodex(row, raw, at);
+            failCodex(row, "context_mismatch"); this.#report(p.instanceId, "context_mismatch");
+          } else { applyCodex(row, raw, at); this.#report(p.instanceId, "read_completed"); }
         }
         this.#failures.delete(key);
       } catch (error) {
         if (this.#abort.signal.aborted) return;
         this.#failures.set(key, Math.min(5, (this.#failures.get(key) ?? 0) + 1));
-        for (const p of matching) {
-          const row = this.state.providers.find(r => r.alias === p.instanceId);
-          if (row) failCodex(row, error instanceof BalanceReadError ? error.code : "read_failed");
+        for (const { p, binding } of matching) {
+          const row = this.#currentRow(p, binding);
+          if (!row) continue;
+          const reason = error instanceof BalanceReadError ? error.code : "read_failed";
+          failCodex(row, reason);
+          this.#report(p.instanceId, reason);
         }
       }
       this.#changed = true;

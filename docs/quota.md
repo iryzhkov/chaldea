@@ -396,16 +396,49 @@ HOME/auth context; use T3's effective runtime path for `codexHome`, including
 a shadow home when configured. The observer
 also requires a loopback T3 URL, an enabled/installed/authenticated Codex provider,
 a confirmed ChatGPT auth type, and an exact normalized match between codexHome and the published effective runtime
-home (shadowHomePath when present, otherwise homePath). Missing runtime paths,
-instance environment overrides, a remote server or an unmatched context leave the
-balance unknown. If T3 supplies a workspace identity, its private hash must also
+home (shadowHomePath when present, otherwise homePath). By default, missing runtime paths
+leave the balance unknown. Instance environment overrides, a remote server or an
+unmatched context also leave it unknown. If T3 supplies a workspace identity, its private hash must also
 match the read response; no identity or hash is persisted or reported. There is no fallback to the invoking shell's account. The collector
 sets HOME/CODEX_HOME explicitly and excludes inherited auth tokens and endpoint
 overrides. Instances requiring custom auth environment need a future context adapter.
-Equal HOME/CODEX_HOME/executable tuples share one collector across aliases; paths and
+A context may set `"assertRuntimeHome": true` to trust its configured `home` and
+`codexHome` when T3 omits runtime paths. This defaults to false and only relaxes
+the missing-path check. Published paths still win: a disagreement remains
+`runtime_home_mismatch`. All other eligibility and account identity checks remain.
+Human and JSON status label this binding `asserted`, and the startup collector
+log includes `binding: asserted`. A matching published path is labeled `verified`.
+An assertion cannot confirm which account T3 actually uses. The worst case is
+displaying another account's balance. Nothing spends or acts on that figure.
+Asserted observations also cannot affect provider switching; routing uses T3's
+included-usage windows instead.
+
+Equal HOME/CODEX_HOME/executable tuples share one collector across aliases even
+when their assertion settings differ; each alias keeps its own opt-in. Paths and
 context keys are internal and never appear in status/feed output. Reconfiguration
 invalidates the wallet before a new context can report it. Without a quota config,
-T3 windows/reset counts still work and Codex money remains unknown.
+T3 windows/reset counts still work. Codex money has an unknown value, with metric
+state `error` and reason `context_not_configured` to explain the missing binding.
+
+Rejected Codex bindings now log one `Codex balance collector` line per provider
+and reason transition, and persist the same reason in the balance metric's
+`error` field. Human status shows `reason runtime_home_unknown` instead of
+`observed never`; JSON exposes the stable code. No paths, account identifiers,
+credential hashes or raw provider errors enter these diagnostics.
+`runtime_home_unknown` means T3 omitted published `runtimePaths` and the context
+has not opted into an operator assertion. `runtime_home_mismatch`
+means `codexHome` differs from the published effective path. Other codes identify
+missing aliases, disabled/uninstalled/unavailable providers, auth type/status,
+instance environment overrides, remote T3 and missing quota context bindings.
+A missing configured alias appears in cached status within the 64-row bound.
+The first scheduled read logs `read_started`; results log `read_completed` or
+a sanitized failure code only when the outcome changes. `spawn_failed` means
+the configured executable or its working directory could not be used, including
+an executable absent from the service PATH. The existing read cadence and backoff
+are unchanged. When the same binding becomes eligible again, cached values and
+observation times survive until the next due read. Metrics still awaiting an
+observation show `read_scheduled`. A changed credential context discards the old
+observations.
 
 Collection happens once when the observer receives its startup catalog, then every
 five minutes with ±10% jitter while connected to T3. A ten-second scheduler checks
