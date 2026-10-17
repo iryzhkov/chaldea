@@ -121,6 +121,10 @@ export class FeedPoster {
   enqueue(record: QuotaRecord, ack?: () => boolean | void): void {
     const key = quotaKey(record);
     if (this.#queue.has(key)) return;
+    if (!record.headroom && this.#queue.size >= MAX_QUEUED_RECORDS) {
+      const advisory = [...this.#queue].find(([, item]) => item.record.headroom !== undefined);
+      if (advisory) this.#queue.delete(advisory[0]); // Its owner retains/coalesces the durable advisory intent.
+    }
     if (this.#queue.size >= MAX_QUEUED_RECORDS) {
       this.#options.logger.warn("feed worker full; durable intent retained"); return;
     }
@@ -143,8 +147,13 @@ export class FeedPoster {
   async idle(): Promise<void> { while (this.#draining) await this.#draining; }
   close(): void { this.#closed = true; if (this.#timer) clearTimeout(this.#timer); }
   async #drain(): Promise<void> {
-    for (const [key, item] of this.#queue) {
-      if (this.#closed) return;
+    const attempted = new Set<string>();
+    while (!this.#closed) {
+      const pending = [...this.#queue].filter(([key]) => !attempted.has(key));
+      const next = pending.find(([, item]) => !item.record.headroom) ?? pending[0];
+      if (!next) return;
+      const [key, item] = next;
+      attempted.add(key);
       let ok = false;
       try {
         if (this.#akasha) ok = await (this.#options.deliver ?? ((e) => publish(e, this.#options.publisher)))(quotaPublication(item.record, this.#options.host));
