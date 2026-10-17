@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { removeArtifacts, active as liveIntent } from './artifacts.ts';
 import { removeLog } from './logs.ts';
 
-export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; logPath?: string; logTruncated?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[] };
+export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; logPath?: string; logTruncated?: boolean; outputSyncFailed?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[] };
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 

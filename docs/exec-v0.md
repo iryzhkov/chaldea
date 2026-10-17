@@ -159,12 +159,18 @@ only the explicitly named regular artifact files in `<state_root>/.retained/<job
 outside every guest mount. Artifact paths are checked for symlinks/special files;
 the existing 32-file/64 MiB aggregate cap applies. Missing, unsafe or over-cap
 artifacts are reported as unavailable while other requested files remain recoverable.
-The host stores no argv, environment or snapshot in recovery data.
+The host stores no argv, environment or snapshot in recovery data. Recovery writes
+are best-effort under storage I/O failures: streaming and the actual exit status
+still complete, metadata is retried after workspace cleanup frees space, and a
+degraded recovery is reported by fetch. Any holder of the host's job SSH key can
+fetch a known job UUID under the existing shared job-account trust boundary.
 
 Host recovery lasts three days from completion, with startup/admission/fetch pruning
 and oldest-first eviction at 2 GiB / 1,000 jobs inside the existing 20 GiB image
 budget. Active jobs and fetch readers hold locks; active jobs reserve output plus
-artifact capacity. A successful job removes its host copy after the result is sent.
+artifact capacity. A successful job removes its host copy after the result is sent to SSH. If the
+connection drops after that write but before the client receives it, the local
+outcome can remain uncertain with no retained host copy.
 A failed result delivery also retains the copy. A hard host/server crash may leave
 incomplete recovery; fetch refuses it rather than claiming a result.
 

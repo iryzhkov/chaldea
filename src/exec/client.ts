@@ -273,7 +273,6 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
     await upload;
     const sshCode = await exit;
     if (result === undefined || sshCode !== 0) throw new Error('connection lost before a confirmed result');
-    if (artifact) { await artifact.sync(); await artifact.close(); artifact = undefined; }
     intent.outcome = 'finished'; intent.exitCode = result;
     process.stderr.write('chaldea ran on ' + options.host + '\n');
     return result;
@@ -290,8 +289,14 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
     throw new Error(message);
   } finally {
     process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
-    if (artifact) { await artifact.sync(); await artifact.close(); }
-    await log.close();
+    const writes = await Promise.allSettled([
+      artifact ? (async () => { try { await artifact!.sync(); } finally { await artifact!.close(); } })() : Promise.resolve(),
+      log.close(),
+    ]);
+    if (writes.some(write => write.status === 'rejected')) {
+      intent.outputSyncFailed = true;
+      process.stderr.write('chaldea: local output sync failed; retaining job outcome\n');
+    }
     intent.ended = new Date().toISOString();
     intent.logTruncated = log.truncated;
     intent.artifactPaths = [...seen].slice(0, artifactRemaining ? -1 : undefined).map(name => join(destination, name));

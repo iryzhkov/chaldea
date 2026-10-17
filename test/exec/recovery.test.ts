@@ -65,7 +65,7 @@ async function fixture() {
   return {
     root, work, state,
     command,
-    run: (code: string, artifact = true) => command(['--host', 'test', '--no-queue', ...(artifact ? ['--artifact', 'out/result'] : []), '--', python, '-c', code]),
+    run: (code: string, artifact = true, extra: NodeJS.ProcessEnv = {}) => command(['--host', 'test', '--no-queue', ...(artifact ? ['--artifact', 'out/result'] : []), '--', python, '-c', code], extra),
     entries: async () => Promise.all((await fs.readdir(join(state, 'journal'))).filter(x => x.endsWith('.json')).map(async x => JSON.parse(await fs.readFile(join(state, 'journal', x), 'utf8')))),
     done: async (id: string) => {
       const dir = join(root, 'done');
@@ -176,4 +176,30 @@ test('log caps, age/count pruning, and active reservations use fake time and spa
     await prune(journal, 14 * 86400000, 0);
     await assert.rejects(fs.access(logPath(state, id)), { code: 'ENOENT' });
   } finally { await fs.rm(state, { recursive: true, force: true }); }
+});
+
+test('a final log fsync error preserves the confirmed exit code in the journal', { timeout: 15000 }, async () => {
+  const f = await fixture();
+  try {
+    const injection = join(f.root, 'fail-log-sync.mjs');
+    await fs.writeFile(injection, [
+      "import * as fs from 'node:fs/promises';",
+      "const file = await fs.open(process.env.INJECT_PROBE, 'w');",
+      "const prototype = Object.getPrototypeOf(file);",
+      "const sync = prototype.sync;",
+      "prototype.sync = async function () {",
+      "  const path = await fs.readlink('/proc/self/fd/' + this.fd);",
+      "  if (path.endsWith('.log')) throw Object.assign(new Error('fixture ENOSPC'), {code: 'ENOSPC'});",
+      "  return sync.call(this);",
+      "};",
+      "await file.close();",
+    ].join('\n'));
+    const result = await collected(f.run('import sys; print("delivered"); sys.exit(7)', false,
+      { NODE_OPTIONS: '--import=' + injection, INJECT_PROBE: join(f.root, 'probe') }));
+    assert.equal(result.code, 7, result.err);
+    assert.match(result.err, /local output sync failed/);
+    const [entry] = await f.entries();
+    assert.equal(entry.outcome, 'finished'); assert.equal(entry.exitCode, 7);
+    assert.match(await fs.readFile(entry.logPath, 'utf8'), /delivered/);
+  } finally { await f.remove(); }
 });

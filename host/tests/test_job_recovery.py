@@ -8,7 +8,6 @@ import uuid
 
 import pytest
 
-server = type("Server", (), {})()
 # runpy functions keep their module globals, so patch globals through the dict.
 module = runpy.run_path(str(Path(__file__).resolve().parents[1] / "chaldea-job-server"))
 retention = module["retention"]
@@ -89,10 +88,10 @@ def test_output_and_regular_named_artifacts_caps(tmp_path):
     (workspace / "symlink").symlink_to(workspace / "small")
     os.mkfifo(workspace / "fifo")
     req = request(artifacts=["too-big", "small", "missing", "symlink", "fifo"])
-    with patch.dict(retention.RetainedJob.output.__globals__, LOG_CAP=32):
+    with patch.dict(retention.RetainedJob.output.__globals__, RETENTION_LOG_CAP=32):
         job = retention.RetainedJob(tmp_path, req, {})
         job.output("O", b"x" * 100)
-    with patch.dict(retention.RetainedJob.finish.__globals__, ARTIFACT_CAP=4):
+    with patch.dict(retention.RetainedJob.finish.__globals__, RETENTION_ARTIFACT_CAP=4):
         job.finish(workspace, module["artifact_file"], "preempted")
     job.close(True)
     assert (job.path / "output.log").stat().st_size == 32
@@ -112,11 +111,10 @@ def test_fetch_is_read_only_and_versioned_and_survives_workspace_cleanup(tmp_pat
     path = finished(tmp_path, workspace, req, now=100)
     module["cleanup"](tmp_path)
     assert not workspace.exists() and path.exists()
-    with patch.dict(retention.fetch.__wrapped__.__globals__, **{}):
-        # A fake wall clock proves fetch invokes expiration without waiting.
-        with patch.object(retention.time, "time", return_value=101):
-            with retention.fetch(tmp_path, {"version": 1, "jobId": req["jobId"]}, {}) as (found, meta):
-                assert found == path and meta["outcome"] == "finished"
+    # A fake wall clock proves fetch invokes expiration without waiting.
+    with patch.object(retention.time, "time", return_value=101):
+        with retention.fetch(tmp_path, {"version": 1, "jobId": req["jobId"]}, {}) as (found, meta):
+            assert found == path and meta["outcome"] == "finished"
     for value in [{"version": 2, "jobId": req["jobId"]}, {"version": 1, "jobId": "../escape"}]:
         with pytest.raises(ValueError):
             with retention.fetch(tmp_path, value, {}):
@@ -160,3 +158,111 @@ def test_success_discards_host_copy_but_lost_result_keeps_it(tmp_path):
             else:
                 module["run_job"](tmp_path, tmp_path, req, workspace, {})
         assert (tmp_path / ".retained" / req["jobId"]).exists() == lose_result
+
+
+def test_installed_two_file_server_starts_without_python_helpers(tmp_path):
+    import shutil
+    import struct
+    import subprocess
+    import sys
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    source = Path(__file__).resolve().parents[1]
+    for name in ("chaldea-job-server", "exec-protocol.json"):
+        shutil.copyfile(source / name, installed / name)
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"state_root": str(tmp_path / "jobs"), "require_mount": False}))
+    body = json.dumps({"version": 1, "jobId": str(uuid.uuid4())}).encode()
+    result = subprocess.run([sys.executable, "-I", str(installed / "chaldea-job-server"), "--config", str(config)],
+                            input=b"F" + struct.pack("!I", len(body)) + body,
+                            capture_output=True, timeout=5,
+                            env={**os.environ, "SSH_ORIGINAL_COMMAND": "chaldea-exec-fetch-v1"})
+    assert result.stdout[:1] == b"H", result.stderr
+    assert b"fetchVersion" in result.stdout
+    assert b"job recovery not retained" in result.stdout
+    assert sorted(p.name for p in installed.iterdir()) == ["chaldea-job-server", "exec-protocol.json"]
+
+
+@pytest.mark.parametrize("failure", ["write", "flush", "fsync", "metadata"])
+@pytest.mark.parametrize("code", [0, 7])
+def test_full_recovery_storage_never_suppresses_output_or_real_result(tmp_path, failure, code):
+    import errno
+    import io
+    import struct
+    from types import SimpleNamespace
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    req = request(artifacts=[])
+    env = module["run_job"].__globals__
+    real_job = retention.RetainedJob
+    real_metadata = env["retention_metadata"]
+    saved = []
+    class FaultyLog:
+        def __init__(self, file):
+            self.file = file
+        def write(self, data):
+            if failure == "write":
+                raise OSError(errno.ENOSPC, "fixture only")
+            return self.file.write(data)
+        def flush(self):
+            if failure == "flush":
+                raise OSError(errno.ENOSPC, "fixture only")
+            return self.file.flush()
+        def fileno(self):
+            if failure == "fsync":
+                raise OSError(errno.ENOSPC, "fixture only")
+            return self.file.fileno()
+        def close(self):
+            self.file.close()
+    def make_job(*args, **kwargs):
+        job = real_job(*args, **kwargs)
+        job.log = FaultyLog(job.log)
+        saved.append(job)
+        return job
+    initial = [True]
+    def metadata(path, value):
+        if failure == "metadata" and not initial[0] and workspace.exists():
+            raise OSError(errno.ENOSPC, "fixture only")
+        initial[0] = False
+        return real_metadata(path, value)
+    def execute(*_):
+        env["send"]("O", b"actual-job-output")
+        return code
+    stream = io.BytesIO()
+    with (patch.object(retention, "RetainedJob", make_job),
+          patch.dict(env, execute=execute, retention_metadata=metadata),
+          patch.object(env["sys"], "stdout", SimpleNamespace(buffer=stream))):
+        module["run_job"](tmp_path, tmp_path, req, workspace, {})
+    raw = stream.getvalue()
+    frames = []
+    while raw:
+        size = struct.unpack("!I", raw[1:5])[0]
+        frames.append((raw[:1], raw[5:5 + size]))
+        raw = raw[5 + size:]
+    assert frames == [(b"O", b"actual-job-output"), (b"X", module["encode"]({"exitCode": code}))]
+    assert saved[0].meta["recoveryDegraded"]
+    if code:
+        # Once cleanup frees space, even a failed first metadata write is retried.
+        meta = json.loads((saved[0].path / "metadata.json").read_text())
+        assert meta["outcome"] == "finished" and meta["exitCode"] == code
+        assert meta["recoveryDegraded"]
+
+
+def test_prune_uses_bounded_descriptors_and_ignores_unexpected_entries(tmp_path, capsys):
+    import resource
+    store = tmp_path / ".retained"
+    store.mkdir()
+    for _ in range(100):
+        path = store / str(uuid.uuid4())
+        path.mkdir()
+        (path / "lock").touch()
+        (path / "metadata.json").write_text(json.dumps({"started": 100, "ended": 100}))
+    (store / "unexpected-secret-name").write_text("ignored, never echoed")
+    before = resource.getrlimit(resource.RLIMIT_NOFILE)
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, before[1]))
+        retention.prune(tmp_path, {}, now=101)
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, before)
+    assert len(list(store.iterdir())) == 101
+    assert "unexpected recovery entry ignored" in capsys.readouterr().err

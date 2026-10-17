@@ -22,7 +22,7 @@ export function summary(entry: Intent) {
   return [
     'Job: ' + entry.jobId, 'Outcome: ' + entry.outcome, 'Exit code: ' + (entry.exitCode ?? 'unknown'),
     'Host: ' + entry.host, 'Started: ' + entry.started, 'Ended: ' + (entry.ended ?? 'unknown'),
-    'Log: ' + (entry.logPath ?? 'unavailable') + (entry.logTruncated ? ' (truncated at 64 MiB)' : ''),
+    'Log: ' + (entry.logPath ?? 'unavailable') + (entry.logTruncated ? ' (truncated at 64 MiB)' : '') + (entry.outputSyncFailed ? ' (local output sync failed)' : ''),
     'Artifacts: ' + (entry.artifactPaths?.join(', ') || 'none'),
   ].join('\n') + '\n';
 }
@@ -168,7 +168,8 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     await fs.rename(temporary, path);
     entry.outcome = meta.outcome; entry.exitCode = meta.exitCode ?? undefined;
     entry.started = new Date(meta.started * 1000).toISOString(); entry.ended = new Date(meta.ended * 1000).toISOString();
-    entry.logPath = path; entry.logTruncated = meta.logTruncated === true;
+    entry.logPath = path; entry.logTruncated = meta.logTruncated === true; entry.outputSyncFailed = false;
+    if (meta.recoveryDegraded === true) await write('Host recovery storage was degraded; output or artifacts may be incomplete.\n');
     entry.artifactPaths = [...seen].map(name => join(destination, name));
     await record(join(state, 'journal'), entry, false);
     await write(summary(entry));
