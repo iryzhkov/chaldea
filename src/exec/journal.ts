@@ -1,7 +1,8 @@
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
+import { removeArtifacts } from './artifacts.ts';
 
-export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; outcome: 'uncertain' | 'finished'; exitCode?: number };
+export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; exitCode?: number };
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 
@@ -37,7 +38,10 @@ export async function prune(dir: string, age = DAYS, keep = KEEP) {
   retained = active.size;
   for (const entry of files) {
     if (active.has(entry.path)) continue;
-    if (retained >= keep || entry.stat.mtimeMs < Date.now() - age) await fs.unlink(entry.path);
+    if (retained >= keep || entry.stat.mtimeMs < Date.now() - age) {
+      try { await removeArtifacts(JSON.parse(await fs.readFile(entry.path, 'utf8'))); } catch (e: any) { if (e instanceof SyntaxError) { /* partial update */ } else throw e; }
+      await fs.unlink(entry.path);
+    }
     else retained++;
   }
 }

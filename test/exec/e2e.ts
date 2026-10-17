@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import { watch } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
@@ -12,13 +12,16 @@ import { randomUUID } from 'node:crypto';
 import { frame, frames, json, VERSION } from '../../src/exec/protocol.ts';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
-const server = process.env.CHALDEA_JOB_SERVER ?? resolve(repo, '../fleet-config-jobhost/roles/chaldea_job_host/files/chaldea-job-server');
+const server = process.env.CHALDEA_JOB_SERVER;
+if (!server) throw new Error('CHALDEA_JOB_SERVER must point to the reviewed role files/chaldea-job-server; no sibling checkout fallback');
+const role = dirname(dirname(server));
 const cli = join(repo, 'bin/chaldea');
+const sshd = process.env.CHALDEA_SSHD ?? '/usr/bin/sshd';
 
-async function collected(child: ChildProcess) {
+async function collected(child: ChildProcess, timeoutMs = 10000) {
   let out = ''; let err = '';
   child.stdout!.on('data', x => { out += x; }); child.stderr!.on('data', x => { err += x; });
-  const timeout = setTimeout(() => child.kill('SIGKILL'), 10000);
+  const timeout = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
   const [code, signal] = await once(child, 'close');
   clearTimeout(timeout);
   return { code, signal, out, err };
@@ -58,7 +61,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
   }
   const run = (args: string[]) => spawn(process.execPath, [cli, 'exec', '--host', 'test', ...args], { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] });
   async function configure(extra: object = {}) {
-    await fs.writeFile(config, JSON.stringify({ state_root: jobroot, ...extra }));
+    await fs.writeFile(config, JSON.stringify({ state_root: jobroot, require_mount: false, pasta_binary: process.env.CHALDEA_PASTA ?? '/usr/bin/pasta', ...extra }));
   }
   try {
     await fs.mkdir(work); await fs.mkdir(jobroot);
@@ -67,8 +70,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
     // Ephemeral fixture keys only; never touch ~/.ssh or the user's agent.
     for (const path of [hostKey, clientKey]) execFileSync('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', path], { stdio: 'ignore' });
     const pub = (await fs.readFile(clientKey + '.pub', 'utf8')).trim();
-    await fs.writeFile(join(scratch, 'authorized_keys'),
-      'restrict,from="127.0.0.1",command="/usr/bin/python3 ' + server + ' --config ' + config + '" ' + pub + '\n');
+
     const hostPub = execFileSync('ssh-keygen', ['-y', '-f', hostKey]).toString().trim();
     await fs.writeFile(join(scratch, 'known_hosts'), '[127.0.0.1]:' + port + ' ' + hostPub + '\n');
     await fs.writeFile(sshConfig, `Host chaldea-job-test
@@ -84,30 +86,17 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
   ControlPath ${controls}
 `);
     await configure();
-    await fs.writeFile(join(scratch, 'sshd.conf'), `Port ${port}
-ListenAddress 127.0.0.1
-HostKey ${hostKey}
-PidFile ${join(scratch, 'sshd.pid')}
-AuthorizedKeysFile ${join(scratch, 'authorized_keys')}
-StrictModes no
-UsePAM no
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PubkeyAuthentication yes
-AuthenticationMethods publickey
-AllowUsers ${userInfo().username}
-PermitUserEnvironment no
-PermitUserRC no
-PermitTTY no
-AllowTcpForwarding no
-AllowStreamLocalForwarding no
-AllowAgentForwarding no
-X11Forwarding no
-PermitTunnel no
-LogLevel VERBOSE
-`);
-    execFileSync('/usr/bin/sshd', ['-t', '-f', join(scratch, 'sshd.conf')], { stdio: 'pipe' });
-    daemon = spawn('/usr/bin/sshd', ['-D', '-e', '-f', join(scratch, 'sshd.conf')], { stdio: ['ignore', 'ignore', 'pipe'] });
+    execFileSync(process.env.CHALDEA_TEST_PYTHON ?? 'python3', ['-I', join(repo, 'test/exec/render.py'), role, scratch,
+      JSON.stringify({
+        chaldea_job_host_port: port, chaldea_job_host_user: userInfo().username,
+        chaldea_job_host_listen: ['127.0.0.1'], chaldea_job_host_pid_file: join(scratch, 'sshd.pid'),
+        chaldea_job_host_host_key: hostKey, chaldea_job_host_authorized_keys: join(scratch, 'authorized_keys'),
+        chaldea_job_host_log_level: 'VERBOSE',
+        chaldea_job_host_command: '/usr/bin/python3 -I ' + server + ' --config ' + config,
+        chaldea_job_host_sources: [{ ip: '127.0.0.1', public_key: pub }]
+      })], { stdio: 'pipe' });
+    execFileSync(sshd, ['-t', '-f', join(scratch, 'sshd.conf')], { stdio: 'pipe' });
+    daemon = spawn(sshd, ['-D', '-e', '-f', join(scratch, 'sshd.conf')], { stdio: ['ignore', 'ignore', 'pipe'] });
     await new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('sshd startup: ' + daemonLog)), 5000);
       daemon!.stderr!.on('data', x => {
@@ -179,17 +168,7 @@ assert not pathlib.Path(os.path.expanduser('~/.ssh')).exists()
 assert not pathlib.Path('/home/${userInfo().username}/.ssh').exists()
 assert not pathlib.Path('/etc/shadow').exists()
 assert not glob.glob('/dev/nvidia*') and not glob.glob('/dev/dri/*')
-# Invalid empty-name ioctl payloads cannot create anything even if this guard
-# regresses; without seccomp they return EINVAL/ENOTTY rather than EPERM.
-import fcntl,errno
-fd=os.open('/work',os.O_RDONLY)
-try:
-    for request in (0x50009401,0x5000940e,0x50009417,0x50009418,0x4008941a):
-        try:
-            fcntl.ioctl(fd,request,bytearray(4096),True)
-            raise AssertionError('Btrfs quota escape ioctl accepted')
-        except OSError as error: assert error.errno == errno.EPERM, error
-finally: os.close(fd)
+assert os.statvfs('/dev/shm').f_blocks * os.statvfs('/dev/shm').f_frsize == 64*1024**2
 try:
     result=subprocess.run(['sudo','-n','true'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     assert result.returncode != 0
@@ -199,7 +178,7 @@ print('isolation-ok')
       const result = await collected(run(['--', 'python3', '-c', code]));
       assert.equal(result.code, 0, result.err); assert.match(result.out, /isolation-ok/);
       const gpu = await collected(run(['--gpu', '--', 'true']));
-      assert.equal(gpu.code, 125); assert.match(gpu.err, /GPU unavailable/);
+      assert.equal(gpu.code, 255); assert.match(gpu.err, /GPU unavailable/);
     });
 
     await t.test('cleanup survives unreadable job-created directories', async () => {
@@ -211,13 +190,14 @@ print('isolation-ok')
 
     await t.test('lost client kills the entire job group and keeps durable outcome uncertain', async () => {
       const marker = 'chaldea-disconnect-' + randomUUID();
-      const child = run(['--', 'python3', '-c', 'import subprocess,sys,time; subprocess.Popen(["python3","-c","import time; time.sleep(100)",sys.argv[1]+"-descendant"],start_new_session=True); print("started",flush=True); time.sleep(100)', marker]);
+      const child = run(['--', 'python3', '-c', 'import subprocess,sys,time; subprocess.Popen(["python3","-c","import time; time.sleep(100)",sys.argv[1]+"-descendant"],start_new_session=True); print("started",flush=True); __import__("os").close(1); __import__("os").close(2); time.sleep(100)', marker]);
       let stderr = ''; child.stderr!.on('data', x => { stderr += x; });
       await Promise.race([once(child.stdout!, 'data'), once(child, 'close').then(() => { throw new Error('job exited before streaming: ' + stderr); })]);
       const id = /chaldea job ([0-9a-f-]+)/.exec(stderr)![1];
       const processList = execFileSync('ps', ['-u', userInfo().username, '-o', 'pid=,args=']).toString();
       const pids = processList.split('\n').filter(line => line.includes(marker)).map(line => Number(line.trim().split(/\s/)[0]));
       assert.ok(pids.length > 0);
+      await new Promise(resolve => setTimeout(resolve, 100)); // pipes have closed, process still runs
       const deleted = disappearance(jobroot, id);
       const closed = once(child, 'close');
       child.kill('SIGKILL'); await deleted; await closed;
@@ -230,11 +210,150 @@ print('isolation-ok')
       assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
     });
 
+    await t.test('target forced-server crash leaves uncertainty, kills the job and next startup recovers', async () => {
+      const marker = 'chaldea-target-crash-' + randomUUID();
+      const child = run(['--', 'python3', '-c', 'import time; print("ready",flush=True); time.sleep(100)', marker]);
+      let stderr = ''; child.stderr!.on('data', x => { stderr += x; });
+      const resultPromise = collected(child);
+      await once(child.stdout!, 'data');
+      const id = /chaldea job ([0-9a-f-]+)/.exec(stderr)![1];
+      const table = execFileSync('ps', ['-u', userInfo().username, '-o', 'pid=,args=']).toString().split('\n');
+      const serverPids = table.filter(line => line.includes('--config ' + config))
+        .map(line => Number(line.trim().split(/\s/)[0]));
+      const jobPids = table.filter(line => line.includes(marker))
+        .map(line => Number(line.trim().split(/\s/)[0]));
+      assert.equal(serverPids.length, 1);
+      process.kill(serverPids[0], 'SIGKILL');
+      const lost = await resultPromise;
+      assert.equal(lost.code, 255); assert.match(lost.err, /uncertain/);
+      assert.equal(JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8')).outcome, 'uncertain');
+      const recovered = await collected(run(['--', 'printf', 'recovered']));
+      assert.equal(recovered.code, 0, recovered.err); assert.equal(recovered.out, 'recovered');
+      for (const pid of jobPids) {
+        try { assert.match(await fs.readFile('/proc/' + pid + '/stat', 'utf8'), /\) Z /); }
+        catch (error: any) { if (error.code !== 'ENOENT') throw error; }
+      }
+      assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+    });
+
+    await t.test('private network hides host TCP listeners, every host address and abstract sockets', async () => {
+      const tcp = net.createServer(socket => socket.end('host-only'));
+      await new Promise<void>(r => tcp.listen(0, '0.0.0.0', r));
+      const tcpPort = (tcp.address() as net.AddressInfo).port;
+      const abstractName = 'chaldea-host-only-' + randomUUID();
+      const abstract = net.createServer(socket => socket.end('host-only'));
+      await new Promise<void>(r => abstract.listen('\0' + abstractName, r));
+      try {
+        const addresses = JSON.parse(execFileSync('ip', ['-j', 'address', 'show']).toString())
+          .flatMap((row: any) => row.addr_info.map((a: any) => a.local));
+        const code = `import socket,json,errno
+addresses=json.loads(${JSON.stringify(JSON.stringify(addresses))})
+for address in addresses:
+    sock=socket.socket(socket.AF_INET6 if ':' in address else socket.AF_INET)
+    sock.settimeout(.3)
+    try:
+        sock.connect((address,${tcpPort}))
+        raise AssertionError('host address reachable: '+address)
+    except OSError: pass
+    finally: sock.close()
+sock=socket.socket(socket.AF_UNIX)
+try:
+    sock.connect('\\0${abstractName}')
+    raise AssertionError('host abstract socket reachable')
+except OSError: pass
+finally: sock.close()
+assert '${abstractName}' not in open('/proc/net/unix').read()
+# The job's own loopback remains usable; it is not host loopback.
+local=socket.socket()
+local.bind(('127.0.0.1',0)); local.listen()
+peer=socket.create_connection(('127.0.0.1',local.getsockname()[1]))
+accepted,_=local.accept(); accepted.close(); peer.close(); local.close()
+print('network-isolation-ok')
+`;
+        const result = await collected(run(['--', 'python3', '-c', code]));
+        assert.equal(result.code, 0, result.err); assert.match(result.out, /network-isolation-ok/);
+      } finally {
+        await new Promise<void>(r => tcp.close(() => r()));
+        await new Promise<void>(r => abstract.close(() => r()));
+      }
+    });
+
+    await t.test('outbound DNS and HTTPS work when the host has internet', async context => {
+      const code = "import socket,urllib.request; socket.getaddrinfo('example.com',443); assert urllib.request.urlopen('https://example.com',timeout=5).status == 200; print('https-ok')";
+      try { execFileSync('python3', ['-I', '-c', code], { timeout: 7000, stdio: 'pipe' }); }
+      catch { context.skip('host DNS/HTTPS unavailable; outbound check skipped'); return; }
+      const result = await collected(run(['--', 'python3', '-c', code]));
+      assert.equal(result.code, 0, result.err); assert.match(result.out, /https-ok/);
+    });
+
+    await t.test('mount absence is refused, startup leftovers are cleaned, and the next call works', async () => {
+      await configure({ require_mount: true });
+      const refused = await collected(run(['--', 'true']));
+      assert.equal(refused.code, 255); assert.match(refused.err, /storage unavailable.*not mounted/);
+      const id = /chaldea job ([0-9a-f-]+)/.exec(refused.err)![1];
+      assert.equal(JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8')).outcome, 'refused');
+      await configure();
+      const leftover = join(jobroot, randomUUID()); await fs.mkdir(leftover);
+      await fs.writeFile(join(leftover, 'interrupted'), 'reboot leftover');
+      const result = await collected(run(['--', 'printf', 'after-reboot']));
+      assert.equal(result.code, 0, result.err); assert.equal(result.out, 'after-reboot');
+      assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+    });
+
+    await t.test('stale control socket is replaced without rerunning an uncertain job', async () => {
+      await collected(ssh(['-O', 'exit', 'chaldea-job-test']));
+      execFileSync('python3', ['-I', '-c', 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()', controls]);
+      const result = await collected(run(['--', 'printf', 'new-connection']));
+      assert.equal(result.code, 0, result.err); assert.equal(result.out, 'new-connection');
+    });
+
+    await t.test('remote 125 stays finished and is distinct from local failure 255', async () => {
+      const result = await collected(run(['--', 'python3', '-c', 'raise SystemExit(125)']));
+      assert.equal(result.code, 125, result.err);
+      const id = /chaldea job ([0-9a-f-]+)/.exec(result.err)![1];
+      const entry = JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8'));
+      assert.equal(entry.outcome, 'finished'); assert.equal(entry.exitCode, 125);
+    });
+
+    await t.test('idle host preempts with SIGTERM then SIGKILL after ten seconds', { timeout: 22000 }, async () => {
+      const marker = 'chaldea-test-game-' + randomUUID();
+      await configure({ policy: 'idle', desktop_user: userInfo().username,
+        steam_game_pattern: marker, minecraft_pattern: 'a^' });
+      const child = run(['--', 'python3', '-c',
+        'import signal,pathlib,time; signal.signal(signal.SIGTERM,lambda *_:pathlib.Path(".term-signal").write_text("term")); print("ready",flush=True); time.sleep(100)']);
+      let stderr = ''; child.stderr!.on('data', x => { stderr += x; });
+      const resultPromise = collected(child, 20000);
+      await once(child.stdout!, 'data');
+      const id = /chaldea job ([0-9a-f-]+)/.exec(stderr)![1];
+      let watcher: ReturnType<typeof watch>;
+      let timer: ReturnType<typeof setTimeout>;
+      const term = new Promise<number>((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error('job never received SIGTERM')), 18000);
+        watcher = watch(join(jobroot, id), (_, name) => {
+          if (name === '.term-signal') resolve(performance.now());
+        });
+      });
+      const fakeGame = spawn('sleep', ['30'], { argv0: marker, stdio: 'ignore' });
+      try {
+        const termAt = await term;
+        const result = await resultPromise;
+        assert.equal(result.code, 255, result.err); assert.match(result.err, /preempted/);
+        assert.ok(performance.now() - termAt >= 9500, 'SIGKILL must allow ten seconds of SIGTERM grace');
+        const entry = JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8'));
+        assert.equal(entry.outcome, 'preempted');
+      } finally {
+        clearTimeout(timer!); watcher!.close();
+        fakeGame.kill('SIGTERM'); child.kill('SIGTERM');
+        await resultPromise;
+        await configure();
+      }
+    });
+
     await t.test('host refuses over-cap and disk-full admission; no workspace remains', async () => {
       for (const extra of [{ state_cap_bytes: 32 * 1024 ** 2 }, { min_free_bytes: Number.MAX_SAFE_INTEGER }]) {
         await configure(extra);
         const result = await collected(run(['--', 'true']));
-        assert.equal(result.code, 125); assert.match(result.err, /over cap|disk full/);
+        assert.equal(result.code, 255); assert.match(result.err, /over cap|image full/);
         assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
       }
       await configure();

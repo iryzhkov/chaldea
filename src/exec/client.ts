@@ -1,10 +1,11 @@
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { manifest } from './manifest.ts';
+import { cleanArtifacts } from './artifacts.ts';
 import { record, prune, DAYS, type Intent } from './journal.ts';
 import { frames, send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, type Request } from './protocol.ts';
 
@@ -26,45 +27,54 @@ export function argumentsFor(args: string[]) {
   return { host, gpu, artifacts, argv };
 }
 
-async function artifactCleanup(root: string, checkSpace = true) {
-  for (const directory of [dirname(root), root]) {
-    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-    const stat = await fs.lstat(directory);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('artifact directory must not be a symlink');
+class RemoteFailure extends Error {
+  outcome: Intent['outcome'];
+  constructor(data: Buffer) {
+    const value = JSON.parse(data.toString());
+    const outcome = ['refused', 'preempted'].includes(value.outcome) ? value.outcome : 'uncertain';
+    super('host ' + outcome + ': ' + String(value.message).slice(0, 1024));
+    this.outcome = outcome;
   }
-  let total = 0;
-  async function size(path: string): Promise<number> {
-    const st = await fs.lstat(path);
-    if (!st.isDirectory()) return st.size;
-    return (await Promise.all((await fs.readdir(path)).map(n => size(join(path, n))))).reduce((a, b) => a + b, 0);
+}
+export async function staleControl(config: string, host: string) {
+  const options = execFileSync('ssh', ['-F', config, '-T', '-G', host], { maxBuffer: 128 * 1024 }).toString();
+  const path = /^controlpath (.+)$/m.exec(options)?.[1];
+  if (!path || path === 'none') return;
+  let before;
+  try { before = await fs.lstat(path); } catch (e: any) { if (e.code === 'ENOENT') return; throw e; }
+  if (!before.isSocket()) throw new Error('SSH control path is not a socket');
+  try { execFileSync('ssh', ['-F', config, '-O', 'check', host], { timeout: 1000, stdio: 'pipe' }); }
+  catch (e: any) {
+    if (e.status !== 255) throw new Error('SSH control master did not answer; no job dispatched');
+    try {
+      const after = await fs.lstat(path);
+      if (after.ino === before.ino && after.dev === before.dev) await fs.unlink(path);
+    } catch (error: any) { if (error.code !== 'ENOENT') throw error; }
   }
-  for (const name of await fs.readdir(root)) {
-    const path = join(root, name); const st = await fs.lstat(path);
-    if (st.mtimeMs < Date.now() - DAYS) await fs.rm(path, { recursive: true, force: true });
-    else total += await size(path);
-  }
-  if (checkSpace && total + MAX_ARTIFACT > 20 * 1024 ** 3) throw new Error('local artifacts near 20 GiB cap; remove artifacts before dispatch');
 }
 
 export async function run(args: string[]): Promise<number> {
   const options = argumentsFor(args);
   const snapshot = await manifest();
   const artifactRoot = join(snapshot.root, '.chaldea/artifacts');
-  await artifactCleanup(artifactRoot);
   const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
   const journal = join(state, 'journal');
+  await fs.mkdir(journal, { recursive: true, mode: 0o700 });
+  await cleanArtifacts(journal, options.host, options.artifacts.length ? MAX_ARTIFACT : 0);
   await prune(journal, DAYS, 999);
   if ((await fs.readdir(journal)).length >= 1000) throw new Error('journal at its 1000-entry cap; inspect retained outcomes before dispatch');
+  const controls = join(state, 'ssh');
+  await fs.mkdir(controls, { recursive: true, mode: 0o700 });
+  const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
+  await staleControl(config, 'chaldea-job-' + options.host);
   const jobId = randomUUID();
   const intent: Intent = { jobId, host: options.host, argv: options.argv,
-    started: new Date().toISOString(), pid: process.pid, outcome: 'uncertain' };
+    started: new Date().toISOString(), pid: process.pid, outcome: 'uncertain',
+    worktree: snapshot.root, artifactDir: join(artifactRoot, jobId) };
   // This fsync completes before the first possible remote side effect. Nothing
   // ever automatically retries an uncertain intent, including on a later invocation.
   await record(journal, intent);
   process.stderr.write('chaldea job ' + jobId + '\n');
-  const controls = join(state, 'ssh');
-  await fs.mkdir(controls, { recursive: true, mode: 0o700 });
-  const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
   const ssh = spawn('ssh', ['-F', config, '-T', '-a', '-x',
     '-o', 'BatchMode=yes', '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
     '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'RequestTTY=no',
@@ -85,7 +95,7 @@ export async function run(args: string[]): Promise<number> {
   try {
     const incoming = frames(ssh.stdout)[Symbol.asyncIterator]();
     const hello = await incoming.next();
-    if (!hello.done && hello.value.type === 'R') throw new Error('host refused job: ' + String(JSON.parse(hello.value.data.toString()).message).slice(0, 1024));
+    if (!hello.done && hello.value.type === 'R') throw new RemoteFailure(hello.value.data);
     if (hello.done || hello.value.type !== 'H' || JSON.parse(hello.value.data.toString()).version !== VERSION) {
       throw new Error('unsupported job protocol');
     }
@@ -119,6 +129,11 @@ export async function run(args: string[]): Promise<number> {
           throw new Error('invalid artifact metadata');
         }
         seen.add(meta.path);
+        for (const directory of [dirname(artifactRoot), artifactRoot]) {
+          await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+          const st = await fs.lstat(directory);
+          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('artifact directory must not be a symlink');
+        }
         const target = join(destination, meta.path);
         await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
         artifact = await fs.open(target, 'wx', 0o600);
@@ -133,8 +148,7 @@ export async function run(args: string[]): Promise<number> {
         result = code;
         ssh.stdin.end();
       } else if (type === 'R') {
-        const message = JSON.parse(data.toString()).message;
-        throw new Error('host refused job: ' + String(message).slice(0, 1024));
+        throw new RemoteFailure(data);
       } else throw new Error('unexpected protocol frame');
     }
     if (uploadError) throw uploadError;
@@ -148,12 +162,15 @@ export async function run(args: string[]): Promise<number> {
   } catch (e) {
     stop();
     await exit.catch(() => {});
-    // Partial artifacts have no success meaning; the durable intent stays uncertain.
-    throw new Error((e as Error).message + '; outcome uncertain; inspect journal ' + join(journal, jobId + '.json'));
+    if (e instanceof RemoteFailure && e.outcome !== 'uncertain') {
+      intent.outcome = e.outcome;
+      await record(journal, intent, false);
+    }
+    throw new Error((e as Error).message + '; outcome ' + intent.outcome + '; inspect journal ' + join(journal, jobId + '.json'));
   } finally {
     process.off('SIGINT', stop); process.off('SIGTERM', stop);
     if (artifact) await artifact.close();
     await prune(journal);
-    await artifactCleanup(artifactRoot, false);
+    await cleanArtifacts(journal, options.host);
   }
 }

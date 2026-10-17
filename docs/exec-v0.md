@@ -48,16 +48,16 @@ by that workspace, not host /tmp. /run and the original home are absent. No Huya
 Docker, SSH-agent or D-Bus user sockets, credentials, sudo grants or host tool
 configuration are mounted. All subprocess environment variables are rebuilt.
 
-**Networking is on by default, including host/loopback reachability. There is no
-egress allowlist.** Bubblewrap does not provide one. Network authorization for
+**Outbound networking is on through pasta in a private network namespace.**
+Host-loopback/gateway mapping and forwarding are disabled, and nftables rejects
+all non-loopback host interface addresses. Host abstract sockets are isolated.
+There is no general internet/LAN egress allowlist. Network authorization for
 services remains their responsibility. This v0 does not offer job credentials.
 
 NVIDIA device nodes are mounted only for --gpu. The operator selects the RTX 4090
 nodes and NVIDIA Vulkan ICD; the AMD iGPU (normally Vulkan device 0 on omarchy-pc)
-is not exposed. Native x86_64 and aarch64 Linux jobs only: a narrow seccomp filter
-rejects foreign syscall ABIs and Btrfs subvolume/snapshot/readonly-setting ioctls
-so jobs cannot bypass the Btrfs quota by creating nested subvolumes. It is not a
-general syscall allowlist.
+is not exposed. Nested user namespaces are disabled when supported. The isolated
+Python forced command ignores user-site/PYTHONPATH configuration.
 
 ## Bounds and recovery
 
@@ -67,18 +67,24 @@ general syscall allowlist.
 - Runtime: six hours; upload: two minutes; one active job per host, immediate busy refusal.
 - Workspaces, successful or failed: deleted immediately. Stale workspaces after
   an uncatchable server crash are removed on the next admitted connection/start,
-  under the host lock, with the kernel quota still bounding their disk use.
-- Host workspace state: 20 GiB hard filesystem quota (Btrfs qgroup or Unix user
-  quota); admission also reserves 256 MiB free space plus snapshot capacity.
+  under the host lock, within a one-second cleanup budget. Unremovable leftovers
+  are logged and stay inside the image bound without wedging later jobs.
+- Host workspace state: one 20 GiB fixed-size ext4 image (inventory adjustable).
+  Admission requires the mount and reserves 256 MiB free space plus snapshot capacity.
+  Its optional mount cannot block boot. An absent mount gives a clear refusal.
   Authentication logs have a separate 16 MiB, 14-day journal namespace.
-- Local artifacts: 14 days, pruned at invocation start/end; new dispatch is refused
-  near 20 GiB of artifacts. Partial artifacts share the same retention.
+- Local artifacts: 14 days and 20 GiB per destination across worktrees, accounted
+  through the journal. Old completed artifacts are evicted under size pressure.
+  Journal eviction also removes the referenced artifacts. Kernel flock protects
+  per-host accounting and requires no stale-lock cleanup after reboot.
 - Local client journal: mode 0600, fsynced before SSH dispatch and atomically
   replaced after confirmed completion; 14 days / 1,000 entries, no output logs.
 
 The local journal lives in `~/.local/state/chaldea/exec/journal/<job-id>.json`.
 Its initial outcome is deliberately `uncertain`, and only a confirmed clean result
-changes it to `finished`. A crash before dispatch, during upload/execution, after
+changes it to `finished`. Definitive non-execution is `refused`; gaming that
+interrupts a running job is `preempted`. Remote exit 125 passes through; local
+Chaldea failures use 255. A remote 255 has a finished journal entry. A crash before dispatch, during upload/execution, after
 remote cleanup or before journal completion never triggers another run. Inspect
 an uncertain entry; an explicit new invocation is a new job.
 
@@ -89,7 +95,8 @@ The role pins known hosts separately in `~/.ssh/chaldea-job_known_hosts`; unknow
 keys fail closed. A real disconnect closes stdin and kills the job process group;
 bubblewrap's parent-death behavior and PID namespace also kill escaped descendants.
 A silent network partition is detected by SSH keepalives (15 s, two missed replies).
-There is no reconnect-without-rerun support.
+Stale ControlMaster sockets are replaced before a new dispatch. There is no
+reconnect/replay path; source or target reboot leaves dispatched work uncertain.
 
 `CHALDEA_SSH_CONFIG` and `CHALDEA_STATE_DIR` override those two client paths for
 isolated tests. They are local operator configuration, never remote job input.
@@ -108,11 +115,16 @@ CHALDEA_JOB_SERVER=/home/igor/Work/chaldea/fleet-config-jobhost/roles/chaldea_jo
 The E2E must run without root and uses a free loopback port, disposable fixture
 keys and its own sshd. It never changes the real daemon, firewall, keys or users.
 It tests live output/status, artifacts and cleanup, real forwarding/PTY/shell
-refusals, isolated HOME/sockets/GPU/environment, quota-escape syscall refusal,
+refusals, isolated HOME/sockets/GPU/environment, private network isolation and timed preemption,
 connection loss (including a descendant with its own session), uncertain intent,
 and fault-injected disk-full/over-cap admission. It reports spawn-to-first-stdout
 latency on the second multiplexed invocation and asserts under two seconds.
-Filesystem quota installation, real GPU execution and real-host desktop policy
-are not exercised by this rootless test. Unit tests in the fleet repository cover
+Image mounting/cgroup enforcement, actual reboot behavior, real GPU execution and real-host desktop policy
+are not exercised by this rootless test. Rendering uses an existing Python with
+Jinja2 (CHALDEA_TEST_PYTHON overrides python3); CHALDEA_PASTA and CHALDEA_SSHD
+can point to existing test binaries. CI uses the same E2E and a pinned companion
+commit through the existing read-only github-chaldea-fleet-config alias. It installs
+no host packages and reports a notice when required tools or unprivileged SSH/
+bubblewrap are unavailable. Unit tests in the fleet repository cover
 the idle gate's fail-closed decisions; that repository's CI also tests client
 key metadata and SSH configuration without opening a connection.
