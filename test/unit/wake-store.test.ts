@@ -50,7 +50,7 @@ test("transactional resolution, stable retry keys, cancel, payload limits, reope
     assert.throws(()=>new WakeStore(f.path,"changed-environment"),/already owned/);
   }finally{f.close();}
 });
-test("answer/deadline serializations and concurrent requests latch exactly one immutable outcome",async()=>{
+test("serialized answers before and after the deadline latch one immutable outcome",async()=>{
   const f=fixture();
   try{
     const now=Date.now();const q=question(now);q.deadline=iso(now+250);

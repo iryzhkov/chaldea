@@ -26,6 +26,16 @@ export class WaitEngine {
   private stopped = false;
   private pumping = false;
   private fatal = false;
+  private storageFailed = false;
+  private failStorage(): void {
+    if (this.storageFailed) return;
+    this.storageFailed=true;this.fatal=true;
+    this.clock.clear();clearTimeout(this.storageRetry);
+    const fallback=() => console.error("Chaldea waits: fatal storage error; restarting");
+    try { this.options.report ? this.options.report("watcher_needs_attention") : fallback(); }
+    catch { fallback(); }
+    finally { setImmediate(() => process.exit(1)); }
+  }
   private storageRetry: NodeJS.Timeout | undefined;
   private storageAttempts = 0;
   private storageBlocked = false;
@@ -42,7 +52,7 @@ export class WaitEngine {
     try { operation(); }
     catch(error) {
       if (error instanceof CheckpointBlockedError) { this.pendingCommits.set(id,operation);this.backoffStorage(); }
-      else { this.fatal=true;this.options.report?.("watcher_needs_attention"); }
+      else this.failStorage();
     }
   }
   constructor(store: WakeStore, t3: WaitT3, options: EngineOptions) { this.store=store; this.t3=t3; this.options=options; }
@@ -69,7 +79,7 @@ export class WaitEngine {
   private phone(reg: Registration): string {
     const q = reg.input as DecisionInput;
     return JSON.stringify({id:"chaldea-decision:" + this.store.environment + ":" + reg.id,
-      title:"Chaldea decision",content:q.question + "\nNo answer: " + q.defaultAction + " " + q.dependentAction + "\nDeadline: " + q.deadline,
+      title:"Chaldea decision",content:q.question + "\nNo answer: " + q.defaultAction + " " + (q.dependentAction ?? "the dependent action") + "\nDeadline: " + q.deadline,
       priority:"default",url:new URL("/decisions/" + reg.id,this.options.answerBaseUrl).toString()});
   }
   answer(id: string, answer: string, source: AnswerSource): Item {
@@ -188,7 +198,7 @@ export class WaitEngine {
       this.storageAttempts=0;this.storageBlocked=false;
     } catch(error) {
       if (error instanceof CheckpointBlockedError) this.backoffStorage();
-      else { this.fatal=true;this.options.report?.("watcher_needs_attention"); }
+      else this.failStorage();
     } finally { this.pumping=false; }
   }
   private async deliver(delivery: Delivery): Promise<void> {
