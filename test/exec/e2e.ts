@@ -302,7 +302,11 @@ print('network-isolation-ok')
       }
     });
 
-    await t.test('sandbox DNS has usable resolvers even when the host uses a loopback stub', async () => {
+    await t.test('sandbox DNS has usable resolvers even when the host uses a loopback stub', async context => {
+      const hostHasStub = execFileSync('/usr/bin/python3', ['-I', '-c',
+        "import ipaddress,pathlib; print(any(ipaddress.ip_address(line.split()[1]).is_loopback for line in pathlib.Path('/etc/resolv.conf').read_text().splitlines() if line.split()[:1] == ['nameserver']))"
+      ], { encoding: 'utf8' }).trim() === 'True';
+      if (!hostHasStub) { context.skip('host /etc/resolv.conf has no loopback nameserver; loopback-stub regression requires one'); return; }
       const code = `import ipaddress,pathlib
 addresses = [ipaddress.ip_address(line.split()[1]) for line in pathlib.Path('/etc/resolv.conf').read_text().splitlines() if line.split()[:1] == ['nameserver']]
 assert addresses, 'sandbox must have a nameserver'
