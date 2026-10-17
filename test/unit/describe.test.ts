@@ -25,7 +25,7 @@ test("installed discovery and full help never load user state or services", () =
 
 test("stateful verification and exec history are writes", () => {
   const reads = description.commands.filter(c => c.access === "read").map(c => c.name);
-  assert.deepEqual(reads, ["wait status", "decision status"]);
+  assert.deepEqual(reads, ["quota status", "wait status", "decision status"]);
   for (const command of description.commands) {
     assert.ok(command.summary.length > 0 && !command.summary.includes("\n"));
   }
