@@ -9,7 +9,7 @@ import { description } from "../../src/describe.ts";
 test("installed discovery and full help never load user state or services", () => {
   const home = mkdtempSync(join(tmpdir(), "chaldea-describe-"));
   assert.notEqual(home, process.env.HOME);
-  for (const args of [["--describe"], ["--help"], ["exec", "--help"]]) {
+  for (const args of [["--describe"], ["--help"], ["exec", "--help"], ["quota", "--help"], ["t3", "--help"]]) {
     const result = spawnSync(process.execPath, ["bin/chaldea", ...args], {
       encoding: "utf8", env: { ...process.env, HOME: home,
         XDG_CONFIG_HOME: join(home, "missing"), CHALDEA_STATE_DIR: join(home, "state") },

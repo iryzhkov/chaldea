@@ -130,6 +130,10 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     return 0;
   }
   const [group, command, ...rest] = argv;
+  if ((group === "quota" || group === "t3") && (command === "--help" || command === "-h") && rest.length === 0) {
+    process.stdout.write(USAGE);
+    return 0;
+  }
   try {
     if (group && ["waits","wait","decision","mcp"].includes(group)) {
       const { waitsCli } = await import("./waits/cli.ts");
