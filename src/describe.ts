@@ -4,6 +4,7 @@ export const description = {
   "summary": "Fleet compute, quota observation, durable waits, decisions and access trust.",
   "help": "chaldea --help",
   "commands": [
+    { "name": "route", "summary": "Recommend a native T3 delegate target using quota pacing and model statistics", "access": "write" },
     {
       "name": "exec",
       "summary": "Run a command on a fleet job host",

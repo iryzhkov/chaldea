@@ -1,0 +1,68 @@
+{
+  "catalog": [
+    {
+      "providerInstanceId": "codex",
+      "driverKind": "codex",
+      "canRunChildTask": true,
+      "models": [
+        {
+          "id": "gpt-6.1-sol",
+          "options": [
+            {
+              "id": "reasoningEffort",
+              "type": "select",
+              "options": [
+                {
+                  "id": "high"
+                },
+                {
+                  "id": "medium"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "providerInstanceId": "claudeAgent",
+      "driverKind": "claudeAgent",
+      "canRunChildTask": true,
+      "models": [
+        {
+          "id": "claude-opus-5-5",
+          "options": [
+            {
+              "id": "effort",
+              "type": "select",
+              "options": [
+                {
+                  "id": "high"
+                },
+                {
+                  "id": "medium"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "now": 1792238400000,
+  "quota": {
+    "claudeAgent": {
+      "observedAt": "2026-10-17T12:00:00Z",
+      "windows": [
+        {
+          "kind": "weekly",
+          "remainingPercent": 62,
+          "windowDurationMins": 10080,
+          "resetsAt": "2026-10-20T07:12:00Z"
+        }
+      ],
+      "activeStop": false
+    }
+  },
+  "analytics": null
+}
