@@ -1,11 +1,35 @@
 # Fleet compute v0
 
-`chaldea exec --host agent-a [--artifact out/file] [--gpu] -- CMD ARG...`
+`chaldea exec [--host agent-a] [--artifact out/file] [--gpu] -- CMD ARG...`
 runs the current Git worktree on an enrolled Linux job host. Run it from any
 directory inside that worktree; the command keeps that relative working directory.
 Arguments are sent as an array, without shell expansion. Request a shell explicitly
 as `-- sh -c '...'` when the build needs one; that shell runs inside the sandbox.
 SSH itself never grants a shell.
+
+Without `--host`, read `~/.config/chaldea/exec-hosts` in order. Fleet config
+writes one bare host name per line, resolving to `chaldea-job-NAME` in
+`~/.ssh/chaldea-job.conf`, for example:
+
+```text
+agent-a
+agent-b
+omarchy-pc
+laptop
+```
+
+Use the laptop's actual enrolled hostname in the last line. Blank lines and
+whole-line `#` comments are allowed; duplicate names are tried once. Skip this
+machine's short hostname. Each skipped host prints its reason, and a confirmed
+job result prints the host used. Fall through only on a confirmed refusal before
+execution (busy, gaming gate, or unavailable sandbox), a local target lock held
+by another exec, or a connection closed before sending the job request.
+After any request write, connection loss stays uncertain and is never retried;
+preemption and protocol errors also stop the invocation. Every attempted host
+has its own journal entry. All targets unavailable exits **69**, with a one-line
+host/reason summary, without waiting or queuing. An explicit `--host H` attempts
+only H and keeps the existing status/error behavior.
+
 
 Use Node **26.10.0** (`mise install`), `npm ci`, then
 `node bin/chaldea exec ...` or install the package's `chaldea` bin entry.
@@ -27,7 +51,7 @@ nothing. See that repository's `docs/job-host.md` for per-host apply commands.
 2. Client sends Q JSON: version, UUID jobId, argv, relative cwd, gpu, artifact paths, and files with relative path, size, 0644/0755 mode and SHA-256.
 3. Client sends B frames of at most 64 KiB in manifest order, followed by empty E; stdin remains open so EOF cancels the job.
 4. Server streams O stdout and S stderr, then A JSON artifact metadata and B bytes for each named artifact (regular files only).
-5. Server deletes the workspace before X JSON exitCode (0–255); R JSON is an error. Missing X or a failed SSH session leaves the journal outcome uncertain; no replay or automatic retry exists.
+5. Server deletes the workspace before X JSON exitCode (0–255); R JSON is an error. Missing X or a failed SSH session leaves the journal outcome uncertain; dispatched work is never replayed.
 
 ## Snapshot and sandbox contract
 
@@ -79,7 +103,7 @@ Python forced command ignores user-site/PYTHONPATH configuration.
 - Local artifacts: 14 days and 20 GiB per destination across worktrees, accounted
   through the journal. Old completed artifacts are evicted under size pressure.
   Journal eviction also removes the referenced artifacts. Kernel flock protects
-  per-host accounting and requires no stale-lock cleanup after reboot. A second
+  per-host accounting and requires no stale-lock cleanup after reboot. Calls to different targets may run concurrently. A second
   local call for that host reports a busy refusal and journals refused without
   contacting SSH.
 - Local client journal: mode 0600, fsynced before SSH dispatch and atomically
@@ -89,7 +113,8 @@ The local journal lives in `~/.local/state/chaldea/exec/journal/<job-id>.json`.
 Its initial outcome is deliberately `uncertain`, and only a confirmed clean result
 changes it to `finished`. Definitive non-execution is `refused`; gaming that
 interrupts a running job is `preempted`. Remote exit 125 passes through; local
-Chaldea failures use 255. A remote 255 has a finished journal entry. A crash before dispatch, during upload/execution, after
+Chaldea failures use 255. A remote 255 has a finished journal entry. Auto-mode exhaustion uses 69 (a remote 69 still has a finished journal entry).
+A crash before dispatch, during upload/execution, after
 remote cleanup or before journal completion never triggers another run. Inspect
 an uncertain entry; an explicit new invocation is a new job.
 
@@ -103,7 +128,7 @@ A silent network partition is detected by SSH keepalives (15 s, two missed repli
 Stale ControlMaster sockets are replaced before a new dispatch. There is no
 reconnect/replay path; source or target reboot leaves dispatched work uncertain.
 
-`CHALDEA_SSH_CONFIG` and `CHALDEA_STATE_DIR` override those two client paths for
+`CHALDEA_EXEC_HOSTS`, `CHALDEA_SSH_CONFIG` and `CHALDEA_STATE_DIR` override the host-list, SSH-config and state paths for
 isolated tests. They are local operator configuration, never remote job input.
 
 ## Verification
@@ -113,6 +138,8 @@ export TMPDIR=/home/igor/.cache/chaldea-scratch/laneC
 npm ci
 npm run exec:check
 npm run exec:test
+# On agent-a: fake job hosts exercise fallback and connection-loss boundaries.
+node --test test/exec/fallback.e2e.ts
 # Companion checkout contains the exact server under review:
 CHALDEA_JOB_SERVER=/home/igor/Work/chaldea/fleet-config-jobhost/roles/chaldea_job_host/files/chaldea-job-server npm run exec:e2e
 ```

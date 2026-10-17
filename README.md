@@ -1,6 +1,6 @@
 # Chaldea
 
-Fleet compute v0: `node bin/chaldea exec --host H -- CMD...`. See [setup, protocol, bounds and tests](docs/exec-v0.md).
+Fleet compute v0: `node bin/chaldea exec [--host H] -- CMD...`. Without `--host`, try the ordered hosts in `~/.config/chaldea/exec-hosts` (one bare name per line), skipping this machine. See [setup, protocol, bounds and tests](docs/exec-v0.md).
 
 Chaldea is the agent platform that extends official T3 with what it does not provide: quota resilience, fleet compute, review loops, role routing and agent access control.
 

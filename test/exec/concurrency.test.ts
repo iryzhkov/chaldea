@@ -47,14 +47,14 @@ test('lock open and flock operation errors fail clearly with 255, without a busy
       await fs.writeFile(fixture, '#!/bin/sh\nexit 71\n', { mode: 0o700 });
       if (kind === 'open') await fs.mkdir(join(state, 'artifacts-test.lock'));
       const args = [cli, 'exec', '--host', 'test', '--', 'true'];
-      // Replace only the external utility in the execve request. The shipped
-      // lock script, error handling, PID and exit behavior execute unchanged.
+      // Replace only flock with a failing utility; keep the real fd-lock path.
       const inject = [
-        'const execve = process.execve;',
-        'process.execve = (file, args, env) => {',
-        '  if (file === "/bin/sh") args[2] = args[2].replace("/usr/bin/flock", \'"$CHALDEA_TEST_FLOCK"\');',
-        '  return execve(file, args, env);',
+        'const cp = (await import("node:child_process")).default; const exec = cp.execFileSync;',
+        'cp.execFileSync = (file, args, options) => {',
+        '  if (file === "/usr/bin/flock") file = process.env.CHALDEA_TEST_FLOCK;',
+        '  return exec(file, args, options);',
         '};',
+        '(await import("node:module")).syncBuiltinESMExports();',
         'process.argv = [process.execPath, ...' + JSON.stringify(args) + '];',
         'await import(' + JSON.stringify(new URL('../../bin/chaldea', import.meta.url).href) + ');',
       ].join('\n');
