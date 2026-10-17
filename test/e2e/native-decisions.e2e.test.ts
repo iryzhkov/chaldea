@@ -4,7 +4,6 @@ import { join,resolve } from "node:path";
 import { mkdirSync,writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import { createServer } from "node:http";
 import * as Effect from "effect/Effect";
 import { startDisposableT3,t3Version } from "../helpers/disposable-t3.ts";
 import { scratchDir } from "../helpers/scratch.ts";
@@ -33,16 +32,6 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
   let service:Awaited<ReturnType<typeof startWaitService>>|undefined;
   let childService:Awaited<ReturnType<typeof processService>>|undefined;
   let watcher:ShellWatcher|undefined;
-  const cards=new Map<string,string>();let loseAck=true;const relayAttempts:string[]=[];
-  const relay=createServer(async(req,res)=>{
-    assert.equal(req.url,"/notify");assert.equal(req.headers.authorization,"Bearer native-fake-relay");
-    let data="";for await(const part of req)data+=part;
-    relayAttempts.push(data);const payload=JSON.parse(data);
-    if(cards.has(payload.id))assert.equal(cards.get(payload.id),data);
-    cards.set(payload.id,data);
-    if(loseAck){loseAck=false;res.destroy();return;}res.writeHead(202);res.end("{}");
-  });
-  await new Promise<void>(r=>relay.listen(0,"127.0.0.1",r));
   try{
     const token=t3.issueToken(["orchestration:read","orchestration:operate"]);
     const rpc=<A>(fn:(c:Parameters<Parameters<typeof withClient>[1]>[0])=>Effect.Effect<A,unknown>)=>withClient({serverUrl:t3.serverUrl,token},fn);
@@ -60,10 +49,8 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
     };
     const config:WaitConfig={environment,t3BaseDir:t3.baseDir,tokenFile:join(dir.path,"token"),database:join(dir.path,"state/wakes.sqlite"),
       socket:join(dir.path,"service.sock"),listenAddress:"127.0.0.1",port:0,answerBaseUrl:"http://127.0.0.1:7385",
-      threadBaseUrl:"https://t3.fixture.invalid",answerTokenFile:join(dir.path,"answer-token"),notifyUrl:"http://127.0.0.1:"+(relay.address() as {port:number}).port,
-      notifyEnvFile:join(dir.path,"notify.env"),logFile:join(dir.path,"state/waits.log")};
+      answerTokenFile:join(dir.path,"answer-token"),logFile:join(dir.path,"state/waits.log")};
     mkdirSync(join(dir.path,"state"));writePrivateFile(config.tokenFile,token);writePrivateFile(config.answerTokenFile,"native-answer-token");
-    writePrivateFile(config.notifyEnvFile!,"NOTIFY_TOKEN=native-fake-relay");
     const configPath=join(dir.path,"config.json");writeFileSync(configPath,JSON.stringify(config));
     const invoke=(method:string,input:unknown)=>callService(config.socket,method,input) as Promise<Item>;
     const policy=(threadId:string,ms=1500)=>({threadId,requestId:key(),dependentAction:"deploy the fixture",defaultAction:"defer",deadline:new Date(Date.now()+ms).toISOString()});
@@ -101,15 +88,12 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       assert.equal(cli.code,0,cli.stderr);const row=JSON.parse(cli.stdout) as Item;
       await dispatchMessage(t3,token,thread,"chaldea-native-question",key());const requestId=await pending(thread);
       await until("bound question",async()=>service!.store.native(row.id).request_id===requestId);
-      const phoneId="chaldea-decision:"+environment+":"+row.id;
-      await until("native phone ACK retry",async()=>relayAttempts.filter(s=>JSON.parse(s).id===phoneId).length===2);
-      assert.equal(JSON.parse(cards.get(phoneId)!).url,"https://t3.fixture.invalid/"+environment+"/"+thread);
       await human(thread,requestId);await settled(row);
       assert.equal(JSON.parse((await invoke("chaldea_decision_status",{id:row.id})).outcome!).source,"t3");
       assert.equal(await wakeCount(thread,row.id),0);
       await until("Claude continued",async()=>(await projection(thread)).runs.some(r=>r.status==="completed"));
       await service!.stop();service=await startWaitService(config);await sleep(100);
-      assert.equal(relayAttempts.filter(s=>JSON.parse(s).id===phoneId).length,2);assert.equal(await wakeCount(thread,row.id),0);
+      assert.equal(await wakeCount(thread,row.id),0);
     });
     await t.test("deadline answers every native question with safe text and continues the Claude turn",async()=>{
       const thread=await create();const row=await prepare(thread,2200);
@@ -251,6 +235,6 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
     });
   }finally{
     await childService?.stop();await service?.stop();await watcher?.close();await t3.stop();
-    await new Promise<void>(r=>relay.close(()=>r()));dir.remove();
+    dir.remove();
   }
 });

@@ -4,7 +4,7 @@ import { ownDatabase } from "./owner.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { DAY, MAX_AGE, validate, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
+import { MAX_AGE, validate, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
 
 export interface Item {
   id: string; kind: "wait" | "decision" | "native"; parent: string; project: string; request_key: string; request_at: number;
@@ -13,8 +13,8 @@ export interface Item {
   outcome: string | null; created: number; terminal: number | null;
 }
 export interface Delivery {
-  id: string; item: string; channel: "wake" | "phone" | "native"; payload: string;
-  state: "pending" | "sending" | "sent" | "suppressed" | "blocked" | "uncertain" | "undeliverable"; disposition: string | null; attempts: number; next_at: number; expires: number | null;
+  id: string; item: string; channel: "wake" | "native"; payload: string;
+  state: "pending" | "sending" | "sent" | "suppressed" | "blocked" | "uncertain"; disposition: string | null; attempts: number; next_at: number; expires: number | null;
 }
 export interface NativePolicy { item: string; request_id: string | null; bind_until: number; baseline: string; questions: string|null; turn_item:string|null; created?:number }
 export interface Registration { id: string; kind: Item["kind"]; input: Input; deadline: number; requestAt: number; hash: string }
@@ -65,6 +65,9 @@ export class WakeStore {
     if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('replay_fence','0')").run();
+    // Remove the retired notification channel before replaying any delivery.
+    // The outbox uses unconstrained TEXT channels, so no table rebuild is needed.
+    this.db.prepare("DELETE FROM outbox WHERE channel='phone'").run();
     // 'sending' means an ambiguous RPC after restart. Retry the identical stored payload.
     this.db.prepare("UPDATE outbox SET state='pending' WHERE state='sending'").run();
     try { this.maintain(Date.now()); } catch(error) { if (!(error instanceof CheckpointBlockedError)) throw error; }
@@ -105,7 +108,7 @@ export class WakeStore {
     if (row && row.hash !== reg.hash) throw new Error("requestId reused with changed payload");
     return row;
   }
-  register(reg: Registration, project: string, targetRun: string | null, phonePayload?: string, now = Date.now(), nativeBaseline: string[] = [], nativeQuestions:string|null=null, nativeItem:string|null=null): Item {
+  register(reg: Registration, project: string, targetRun: string | null, now = Date.now(), nativeBaseline: string[] = [], nativeQuestions:string|null=null, nativeItem:string|null=null): Item {
     return this.transaction(() => {
       const existing = this.existing(reg); if (existing) return existing;
       if (reg.requestAt <= Number(this.meta("replay_fence"))) throw new Error("requestId retired by retention fence");
@@ -141,11 +144,6 @@ export class WakeStore {
       if (reg.kind === "native") this.db.prepare("INSERT INTO native_decisions(item,request_id,bind_until,baseline,questions,turn_item) VALUES(?,?,?,?,?,?)")
         .run(reg.id,"runtimeRequestId" in reg.input ? reg.input.runtimeRequestId ?? null : null,
           Math.min(reg.deadline,now+10*60_000),JSON.stringify(nativeBaseline),nativeQuestions,nativeItem);
-      if (phonePayload) {
-        if (Buffer.byteLength(phonePayload) > 4096) throw new Error("Phone payload exceeds cap");
-        this.db.prepare("INSERT INTO outbox(id,item,channel,payload,state,next_at,expires) VALUES(?,?,'phone',?,'pending',?,?)")
-          .run("chaldea-decision:" + this.environment + ":" + reg.id,reg.id,phonePayload,now,Math.min(reg.deadline,now+DAY));
-      }
       return this.get(reg.id);
     });
   }
@@ -183,7 +181,6 @@ export class WakeStore {
       if (Buffer.byteLength(payload) > 4096) throw new Error("Wake exceeds 4 KiB");
       this.db.prepare("UPDATE items SET state='resolved',outcome=?,terminal=? WHERE id=?").run(JSON.stringify(outcome),now,id);
       this.db.prepare("INSERT INTO outbox(id,item,channel,payload,state,next_at) VALUES(?,?,'wake',?,'pending',?)").run(commandId,id,payload,now);
-      this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND channel='phone' AND state='pending'").run(id);
       return this.get(id);
   }
   answer(id: string, answer: string, source: AnswerSource, now?: number): Item {
@@ -213,7 +210,7 @@ export class WakeStore {
   nativeTracking(parent:string):NativePolicy[]{
     return this.db.prepare("SELECT n.*,i.created FROM native_decisions n JOIN items i ON i.id=n.item WHERE i.parent=? AND i.state=\'parked\'").all(parent) as unknown as NativePolicy[];
   }
-  bindNative(id: string, requestId: string, phonePayload: string, now=Date.now(), questions:string|null=null, itemId:string|null=null): boolean {
+  bindNative(id: string, requestId: string, now=Date.now(), questions:string|null=null, itemId:string|null=null): boolean {
     return this.transaction(() => {
       const row=this.get(id),policy=this.native(id);
       if (row.state !== "parked" || policy.request_id !== null) return false;
@@ -222,20 +219,12 @@ export class WakeStore {
       }
       if(questions && Buffer.byteLength(questions)>4096)throw new Error("Native question schema exceeds cap");
       this.db.prepare("UPDATE native_decisions SET request_id=?,questions=?,turn_item=? WHERE item=?").run(requestId,questions,itemId,id);
-      this.phoneLocked(row,phonePayload,now);return true;
+      return true;
     });
   }
   captureNative(id:string,questions:string|null,itemId:string|null):void{
     if(questions && Buffer.byteLength(questions)>4096)throw new Error("Native question schema exceeds cap");
     this.transaction(()=>this.db.prepare("UPDATE native_decisions SET questions=coalesce(questions,?),turn_item=coalesce(turn_item,?) WHERE item=?").run(questions,itemId,id));
-  }
-  private phoneLocked(row: Item, payload: string, now: number): void {
-    if (Buffer.byteLength(payload)>4096) throw new Error("Phone payload exceeds cap");
-    this.db.prepare("INSERT OR IGNORE INTO outbox(id,item,channel,payload,state,next_at,expires) VALUES(?,?,'phone',?,'pending',?,?)")
-      .run("chaldea-decision:"+this.environment+":"+row.id,row.id,payload,now,Math.min(row.deadline,now+DAY));
-  }
-  nativePhone(id: string, payload: string, now=Date.now()): void {
-    this.transaction(() => this.phoneLocked(this.get(id),payload,now));
   }
   queueNative(id: string, payload: string, now=Date.now()): boolean {
     return this.transaction(() => {
@@ -258,7 +247,6 @@ export class WakeStore {
     if (row.kind !== "native") throw new Error("Not a native decision");
     if (row.state === "parked") this.db.prepare("UPDATE items SET state='resolved',outcome=?,terminal=? WHERE id=?").run(JSON.stringify(outcome),now,row.id);
     else if (row.outcome === null) this.db.prepare("UPDATE items SET outcome=? WHERE id=?").run(JSON.stringify(outcome),row.id);
-    this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND channel='phone' AND state='pending'").run(row.id);
   }
   nativeAttention(id: string, outcome: Outcome, responseState="suppressed", now=Date.now()): void {
     this.transaction(() => {
@@ -304,9 +292,6 @@ export class WakeStore {
       this.db.prepare("UPDATE outbox SET state='blocked' WHERE id=? AND state='sending'").run(id);
       this.db.prepare("UPDATE items SET disposition='delivery_rejected' WHERE id=(SELECT item FROM outbox WHERE id=?)").run(id);
     });
-  }
-  undeliverable(id: string): void {
-    this.transaction(() => { this.db.prepare("UPDATE outbox SET state='undeliverable',disposition='relay_unprovisioned' WHERE id=? AND channel='phone' AND state='pending'").run(id); });
   }
   sent(id: string): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='sent' WHERE id=?").run(id); }); }
   retry(id: string, at: number): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='pending',next_at=? WHERE id=? AND state IN ('pending','sending')").run(at,id); }); }

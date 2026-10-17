@@ -56,7 +56,7 @@ remain a fallback for providers without native questions.
 thread subscription, and binds the first new `user_input` runtime request
 created within ten minutes (or before the deadline, if earlier). Existing
 requests are excluded. One unbound preparation per thread is allowed; an
-unbound policy expires without a message or phone card. After binding, the
+unbound policy expires without a message. After binding, the
 deadline applies to that request alone, including every question in a
 multi-question request. Binding atomically saves at most 4 KiB of answer-routing
 schema (question IDs, custom-answer/multi-select flags and required fixed-option
@@ -242,9 +242,7 @@ Use native delegation completion and `watch_pull_request` for those workflows.
 Connection failure uses capped reconnect backoff, delivery failure uses persisted
 backoff, and credentials are reread on every connection/request. Protocol/schema
 drift and environment mismatch stop delivery until service restart after repair.
-The calendar helper retries transient failure with capped backoff. Wake and phone
-delivery use separate concurrency slots, so a stalled relay cannot consume wake
-capacity. No connection event sends a wake. Offline T3 delays receipt acceptance; provider
+The calendar helper retries transient failure with capped backoff. No connection event sends a wake. Offline T3 delays receipt acceptance; provider
 execution latency is separate from registration/condition-to-receipt latency.
 
 Cancellation before resolution produces no wake. Once resolution has latched,
@@ -253,32 +251,7 @@ pending delivery may still be suppressed. A claimed send returns
 claims to retract an accepted T3 message. An orphan or rejected delivery needs
 operator attention; do not edit IDs to force a retry.
 
-## Phone and answer page
-
-Each fallback question, or newly bound native question, creates one phone outbox row with immutable
-`{content,title,id,priority,url}`, ID
-`chaldea-decision:<environment>:<questionId>`. The service POSTs `/notify`
-with a bearer credential, marks sent only on HTTP 202, and retries the same bytes
-after ambiguity. It never creates notification rows on reconnect, scans or
-deadline. Unaccepted notifications stop after the question resolves, at its
-deadline, or after 24 hours. An already-queued relay card may arrive later; its
-tap shows current state. A slow/offline relay cannot block the deadline or wake.
-If relay URL/env-file configuration is absent, the phone row becomes
-`undeliverable` with disposition `relay_unprovisioned`, zero send attempts and
-no retry timer. Provisioning later affects new questions; scans/restarts do not
-re-notify old ones. A configured relay retains capped backoff and expiry.
-
-Native cards link directly to the T3 HTTP thread route, `/<environment>/<threadId>`;
-fallback cards link to `/decisions/<id>`. Set `threadBaseUrl` to the trusted,
-phone-reachable T3 origin (HTTPS LAN/mesh routing is deployment work). Without
-it the watcher uses the configured/discovered T3 origin, which may only be
-reachable locally. Unbound preparations do not notify.
-
-This is one logical card identity, not a qualified exactly-once audible alert.
-Existing relay ID replacement may re-alert; phone/relay ACK-loss, dismissal and
-reboot qualification remain attended deployment work. Source:
-OV `viking://resources/homelab/notify-relay.md`. This implementation does not
-modify that relay or the phone.
+## Fallback answer page
 
 The answer page uses HTTP Basic login `chaldea` and a private answer token as the
 password (or bearer auth for API clients). It escapes all question/option text,
@@ -310,10 +283,7 @@ Install/link the CLI separately. Create `~/.config/chaldea/waits.json`:
   "listenAddress": "127.0.0.1",
   "port": 7385,
   "answerBaseUrl": "http://127.0.0.1:7385",
-  "threadBaseUrl": "https://YOUR_TRUSTED_T3_ORIGIN",
   "answerTokenFile": "/home/igor/.config/chaldea/waits-answer-token",
-  "notifyUrl": "http://192.168.70.223:8399",
-  "notifyEnvFile": "/home/igor/.config/homelab-notify/env",
   "logFile": "/home/igor/.local/state/chaldea/waits.log"
 }
 ```
@@ -331,16 +301,8 @@ The deployment operator must provision:
 2. An owner-owned mode-0600 answer token file with a random password. Never put
    it in argv, the URL or logs. Arrange authenticated LAN/mesh HTTPS routing and
    set `answerBaseUrl` to the externally reachable origin only if exposure is
-   approved. The default loopback URL is useful locally but not on the phone.
-3. An owner-owned mode-0600 relay env file containing the literal assignment
-   `NOTIFY_TOKEN=<credential>` (the existing homelab-notify format);
-   `NOTIFY_RELAY_TOKEN` and an optional `export ` prefix are also accepted. The parser does not source shell code.
-   omarchy-pc has no such file yet. Resolve the credential through the existing
-   SOPS/notify deployment; this PR neither fetches nor copies a real secret.
-   Missing relay configuration creates one `undeliverable` phone row with a
-   clear disposition and no retries. Configured relay/credential failures use
-   bounded backoff until resolution/expiry; they do not stop questions.
-4. The local service unit and MCP registration in every desired provider.
+   approved. The default URL is loopback-only.
+3. The local service unit and MCP registration in every desired provider.
    Precreate the state/cache/config directories with private permissions.
    Install `packaging/systemd/chaldea-waits.service` in the user's systemd
    directory, reload, and enable it when approved. If waits should run without
@@ -372,7 +334,7 @@ New work is rejected under disk pressure. No unresolved/uncertain/blocked wake
 is pruned.
 
 Defaults: 128 active waits (one per thread), 128 pending native/fallback decisions combined, at most 10,000
-terminal tombstones and 42 days; wake/phone payload 4 KiB, normalized registration
+terminal tombstones and 42 days; wake/native response payload 4 KiB, normalized registration
 3 KiB, native answer schema 4 KiB, recent-request baseline 4 KiB, native request ID 2 KiB, dependent action
 512 bytes, question 1 KiB, 2–8 options of 256 bytes. No raw T3 event is persisted.
 Request keys use `<13-digit epoch milliseconds>:<unique key>`; new keys older
@@ -395,7 +357,7 @@ suppress its wake. Only explicit `settledOverride:"settled"`, archive or deletio
 parks delivery. Chaldea does not hold/restore auto-settlement preferences.
 
 GitHub/URL/service/feed sources, cron, scheduled sessions, LAN webhook ingress,
-cross-host waits/broker, fleet deployment, and phone receiver hardening remain
+cross-host waits/broker, fleet deployment remain
 out of scope. PR watching remains native. A generic user continuation whose
 source-run identity T3 does not retain cannot be guessed into a pinned cohort.
 
@@ -411,12 +373,11 @@ CHALDEA_T3_BIN="$HOME/.t3/runtime/versions/0.1.0/t3" CHALDEA_REQUIRE_E2E=1 npm t
 Unit tests cover transaction/retry-key invariants, concurrent answer/deadline
 arbitration, the approval-labelled-default reproduction, source/self-answer
 checks, cancellation, retention/fences/caps, quota/continuation/child completion,
-lost wake ACKs, archived-parent ambiguity, unconfigured/configured relay handling,
-real SQLite readers blocking deadlines/receipt persistence, database-owner
+lost wake ACKs, archived-parent ambiguity, real SQLite readers blocking deadlines/receipt persistence, database-owner
 exclusion/SIGKILL recovery, deleted parents and credential modes. E2E uses
-`test/helpers/disposable-t3.ts`, fake Claude/Codex and a loopback relay, with
+`test/helpers/disposable-t3.ts`, fake Claude/Codex, with
 isolated HOME/base directories. It exercises one wake per time/target run/question,
-already-true/cancel cases, CLI/MCP/page answers, default races, relay ACK loss,
+already-true/cancel cases, CLI/MCP/page answers, default races,
 watcher SIGKILL at registration/latch/pre-send/post-commit/delivered, and watcher
 and T3 restarts. Native tests cover prepare-before-Claude-ask, human answers
 without a wake, multi-question deadline text and turn continuation, permission
@@ -429,4 +390,4 @@ contract state through real reads/commands. Page tests cover null-origin
 same-origin POST acceptance and cross-site refusal. Each run prints registration-to-committed-wake latency; about
 two seconds is the healthy-host target. CI's existing workflow runs all of these
 on the self-hosted agent-a runner. The real T3 settings/port, quota service,
-feed, relay and phone are never part of these tests.
+feed are never part of these tests.

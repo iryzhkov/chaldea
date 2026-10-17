@@ -1,6 +1,6 @@
 # Chaldea
 
-Fleet compute v0: `node bin/chaldea exec --host H -- CMD...`. See [setup, protocol, bounds and tests](docs/exec-v0.md).
+Fleet compute v0: `node bin/chaldea exec [--host H] -- CMD...`. Without `--host`, try the ordered hosts in `~/.config/chaldea/exec-hosts` (one fleet inventory name per line; fleet config omits this machine). See [setup, protocol, bounds and tests](docs/exec-v0.md).
 
 Chaldea is a personal project extending T3 Code with quota resilience, fleet compute, durable waits, a decision inbox and agent access control. It targets the pinned T3 Code stable release v0.1.0 (commit `81493ef`); see [the vendored contracts and runtime provenance](vendor/t3-contracts/PROVENANCE.md).
 

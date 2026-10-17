@@ -45,6 +45,8 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run exec:check
       - run: npm run exec:test
+      - name: Run ordered fallback against two fake job hosts
+        run: node --test test/exec/fallback.e2e.ts
       - name: Explain exec SSH and sandbox E2E skip
         run: |
           reason="Exec SSH/sandbox E2E skipped: its reviewed chaldea-job-server and SSH templates are pinned to private chaldea-fleet-config commit 435985308b84c1ad5ee0f3756100b9326a36a604. Hosted fork PR jobs have no deploy key. Exec typecheck/unit tests and the real-T3 E2E suite still run."

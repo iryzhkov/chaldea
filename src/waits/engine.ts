@@ -1,14 +1,11 @@
-import { WakeStore, CheckpointBlockedError, type Item, type Registration, type Delivery } from "../wake/store.ts";
+import { WakeStore, CheckpointBlockedError, type Item, type Delivery } from "../wake/store.ts";
 import type { WaitT3, WaitSnapshot } from "../t3/waits.ts";
 import { NativeDecisions, questionSchema } from "../decisions/native.ts";
 import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
-import type { WaitInput, DecisionInput, NativeDecisionInput, AnswerSource } from "./types.ts";
+import type { WaitInput, NativeDecisionInput, AnswerSource } from "./types.ts";
 
 export interface EngineOptions {
-  answerBaseUrl: string;
-  threadUrl?: (threadId:string) => string;
-  notify?: (payload: string) => Promise<void>;
   // Test seam for abrupt process termination at durable/ambiguous boundaries.
   boundary?: (name: string, item: string) => void;
   report?: (event: string) => void;
@@ -24,7 +21,7 @@ export class WaitEngine {
   private observers = new Map<string,{abort:AbortController; retry?:NodeJS.Timeout}>();
   private inflight = new Map<string,Delivery["channel"]>();
   private hasSlot(channel: Delivery["channel"]): boolean {
-    return [...this.inflight.values()].filter(c=>c===channel).length < (channel === "phone" ? 2 : 8);
+    return [...this.inflight.values()].filter(c=>c===channel).length < 8;
   }
   private stopped = false;
   private pumping = false;
@@ -58,8 +55,8 @@ export class WaitEngine {
       else this.failStorage();
     }
   }
-  constructor(store: WakeStore, t3: WaitT3, options: EngineOptions) { this.store=store; this.t3=t3; this.options=options;
-    this.native=new NativeDecisions(store,item=>this.nativePhone(item),options.boundary); }
+  constructor(store: WakeStore, t3: WaitT3, options: EngineOptions = {}) { this.store=store; this.t3=t3; this.options=options;
+    this.native=new NativeDecisions(store,options.boundary); }
   start(): void { this.poke(); }
   trackedNative(parent:string):ReturnType<WakeStore["nativeTracking"]>{
     if(this.fatal)throw new Error("Watcher needs attention");
@@ -83,7 +80,7 @@ export class WaitEngine {
       pinned = reg.input.condition.runId ?? target.runs.toSorted((a,b) => b.ordinal-a.ordinal)[0]?.id ?? null;
       if (!pinned || !target.runs.some(r => r.id === pinned)) throw new Error("Target has no accepted run to pin");
     }
-    const row = this.store.register(reg,parent.project,pinned,kind === "decision" ? this.phone(reg) : undefined);
+    const row = this.store.register(reg,parent.project,pinned);
     this.options.boundary?.("registered",row.id);
     this.poke();
     return row;
@@ -106,21 +103,9 @@ export class WaitEngine {
       if(request.status==="pending" && !questions)throw new Error("Native question schema is unavailable or exceeds 4 KiB; prepare before asking");
     }
     const baseline=(parent.requests??[]).filter(r=>r.created>=started-1000).map(r=>r.id);
-    const row=this.store.register(reg,parent.project,null,undefined,Date.now(),baseline,questions,itemId);
+    const row=this.store.register(reg,parent.project,null,Date.now(),baseline,questions,itemId);
     this.snapshots.set(parent.id,parent);
     this.options.boundary?.("registered",row.id);this.poke();return this.store.get(row.id);
-  }
-  private nativePhone(item:Item):string{
-    const input=JSON.parse(item.input) as NativeDecisionInput;
-    return JSON.stringify({id:"chaldea-decision:"+this.store.environment+":"+item.id,title:"Chaldea decision",
-      content:"Answer the native question in T3.\nNo answer: "+input.defaultAction+" "+input.dependentAction+"\nDeadline: "+input.deadline,
-      priority:"default",url:this.options.threadUrl?.(item.parent)??"t3-thread://v1/"+encodeURIComponent(item.parent)});
-  }
-  private phone(reg: Registration): string {
-    const q = reg.input as DecisionInput;
-    return JSON.stringify({id:"chaldea-decision:" + this.store.environment + ":" + reg.id,
-      title:"Chaldea decision",content:q.question + "\nNo answer: " + q.defaultAction + " " + (q.dependentAction ?? "the dependent action") + "\nDeadline: " + q.deadline,
-      priority:"default",url:new URL("/decisions/" + reg.id,this.options.answerBaseUrl).toString()});
   }
   answer(id: string, answer: string, source: AnswerSource): Item {
     const row=this.store.answer(id,answer,source); this.options.boundary?.("resolved",id); this.poke(); return row;
@@ -167,8 +152,6 @@ export class WaitEngine {
     try {
       for (const [id,commit] of this.pendingCommits) { commit();this.pendingCommits.delete(id); }
       const now=Date.now();
-      if (!this.options.notify) for (const d of this.store.deliveries())
-        if (d.channel === "phone" && d.state === "pending") this.store.undeliverable(d.id);
       for (const item of this.store.active()) {
         if (this.snapshots.has(item.parent)) {
           const p=this.snapshots.get(item.parent);
@@ -212,19 +195,13 @@ export class WaitEngine {
         entry.abort.abort(); clearTimeout(entry.retry); this.observers.delete(id); this.snapshots.delete(id); this.cursors.delete(id);
       }
       for (const id of needed) this.watch(id);
-      // Network operations run independently: an offline relay never delays a deadline or wake.
-      for (const d of this.store.deliveries().sort((a,b) => a.channel === b.channel ? 0 : a.channel === "phone" ? 1 : -1)) {
+      for (const d of this.store.deliveries()) {
         if (d.state !== "pending") continue;
-        const item=this.store.get(d.item);
-        if(d.channel==="phone" && !this.options.notify){this.store.undeliverable(d.id);continue;}
-        if (d.channel === "phone" && (item.state !== "parked" || (d.expires !== null && now >= d.expires))) {
-          this.store.suppress(d.id); continue;
-        }
         if (d.next_at <= now && this.hasSlot(d.channel) && !this.inflight.has(d.id)) {
           this.inflight.set(d.id,d.channel); void this.deliver(d).finally(() => { this.inflight.delete(d.id); this.poke(); });
         }
       }
-      if (this.storageRetry) return; // A synchronous phone claim may have armed storage backoff.
+      if (this.storageRetry) return; // A delivery claim may have armed storage backoff.
       const times:number[]=[];
       for (const i of this.store.active()) {
         if(i.kind==="native"){
@@ -258,13 +235,11 @@ export class WaitEngine {
   private async deliver(delivery: Delivery): Promise<void> {
     try {
       const item=this.store.get(delivery.item);
-      if (delivery.channel !== "phone") {
-        const parent=await this.t3.snapshot(item.parent);
-        if (!parent || parent.deleted || parent.project !== item.project || parent.archived || parent.settled) {
-          this.persistDelivery(delivery.id,() => this.store.orphan(item.id,!parent || parent.deleted ? "parent_deleted" : "parent_inactive")); return;
-        }
-        if(delivery.channel==="native" && !this.native.beforeSend(item,delivery,parent))return;
+      const parent=await this.t3.snapshot(item.parent);
+      if (!parent || parent.deleted || parent.project !== item.project || parent.archived || parent.settled) {
+        this.persistDelivery(delivery.id,() => this.store.orphan(item.id,!parent || parent.deleted ? "parent_deleted" : "parent_inactive")); return;
       }
+      if(delivery.channel==="native" && !this.native.beforeSend(item,delivery,parent))return;
       // Recheck after async preflight: cancel/answer may have suppressed this row.
       const claimed=this.store.claim(delivery.id); if (!claimed) return;
       this.options.boundary?.("before_send",delivery.item);
@@ -282,11 +257,7 @@ export class WaitEngine {
         }
         return;
       }
-      if (claimed.channel === "wake") await this.t3.dispatch(claimed.payload);
-      else {
-        if (!this.options.notify) throw new Error("Notify relay not provisioned");
-        await this.options.notify(claimed.payload);
-      }
+      await this.t3.dispatch(claimed.payload);
       this.options.boundary?.("after_send",delivery.item);
       this.persistDelivery(claimed.id,() => {
         this.store.sent(claimed.id);this.options.boundary?.("delivered",delivery.item);
