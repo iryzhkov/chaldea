@@ -7,7 +7,7 @@ import { WakeStore } from "../wake/store.ts";
 import { WaitEngine, type EngineOptions } from "./engine.ts";
 import { createWaitT3 } from "../t3/waits.ts";
 import { discoverServerUrl } from "../t3/adapter.ts";
-import { loadConfig, privateFile, notify, type WaitConfig } from "./config.ts";
+import { loadConfig, privateFile, type WaitConfig } from "./config.ts";
 import { boundedLog } from "./log.ts";
 import { object, text } from "./types.ts";
 
@@ -54,6 +54,8 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       switch(v.method){
         case "chaldea_wait":result=await engine.register("wait",input);break;
         case "chaldea_decision_ask":result=await engine.register("decision",input);break;
+        case "chaldea_decision_prepare":result=await engine.registerNative(input);break;
+        case "chaldea_decision_track":result=await engine.registerNative(input,true);break;
         case "chaldea_wait_cancel":result=engine.cancel(text(input.id,"id"));break;
         case "chaldea_decision_answer":result=await engine.answerFromThread(text(input.id,"id"),text(input.answer,"answer",256),text(input.answeringThreadId,"answeringThreadId"));break;
         case "chaldea_decision_answer_cli":result=engine.answer(text(input.id,"id"),text(input.answer,"answer",256),"cli");break;
@@ -63,6 +65,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       if (result && typeof result === "object" && "kind" in result && "id" in result) {
         const item=result as import("../wake/store.ts").Item;
         result={...item,...(item.kind === "wait" ? {waitId:item.id} : {questionId:item.id}),
+          ...(item.kind === "native" ? {native:{runtimeRequestId:engine.store.native(item.id).request_id,preparationExpiresAt:engine.store.native(item.id).bind_until}} : {}),
           delivery:engine.store.deliveries().filter(d=>d.item===item.id).map(d=>({channel:d.channel,state:d.state,disposition:d.disposition,attempts:d.attempts,nextAt:d.next_at}))};
       }
       send(res,200,result);
@@ -80,8 +83,8 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       const serverUrl=config.serverUrl??discoverServerUrl(config.t3BaseDir);
       if(!serverUrl)throw new Error("T3 is offline");
       return {serverUrl,token:privateFile(config.tokenFile),signal:AbortSignal.timeout(10_000)};
-    },config.environment);
-    engine=new WaitEngine(store,t3,{answerBaseUrl:config.answerBaseUrl,...(config.notifyUrl && config.notifyEnvFile ? {notify:(p:string)=>notify(config,p)} : {}),report,...extras});
+    },config.environment,id=>engine!.trackedNative(id));
+    engine=new WaitEngine(store,t3,{report,...extras});
     const running=engine;
     page=createServer(async(req,res)=>{
       res.setHeader("Cache-Control","no-store");
@@ -98,9 +101,14 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
         const match=/^\/decisions\/([a-f0-9-]+)$/.exec(url.pathname);
         const csrf=(id:string)=>createHmac("sha256",secret).update("answer:"+id).digest("hex");
         if(req.method==="POST"&&match){
-          if(req.headers.origin && req.headers.origin!==new URL(config.answerBaseUrl).origin)throw new Error("Origin refused");
+          const site=req.headers["sec-fetch-site"];
+          if(site==="cross-site" || (site!=="same-origin" && req.headers.origin!==new URL(config.answerBaseUrl).origin)){
+            report("answer_origin_refused");send(res,400,{error:"Answer origin refused: use the authenticated page on the same origin"});return;
+          }
           const form=new URLSearchParams(await body(req));
-          if(!equal(form.get("csrf")??"",csrf(match[1]!)))throw new Error("Invalid form token");
+          if(!equal(form.get("csrf")??"",csrf(match[1]!))){
+            report("answer_form_token_invalid");send(res,400,{error:"Invalid form token: reload the decision page"});return;
+          }
           running.answer(match[1]!,text(form.get("answer"),"answer",256),"page");
           res.writeHead(303,{Location:"/decisions/"+match[1]});res.end();return;
         }
@@ -117,7 +125,13 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
         }
         res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});
         res.end('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Chaldea decisions</title><style>body{font:18px system-ui;max-width:48rem;margin:2rem auto;padding:1rem}article{border-bottom:1px solid #aaa;padding:1rem 0}button{font:inherit;margin:.4rem;padding:.6rem}</style>'+html+'</html>');
-      }catch{send(res,400,{error:"Invalid decision request"});}
+      }catch(error){
+        // Only allowlisted validation errors reach the page; never log request or secret data.
+        report("answer_request_invalid");
+        const message=error instanceof Error && ["Unknown item","Not a decision","Answer must be one of the options","Request exceeds cap"].includes(error.message)
+          ? error.message : "Invalid decision request: reload the page and choose a listed answer";
+        send(res,400,{error:message});
+      }
     });
     page.requestTimeout=10_000;page.headersTimeout=10_000;page.maxConnections=32;
     await listen(page,{host:config.listenAddress,port:config.port});
@@ -132,7 +146,8 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
 }
 export function callService(socket:string,method:string,input:unknown):Promise<unknown>{
   return new Promise((resolve,reject)=>{
-    const req=request({socketPath:socket,path:"/rpc",method:"POST",headers:{"Content-Type":"application/json"},timeout:15_000},res=>{
+    // Do not reuse a keep-alive Unix connection across watcher replacement.
+    const req=request({socketPath:socket,path:"/rpc",method:"POST",agent:false,headers:{"Content-Type":"application/json"},timeout:15_000},res=>{
       let data="";res.setEncoding("utf8");res.on("data",s=>{data+=s;if(Buffer.byteLength(data)>16384)req.destroy(new Error("IPC response exceeds cap"));});
       res.on("end",()=>{try{const value=JSON.parse(data);res.statusCode===200?resolve(value):reject(new Error(value.error??"Service refused"));}catch(e){reject(e);}});
     });

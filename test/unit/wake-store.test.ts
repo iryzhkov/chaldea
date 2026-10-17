@@ -176,3 +176,40 @@ test("completion pins a run, follows restart/quota/provider lineage and children
   s.children[0]!.status="completed";s.pendingRuns.push("c");assert.equal(completion(s,"a"),null);
   s.pendingRuns=[];assert.equal(completion(s,"a")?.runId,"c");
 });
+
+test("startup retires legacy phone rows and preserves decisions, policy and wake replay",()=>{
+  const dir=scratchDir("retired-outbox"),path=join(dir.path,"db");
+  let store=new WakeStore(path,"test-env");
+  try{
+    const now=Date.now();
+    const decision=store.register(store.prepare("decision",question(now)),"project",null);
+    const native=store.register(store.prepare("native",{threadId:"native",requestId:now+":native",
+      runtimeRequestId:"request",dependentAction:"run the step",defaultAction:"defer",deadline:iso(now+10_000)}),"project",null);
+    const wake=store.register(store.prepare("wait",wait(0,now)),"project",null);
+    store.resolve(wake.id,{reason:"time"});
+    const payload=store.deliveries()[0]!.payload;
+    store.claim(store.deliveries()[0]!.id);
+    store.queueNative(native.id,'{"native":"immutable"}');
+    for(const [i,state] of ["pending","sending","sent","undeliverable","suppressed"].entries()){
+      const row=i===0?decision:store.register(store.prepare("decision",{...question(now),requestId:now+":old-"+i}),"project",null);
+      store.db.prepare("INSERT INTO outbox(id,item,channel,payload,state,attempts,next_at,disposition) VALUES(?,?,'phone','{}',?,?,?,?)")
+        .run("old-"+i,row.id,state,state==="undeliverable"?0:1,now,state==="undeliverable"?"relay_unprovisioned":null);
+    }
+    const policy=store.native(native.id),original=store.get(decision.id);
+    store.close();
+    assert.throws(()=>new WakeStore(path,"other-env"),/another environment/);
+    for(let reopen=0;reopen<2;reopen++){
+      store=new WakeStore(path,"test-env");
+      assert.deepEqual(store.get(decision.id),original);
+      assert.deepEqual(store.native(native.id),policy);
+      assert.equal(store.deliveries().length,2);
+      assert.ok(store.deliveries().every(d=>d.channel==="wake"||d.channel==="native"));
+      const recovered=store.deliveries().find(d=>d.item===wake.id)!;
+      assert.equal(recovered.payload,payload);assert.equal(recovered.state,"pending");assert.equal(recovered.attempts,1);
+      assert.equal(store.deliveries().find(d=>d.item===native.id)!.payload,'{"native":"immutable"}');
+      if(reopen===0)store.close();
+    }
+    store.answer(decision.id,"Run","cli",now);
+    assert.equal(JSON.parse(store.get(decision.id).outcome!).source,"cli");
+  }finally{store.close();dir.remove();}
+});

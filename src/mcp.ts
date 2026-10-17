@@ -4,6 +4,8 @@ const str={type:"string"};
 const identity={threadId:{...str,description:"Your own orchestrator_capabilities.parentThreadId on this host"},
   requestId:{...str,description:"Stable retry key: <13-digit epoch milliseconds>:<unique key>; reuse with identical arguments"}};
 const schema=(properties:Record<string,unknown>,required:string[])=>({type:"object",properties,required,additionalProperties:false});
+const nativePolicy={...identity,dependentAction:{...str,description:"The dependent action to skip or defer; never a permission or approval"},defaultAction:{enum:["skip","defer"]},deadline:{...str,description:"RFC3339 with offset"}};
+const nativeRequired=["threadId","requestId","dependentAction","defaultAction","deadline"];
 export const WAIT_TOOLS=[
   {name:"chaldea_wait",description:"Register one durable time or same-host thread/run wait and return immediately. End your turn when ready; one marked queued wake follows resolution. Use native PR watching/delegation for those cases.",
     inputSchema:schema({...identity,condition:{oneOf:[
@@ -11,12 +13,14 @@ export const WAIT_TOOLS=[
       schema({kind:{const:"thread"},threadId:str,runId:str},["kind","threadId"])]},deadline:str},["threadId","requestId","condition"])},
   {name:"chaldea_wait_cancel",description:"Cancel an unresolved wait without a wake. Reports in-flight/accepted delivery honestly.",inputSchema:schema({id:str},["id"])},
   {name:"chaldea_wait_status",description:"Read wait state and its immutable outcome.",inputSchema:schema({id:str},["id"])},
-  {name:"chaldea_decision_ask",description:"Park a question for Igor and keep working. No answer by the deadline only skips/defers dependent work; it never selects an option or grants approval or permission.",
+  {name:"chaldea_decision_prepare",description:"Before asking Igor a native question (including blocking Claude AskUserQuestion), commit a safe deadline policy and return immediately. Ask in T3 next: binds the next user_input request on your own thread within 10 minutes. Native human answers add no Chaldea wake; deadline responses only skip/defer. Never tracks or answers permissions/approvals.",inputSchema:schema(nativePolicy,nativeRequired)},
+  {name:"chaldea_decision_track",description:"Track a known native user_input runtimeRequestId on your own thread, for example a Codex async question. Retrieves a bounded answer schema, including older questions by verified T3 item lookup; refuses unavailable or oversized schemas. Native answers stay in T3. Only safe skip/defer text may be sent at the deadline; permissions/approvals are refused.",inputSchema:schema({...nativePolicy,runtimeRequestId:str},[...nativeRequired,"runtimeRequestId"])},
+  {name:"chaldea_decision_ask",description:"Fallback only for providers that cannot ask natively: park a question for Igor and keep working. No answer by the deadline only skips/defers dependent work; it never selects an option or grants approval or permission.",
     inputSchema:schema({...identity,question:str,options:{type:"array",items:str,minItems:2,maxItems:8},dependentAction:{...str,description:"The dependent action to skip or defer if Igor does not answer"},
       defaultAction:{enum:["skip","defer"]},deadline:str},
       ["threadId","requestId","question","options","dependentAction","defaultAction","deadline"])},
-  {name:"chaldea_decision_answer",description:"Answer from another local thread, recorded as an agent answer (mcp:<thread>), never as human consent. Your own asking thread cannot answer. Igor uses the page or CLI.",inputSchema:schema({id:str,answer:str,answeringThreadId:identity.threadId},["id","answer","answeringThreadId"])},
-  {name:"chaldea_decision_status",description:"Read a question's answer/default, state and deadline.",inputSchema:schema({id:str},["id"])},
+  {name:"chaldea_decision_answer",description:"Answer a fallback inbox question from another local thread, recorded as an agent answer (mcp:<thread>), never as human consent. Your own asking thread cannot answer. Igor uses the page or CLI.",inputSchema:schema({id:str,answer:str,answeringThreadId:identity.threadId},["id","answer","answeringThreadId"])},
+  {name:"chaldea_decision_status",description:"Read native policy/binding or fallback answer/default, state, deadline and delivery status. Native answers are submitted in T3, never through chaldea_decision_answer.",inputSchema:schema({id:str},["id"])},
 ];
 export async function runMcp(socket:string):Promise<void>{
   let buffer="";let chain=Promise.resolve();
