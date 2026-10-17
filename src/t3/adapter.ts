@@ -433,6 +433,26 @@ export async function withClient<A>(
 }
 
 /**
+ * The sole wake delivery seam. Pinned 0.1.0 rewrites createdBy to user at WS
+ * intake and rejects notification payloads. Igor explicitly approved one marked,
+ * queued user message per item. Keep the journal's command bytes immutable:
+ * RPC success confirms the durable receipt; ambiguous calls replay the same ID.
+ * Switch to native notifications here when a qualified T3 version permits them.
+ */
+export class WakeRejectedError extends Error {
+  override readonly name = "WakeRejectedError";
+}
+export async function dispatchChaldeaWake(options: ConnectOptions, payload: string): Promise<void> {
+  const accepted = await withClient(options, client =>
+    client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
+      Effect.map(() => true),
+      Effect.catchTag("OrchestrationV2DispatchCommandError", error =>
+        /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
+          ? Effect.succeed(false) : Effect.fail(error))));
+  if (!accepted) throw new WakeRejectedError("T3 durably rejected this wake; operator attention required");
+}
+
+/**
  * Sets T3's server-scoped `autoResumeLimitedThreads` through the public
  * `server.updateSettings` RPC, so T3 persists it with its own writer. Needs a
  * bearer with the `settings:write` scope. Resolves to the value T3 reports back.
