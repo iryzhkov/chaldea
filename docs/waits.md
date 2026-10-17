@@ -1,13 +1,13 @@
 # Durable waits and the decision inbox
 
 This first slice adds time and same-host thread/run waits, a provider-independent
-question store, and one shared SQLite wake/phone outbox. CLI and MCP use one local
+fallback question store, native T3 question policies, and one shared SQLite outbox. CLI and MCP use one local
 user service through a mode-0600 Unix socket. There are no scans that post messages
 and no recurring condition-polling loop. The answer page defaults to loopback.
 
 ## One wake, and the approved T3 0.1.0 deviation
 
-Each resolved wait/question commits its outcome and one immutable wake command in
+Each resolved wait/fallback question commits its outcome and one immutable wake command in
 the same SQLite transaction. Command and message IDs are
 `chaldea-wait:<id>:wake` or `chaldea-decision:<id>:wake`. Delivery uses
 `message.dispatch`, `dispatchMode:{type:"queue_after_active"}`, empty attachments,
@@ -44,6 +44,102 @@ Evidence is pinned official T3 v0.1.0, commit
   A previously-rejected durable receipt parks delivery as `blocked`/`delivery_rejected`;
   it is retained for operator attention and never silently assigned a new ID.
 
+## Native questions first
+
+Igor answers in the T3 thread. Register a deadline policy **before** using a
+native question tool: Claude's `AskUserQuestion` pauses the turn, so registration
+after asking cannot work. This implements section 4 of the step-5 brief,
+Jocasta `3c642bfd5e2d1a09084990039a392f04@1`. Chaldea's separate page/store
+remain a fallback for providers without native questions.
+
+`chaldea_decision_prepare` commits immediately, watches the caller's existing
+thread subscription, and binds the first new `user_input` runtime request
+created within ten minutes (or before the deadline, if earlier). Existing
+requests are excluded. One unbound preparation per thread is allowed; an
+unbound policy expires without a message or phone card. After binding, the
+deadline applies to that request alone, including every question in a
+multi-question request. Binding atomically saves at most 4 KiB of answer-routing
+schema (question IDs, custom-answer/multi-select flags and required fixed-option
+labels/values) and the verified T3 turn-item ID, without question prose or
+option descriptions. T3 timeline rows
+are bounded; an omitted older turn item never erases this saved policy. Reconnect
+takes a fresh authoritative control-plane snapshot. An
+already-answered request observed after downtime closes its policy; it never
+binds a later, unrelated question. If that first request is already tracked by
+another policy, the preparation closes as `already_tracked` without a wake;
+it does not move to the next question.
+
+For async questions whose ID is already known, use `chaldea_decision_track`
+with `runtimeRequestId`. The service verifies the request belongs to the caller's
+thread and is `user_input`, and requires a readable schema within the 4 KiB cap
+before committing. Older questions use public `orchestration.getTurnItem`
+point reads rather than a transcript scan. The pinned provider-item node/turn
+ID relationship supplies a lookup candidate; the result must be a
+`user_input_request` with the exact runtime request ID before it can be used.
+Unavailable or oversized schemas are refused with a specific error. Permissions and approval requests are never bound
+or answered. Both APIs require the caller's own explicit thread ID and a saved
+retry key; retries preserve the policy's original binding and deadline.
+
+Completed historical questions are also read by their persisted, verified item
+ID when T3 omits the resolved request from its bounded control snapshot. This
+preserves the human-answer path after paging and watcher restart.
+
+A human answer in T3 records `native_answered`, `source:"t3"`, and the runtime
+request ID, with **no Chaldea wake**. T3 delivers that answer itself. At the
+deadline Chaldea persists one immutable `runtime-request.respond` command,
+`commandId:"chaldea-native:<questionId>:default"`, before sending. Each
+free-text answer is exactly:
+
+```text
+No answer by the deadline: defer deploy the dependent action
+```
+
+The declared action is only `skip` or `defer`; there is no approval-valued
+default. The pinned UI treats absent `allowCustomAnswer` as true; Chaldea uses
+that same free-text path. For `allowCustomAnswer:false`, it selects only an
+option whose entire label and optional wire value match the declared action
+(case-insensitively). It never guesses from prose such as “skip checks and
+approve”. If any question has no safe path, is missing, or cannot resume,
+the policy becomes `needs_attention` and commits one marked queued wake with
+a status pointer. It sends no automatic answer. Respond in T3 or defer the
+dependent action; do not manufacture permission.
+
+T3's pending-state check arbitrates the human/deadline race. An accepted
+durable receipt records `native_default`, `defaulted:true`, `source:"chaldea"`.
+Only a replayed “previously rejected” durable receipt is definitive. The public
+RPC also wraps startup/internal failures in the same error type, so other
+failures retry unchanged. A definitive rejection is reconciled against T3: a resolved request records
+the native winner; an unresolved/unavailable request needs attention.
+Ambiguous sends replay the identical stored command and receipt before
+classifying a resolved request. Neither a confirmed default answer nor a
+human answer creates a second Chaldea message.
+
+Pinned T3 evidence (official v0.1.0, same commit as above):
+
+- [Runtime request kind, status and response capabilities](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/packages/contracts/src/orchestrationV2.ts#L1114-L1133),
+  [question contract](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/packages/contracts/src/orchestrationV2.ts#L1242-L1259),
+  and [public respond command](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/packages/contracts/src/orchestrationV2.ts#L3077-L3090)
+  distinguish user input from permission decisions and permit string answers.
+- [Respond arbitration and message continuation](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/apps/server/src/orchestration-v2/Orchestrator.ts#L7351-L7590)
+  checks pending state before resolution; message-capable answers enqueue
+  `async-answer:<runtimeRequestId>` atomically. The only native response
+  delivery seam is `respondChaldeaDecision` in `src/t3/adapter.ts`.
+- [Claude native tool callback](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts#L8191-L8250)
+  is live; [Codex async question mapping](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts#L5027-L5055)
+  is message-capable.
+- [Pinned provider-item IDs](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/packages/provider-core/src/server/IdAllocator.ts#L284-L291)
+  differ only in their node/turn-item prefix. Point reads always verify the
+  returned item type, thread, item ID and request ID; they never trust the candidate alone.
+
+Watcher restarts preserve either capability. T3/provider restart can lose a
+**live** callback; pinned T3 marks it unavailable rather than reconstructing the
+provider's blocked turn. [Startup/shutdown recovery](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts#L222-L244)
+preserves message-capable requests and cancels other pending callbacks.
+Chaldea reports one attention wake, never claims that
+turn continued. Message-capable async questions survive T3 restart and receive
+one native continuation. This is a pinned T3 limitation, not a second delivery
+path for live questions.
+
 ## Calls and identity
 
 The session passes its own `orchestrator_capabilities.parentThreadId` explicitly.
@@ -64,6 +160,15 @@ chaldea wait thread --target "$other_thread" --run "$run_id" --thread "$thread_i
 chaldea wait status "$wait_id"
 chaldea wait cancel "$wait_id"
 
+chaldea decision prepare --thread "$thread_id" --request-id "$request_id" \
+  --dependent-action 'deploy the dependent action' --default-action defer \
+  --deadline 2026-10-18T09:00:00-07:00
+# Ask natively in T3 next. For an already-known async runtime request instead:
+chaldea decision track --thread "$thread_id" --runtime-request "$runtime_request_id" \
+  --request-id "$another_request_id" --dependent-action 'deploy the dependent action' \
+  --default-action defer --deadline 2026-10-18T09:00:00-07:00
+
+# Fallback for providers without native questions:
 chaldea decision ask --thread "$thread_id" --question 'Run the dependent step?' \
   --option Defer --option Run --dependent-action 'run the dependent step' \
   --default-action defer --deadline 2026-10-18T09:00:00-07:00
@@ -73,11 +178,12 @@ chaldea decision status "$question_id"
 
 The call commits registration and returns immediately with `id`, `waitId` or
 `questionId`, state and delivery status. A wait lets the session end its turn; a
-question lets it continue unrelated work. The answer page and CLI/MCP share the
+fallback question lets it continue unrelated work. Native blocking tools follow their
+provider semantics; preparation returns before asking. The fallback page and CLI/MCP share the
 same transaction that arbitrates answer versus deadline. Answers after the
 deadline apply the declared default even if the timer has not run yet.
 
-The asker declares `dependentAction` and `defaultAction:"skip"|"defer"`; there
+For the fallback inbox, the asker declares `dependentAction` and `defaultAction:"skip"|"defer"`; there
 is no option-valued default or safety attestation. At the deadline the immutable
 outcome is only `{reason:"deadline",defaulted:true,action:"skip"|"defer"}`, with
 no answer text. The wake says “no answer by the deadline: skip/defer <dependent
@@ -86,7 +192,7 @@ Obsolete `default`/`defaultSafe` inputs are refused. Previously parked questions
 also use this structural deadline outcome; their old option-valued default is
 never selected. Defaults never grant consent, permissions or expanded autonomy.
 
-Igor answers through the authenticated page (source `page`) or CLI (source
+For fallback questions Igor answers through the authenticated page (source `page`) or CLI (source
 `cli`). MCP/agent IPC answers must name `answeringThreadId`, validated on this
 host's T3, and cannot come from the asking thread. Another thread's answer is
 recorded as `mcp:<thread>`, never as human consent. Answer outcomes and wakes
@@ -97,9 +203,19 @@ A notification tap does not answer.
 
 MCP stdio: register `chaldea mcp --config /absolute/path/waits.json` with each
 provider's MCP configuration. It exposes `chaldea_wait`,
-`chaldea_wait_cancel`, `chaldea_wait_status`, `chaldea_decision_ask`,
+`chaldea_wait_cancel`, `chaldea_wait_status`, `chaldea_decision_prepare`,
+`chaldea_decision_track`, `chaldea_decision_ask`,
 `chaldea_decision_answer`, `chaldea_decision_status`. Tool schemas document explicit
-identity, stable retry keys and safe-default rules. The MCP process holds no T3
+identity, stable retry keys and safe-default rules. Native tool arguments are:
+
+- `chaldea_decision_prepare({threadId,requestId,dependentAction,defaultAction,deadline})`
+- `chaldea_decision_track({threadId,requestId,dependentAction,defaultAction,deadline,runtimeRequestId})`
+- `chaldea_decision_status({id})` returns the native binding, preparation expiry,
+  immutable resolution and delivery status. It also accepts fallback IDs.
+
+All preparation/tracking arguments are required; `defaultAction` is `skip|defer`,
+`deadline` is RFC3339 with an offset. `chaldea_decision_answer` only answers the
+fallback inbox; native questions must be answered in T3. The MCP process holds no T3
 token and does not own state; Unix socket access is the local-user trust boundary.
 
 ## Observation, restart and cancellation
@@ -113,7 +229,7 @@ or per-wait process. Overdue deadlines resolve once on startup.
 
 Thread waits pin an explicit run, or the latest accepted run at registration;
 there is no “next future run” or generic idle predicate. Self-dependencies and
-local dependency cycles are rejected. Full public thread snapshots plus live
+local dependency cycles are rejected. Public control-plane snapshots plus live
 subscriptions close the subscribe/read race. Cursors are journalled on observed
 events; reconnect requests a fresh authoritative full snapshot rather than
 reconstructing state from old raw events. Missing pinned history never means
@@ -139,7 +255,7 @@ operator attention; do not edit IDs to force a retry.
 
 ## Phone and answer page
 
-Each question creates one phone outbox row with immutable
+Each fallback question, or newly bound native question, creates one phone outbox row with immutable
 `{content,title,id,priority,url}`, ID
 `chaldea-decision:<environment>:<questionId>`. The service POSTs `/notify`
 with a bearer credential, marks sent only on HTTP 202, and retries the same bytes
@@ -152,6 +268,12 @@ If relay URL/env-file configuration is absent, the phone row becomes
 no retry timer. Provisioning later affects new questions; scans/restarts do not
 re-notify old ones. A configured relay retains capped backoff and expiry.
 
+Native cards link directly to the T3 HTTP thread route, `/<environment>/<threadId>`;
+fallback cards link to `/decisions/<id>`. Set `threadBaseUrl` to the trusted,
+phone-reachable T3 origin (HTTPS LAN/mesh routing is deployment work). Without
+it the watcher uses the configured/discovered T3 origin, which may only be
+reachable locally. Unbound preparations do not notify.
+
 This is one logical card identity, not a qualified exactly-once audible alert.
 Existing relay ID replacement may re-alert; phone/relay ACK-loss, dismissal and
 reboot qualification remain attended deployment work. Source:
@@ -160,7 +282,12 @@ modify that relay or the phone.
 
 The answer page uses HTTP Basic login `chaldea` and a private answer token as the
 password (or bearer auth for API clients). It escapes all question/option text,
-requires an HMAC form token, checks supplied Origin, disallows framing and
+requires an HMAC form token and either `Sec-Fetch-Site: same-origin` or an
+Origin matching `answerBaseUrl`. `Origin: null` is accepted only with the
+same-origin fetch signal, fixing browsers using the page\'s `no-referrer`
+policy. Cross-site fetches are refused, including null origins. Origin and
+form-token failures return specific messages and log only an event reason,
+never headers, submitted data or secrets. The page disallows framing and
 cross-origin resources, and carries no credential in a URL. Use a trusted LAN
 HTTPS reverse proxy or HTTPS mesh endpoint **before any non-loopback bind**;
 plain HTTP Basic credentials must never cross the LAN. Listen/exposure is an
@@ -183,6 +310,7 @@ Install/link the CLI separately. Create `~/.config/chaldea/waits.json`:
   "listenAddress": "127.0.0.1",
   "port": 7385,
   "answerBaseUrl": "http://127.0.0.1:7385",
+  "threadBaseUrl": "https://YOUR_TRUSTED_T3_ORIGIN",
   "answerTokenFile": "/home/igor/.config/chaldea/waits-answer-token",
   "notifyUrl": "http://192.168.70.223:8399",
   "notifyEnvFile": "/home/igor/.config/homelab-notify/env",
@@ -243,9 +371,10 @@ re-dispatch; a crash still replays the immutable command/receipt protocol.
 New work is rejected under disk pressure. No unresolved/uncertain/blocked wake
 is pruned.
 
-Defaults: 128 active waits (one per thread), 128 pending decisions, at most 10,000
+Defaults: 128 active waits (one per thread), 128 pending native/fallback decisions combined, at most 10,000
 terminal tombstones and 42 days; wake/phone payload 4 KiB, normalized registration
-3 KiB, question 1 KiB, 2–8 options of 256 bytes. No raw T3 event is persisted.
+3 KiB, native answer schema 4 KiB, recent-request baseline 4 KiB, native request ID 2 KiB, dependent action
+512 bytes, question 1 KiB, 2–8 options of 256 bytes. No raw T3 event is persisted.
 Request keys use `<13-digit epoch milliseconds>:<unique key>`; new keys older
 than 42 days or beyond the monotone pruning fence are rejected before insertion.
 Known keys return the original item and reject payload changes. This permits
@@ -259,8 +388,8 @@ budget and do not depend on an agent model being available.
 
 ## Deliberate gaps and later slices
 
-Native T3 pending-question tracking and auto-settlement hold/restore are omitted
-from this six-day slice. All providers can use Chaldea's own inbox. A long wait
+Native preparation/tracking is implemented; Chaldea\'s own inbox remains a
+provider fallback. Auto-settlement hold/restore is still omitted. A long wait
 can be automatically settled by T3; computed auto-settlement does **not**
 suppress its wake. Only explicit `settledOverride:"settled"`, archive or deletion
 parks delivery. Chaldea does not hold/restore auto-settlement preferences.
@@ -289,7 +418,15 @@ exclusion/SIGKILL recovery, deleted parents and credential modes. E2E uses
 isolated HOME/base directories. It exercises one wake per time/target run/question,
 already-true/cancel cases, CLI/MCP/page answers, default races, relay ACK loss,
 watcher SIGKILL at registration/latch/pre-send/post-commit/delivered, and watcher
-and T3 restarts. Each run prints registration-to-committed-wake latency; about
+and T3 restarts. Native tests cover prepare-before-Claude-ask, human answers
+without a wake, multi-question deadline text and turn continuation, permission
+refusal, fixed-only needs-attention, native command ACK loss, every native
+watcher crash boundary, a Codex async question beyond 77 timeline rows plus
+watcher restart, Codex message-capable T3 restart and unavailable live
+Claude restart. Pinned adapters never emit `allowCustomAnswer:false`; the
+fixed-only e2e seeds only the disposable T3 projection to exercise that public
+contract state through real reads/commands. Page tests cover null-origin
+same-origin POST acceptance and cross-site refusal. Each run prints registration-to-committed-wake latency; about
 two seconds is the healthy-host target. CI's existing workflow runs all of these
 on the self-hosted agent-a runner. The real T3 settings/port, quota service,
 feed, relay and phone are never part of these tests.

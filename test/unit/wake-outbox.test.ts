@@ -65,7 +65,7 @@ test("deleted parent parks a resolved wake; missing relay cannot delay the defau
 test("fatal storage errors log once, refuse registrations and exit non-zero for systemd recovery",{timeout:10_000},async()=>{
   const dir=scratchDir("wake-storage-fatal");
   try{
-    for(const mode of ["maintenance","receipt","logger"]){
+    for(const mode of ["maintenance","receipt","logger","tracking"]){
       const path=join(dir.path,mode+".sqlite");
       const result=await new Promise<{code:number|null;signal:string|null;out:string;err:string}>((resolveChild,reject)=>{
         const child=spawn(process.execPath,[resolve("test/helpers/waits-storage-failure.ts"),path,mode],{stdio:["ignore","pipe","pipe"],timeout:5000});

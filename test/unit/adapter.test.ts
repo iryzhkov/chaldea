@@ -13,6 +13,7 @@ import {
   TransientConnectionError,
   connectShell,
   socketUrl,
+  respondChaldeaDecision,
 } from "../../src/t3/adapter.ts";
 
 async function listen(server: Server): Promise<string> {
@@ -26,6 +27,30 @@ function refusing(status: number, body: unknown): Server {
     response.end(JSON.stringify(body));
   });
 }
+
+test("native response RPC distinguishes ambiguous dispatch errors from replayed durable rejection",async()=>{
+  const server=createServer(),wss=new WebSocketServer({server});
+  const payload=JSON.stringify({type:"runtime-request.respond",commandId:"native-receipt",threadId:"fixture",requestId:"question",answers:{q:"defer"}});
+  const seen:unknown[]=[];let attempts=0;
+  wss.on("connection",socket=>socket.on("message",data=>{
+    const request=JSON.parse(String(data));
+    if(request._tag!=="Request")return;
+    seen.push(request.payload);attempts++;
+    const error={_tag:"OrchestrationV2DispatchCommandError",commandId:"native-receipt",commandType:"runtime-request.respond",
+      message:attempts===1?"Failed to dispatch orchestration V2 command":"Command was previously rejected"};
+    socket.send(JSON.stringify({_tag:"Exit",requestId:request.id,exit:attempts===2
+      ? {_tag:"Success",value:{sequence:1}}
+      : {_tag:"Failure",cause:[{_tag:"Fail",error}]}}));
+  }));
+  try{
+    const serverUrl=await listen(server),options={serverUrl,token:"fixture-token",signal:AbortSignal.timeout(3000)};
+    await assert.rejects(respondChaldeaDecision(options,payload),/Failed to dispatch orchestration V2 command/);
+    assert.equal(await respondChaldeaDecision(options,payload),true);
+    assert.equal(await respondChaldeaDecision(options,payload),false);
+    assert.equal(seen.length,3);assert.deepEqual(seen[0],JSON.parse(payload));
+    assert.deepEqual(seen[0],seen[1]);assert.deepEqual(seen[1],seen[2]);
+  }finally{wss.close();server.close();}
+});
 
 test("the socket URL asks for orchestration protocol 2", () => {
   assert.equal(new URL(socketUrl("http://127.0.0.1:7391")).searchParams.get("orchestrationProtocol"), "2");
