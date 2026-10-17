@@ -7,8 +7,8 @@ and no recurring condition-polling loop. The answer page defaults to loopback.
 
 ## One wake, and the approved T3 0.1.0 deviation
 
-Each resolved wait/fallback question commits its outcome and one immutable wake command in
-the same SQLite transaction. Command and message IDs are
+Each resolved wait/fallback question commits its outcome and one wake row in
+the same SQLite transaction. Up to eight active waits per thread are allowed; pending wait wakes combine into one queued message listing each wait ID and outcome, with membership and shared payload frozen before the first delivery attempt and each wait retaining its own delivery record. Command and message IDs are
 `chaldea-wait:<id>:wake` or `chaldea-decision:<id>:wake`. Delivery uses
 `message.dispatch`, `dispatchMode:{type:"queue_after_active"}`, empty attachments,
 and short text:
@@ -141,6 +141,8 @@ one native continuation. This is a pinned T3 limitation, not a second delivery
 path for live questions.
 
 ## Calls and identity
+
+For waits, `requestId` is optional: the server generates `<epoch milliseconds>:<random>` when omitted; pass a saved explicit key and identical arguments for idempotent retries after ambiguity.
 
 The session passes its own `orchestrator_capabilities.parentThreadId` explicitly.
 This field names the calling thread, despite its name. The service validates the

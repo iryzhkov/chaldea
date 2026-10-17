@@ -1,4 +1,5 @@
 // Provider-independent public inputs. No implicit caller identity.
+import { randomUUID } from "node:crypto";
 export const DAY = 86_400_000;
 export const MAX_AGE = 42 * DAY;
 export const MAX_DEADLINE = 35 * DAY;
@@ -35,7 +36,8 @@ export function requestTime(key: unknown): number {
   return Number(s.slice(0, 13));
 }
 export function validate(kind: "wait" | "decision" | "native", value: unknown, now: number): { input: Input; deadline: number; requestAt: number } {
-  const v = object(value);
+  const v = {...object(value)};
+  if (kind === "wait" && v.requestId === undefined) v.requestId = now+":"+randomUUID();
   text(v.threadId, "threadId"); const requestAt = requestTime(v.requestId);
   if (requestAt > now + 300_000 || requestAt < now - MAX_AGE) throw new Error("requestId outside replay age");
   let input: Input; let deadline: number;
