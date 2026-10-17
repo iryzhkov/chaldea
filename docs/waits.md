@@ -60,7 +60,9 @@ unbound policy expires without a message or phone card. After binding, the
 deadline applies to that request alone, including every question in a
 multi-question request. Reconnect takes a fresh authoritative snapshot. An
 already-answered request observed after downtime closes its policy; it never
-binds a later, unrelated question.
+binds a later, unrelated question. If that first request is already tracked by
+another policy, the preparation closes as `already_tracked` without a wake;
+it does not move to the next question.
 
 For async questions whose ID is already known, use `chaldea_decision_track`
 with `runtimeRequestId`. The service verifies the request belongs to the caller's
@@ -90,7 +92,9 @@ dependent action; do not manufacture permission.
 
 T3's pending-state check arbitrates the human/deadline race. An accepted
 durable receipt records `native_default`, `defaulted:true`, `source:"chaldea"`.
-A definitive rejection is reconciled against T3: a resolved request records
+Only a replayed “previously rejected” durable receipt is definitive. The public
+RPC also wraps startup/internal failures in the same error type, so other
+failures retry unchanged. A definitive rejection is reconciled against T3: a resolved request records
 the native winner; an unresolved/unavailable request needs attention.
 Ambiguous sends replay the identical stored command and receipt before
 classifying a resolved request. Neither a confirmed default answer nor a

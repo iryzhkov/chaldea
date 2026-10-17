@@ -92,7 +92,7 @@ test("unsafe fixed questions and unavailable requests each create exactly one at
   }
 });
 test("native deadlines arbitrate both human/default winners through T3; ambiguous ACK reuses exact bytes",async()=>{
-  for(const mode of ["human_first","default_first","lost_ack"]){
+  for(const mode of ["human_first","default_first","lost_ack","transient_rpc","lost_then_human"]){
     const f=fixture();let engine:WaitEngine|undefined;try{
       const q=request();let on:((s:WaitSnapshot|null,c:number)=>void)|undefined;
       const receipts=new Map<string,boolean>(),payloads:string[]=[];
@@ -102,7 +102,11 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
         async respond(payload){
           payloads.push(payload);const id=JSON.parse(payload).commandId;
           if(receipts.has(id))return receipts.get(id)!;
-          if(mode==="human_first"){q.status="resolved";receipts.set(id,false);on?.(snapshot([q]),2);return false;}
+          if(mode==="transient_rpc" && payloads.length===1)throw new Error("Transient public dispatch error");
+          if(mode==="lost_then_human" && payloads.length===1){
+            q.status="resolved";on?.(snapshot([q]),2);throw new Error("Send dropped; human answered before replay");
+          }
+          if(mode==="human_first" || mode==="lost_then_human"){q.status="resolved";receipts.set(id,false);on?.(snapshot([q]),2);return false;}
           q.status="resolved";receipts.set(id,true);on?.(snapshot([q]),2);
           if(mode==="lost_ack")throw new Error("Lost native receipt after commit");
           return true;
@@ -112,14 +116,15 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
       const row=await engine.registerNative({...input("parent",100),runtimeRequestId:q.id},true);
       await until(()=>f.store.get(row.id).outcome!==null);
       const outcome=JSON.parse(f.store.get(row.id).outcome!);
-      assert.equal(outcome.defaulted,mode!=="human_first");assert.equal(outcome.source,mode==="human_first"?"t3":"chaldea");
-      assert.equal(receipts.size,1);assert.equal(payloads.length,mode==="lost_ack"?2:1);
-      if(mode==="lost_ack")assert.equal(payloads[0],payloads[1]);
+      const humanWon=mode==="human_first"||mode==="lost_then_human",retried=["lost_ack","transient_rpc","lost_then_human"].includes(mode);
+      assert.equal(outcome.defaulted,!humanWon);assert.equal(outcome.source,humanWon?"t3":"chaldea");
+      assert.equal(receipts.size,1);assert.equal(payloads.length,retried?2:1);
+      if(retried)assert.equal(payloads[0],payloads[1]);
       assert.equal(f.store.deliveries().filter(d=>d.channel==="wake").length,0);
       const phone=f.store.deliveries().find(d=>d.channel==="phone")!;
       assert.equal(JSON.parse(phone.payload).url,"https://t3.invalid/env/parent");
       assert.equal(phone.state,"undeliverable");assert.equal(phone.attempts,0);
-      assert.equal(f.store.deliveries().find(d=>d.channel==="native")!.state,mode==="human_first"?"suppressed":"sent");
+      assert.equal(f.store.deliveries().find(d=>d.channel==="native")!.state,humanWon?"suppressed":"sent");
     }finally{await engine?.stop();f.close();}
   }
 });
