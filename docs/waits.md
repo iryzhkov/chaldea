@@ -204,7 +204,7 @@ at the keyboard. Do not manufacture consent or pass agent choices off as Igor's.
 A notification tap does not answer.
 
 MCP stdio: register `chaldea mcp --config /absolute/path/waits.json` with each
-provider's MCP configuration. It exposes `chaldea_wait`,
+provider's MCP configuration. It exposes `chaldea_route`, `chaldea_wait`,
 `chaldea_wait_cancel`, `chaldea_wait_status`, `chaldea_decision_prepare`,
 `chaldea_decision_track`, `chaldea_decision_ask`,
 `chaldea_decision_answer`, `chaldea_decision_status`. Tool schemas document explicit
@@ -217,8 +217,16 @@ identity, stable retry keys and safe-default rules. Native tool arguments are:
 
 All preparation/tracking arguments are required; `defaultAction` is `skip|defer`,
 `deadline` is RFC3339 with an offset. `chaldea_decision_answer` only answers the
-fallback inbox; native questions must be answered in T3. The MCP process holds no T3
-token and does not own state; Unix socket access is the local-user trust boundary.
+fallback inbox; native questions must be answered in T3. For waits and decisions,
+the private service owns T3 access and durable state; the MCP process forwards
+requests over the Unix socket, which is the local-user trust boundary.
+
+`chaldea_route` is an exception. It runs advisory routing in the MCP process,
+reads the configured local T3 token and observer snapshot, and owns bounded
+Slopalytics/Claude-usage caches. With the Claude collector explicitly enabled,
+it also reads the configured local OAuth credential read-only. It never launches
+a child or mutates T3; delegate through native T3 after receiving its target.
+See [routing configuration and credential handling](route.md).
 
 ## Observation, restart and cancellation
 

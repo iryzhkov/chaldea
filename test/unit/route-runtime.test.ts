@@ -62,10 +62,11 @@ test("capacity thresholds are shared defaults; route overrides also govern capac
   const d = routeScratch();
   try {
     const capacityConfigFile = join(d.path, "capacity.json"), configPath = join(d.path, "route.json");
-    writeFileSync(capacityConfigFile, JSON.stringify({ paceMargin: .05, minimumRemaining: .07 }));
+    writeFileSync(capacityConfigFile, JSON.stringify({ paceMargin: .05, minimumRemaining: .07, maxAgeMs: 3600000 }));
     writeFileSync(configPath, JSON.stringify({ capacityConfigFile }));
     assert.equal(loadRouteConfig(d.path, configPath).paceMargin, .05);
     assert.equal(loadRouteConfig(d.path, configPath).minimumRemaining, .07);
+    assert.equal(loadRouteConfig(d.path, configPath).quotaMaxAgeMs, 3600000);
     writeFileSync(configPath, JSON.stringify({ capacityConfigFile, paceMargin: .03 }));
     assert.equal(loadRouteConfig(d.path, configPath).paceMargin, .03);
   } finally { d.remove(); }

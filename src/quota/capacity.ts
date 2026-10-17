@@ -140,7 +140,7 @@ export function retainBurnSample(row: ProviderHeadroom, nextAt: string): void {
   if (last && Date.parse(old.observedAt) - Date.parse(last.observedAt) < 5 * 60000) return;
   const samples = [...history, { observedAt: old.observedAt, windows: old.value }]
     .filter(s => Date.parse(nextAt) - Date.parse(s.observedAt) <= 48 * 3600000).slice(-288);
-  // <=1 MiB across the observer\u0027s 64-provider cap, leaving room for its durable outbox.
+  // <=1 MiB across the observer's 64-provider cap, leaving room for its durable outbox.
   let bytes = 2;
   const kept: BurnSample[] = [];
   for (const sample of samples.toReversed()) {

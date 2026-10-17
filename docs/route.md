@@ -45,7 +45,8 @@ Routing prefers use-it, then unlimited, then paced. Tight and stopped are
 excluded. Unknown falls back to the role's Claude default. A review's provider
 constraint always applies. The base pacing rule prefers Claude when remaining
 fraction minus fraction of native window time left is at least 0.10; otherwise
-it prefers Codex. Missing/stale pacing keeps the role default.
+it prefers Codex. Missing/stale pacing keeps the role default unless capacity
+preference or usable Slopalytics statistics decide the comparison.
 
 The observer keeps up to 288 previous window observations per provider, sampled
 at least five minutes apart and retained for 48 hours, with a 16 KiB per-provider
@@ -107,8 +108,12 @@ from the observer's `quota.json`. Use `--config PATH` for CLI or
 
 Optional absolute paths are `stateFile`, `cacheDir`, `t3BaseDir`, `tokenFile`,
 `capacityConfigFile` and `claudeUsage.credentialFile`. Defaults use the normal
-Chaldea observer state, local T3, read-only T3 token and
-`~/.cache/chaldea/route/`. Capacity configuration defaults to
+Chaldea observer state, local T3, the shared observer token at
+`~/.config/chaldea/t3-token`, and `~/.cache/chaldea/route/`. That token may include
+`orchestration:operate` for the observer; routing only calls `server.getConfig`.
+For least privilege, configure `tokenFile` to a dedicated token with only
+`orchestration:read`, as the e2e fixture does. Routing runs inside the stdio MCP
+process, which reads this token and owns its collection caches. Capacity configuration defaults to
 `~/.config/chaldea/capacity.json`; quota status accepts `--capacity-config PATH`.
 
 ```json

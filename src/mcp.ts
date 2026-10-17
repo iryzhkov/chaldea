@@ -1,4 +1,5 @@
-// MCP stdio transport. The private IPC service owns all durable state and T3 access.
+// MCP stdio transport. Waits/decisions use the private IPC service.
+// Advisory routing reads local T3/observer data and owns its bounded collection caches.
 import { callService } from "./waits/service.ts";
 import { route } from "./route/runtime.ts";
 const str={type:"string"};

@@ -62,5 +62,6 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
   const capacity = loadCapacityConfig(home, c.capacityConfigFile);
   if (r.paceMargin === undefined) c.paceMargin = capacity.paceMargin;
   if (r.minimumRemaining === undefined) c.minimumRemaining = capacity.minimumRemaining;
+  if (r.quotaMaxAgeMs === undefined) c.quotaMaxAgeMs = capacity.maxAgeMs;
   return c;
 }
