@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs the Chaldea CLI from this checkout with the pinned Node (type stripping, no build step).
+here=$(dirname "$(readlink -f "$0")")
+exec node "$here/../src/cli.ts" "$@"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for the `feed` CLI in tests: records each invocation, never posts.
+here=$(dirname "$(readlink -f "$0")")
+exec node "$here/feed-recorder.mjs" "$@"
