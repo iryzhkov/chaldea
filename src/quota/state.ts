@@ -5,15 +5,16 @@
 // fsync of the directory) with mode 0600. Retention is enforced on every save:
 // posted keys expire 42 days after the stop they describe and parked threads
 // 42 days after they were seen; each map is capped, oldest first, so the file
-// stays under about 3 MB whatever happens upstream (2.7 MB with both caps full
-// of real-length T3 IDs).
+// stays bounded. Pending delivery adds at most 4 MiB of immutable records;
+// the whole state is limited to 8 MiB, plus one atomic temporary file.
 //
 // Evicting a key must never let its record be posted again. Every eviction
 // raises `evictedThrough` to the stop time of the evicted key, and stops at or
 // before that time are never reported. Eviction therefore errs towards losing
 // a record, never towards repeating one.
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
+import { statSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
+import type { QuotaRecord } from "./observer.ts";
 import type { SwitchIntent } from "./switcher.ts";
 export const MAX_ACTIVE_SWITCHES = 128;
 export const MAX_COMPLETED_SWITCHES = 1_000;
@@ -45,16 +46,20 @@ export interface ObserverState {
   cursor: number | null;
   /** `kind|threadId|runId` mapped to the stop time of the stop it describes. */
   readonly posted: Map<string, number>;
+  readonly pendingDelivery: Map<string, QuotaRecord>;
+  deliveryDropped: number;
   readonly parked: Map<string, ParkedThread>;
   readonly switches: Map<string, SwitchIntent>;
   /** Newest stop time among evicted keys; stops at or before it are never reported. */
   evictedThrough: number | null;
 }
 
-const FORMAT_VERSION = 3;
+const FORMAT_VERSION = 4;
+export const MAX_PENDING_BYTES = 4 * 1024 * 1024;
+export const MAX_STATE_BYTES = 8 * 1024 * 1024;
 
 export function emptyState(): ObserverState {
-  return { cursor: null, posted: new Map(), parked: new Map(), switches: new Map(), evictedThrough: null };
+  return { cursor: null, posted: new Map(), pendingDelivery: new Map(), deliveryDropped: 0, parked: new Map(), switches: new Map(), evictedThrough: null };
 }
 
 export function recordKey(kind: RecordKind, threadId: string, runId: string): string {
@@ -101,12 +106,15 @@ export function prune(state: ObserverState, nowMs: number): void {
 
 export function loadState(path: string, nowMs: number): ObserverState {
   if (!existsSync(path)) return emptyState();
+  if (statSync(path).size > MAX_STATE_BYTES) throw new Error("observer_state_too_large");
   const raw = JSON.parse(readFileSync(path, "utf8"));
-  if (raw?.version !== FORMAT_VERSION && raw?.version !== 2) throw new Error(`Unsupported state file version in ${path}`);
+  if (raw?.version !== FORMAT_VERSION && raw?.version !== 3 && raw?.version !== 2) throw new Error(`Unsupported state file version in ${path}`);
   const state: ObserverState = {
     cursor: typeof raw.cursor === "number" ? raw.cursor : null,
     posted: new Map(Object.entries(raw.posted ?? {}).filter((entry): entry is [string, number] => typeof entry[1] === "number")),
     parked: new Map(Object.entries(raw.parked ?? {}) as Array<[string, ParkedThread]>),
+    pendingDelivery: new Map(Object.entries(raw.pendingDelivery ?? {}) as Array<[string, QuotaRecord]>),
+    deliveryDropped: Number.isSafeInteger(raw.deliveryDropped) ? raw.deliveryDropped : 0,
     switches: new Map(Object.entries(raw.switches ?? {}) as Array<[string, SwitchIntent]>),
     evictedThrough: typeof raw.evictedThrough === "number" ? raw.evictedThrough : null,
   };
@@ -148,7 +156,10 @@ export function saveState(path: string, state: ObserverState, nowMs: number): vo
     posted: Object.fromEntries(state.posted),
     parked: Object.fromEntries(state.parked),
     switches: Object.fromEntries(state.switches),
+    pendingDelivery: Object.fromEntries(state.pendingDelivery),
+    deliveryDropped: state.deliveryDropped,
   }));
+  if (body.length > MAX_STATE_BYTES) throw new Error("observer_state_capacity");
   const temporary = `${path}.tmp`;
   const fd = openSync(temporary, "w", 0o600);
   try {

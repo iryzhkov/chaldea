@@ -1,18 +1,10 @@
-// Delivers quota records to the fleet feed through the `feed post` CLI.
-//
-// Posting never blocks the observer: records go into a bounded in-memory
-// queue drained by one worker. Each record gets exactly one attempt with a
-// timeout. The CLI has no idempotency key, so a failed attempt may still have
-// reached the server; retrying could post the record twice. A failure is
-// therefore logged and the record dropped. Bodies carry identifiers and
-// timestamps only, never transcript text or credentials, and the CLI's stderr
-// is never logged (only its length), since it can echo URLs or account names.
+// Quota state owns durability; this worker only handles asynchronous delivery.
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { hostname } from "node:os";
-
 import type { QuotaRecord } from "../quota/observer.ts";
 import type { Logger } from "../log.ts";
-
+import { publish, type PublisherOptions, type Publication } from "../events/publisher.ts";
 export const FEED_SOURCE = "chaldea-quota";
 export const FEED_TAGS = "quota chaldea";
 export const MAX_QUEUED_RECORDS = 256;
@@ -47,125 +39,122 @@ export function body(record: QuotaRecord, host: string): string {
   return `${JSON.stringify({ ...record, host }, null, 2)}\n`;
 }
 
+
+export function quotaKey(record: QuotaRecord): string {
+  // The observer claims each kind once for a stopped run. This is a logical
+  // transition identity, independent of token leases and payload changes.
+  return "quota/" + createHash("sha256").update(JSON.stringify([
+    record.threadId, record.runId, record.kind, record.kind === "quota_resumed" ? record.continuationRunId ?? record.runId : record.runId,
+  ])).digest("hex");
+}
+export function quotaPublication(record: QuotaRecord, host: string): Publication {
+  const transition = quotaKey(record);
+  const data: Record<string, unknown> = { thread_id: record.threadId, run_id: record.runId,
+    provider: record.toProvider ?? record.provider, transition_id: transition };
+  if (record.kind === "quota_parked" && record.resetAt) data.reset_at = record.resetAt;
+  if (record.kind === "provider_switched" || record.kind === "provider_switch_failed") {
+    if (record.fromProvider) data.previous_provider = record.fromProvider;
+    if (record.toModel) data.model = record.toModel;
+    if (record.kind === "provider_switch_failed") data.error_class = "provider_switch_failed";
+  }
+  return { key: transition, source: FEED_SOURCE, host, payload: {
+    v: 1, kind: record.kind, source: FEED_SOURCE, host, severity: record.severity,
+    title: title(record).slice(0, 500), body: body(record, host), tags: ["quota", "chaldea"], data,
+  } };
+}
 export interface FeedPosterOptions {
-  /** Executable to run; `feed` by default, a recorder in tests. */
+  /** Used only in legacy mode, chosen before any delivery attempt. */
   readonly command: string;
   readonly host: string;
   readonly logger: Logger;
   readonly attemptTimeoutMs?: number;
+  readonly publisher?: PublisherOptions;
+  readonly deliver?: (event: Publication) => Promise<boolean>;
+  readonly retryMs?: number;
+  readonly mode?: "legacy" | "akasha";
 }
-
-/** Why an attempt failed, without any of the CLI's output. */
-class AttemptFailure extends Error {
-  readonly exitCode: number | null;
-  readonly signal: string | null;
-  readonly stderrBytes: number;
-  readonly spawnError: string | null;
-
-  constructor(exitCode: number | null, signal: string | null, stderrBytes: number, spawnError: string | null) {
-    super("feed post failed");
-    this.exitCode = exitCode;
-    this.signal = signal;
-    this.stderrBytes = stderrBytes;
-    this.spawnError = spawnError;
-  }
-}
-
-function runOnce(options: FeedPosterOptions, record: QuotaRecord): Promise<void> {
-  const args = [
-    "post",
-    title(record),
-    "--severity",
-    record.severity,
-    "--source",
-    FEED_SOURCE,
-    "--host",
-    options.host,
-    "--tag",
-    FEED_TAGS,
-    "--body-file",
-    "-",
-  ];
-  return new Promise((resolve, reject) => {
-    const child = spawn(options.command, args, { stdio: ["pipe", "ignore", "pipe"] });
-    let stderrBytes = 0;
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderrBytes += chunk.length;
-    });
-    const timer = setTimeout(() => child.kill("SIGKILL"), options.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS);
-    let settled = false;
-    const settle = (failure: AttemptFailure | null) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (failure === null) resolve();
-      else reject(failure);
+/** Before configured cutover retain the legacy one-attempt semantics. An
+ * ambiguous legacy result is never retried; scoped mode never calls this path. */
+async function legacyAttempt(options: FeedPosterOptions, record: QuotaRecord): Promise<void> {
+  await new Promise<void>(resolve => {
+    const child = spawn(options.command, ["post", title(record), "--severity", record.severity,
+      "--source", FEED_SOURCE, "--host", options.host, "--tag", FEED_TAGS, "--body-file", "-"],
+      { stdio: ["pipe", "ignore", "pipe"], detached: true,
+        env: { ...process.env, FEED_IDEMPOTENCY_KEY: quotaKey(record) } });
+    let stderrBytes = 0, settled = false;
+    child.stderr.on("data", (b: Buffer) => { stderrBytes += b.length; });
+    const timer = setTimeout(() => { try { process.kill(-child.pid!, "SIGKILL"); } catch {} },
+      options.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS);
+    const finish = (ok: boolean) => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      if (!ok) options.logger.warn("legacy feed attempt failed; record not retried", { kind: record.kind, stderrBytes });
+      else options.logger.info("posted feed record", { kind: record.kind });
+      resolve();
     };
-    child.once("error", (error: NodeJS.ErrnoException) => {
-      settle(new AttemptFailure(null, null, stderrBytes, error.code ?? "spawn_error"));
-    });
-    child.once("close", (code, signal) => {
-      settle(code === 0 ? null : new AttemptFailure(code, signal, stderrBytes, null));
-    });
-    child.stdin.on("error", () => {
-      // The close handler reports the failure.
-    });
+    child.once("error", () => finish(false));
+    child.once("close", code => finish(code === 0));
+    child.stdin.on("error", () => {});
     child.stdin.end(body(record, options.host));
   });
 }
-
 export class FeedPoster {
   readonly #options: FeedPosterOptions;
-  readonly #queue: Array<QuotaRecord> = [];
+  readonly #akasha: boolean;
+  readonly #queue = new Map<string, { record: QuotaRecord; ack?: () => boolean | void }>();
   #draining: Promise<void> | null = null;
-
+  #timer: NodeJS.Timeout | null = null;
+  #closed = false;
   constructor(options: FeedPosterOptions) {
     this.#options = options;
+    // Configuration selects the mode once. Even incomplete scoped configuration
+    // queues on failure; no auth result can select the legacy command.
+    this.#akasha = options.mode === "akasha" || (options.mode !== "legacy" &&
+      (options.publisher !== undefined || options.deliver !== undefined ||
+       process.env.AKASHA_URL !== undefined || process.env.AKASHA_TOKEN_HELPER !== undefined));
   }
-
-  /** Queues a record; returns immediately. Drops it with a log line when the queue is full. */
-  enqueue(record: QuotaRecord): void {
-    if (this.#queue.length >= MAX_QUEUED_RECORDS) {
-      this.#options.logger.warn("feed queue full; dropping record", { kind: record.kind, thread: record.threadId, run: record.runId });
-      return;
+  enqueue(record: QuotaRecord, ack?: () => boolean | void): void {
+    const key = quotaKey(record);
+    if (this.#queue.has(key)) return;
+    if (this.#queue.size >= MAX_QUEUED_RECORDS) {
+      this.#options.logger.warn("feed worker full; durable intent retained"); return;
     }
-    this.#queue.push(record);
+    this.#queue.set(key, { record, ...(ack ? { ack } : {}) });
     this.#kick();
   }
-
   #kick(): void {
-    this.#draining ??= this.#drain().finally(() => {
+    if (this.#closed || this.#draining) return;
+    this.#draining = this.#drain().finally(() => {
       this.#draining = null;
-      // A record queued after the loop's last check would otherwise wait for the next enqueue.
-      if (this.#queue.length > 0) this.#kick();
+      if (!this.#closed && this.#queue.size > 0 && !this.#timer) {
+        this.#timer = setTimeout(() => { this.#timer = null; this.#kick(); }, this.#options.retryMs ?? 30_000);
+        this.#timer.unref();
+      }
     });
   }
-
-  /** Resolves once the queue is empty; for shutdown and tests. */
-  async idle(): Promise<void> {
-    while (this.#draining !== null) await this.#draining;
-  }
-
+  /** Waits for current attempts, not an outage. Pending work remains durable. */
+  async idle(): Promise<void> { while (this.#draining) await this.#draining; }
+  close(): void { this.#closed = true; if (this.#timer) clearTimeout(this.#timer); }
   async #drain(): Promise<void> {
-    for (let record = this.#queue.shift(); record !== undefined; record = this.#queue.shift()) {
-      await this.#deliver(record);
-    }
-  }
-
-  async #deliver(record: QuotaRecord): Promise<void> {
-    const fields = { kind: record.kind, thread: record.threadId, run: record.runId };
-    try {
-      await runOnce(this.#options, record);
-      this.#options.logger.info("posted feed record", fields);
-    } catch (error) {
-      const failure = error instanceof AttemptFailure ? error : null;
-      this.#options.logger.error("feed post failed; record dropped", {
-        ...fields,
-        exitCode: failure?.exitCode ?? null,
-        signal: failure?.signal ?? null,
-        stderrBytes: failure?.stderrBytes ?? null,
-        spawnError: failure?.spawnError ?? null,
-      });
+    for (const [key, item] of this.#queue) {
+      if (this.#closed) return;
+      let ok = false;
+      try {
+        if (this.#akasha) ok = await (this.#options.deliver ?? ((e) => publish(e, this.#options.publisher)))(quotaPublication(item.record, this.#options.host));
+        else {
+          // Legacy feedd has no receipt contract: claim durably before its
+          // one attempt, preserving the pre-cutover at-most-once policy.
+          if (item.ack?.() === false) continue;
+          this.#queue.delete(key);
+          await legacyAttempt(this.#options, item.record);
+          continue;
+        }
+      }
+      catch {}
+      if (ok) {
+        // The acknowledgement atomically removes the state's pending payload.
+        item.ack?.(); this.#queue.delete(key);
+        this.#options.logger.info("posted feed record", { kind: item.record.kind });
+      } else this.#options.logger.warn("event delivery deferred; durable intent retained", { kind: item.record.kind });
     }
   }
 }

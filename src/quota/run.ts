@@ -2,15 +2,14 @@
 //
 // Connects to local T3, follows the shell stream from the persisted cursor,
 // feeds every event to the observer and hands new records to the feed poster.
-// A record's key is saved to disk before the record is queued, so a crash can
-// lose a record but never repeat one; while the state file cannot be written,
-// new records wait. Connection failures, including T3 not running yet, back
+// The pending payload and its claim are saved in the same atomic state write.
+// While the state file cannot be written, new records wait. Connection failures, including T3 not running yet, back
 // off and reconnect; there is no periodic scan. A refused protocol (HTTP 426) or data
 // the pinned contracts reject stops the observer with exit status 78, which
 // the systemd unit does not restart.
 import { existsSync, statSync, readFileSync } from "node:fs";
 
-import { FeedPoster, MAX_QUEUED_RECORDS } from "../feed/poster.ts";
+import { FeedPoster, MAX_QUEUED_RECORDS, quotaKey } from "../feed/poster.ts";
 import type { Logger } from "../log.ts";
 import {
   AbortedError,
@@ -25,7 +24,7 @@ import {
 import { observe, type QuotaRecord } from "./observer.ts";
 import { switchConfig, type SwitchConfig } from "./routing.ts";
 import { ProviderSwitcher } from "./switcher.ts";
-import { loadState, saveState, type ObserverState } from "./state.ts";
+import { loadState, saveState, MAX_PENDING_BYTES, type ObserverState } from "./state.ts";
 
 /** Exit status for a configuration or protocol problem a restart cannot fix (EX_CONFIG). */
 export const EXIT_CONFIG = 78;
@@ -110,6 +109,7 @@ export class EventSink {
     this.poster = poster;
     this.logger = logger;
     this.retryDelaysMs = retryDelaysMs;
+    this.#pending.push(...state.pendingDelivery.values());
   }
 
   get dirty(): boolean {
@@ -148,7 +148,13 @@ export class EventSink {
       this.logger.info("state file written again", { path: this.statePath, pending: this.#pending.length });
     }
     // Their claims are durable now.
-    for (const record of this.#pending.splice(0)) this.poster.enqueue(record);
+    for (const record of this.#pending.splice(0)) {
+      this.poster.enqueue(record, () => {
+        this.state.pendingDelivery.delete(quotaKey(record));
+        this.save();
+        return !this.dirty;
+      });
+    }
   }
 
   #scheduleRetry(): void {
@@ -173,15 +179,20 @@ export class EventSink {
   record(records: ReadonlyArray<QuotaRecord>): void {
     for (const record of records) {
       this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
-      if (this.#pending.length >= MAX_QUEUED_RECORDS) {
-        this.logger.error("pending record dropped: the state file has been unwritable too long", { kind: record.kind, thread: record.threadId, run: record.runId });
+      const key = quotaKey(record);
+      if (this.state.pendingDelivery.has(key)) continue;
+      if (this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
+          Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES) {
+        this.state.deliveryDropped++;
+        this.logger.error("pending record dropped: durable delivery queue capacity exceeded", { kind: record.kind, thread: record.threadId, run: record.runId });
         continue;
       }
+      this.state.pendingDelivery.set(key, record);
       this.#pending.push(record);
     }
   }
 
-  /** Final save at shutdown; records still pending are dropped with an error. */
+  /** Final save; unsaved records are reported, durable delivery intents remain. */
   close(): void {
     this.save();
     if (this.#retryTimer !== null) {
@@ -213,6 +224,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
   const state = loadState(options.statePath, Date.now());
   const poster = new FeedPoster({ command: options.feedCommand, host: options.host, logger });
   const sink = new EventSink(state, options.statePath, poster, logger);
+  sink.save(); // Recover durable pending payloads even when T3 is offline.
   logger.info("quota observer starting", { cursor: state.cursor, parked: state.parked.size, posted: state.posted.size });
 
   let switcher: ProviderSwitcher | undefined;
@@ -269,6 +281,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
   await switcher?.close();
   sink.close();
   await Promise.race([poster.idle(), new Promise((r) => setTimeout(r, 30_000).unref())]);
+  poster.close();
   logger.info("quota observer stopped", { exitCode });
   return exitCode;
 }
