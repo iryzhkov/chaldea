@@ -20,7 +20,7 @@ const logPath = process.env.FAKE_CLAUDE_LOG;
 const trigger = process.env.FAKE_CLAUDE_TRIGGER ?? "chaldea-quota-trigger";
 const scenario = process.env.FAKE_CLAUDE_SCENARIO ?? "reset";
 const resetDelaySeconds = Number(process.env.FAKE_CLAUDE_RESET_DELAY_S ?? "10");
-const model = "claude-sonnet-4-6";
+const model = process.env.FAKE_CLAUDE_MODEL ?? "claude-sonnet-4-6";
 
 function log(event) {
   if (logPath) appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), pid: process.pid, ...event })}\n`);

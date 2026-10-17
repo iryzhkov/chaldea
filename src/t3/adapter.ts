@@ -21,6 +21,7 @@ import {
   WsRpcGroup,
   type OrchestrationV2ShellStreamItem,
   type OrchestrationV2ThreadShell,
+  type OrchestrationV2ThreadProjection,
 } from "../../vendor/t3-contracts/src/index.ts";
 
 /** The orchestration protocol this adapter was written and tested against. */
@@ -38,6 +39,9 @@ export interface ShellThread {
   readonly id: string;
   readonly status: string;
   readonly providerInstanceId: string;
+  readonly modelSelection?: ModelChoice;
+  readonly settled?: boolean;
+  readonly pendingRequest?: boolean;
   readonly latestRunId: string | null;
   readonly activeRunId: string | null;
   readonly latestRunStartedAt: string | null;
@@ -48,6 +52,8 @@ export interface ShellThread {
     readonly runId: string;
     readonly resetAt: string;
     readonly autoResume: boolean;
+    readonly requestId?: string;
+    readonly snooze?: boolean;
   } | null;
   readonly relationshipToParent: "fork" | "subagent" | null;
   readonly archived: boolean;
@@ -93,6 +99,105 @@ export function discoverServerUrl(baseDir: string): string | null {
   } catch {
     return null;
   }
+}
+
+
+/** Provider routing data deliberately excludes account identities and credentials. */
+export interface ModelChoice {
+  readonly instanceId: string;
+  readonly model: string;
+  readonly options?: ReadonlyArray<{ readonly id: string; readonly value: string | boolean }>;
+}
+export interface SwitchProvider {
+  readonly instanceId: string;
+  readonly driver: string;
+  readonly enabled: boolean;
+  readonly installed: boolean;
+  readonly status: string;
+  readonly availability?: string;
+  readonly auth: { readonly status: string };
+  readonly models: ReadonlyArray<{
+    readonly slug: string;
+    readonly capabilities: { readonly optionDescriptors?: ReadonlyArray<{
+      readonly id: string;
+      readonly type: string;
+      readonly options?: ReadonlyArray<{ readonly id: string }>;
+    }> } | null;
+  }>;
+  readonly usageLimits?: {
+    readonly checkedAt: string;
+    readonly windows: ReadonlyArray<{ readonly usedPercent: number }>;
+    readonly unavailable?: unknown;
+  };
+}
+export interface SwitchPort {
+  catalog(): Promise<{ readonly providers: ReadonlyArray<SwitchProvider>; readonly autoResume: boolean }>;
+  thread(threadId: string): Promise<ShellThread | undefined>;
+  recovery(input: { threadId: string; runId: string; resetAt: string; commandId: string; autoResume: boolean; snooze?: boolean }): Promise<boolean>;
+  clearRecovery(threadId: string, commandId: string): Promise<boolean>;
+  delivered(threadId: string, messageId: string): Promise<boolean>;
+  continue(input: { threadId: string; runId: string; commandId: string; target: ModelChoice }): Promise<boolean>;
+}
+
+/** Each call is scoped; a failed transport can be retried using the identical command. */
+export function switchPort(options: ConnectOptions): SwitchPort {
+  const request = <A>(use: (client: WsClient) => Effect.Effect<A, unknown>) =>
+    withClient(options, (client) => use(client).pipe(Effect.timeout("5 seconds")));
+  const dispatch = (command: Parameters<WsClient["orchestration.dispatchCommand"]>[0]) =>
+    request((client) => client["orchestration.dispatchCommand"](command).pipe(
+      Effect.map(() => true),
+      Effect.catchTag("OrchestrationV2DispatchCommandError", () => Effect.succeed(false)),
+    ));
+  return {
+    catalog: () => request((client) => client["server.getConfig"]({}).pipe(
+      Effect.map((config) => ({
+        providers: config.providers.map((p): SwitchProvider => ({
+          instanceId: p.instanceId, driver: p.driver, enabled: p.enabled, installed: p.installed,
+          status: p.status, auth: { status: p.auth.status },
+          ...(p.availability === undefined ? {} : { availability: p.availability }),
+          models: p.models.map((m) => ({
+            slug: m.slug, capabilities: m.capabilities === null ? null : {
+              ...(m.capabilities.optionDescriptors === undefined ? {} : {
+                optionDescriptors: m.capabilities.optionDescriptors.map((d) => ({
+                  id: d.id, type: d.type,
+                  ...(d.type === "select" ? { options: d.options.map((o) => ({ id: o.id })) } : {}),
+                })),
+              }),
+            },
+          })),
+          ...(p.usageLimits === undefined ? {} : { usageLimits: {
+            checkedAt: p.usageLimits.checkedAt,
+            windows: p.usageLimits.windows.map((w) => ({ usedPercent: w.usedPercent })),
+            ...(p.usageLimits.unavailable === undefined ? {} : { unavailable: true }),
+          } }),
+        })),
+        autoResume: config.settings.autoResumeLimitedThreads,
+      })),
+    )),
+    thread: (threadId) => request((client) =>
+      client["orchestration.getThreadProjection"]({ threadId } as never).pipe(
+        Effect.map(toSwitchThread),
+        Effect.catchTag("OrchestrationV2GetThreadProjectionError", () => Effect.succeed(undefined)),
+      )),
+    delivered: (threadId, messageId) => request((client) =>
+      client["orchestration.getThreadProjection"]({ threadId } as never).pipe(
+        Effect.map((projection) => projection.messages.some((m) => m.id === messageId)),
+      )),
+    recovery: (input) => dispatch({
+      type: "thread.metadata.update", commandId: input.commandId, threadId: input.threadId,
+      limitRecovery: { runId: input.runId, resetAt: input.resetAt, autoResume: input.autoResume,
+        ...(input.snooze === undefined ? {} : { snooze: input.snooze }) },
+    } as never),
+    clearRecovery: (threadId, commandId) => dispatch({
+      type: "thread.metadata.update", commandId, threadId, limitRecovery: null,
+    } as never),
+    continue: (input) => dispatch({
+      type: "message.dispatch", commandId: input.commandId, messageId: input.commandId,
+      threadId: input.threadId, manualContinuationOfRunId: input.runId, modelSelection: input.target,
+      text: "Continue where you left off.", attachments: [],
+      dispatchMode: { type: "start_immediately" }, createdBy: "user", creationSource: "server",
+    } as never),
+  };
 }
 
 export interface ConnectOptions {
@@ -172,12 +277,47 @@ function isoOrNull(value: DateTime.Utc | null | undefined): string | null {
   return value == null ? null : DateTime.formatIso(value);
 }
 
+/** Conservative per-thread preflight from the public projection, never a fleet snapshot. */
+export function toSwitchThread(projection: OrchestrationV2ThreadProjection): ShellThread {
+  const { thread } = projection;
+  // Any newer active/queued run prevents a switch, even if the shell still presents a limit.
+  const run = projection.runs.reduce<OrchestrationV2ThreadProjection["runs"][number] | null>(
+    (latest, candidate) => latest === null || candidate.ordinal > latest.ordinal ? candidate : latest, null);
+  const active = projection.runs.find((r) => ["preparing", "starting", "running", "waiting"].includes(r.status));
+  const errors = projection.turnItems.filter((i) =>
+    i.type === "error" && i.status === "failed" && i.runId === run?.id && i.nodeId === run?.rootNodeId);
+  const failureItem = errors.toSorted((a, b) =>
+    DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt) || b.ordinal - a.ordinal ||
+    String(b.id).localeCompare(String(a.id)))[0];
+  const failure = run?.status === "failed" && failureItem?.type === "error" ? failureItem.failure : null;
+  const recovery = thread.limitRecovery;
+  return {
+    id: thread.id, status: run?.status ?? "idle", providerInstanceId: thread.providerInstanceId,
+    modelSelection: thread.modelSelection, settled: thread.settledOverride === "settled",
+    pendingRequest: projection.runtimeRequests.some((r) => r.status === "pending"),
+    latestRunId: run?.id ?? null, activeRunId: active?.id ?? null,
+    latestRunStartedAt: isoOrNull(run?.startedAt), latestRunCompletedAt: isoOrNull(run?.completedAt),
+    lastErrorClass: failure?.class ?? null,
+    usageLimitResetAt: failure?.class === "usage_limit" ? failure.resetAt ?? null : null,
+    limitRecovery: recovery == null ? null : {
+      runId: recovery.runId, resetAt: recovery.resetAt, autoResume: recovery.autoResume,
+      ...(recovery.snooze === undefined ? {} : { snooze: recovery.snooze }),
+      ...(recovery.requestId === undefined ? {} : { requestId: recovery.requestId }),
+    },
+    relationshipToParent: thread.lineage.relationshipToParent,
+    archived: thread.archivedAt !== null, deleted: thread.deletedAt !== null,
+  };
+}
+
 export function toShellThread(thread: OrchestrationV2ThreadShell): ShellThread {
   const recovery = thread.limitRecovery ?? null;
   return {
     id: thread.id,
     status: thread.status,
     providerInstanceId: thread.providerInstanceId,
+    modelSelection: thread.modelSelection,
+    settled: thread.settledOverride === "settled",
+    pendingRequest: thread.pendingRuntimeRequest !== null,
     latestRunId: thread.latestRunId,
     activeRunId: thread.activeRunId,
     latestRunStartedAt: isoOrNull(thread.latestRunStartedAt),
@@ -186,7 +326,7 @@ export function toShellThread(thread: OrchestrationV2ThreadShell): ShellThread {
     usageLimitResetAt: thread.usageLimitResetAt ?? null,
     limitRecovery: recovery === null
       ? null
-      : { runId: recovery.runId, resetAt: recovery.resetAt, autoResume: recovery.autoResume },
+      : { runId: recovery.runId, resetAt: recovery.resetAt, autoResume: recovery.autoResume, ...(recovery.snooze === undefined ? {} : { snooze: recovery.snooze }), ...(recovery.requestId === undefined ? {} : { requestId: recovery.requestId }) },
     relationshipToParent: thread.lineage.relationshipToParent,
     archived: thread.archivedAt !== null,
     deleted: thread.deletedAt !== null,
@@ -309,13 +449,27 @@ export async function setAutoResumeLimitedThreads(options: ConnectOptions, enabl
  * ends, the signal aborts, or the connection fails. Resolves when the server
  * ends the stream; rejects with one of the error classes above otherwise.
  */
-export function connectShell(options: ConnectOptions, subscription: ShellSubscription): Promise<void> {
-  return withClient(options, (client) =>
-    client["orchestration.subscribeShell"]({
-      ...(subscription.afterSequence === undefined ? {} : { afterSequence: subscription.afterSequence }),
-      requestCompletionMarker: true,
-    }).pipe(
-      Stream.runForEach((item) => Effect.promise(async () => subscription.onEvent(toShellEvent(item)))),
-    ),
-  );
+export async function connectShell(options: ConnectOptions, subscription: ShellSubscription): Promise<void> {
+  let callbackError: unknown;
+  try {
+    await withClient(options, (client) =>
+      client["orchestration.subscribeShell"]({
+        ...(subscription.afterSequence === undefined ? {} : { afterSequence: subscription.afterSequence }),
+        requestCompletionMarker: true,
+      }).pipe(
+        Stream.runForEach((item) => Effect.promise(async () => {
+          try {
+            await subscription.onEvent(toShellEvent(item));
+          } catch (error) {
+            callbackError = error;
+            throw error;
+          }
+        })),
+      ),
+    );
+  } catch (error) {
+    // Callback failures include switch RPC protocol/configuration failures.
+    // Preserve their classification across Effect's callback defect boundary.
+    throw callbackError ?? error;
+  }
 }

@@ -41,6 +41,8 @@ export interface DisposableT3Options {
   readonly resetDelaySeconds?: number;
   /** Writes `autoResumeLimitedThreads` into this instance's settings.json. */
   readonly autoResume: boolean;
+  readonly codex?: "available" | "exhausted";
+  readonly claudeModel?: string;
 }
 
 export interface DisposableT3 {
@@ -137,12 +139,26 @@ export function prepareDisposableT3(options: DisposableT3Options): DisposableT3 
       `export FAKE_CLAUDE_SCENARIO=${shellQuote(options.scenario)}`,
       `export FAKE_CLAUDE_RESET_DELAY_S=${shellQuote(String(options.resetDelaySeconds ?? 10))}`,
       `export FAKE_CLAUDE_TRIGGER=${shellQuote(trigger)}`,
+      `export FAKE_CLAUDE_MODEL=${shellQuote(options.claudeModel ?? "claude-sonnet-4-6")}`,
       `exec ${shellQuote(process.execPath)} ${shellQuote(join(repoRoot, "test/fixtures/fake-claude.mjs"))} "$@"`,
       "",
     ].join("\n"),
   );
   chmodSync(claudeLauncher, 0o755);
 
+  const codexLauncher = join(bin, "codex");
+  if (options.codex) {
+    const codexHome = join(home, ".codex");
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(codexLauncher, [
+      "#!/bin/sh",
+      `export FAKE_CODEX_LOG=${shellQuote(join(root, "fake-codex.jsonl"))}`,
+      `export FAKE_CODEX_EXHAUSTED=${shellQuote(options.codex === "exhausted" ? "1" : "0")}`,
+      `exec ${shellQuote(process.execPath)} ${shellQuote(join(repoRoot, "test/fixtures/fake-codex.mjs"))} "$@"`,
+      "",
+    ].join("\n"));
+    chmodSync(codexLauncher, 0o755);
+  }
   const settingsPath = join(baseDir, "userdata", "settings.json");
   const disabled = (driver: string) => ({ driver, enabled: false });
   writeFileSync(
@@ -151,14 +167,17 @@ export function prepareDisposableT3(options: DisposableT3Options): DisposableT3 
       {
         autoResumeLimitedThreads: options.autoResume,
         enableProviderUpdateChecks: false,
-        defaultModelSelection: { instanceId: "claudeAgent", model: "claude-sonnet-4-6" },
+        defaultModelSelection: { instanceId: "claudeAgent", model: options.claudeModel ?? "claude-sonnet-4-6" },
         providerInstances: {
           claudeAgent: {
             driver: "claudeAgent",
             enabled: true,
             config: { binaryPath: claudeLauncher, homePath: join(home, ".claude") },
           },
-          codex: disabled("codex"),
+          codex: options.codex ? {
+            driver: "codex", enabled: true,
+            config: { binaryPath: codexLauncher, homePath: join(home, ".codex") },
+          } : disabled("codex"),
           opencode: disabled("opencode"),
           cursor: disabled("cursor"),
           grok: disabled("grok"),

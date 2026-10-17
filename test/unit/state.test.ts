@@ -82,3 +82,23 @@ test("an unknown state file version is refused rather than guessed", () => {
     dir.remove();
   }
 });
+
+test("state v2 migrates to v3, preserving claims and releasing unsafe old switch intents", () => {
+  const dir = scratchDir("state-migration");
+  try {
+    const path = join(dir.path, "state.json");
+    const resetAt = new Date(T0 + 60_000).toISOString();
+    writeFileSync(path, JSON.stringify({ version: 2, cursor: 31, posted: { prior: T0 }, parked: {},
+      switches: { old: { threadId: "t", runId: "r", resetAt, from: { instanceId: "claudeAgent", model: "c" },
+        target: { instanceId: "codex", model: "g" }, phase: "dispatching", stopAt: T0, createdAt: T0,
+        expiresAt: T0 + 35 * DAY_MS, restoreAutoResume: false, subagent: false } } }));
+    const state = loadState(path, T0);
+    assert.equal(state.cursor, 31); assert.equal(state.posted.get("prior"), T0);
+    assert.equal(state.switches.get("old")!.phase, "releasing");
+    assert.equal(state.switches.get("old")!.restoreAutoResume, null);
+    assert.ok(state.switches.get("old")!.expiresAt <= T0 + 180_000);
+    saveState(path, state, T0);
+    assert.equal(JSON.parse(readFileSync(path, "utf8")).version, 3);
+    assert.equal(loadState(path, T0).switches.get("old")!.phase, "releasing");
+  } finally { dir.remove(); }
+});

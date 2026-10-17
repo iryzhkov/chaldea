@@ -1,5 +1,7 @@
 // `chaldea` command-line entry point.
 import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { switchConfig } from "./quota/routing.ts";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -18,6 +20,8 @@ quota observe: records T3 usage-limit stops and native auto-resumes in the fleet
   --token-file PATH    Bearer token, mode 0600 (default: ~/.config/chaldea/t3-token)
   --state-file PATH    Cursor and posted keys (default: ~/.local/state/chaldea/quota-observer.json)
   --feed-command PATH  Feed CLI to run (default: feed)
+  --enable-provider-switch  Continue quota stops on an equivalent provider (default: off)
+  --switch-config PATH  JSON { enabled, equivalences: [[Claude model, Codex model], ...] }
   --host NAME          Host name for feed records (default: short hostname)
 
 t3 set-auto-resume: turns T3's autoResumeLimitedThreads on or off through server.updateSettings.
@@ -73,6 +77,8 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
       "token-file": { type: "string" },
       "state-file": { type: "string" },
       "feed-command": { type: "string" },
+      "enable-provider-switch": { type: "boolean" },
+      "switch-config": { type: "string" },
       host: { type: "string" },
       help: { type: "boolean", short: "h" },
     },
@@ -98,6 +104,10 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
       tokenFile: values["token-file"] ?? join(home, ".config", "chaldea", "t3-token"),
       statePath: values["state-file"] ?? join(home, ".local", "state", "chaldea", "quota-observer.json"),
       feedCommand: values["feed-command"] ?? "feed",
+      switching: (() => {
+        const config = switchConfig(values["switch-config"] ? JSON.parse(readFileSync(values["switch-config"], "utf8")) : {});
+        return { ...config, enabled: values["enable-provider-switch"] === true || config.enabled };
+      })(),
       host: values.host ?? shortHostname(),
       logger: createLogger(),
       signal: controller.signal,

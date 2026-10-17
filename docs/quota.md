@@ -1,18 +1,224 @@
 # Quota resilience (plan step 3)
 
 When a provider stops a T3 turn on a usage limit, T3 itself resumes the thread
-at the reported reset time. Chaldea adds only an observer, `chaldea quota
-observe`, that records each stop and each resume in the fleet feed. Chaldea has
-no timers, no journal of its own waits and no wake dispatch: that work belongs
-to T3's `UsageLimitRecoveryWorker`, and its five-second sweep is accepted.
+at the reported reset time. `chaldea quota observe` records stops and resumes
+in the fleet feed. Optional B3 provider switching can continue the same thread
+immediately on an available equivalent model using T3's context handoff.
+Switching defaults to off; native recovery and its five-second sweep remain
+the fallback. Chaldea uses one timer for pending hold cleanup and transient
+switch-path retry backoff; continuation at reset remains native.
 
 Decisions behind this design (Igor, 2026-10-16):
 
 1. Resume is done by T3's native auto-resume (`autoResumeLimitedThreads` on).
-2. Chaldea adds only a thin observer that records quota events in the feed.
-3. A hard limit with no reset time stays parked. The observer posts exactly one
-   warning. The thread resumes only if a later provider event supplies the
-   reset, and then T3 resumes it natively.
+2. With provider switching disabled, Chaldea observes quota events in the feed.
+3. Without an eligible switch target, a hard limit with no reset stays parked
+   and gets one warning. A later provider event supplying a reset lets T3
+   resume it natively.
+
+## Optional provider switching (B3)
+
+Switching is **off by default**. After review, enable it with
+`chaldea quota observe --enable-provider-switch`, or pass
+`--switch-config ~/.config/chaldea/quota-switch.json`:
+
+```json
+{
+  "enabled": true,
+  "equivalences": [
+    ["claude-opus-5-5", "gpt-6.1-sol"],
+    ["claude-sonnet-5-5", "gpt-6-luna"],
+    ["claude-fable-5-1", "gpt-6-astra"]
+  ]
+}
+```
+
+These pairs are the defaults when `equivalences` is omitted. An explicit list
+replaces them and may contain at most 128 pairs, unique on each side. Only the
+`claudeAgent` and `codex` instances participate, with their matching drivers.
+The observer matches exact model slugs in the live `server.getConfig`
+catalog. It carries an explicit Claude `effort` to Codex `reasoningEffort`,
+and vice versa; the target's option descriptor must support that exact value.
+It leaves the original recovery alone if the model or effort is unsupported.
+Other source options are not transferred.
+
+Admission uses only T3's `ServerProvider`: enabled, installed, ready,
+authenticated, and not unavailable, with a known, nonempty `usageLimits.windows`
+list, no `usageLimits.unavailable`, a valid `checkedAt` no more than five minutes
+old (and not in the future), and every window's `usedPercent < 100`.
+Missing/failed probes, an empty catalog, disabled/unhealthy instances and any
+exhausted window mean no switch. Chaldea does not scrape providers, infer a
+refill from elapsed resets, use account billing as quota, or open an agent
+session to refresh a catalog. Native auto-resume remains the fallback.
+A quota reset never moves a working thread. If a later run on the replacement
+provider itself stops on quota, it is a new stop and may switch back when the
+other provider has fresh quota.
+
+The same policy applies to interactive, delegated and scheduled threads. A
+failed usage-limit stop must still be blocking: its reset is in the future.
+A resetless stop must be less than two minutes old and first seen live, or
+completed after this observer process started. Old abandoned stops are never
+admitted on startup or reconnect. A human's per-thread `autoResume:false`
+choice wins over switching. Chaldea distinguishes its deterministic hold ID
+and T3's exact `limit-arm:<thread>:<run>:<resetMs>` snooze-only arm from a human
+cancellation. A native arm with `autoResume:false, snooze:true` does not opt out
+of switching, and its false auto-resume choice is preserved on release. There
+must be no active run, pending runtime request, archival, deletion or explicit
+settlement. Switching
+waits for shell catch-up before acting. When enabled (or when saved intents
+exist), reconnect begins with a current snapshot so stops remain discoverable
+across observer and server restarts. No periodic Chaldea scan is introduced.
+
+### Hold, guarded dispatch and restart behavior
+
+Before any command, the observer saves an intent in its existing atomically
+written state file. IDs use a SHA-256 digest of the JSON tuple `[threadId, runId]`;
+a reset correction cannot mint a second continuation for the same run.
+
+1. For a known reset, send `thread.metadata.update` with
+   `limitRecovery: {runId, resetAt, autoResume:false}` for that exact failure.
+   The omitted snooze choice is preserved. Check that the observer still owns
+   that hold and that the source thread is still eligible.
+2. Save the dispatch phase, then send one `message.dispatch` with target
+   `modelSelection`, `manualContinuationOfRunId`, and text
+   "Continue where you left off." Both `commandId` and `messageId` are
+   `chaldea-switch:<digest>:continue`.
+3. T3 serializes dispatch against the thread, checks its manual run guard and
+   performs its native context handoff, retaining the thread and releasing the
+   old provider session. A restart or uncertain response retries the identical
+   payload and ID only after checking `delivered()` and repeating the current
+   source/target preflight. If already delivered, claim the switch without
+   resending. If the run, provider/model, settlement, pending requests, reset,
+   target health or fresh quota moved, release instead. An ambiguous send
+   checks delivery before falling back to release. A timeout may commit later:
+   cleanup re-enters the receipt check, and subsequent thread events or snapshots
+   reconcile even a cancelled intent into one `provider_switched`. While that
+   outcome is uncertain, `quota_resumed` is deferred; a newer run without the
+   dispatch receipt is reconciled as an ordinary resume.
+4. A guard rejection starts release. Restore the prior native auto-resume
+   choice while the observed `requestId` still belongs to Chaldea. If the
+   recorded prior value was Chaldea's own hold, it is unknown and release
+   uses the live global setting. Preserve the native snooze value; an expired
+   true snooze is omitted from the update so T3 preserves it without rejecting
+   a new snooze in the past. T3 caches rejected receipts, so a confirmed
+   rejected release advances a saved attempt suffix; an uncertain release
+   response reuses its existing suffix.
+5. A successful dispatch claims one info `provider_switched` feed record with
+   thread, source run, from/to provider and model. That stop does not produce
+   `quota_resumed` or reset lateness, including on snapshot reconciliation.
+   Feed delivery keeps B2's at-most-once trade-off.
+
+A resetless stop cannot be armed for native recovery, so there is no recovery
+hold to acquire. The same manual run guard arbitrates its continuation,
+including a race with a later reset or human resume. Source/target preflight
+reads are conservative; the pinned manual guard atomically checks the source
+run and pending requests, but does not expose a compare-and-swap for a
+concurrent model-only edit or settlement. Such an edit after the last
+preflight check can therefore be superseded by the dispatch. Enabling this
+optional path accepts that pinned-server limitation; stronger arbitration
+requires an upstream conditional-dispatch contract.
+
+Intents admit at most 128 unresolved switches; reaching the cap logs once and
+leaves new stops on native recovery. Every active phase has a hard cleanup
+deadline: reset plus two minutes, or two minutes after admission for a
+resetless stop. One next-deadline timer handles idle threads; release retries
+exist only while cleanup is pending. At the reset itself, an undelivered
+continuation is no longer eligible and is released instead of resent.
+After the deadline, an owned hold that T3 refuses to update because the
+thread is archived, settled or awaiting input is cleared with
+`thread.metadata.update limitRecovery:null`. This returns it to native global
+policy and frees its intent slot. Immediately before every restore or clear,
+including a fallback clear after a rejected restore, Chaldea re-reads the thread
+projection and requires both its own hold request ID and the unchanged latest
+run. A newer run or human/native recovery request is left alone and frees the
+intent slot. A read-then-write race remains: pinned T3 has no guarded metadata
+update, so a change after that final projection read can still be overwritten.
+Remove this limitation when upgrading to a T3 version with a metadata update
+that atomically checks the expected recovery request ID and latest run.
+
+Switch work is coalesced in a bounded background worker. Quota records are
+processed before it and never wait for optional switch RPCs. Any switch-path
+exception, including protocol drift or insufficient scope, disables new
+switches, tries to release existing owned holds, and claims one loud
+`provider_switch_failed` warning per source run. Cleanup is attempted at most
+once per active intent per drain. Observation continues. Transient connection
+failures retry the live catalog after exponential backoff from one second to
+at most one minute, then re-enable switching and log once. The failure warning
+is not repeated. Authorization and protocol failures stay disabled until
+credentials change or the observer restarts.
+A genuinely revoked operate scope or an unreachable server cannot be bypassed:
+failed cleanup stays durable and retries; restoring access or restarting the
+observer reconciles it before new work. No client-only deadline can run while
+the host/observer is down, so overdue holds are released immediately on
+reconnect when access permits.
+
+State format 3 migrates format 2 without losing cursor or feed claims. Old
+active v2 switch intents are released, never replayed; a stored false restore
+value of uncertain hold provenance uses the global setting. Completed/cancelled
+records expire after 42 days and are capped at 1,000, with count eviction
+ordered by stop time. The existing watermark prevents reviving evicted stops.
+There are no new per-thread files, transcripts, credentials or unbounded journals.
+Per-thread preflight uses `getThreadProjection`, and a batch shares one server
+config read.
+
+T3 keeps the handoff in the thread. **Binding B3 deviation from plan decision
+12:** a Jocasta copy is deferred; no transcript export or Jocasta write occurs.
+
+### Purchased credits and overage in pinned T3
+
+Igor intends purchased Codex credits to be usable. The pinned
+`ServerProviderUsageLimits` contract exposes no purchased-credit balance or
+active-overage/credit-spending flag. Its `resetCredits.availableCount` counts
+banked unfair-rate-limit reset entitlements: they clear windows only after a
+separate redemption. They do not prove that a turn may spend purchased credits
+while a window remains exhausted. `externalUsage` contains only a label and
+URL for the provider's usage settings, with no capacity or permission value.
+There is no `credits` field in this contract. Accordingly B3 retains the
+fresh-window rule; unredeemed reset metadata and an external link do not
+override a 100% window. Once a T3 redemption updates the windows, ordinary
+admission can use them. A unit test fixes this boundary so a future contract
+upgrade can add purchased-credit admission deliberately.
+
+### Token migration
+
+Switching requires `orchestration:operate` in addition to
+`orchestration:read`. Re-issue the B2 observer token before enabling:
+
+```sh
+install -d -m 700 ~/.config/chaldea
+(umask 077 && t3 auth session issue --base-dir ~/.t3 \
+  --scope orchestration:read --scope orchestration:operate \
+  --ttl 30d --label chaldea-quota --token-only > ~/.config/chaldea/t3-token.next)
+mv ~/.config/chaldea/t3-token.next ~/.config/chaldea/t3-token
+```
+
+Revoke the old session with `t3 auth session list` / `t3 auth session revoke`.
+Revocation closes its old socket; the reconnect re-reads the token file.
+A token lacking operate is rejected before a new hold is changed: log once
+per credential/process, claim a warning, suspend switching and keep observing.
+Previously held work requires the operate scope again to finish cleanup;
+retries cannot bypass authorization. Do not remove an intent file to clear a
+hold.
+
+### B3 acceptance coverage
+
+Unit tests cover both map directions, catalog/effort validation, unknown and
+exhausted quota, deterministic IDs, scope refusal, durable-save failure,
+hold/release ownership, rejected release retries and ambiguous responses.
+Disposable pinned T3 tests use fake Claude stream-json and fake Codex
+app-server peers, without provider credentials or network: Claude to Codex
+with actual portable-history delivery and effort preservation; Codex exhausted
+with native Claude resume; insufficient scope with native resume; SIGKILL
+immediately after the real hold acknowledgement followed by disposable T3 and
+observer restarts both before and after reset; and expiry while archived.
+A pre-reset restart can switch once. A post-reset restart releases and resumes
+natively once. Expired archival holds are cleared and, after unarchive, native
+recovery works. Switched stops have one switch record and no native reset resume.
+
+The defaults' remaining model pairs and Codex-to-Claude switching are covered
+by routing unit tests; that reverse protocol path is not exercised end to end.
+Delegated and scheduled lineage uses the same eligibility path; only standalone
+threads are exercised end to end.
 
 ## What T3 does natively
 
@@ -253,7 +459,7 @@ it; its `quota_parked` key stays, so nothing is repeated.
 | Test fixtures | `$CHALDEA_TEST_SCRATCH` (default `~/.cache/chaldea-test`) | removed after each test, passed or failed; anything a crashed run left is removed by the next run once it is a day old |
 
 Pruning happens on every save, which is every state change and at most every
-five seconds while events arrive; there is no timer. Feed-server retention is
+five seconds while events arrive; there is no separate retention timer. Feed-server retention is
 the feed's own concern.
 
 ## Installing on a host
@@ -283,7 +489,8 @@ succeeded.
    ```
 
    `orchestration:read` covers `orchestration.subscribeShell`; the observer
-   sends no commands. Note the expiry: before it, issue a new token the same
+   sends no commands while switching is disabled. For B3 switching, use the
+   two-scope token migration above. Note the expiry: before it, issue a new token the same
    way into a temporary file, move it over the old one, and revoke the old
    session (`t3 auth session list`, `t3 auth session revoke`). The observer
    picks up the new file on its next reconnect.

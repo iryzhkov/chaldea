@@ -111,3 +111,24 @@ test("a stream item the pinned contracts reject fails closed", async () => {
     server.close();
   }
 });
+
+test("a protocol failure inside the shell callback retains its fail-closed classification", async () => {
+  const server = createServer(), wss = new WebSocketServer({ server });
+  wss.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      const message = JSON.parse(String(data));
+      if (message._tag === "Request") socket.send(JSON.stringify({
+        _tag: "Chunk", requestId: message.id, values: [{ kind: "synchronized" }],
+      }));
+    });
+  });
+  const failure = new ProtocolIncompatibleError("nested RPC contract drift");
+  try {
+    const url = await listen(server);
+    await assert.rejects(connectShell({ serverUrl: url, token: "t" }, {
+      onEvent: () => { throw failure; },
+    }), (error) => error === failure);
+  } finally {
+    wss.close(); server.close();
+  }
+});
