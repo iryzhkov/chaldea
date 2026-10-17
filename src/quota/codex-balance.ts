@@ -1,6 +1,7 @@
 // Read-only Codex app-server client. Never starts a model thread or accepts arbitrary RPCs.
 import { spawn } from "node:child_process";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { readFileSync } from "node:fs";
 
 export interface CodexContext {
   readonly providers: ReadonlyArray<string>;
@@ -46,6 +47,16 @@ export function headroomConfig(raw: unknown = {}): HeadroomConfig {
     grouped.set(key, { ...ctx, providers: [...(previous?.providers ?? []), ...ctx.providers] });
   }
   return { contexts: [...grouped.values()], lowHeadroomPercent: low };
+}
+/** Missing default config leaves balance unknown; explicit paths and malformed files fail closed. */
+export function loadHeadroomConfig(home: string, path?: string): HeadroomConfig {
+  let raw: unknown;
+  try { raw = JSON.parse(readFileSync(path ?? join(home, ".config", "chaldea", "quota.json"), "utf8")); }
+  catch (error) {
+    if (path === undefined && (error as NodeJS.ErrnoException).code === "ENOENT") return headroomConfig();
+    throw error;
+  }
+  return headroomConfig(raw);
 }
 export const contextKey = (c: CodexContext): string => JSON.stringify([c.home, c.codexHome, c.command]);
 
