@@ -33,7 +33,8 @@ def config(tmp_path):
     return {"state": str(state), "key": str(key), "known_hosts": str(known),
             "node": "/fixture/node", "runtime": "/fixture/maintenance.ts",
             "health": "/fixture/health", "anchors": "/fixture/anchors",
-            "output": str(output)}
+            "output": str(output), "repository": fetcher.REMOTE,
+            "bundle_path": fetcher.BUNDLE}
 
 
 def fake_commands(monkeypatch, config, *, failure=None, size=6):
@@ -58,6 +59,8 @@ def fake_commands(monkeypatch, config, *, failure=None, size=6):
         data = b""
         if "rev-parse" in args:
             data = b"a" * 40 + b"\n"
+        if "ls-tree" in args:
+            data = b"100644 blob " + b"b" * 40 + b"\tbundle.jws\n"
         if "-s" in args:
             data = str(size).encode()
         if "blob" in args:
