@@ -52,9 +52,12 @@ export class ObserverProcess {
   /** Pass `serverUrl`, or `t3BaseDir` to discover the URL as the installed unit does. */
   constructor(options: { serverUrl?: string; t3BaseDir?: string; tokenFile: string; statePath: string; feedLog: string; scratch: string; switching?: boolean; crashAfterHold?: boolean }) {
     const target = options.serverUrl !== undefined ? ["--server-url", options.serverUrl] : ["--t3-base-dir", options.t3BaseDir ?? ""];
+    const helper = join(options.scratch, "akasha-test-token");
+    writeFileSync(helper, "#!/bin/sh\nprintf \'%s\\n\' test.lease.signature\n", { mode: 0o700 });
     this.#child = spawn(
       process.execPath,
       [
+        "--import", join(repoRoot, "test/helpers/event-fetch.ts"),
         join(repoRoot, options.crashAfterHold ? "test/helpers/crash-switch-observer.ts" : "src/cli.ts"),
         "quota",
         "observe",
@@ -70,7 +73,7 @@ export class ObserverProcess {
         "e2e-host",
       ],
       {
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: options.scratch, TMPDIR: options.scratch, FEED_RECORDER_LOG: options.feedLog },
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: options.scratch, TMPDIR: options.scratch, FEED_RECORDER_LOG: options.feedLog, AKASHA_URL: "https://akasha.test", AKASHA_TOKEN_HELPER: helper },
         stdio: ["ignore", "ignore", "pipe"],
       },
     );
