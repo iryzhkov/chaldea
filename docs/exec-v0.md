@@ -94,13 +94,15 @@ Python forced command ignores user-site/PYTHONPATH configuration.
 - Snapshot: 64 MiB, 10,000 files; request metadata: 1 MiB.
 - Artifacts: at most 32 explicitly named regular files, 64 MiB aggregate per job.
 - Output: 64 MiB combined stdout/stderr, streamed without a persisted host log.
-- Runtime: six hours; upload: two minutes; one active job per host, immediate busy refusal.
+- Runtime: six hours; upload: two minutes. The server's configured slot count
+  bounds concurrent jobs; a full host refuses immediately.
 - Workspaces, successful or failed: deleted immediately. Stale workspaces after
   an uncatchable server crash are removed on the next admitted connection/start,
-  under the host lock, within a one-second cleanup budget. Unremovable leftovers
+  under the acquired slot lock, within a one-second cleanup budget. Unremovable leftovers
   are logged and stay inside the image bound without wedging later jobs.
 - Host workspace state: one 20 GiB fixed-size ext4 image (inventory adjustable).
-  Admission requires the mount and reserves 256 MiB free space plus snapshot capacity.
+  Admission requires the mount and reserves 256 MiB free space plus maximum
+  snapshot capacity for every configured slot.
   Its optional mount cannot block boot. An absent mount gives a clear refusal.
   Authentication logs have a separate 16 MiB, 14-day journal namespace.
 - Local artifacts: 14 days and 20 GiB per destination across worktrees, accounted
@@ -109,9 +111,12 @@ Python forced command ignores user-site/PYTHONPATH configuration.
   accounting and requires no stale-lock cleanup after reboot. A short state-wide
   lock protects journal changes, pruning and artifact reservations across targets
   and worktrees. It is released before SSH dispatch: calls to the same host may
-  overlap, and the server's configured slots decide admission. Active jobs reserve
+  overlap, and the server's configured slots decide admission. Active jobs requesting artifacts reserve
   up to 64 MiB each before dispatch, so parallel artifact writers cannot overbook
   the cap. A full server returns the existing refused outcome.
+  Stop all older exec client processes before updating clients: the old per-host
+  lock and new accounting lock do not coordinate, so mixed versions must not
+  share a state directory while jobs are running.
 - Local client journal: mode 0600, fsynced before SSH dispatch and atomically
   replaced after confirmed completion; 14 days / 1,000 entries, no output logs.
 
