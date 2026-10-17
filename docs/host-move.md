@@ -80,7 +80,7 @@ uses that mapping and the agreed 24-hour signed-bundle age.
 There is no separate trust-publisher program in fleet-config to relocate. Signing
 already lives in Chaldea's access CLI and is included in the bundled host entry
 point. Publishing remains the explicit operator action of committing only signed
-`access-trust/bundle.jws` bytes to fleet-config main. No key generation or
+`bundle.jws` bytes to chaldea-trust main. No key generation or
 publication is added to convergence. `mcp_registration.py` remains an Ansible
 module in fleet-config. The OpenCode Huyang plugin remains owned by omarchy-setup;
 fleet-config installs its checksum-pinned source.
