@@ -20,7 +20,7 @@ export function trustedFile(path: string, max: number, privateFile = false): Buf
   try { return readTrustedFile(path, { maxBytes: max, secret: privateFile, owners: [0, process.geteuid!()] }); }
   catch (error) {
     // Keep the existing request-time adapter error contract.
-    if (error instanceof ConfigurationError) ensure(false, "unsafe_input");
+    if (error instanceof ConfigurationError && ["type", "links", "owner", "mode", "size"].includes(error.reason)) ensure(false, "unsafe_input");
     throw error;
   }
 }
