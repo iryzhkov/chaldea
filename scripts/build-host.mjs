@@ -14,10 +14,13 @@ try {
   for (const [source, name] of [
     ['src/access/maintenance.ts', 'access-maintenance.mjs'],
     ['src/events/collector.ts', 'akasha-collector.mjs'],
+    ['src/akasha/entry.ts', 'akasha-service.mjs'],
   ]) {
     await build({ entryPoints: [source], outfile: join(stage, 'host', name), bundle: true,
       platform: 'node', format: 'esm', target: 'node26', packages: 'bundle',
-      sourcemap: false, legalComments: 'inline' });
+      sourcemap: false, legalComments: 'inline',
+      // NATS' bundled CommonJS dependencies still require Node built-ins.
+      banner: { js: "import { createRequire as __hostRequire } from 'node:module'; const require = __hostRequire(import.meta.url);" } });
   }
   const result = spawnSync('python3', ['scripts/package-host.py', version, resolve(output), stage], { stdio: 'inherit' });
   if (result.status !== 0) throw new Error('host packaging failed');

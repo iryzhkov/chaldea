@@ -29,7 +29,7 @@ export const MAX_POSTED_KEYS = 10_000;
 /** At most this many parked threads are tracked; an evicted one loses its quota_resumed. */
 export const MAX_PARKED_THREADS = 1_000;
 
-export type RecordKind = "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched" | "provider_switch_failed";
+export type RecordKind = "restart_resumed" | "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched" | "provider_switch_failed";
 
 export interface ParkedThread {
   readonly runId: string;

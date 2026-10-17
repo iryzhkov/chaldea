@@ -97,7 +97,7 @@ Normalization happens before receive time and authorization-run attribution.
 Same tuple/hash returns the original receipt, changed payload returns 409, including
 pending retries. Every retry reauthorizes; expired requests create no new receipt.
 
-The closed kinds are feed_post/report, quota_parked/quota_reset_unknown/quota_resumed/
+The closed kinds are feed_post/report, quota_parked/quota_reset_unknown/quota_resumed/restart_resumed/
 provider_switched/provider_switch_failed, tool_call, deployment_finished/job_finished,
 task_started/task_finished, review_verdict/review_note and agent_status. Registry
 enablement is required for actual producers; emitting a kind conveys no command authority.

@@ -6,7 +6,7 @@ No host convergence is performed by this change.
 
 Build with `npm ci --ignore-scripts`, then
 `npm run host:build -- VERSION OUTPUT`. The build takes no Git metadata, stages
-self-contained ESM trust-maintenance/signing and collector entry points, and writes
+self-contained ESM trust-maintenance/signing, collector and Akasha service entry points, and writes
 `chaldea-host.tar.gz` plus `manifest.json`. The manifest records the version,
 archive SHA-256 and each member's SHA-256. Tests and their dependencies remain in
 source and are excluded from the runtime archive. Archive ordering, ownership, modes and
@@ -14,7 +14,7 @@ timestamps are deterministic. Node 26.10.0 is the runtime baseline. All npm buil
 dependencies, including esbuild, are locked with integrity hashes.
 
 The hosted `host artifact` workflow tests Python host programs, builds twice and
-compares bytes, smoke-tests both bundled entry points and uploads the candidate.
+compares bytes, smoke-tests all three bundled entry points and uploads the candidate.
 On a `host-v*` tag it first fetches full history and requires the tagged commit
 (including an annotated tag's commit) to be reachable from `origin/main`. A tag
 outside main fails visibly before the build, exec tests or publication. It then
@@ -41,6 +41,7 @@ passwd fixes. Paths below are relative to that repository.
 | roles/chaldea_access_trust/files/fetch.py | host/chaldea-access-trust-fetch | existing chaldea_access_trust_fetcher |
 | src/access/maintenance.ts (already in Chaldea) | host/access-maintenance.mjs | root-owned release tree |
 | src/events/collector.ts (already in Chaldea) | host/akasha-collector.mjs | root-owned release tree |
+| src/akasha/entry.ts | host/akasha-service.mjs | root-owned release tree; invoked by homelab-infra |
 
 Image creation, toolchain management, byte-only trust fetching and callback source
 are byte-preserving moves. The image helper was formerly transferred temporarily
