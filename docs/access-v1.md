@@ -112,6 +112,8 @@ with **no freshness leeway**. Publisher renews independently from run hosts.
 Authenticated updater fetches at most every **120 seconds** and calls
 `TrustStore.install`; services use only the local durable bundle for requests.
 Network failure preserves the existing expiry rather than refreshing it.
+Package F's [trust runtime tooling](access-trust-runtime.md) implements operator signing,
+installation and the Akasha clock-health file adapter; its fleet role remains disabled.
 Transport/publisher/updater deployment belongs to package F. This library supplies
 signing, authentication, installation and offline consumption, without a listener.
 
