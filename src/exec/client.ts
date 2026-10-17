@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import { manifest } from './manifest.ts';
-import { cleanArtifacts } from './artifacts.ts';
+import { cleanArtifacts, BOOT_ID } from './artifacts.ts';
 import { record, prune, DAYS, type Intent } from './journal.ts';
 import { frames, send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, type Request } from './protocol.ts';
 
@@ -69,7 +69,7 @@ export async function run(args: string[]): Promise<number> {
   await staleControl(config, 'chaldea-job-' + options.host);
   const jobId = randomUUID();
   const intent: Intent = { jobId, host: options.host, argv: options.argv,
-    started: new Date().toISOString(), pid: process.pid, outcome: 'uncertain',
+    started: new Date().toISOString(), pid: process.pid, bootId: BOOT_ID, outcome: 'uncertain',
     worktree: snapshot.root, artifactDir: join(artifactRoot, jobId) };
   // This fsync completes before the first possible remote side effect. Nothing
   // ever automatically retries an uncertain intent, including on a later invocation.

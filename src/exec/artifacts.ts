@@ -1,8 +1,10 @@
 import * as fs from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { Intent } from './journal.ts';
 export const ARTIFACT_DAYS = 14 * 86400000;
 export const HOST_CAP = 20 * 1024 ** 3;
+export const BOOT_ID = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
 
 export function artifactLocation(entry: Intent): string | undefined {
   if (!entry.worktree || !entry.artifactDir || !/^[0-9a-f-]{36}$/.test(entry.jobId)) return;
@@ -11,7 +13,7 @@ export function artifactLocation(entry: Intent): string | undefined {
   return expected;
 }
 export function active(entry: Intent) {
-  if (entry.outcome !== 'uncertain' || !entry.pid || Date.parse(entry.started) < Date.now() - 22800000) return false;
+  if (entry.bootId !== BOOT_ID || entry.outcome !== 'uncertain' || !entry.pid || Date.parse(entry.started) < Date.now() - 22800000) return false;
   try { process.kill(entry.pid, 0); return true; } catch { return false; }
 }
 async function parents(path: string) {

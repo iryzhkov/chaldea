@@ -1,8 +1,8 @@
 import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
-import { removeArtifacts } from './artifacts.ts';
+import { removeArtifacts, active as liveIntent } from './artifacts.ts';
 
-export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; exitCode?: number };
+export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; exitCode?: number };
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 
@@ -29,10 +29,7 @@ export async function prune(dir: string, age = DAYS, keep = KEEP) {
   for (const entry of files) {
     try {
       const value: Intent = JSON.parse(await fs.readFile(entry.path, 'utf8'));
-      if (value.outcome === 'uncertain' && value.pid && Number.isSafeInteger(value.pid) && value.pid > 0 &&
-          entry.stat.mtimeMs > Date.now() - (6 * 3600 + 1200) * 1000) {
-        try { process.kill(value.pid, 0); active.add(entry.path); } catch { /* exited client */ }
-      }
+      if (liveIntent(value)) active.add(entry.path);
     } catch { /* stale partial journal update */ }
   }
   retained = active.size;
