@@ -42,14 +42,11 @@ export class Ingress {
     return this.visible(p, receipt);
   }
   async visible(p: Principal, receipt: Receipt): Promise<Receipt> {
-    const deadline = performance.now() + this.waitMs;
-    let r = receipt;
-    while (r.state === "pending" && performance.now() < deadline) {
-      await new Promise(resolve => setTimeout(resolve, 20));
-      await p.recheck(); r = this.store.ownedReceipt(r.event_id, p.scope)!;
-    }
+    if (receipt.state === "pending") await this.store.waitReceipt(receipt.event_id, this.waitMs);
     await p.recheck();
-    return r;
+    const current = this.store.ownedReceipt(receipt.event_id, p.scope);
+    ensure(current, "payload_expired", 410);
+    return current;
   }
   async lookup(p: Principal, kind: string, key: string): Promise<Receipt> {
     ownedKind(p, kind as Kind, {});

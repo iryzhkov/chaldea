@@ -21,6 +21,38 @@ export function connect(config: string, host: string, command = COMMANDS.exec): 
   ssh.stderr.pipe(sshStderr()).pipe(process.stderr, { end: false });
   return { ssh, incoming: frames(ssh.stdout), exit };
 }
+export class ProbeUnavailable extends Error {}
+
+// Probe the greeting only: queue connections reserve no slot until W, and
+// cannot execute work without G and Q. No job request enters a probe.
+export async function probeHost(config: string, host: string): Promise<void> {
+  const transport = connect(config, host, COMMANDS.queue);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const hello = await Promise.race([
+      transport.incoming.next(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new ProbeUnavailable('connection timed out before job request')), 10_000);
+      }),
+    ]);
+    if (hello.done) throw new ProbeUnavailable('connection closed before job request');
+    // Protocol/refusal validation belongs to the eventual dispatch connection.
+  } finally {
+    clearTimeout(timer);
+    transport.ssh.stdin.destroy();
+    transport.ssh.kill('SIGTERM');
+    await transport.exit.catch(() => {});
+  }
+}
+
+// Start every bounded probe before awaiting any result; array order is preference.
+export async function probeHosts(hosts: string[], probe: (host: string) => Promise<void>) {
+  return Promise.all(hosts.map(async host => {
+    try { await probe(host); return { host, error: undefined }; }
+    catch (error) { return { host, error: error as Error }; }
+  }));
+}
+
 function stop(t: Transport) {
   // Cancel is best effort; closing stdin also cancels on every protocol path.
   if (!t.ssh.stdin.destroyed) t.ssh.stdin.end(frame('C'));

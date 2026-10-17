@@ -49,6 +49,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   await fs.writeFile(script, [
     "import fs from 'node:fs';",
     "import { spawnSync } from 'node:child_process';",
+    "import { dirname } from 'node:path';",
     'import { frame, frames, json, VERSION } from ' + JSON.stringify(protocol) + ';',
     'const args = process.argv.slice(2);',
     'const host = (args.includes("-G") || args.includes("-O") ? args.at(-1) : args.at(-2)).replace("chaldea-job-", "");',
@@ -57,13 +58,22 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     'const send = (type, value) => process.stdout.write(frame(type, json(value)));',
     'if (args.includes("-G")) { console.log("controlpath " + (mode === "stuck-control" ? process.env.FAKE_CONTROL : "none")); process.exit(0); }',
     'if (args.includes("-O") && mode === "stuck-control") { log("control-check"); await new Promise(r => setTimeout(r, 30000)); process.exit(0); }',
-    'log("connected");',
+    'const probe = args.at(-1) === "chaldea-exec-queue-v1";',
+    'log(probe ? "probed" : "connected");',
     'if (mode === "connect-hang") { process.execve(process.env.FAKE_REAL_SSH, [process.env.FAKE_REAL_SSH, ...args], process.env); }',
     'if (mode === "unreachable") process.exit(255);',
+    'if (probe && mode === "probe-barrier") {',
+    '  const watcher = fs.watch(dirname(process.env.FAKE_LOG));',
+    '  await new Promise(resolve => {',
+    '    const check = () => { if (fs.readFileSync(process.env.FAKE_LOG, "utf8").trim().split("\\n").map(JSON.parse).filter(e => e.event === "probed").length === 2) resolve(); };',
+    '    watcher.on("change", check); check();',
+    '  }); watcher.close();',
+    '}',
     'if (mode === "busy") { send("R", {outcome:"refused",message:"busy",busy:true}); process.exit(0); }',
     'send("H", {version: mode === "invalid" ? 2 : VERSION});',
     'let request;',
     'for await (const item of frames(process.stdin)) {',
+    '  if (probe) { log("probe-input"); process.exit(2); }',
     '  if (item.type === "Q") {',
     '    request = JSON.parse(item.data); log("requested");',
     '    if (mode === "disconnect") process.exit(255);',
@@ -116,6 +126,20 @@ test('two fake job hosts: busy first host falls through to exactly one execution
   } finally { await f.remove(); }
 });
 
+test('concurrent probe barrier preserves preference and sends job bytes to one host', { timeout: 15000 }, async () => {
+  const f = await fixture({ 'fake-a': 'probe-barrier', 'fake-b': 'probe-barrier' });
+  try {
+    const r = await collected(f.run());
+    assert.equal(r.code, 0, r.err);
+    const events = await f.events();
+    assert.deepEqual(events.filter(e => e.event === 'probed').map(e => e.host).sort(), ['fake-a', 'fake-b']);
+    assert.equal(events.some(e => e.event === 'probe-input'), false);
+    assert.deepEqual(events.filter(e => e.event === 'requested').map(e => e.host), ['fake-a']);
+    assert.deepEqual(events.filter(e => e.event === 'started').map(e => e.host), ['fake-a']);
+    assert.deepEqual((await f.intents()).map(i => [i.host, i.outcome]), [['fake-a', 'finished']]);
+  } finally { await f.remove(); }
+});
+
 test('connection and protocol boundaries do not replay dispatched work', { timeout: 30000 }, async t => {
   for (const [mode, retry, outcome] of [
     ['unreachable', true, 'refused'], ['refused', true, 'refused'],
@@ -127,7 +151,7 @@ test('connection and protocol boundaries do not replay dispatched work', { timeo
       const r = await collected(f.run());
       assert.equal(r.code, retry ? 0 : 255, r.err);
       const events = await f.events();
-      assert.equal(events.some(e => e.host === 'fake-b'), retry);
+      assert.equal(events.some(e => e.host === 'fake-b' && e.event === 'connected'), retry);
       const first = (await f.intents()).find(i => i.host === 'fake-a');
       assert.equal(first.outcome, outcome);
     } finally { await f.remove(); }
@@ -196,22 +220,25 @@ test('same target accepts overlapping local execs; accounting lock is released d
   }
 });
 
-test('SSH setup to a silent host honors ConnectTimeout and falls through', { timeout: 60000 }, async () => {
-  const f = await fixture({ 'fake-a': 'connect-hang' });
+test('SSH setup to two silent hosts shares the probe window and falls through', { timeout: 60000 }, async () => {
+  const f = await fixture({ 'fake-a': 'connect-hang', 'fake-b': 'connect-hang' }, ['fake-a', 'fake-b', 'fake-c']);
   const child = f.run();
   try {
     const r = await collected(child);
     assert.equal(r.code, 0, r.err);
     // Completion is driven by real OpenSSH's setup failure. Check its configured
     // timeout directly; process startup and runner scheduling are not the contract.
-    const attempt = (await f.events()).find(e => e.host === 'fake-a' && e.event === 'connected');
+    const attempt = (await f.events()).find(e => e.host === 'fake-a' && e.event === 'probed');
     assert.ok(attempt.args.includes('ConnectTimeout=10'));
     assert.match(f.banner(), /^SSH-2\.0-OpenSSH/);
-    assert.match(r.err, /Connection timed out during banner exchange/);
-    assert.match(r.err, /skipped fake-a: connection closed before job request/);
-    assert.match(r.err, /ran on fake-b/);
-    assert.deepEqual((await f.events()).filter(e => e.event === 'requested').map(e => e.host), ['fake-b']);
-    assert.deepEqual((await f.intents()).map(i => [i.host, i.outcome]).sort(), [['fake-a', 'refused'], ['fake-b', 'finished']]);
+    assert.match(r.err, /skipped fake-a: connection (timed out|closed) before job request/);
+    assert.match(r.err, /skipped fake-b: connection (timed out|closed) before job request/);
+    assert.match(r.err, /ran on fake-c/);
+    const events = await f.events();
+    assert.deepEqual(events.filter(e => e.event === 'probed').map(e => e.host).sort(), ['fake-a', 'fake-b', 'fake-c']);
+    assert.deepEqual(events.filter(e => e.event === 'connected').map(e => e.host), ['fake-c']);
+    assert.deepEqual(events.filter(e => e.event === 'requested').map(e => e.host), ['fake-c']);
+    assert.deepEqual((await f.intents()).map(i => [i.host, i.outcome]).sort(), [['fake-a', 'refused'], ['fake-b', 'refused'], ['fake-c', 'finished']]);
   } finally { child.kill('SIGKILL'); await f.remove(); }
 });
 

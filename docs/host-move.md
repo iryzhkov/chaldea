@@ -15,8 +15,12 @@ dependencies, including esbuild, are locked with integrity hashes.
 
 The hosted `host artifact` workflow tests Python host programs, builds twice and
 compares bytes, smoke-tests both bundled entry points and uploads the candidate.
-On a `host-v*` tag it requires the real exec E2E workflow as well, then attaches
-those exact bytes to a versioned GitHub release. Main builds remain CI candidates.
+On a `host-v*` tag it first fetches full history and requires the tagged commit
+(including an annotated tag's commit) to be reachable from `origin/main`. A tag
+outside main fails visibly before the build, exec tests or publication. It then
+requires the real exec E2E workflow and attaches those exact bytes to a versioned
+GitHub release. Tag from main after merge; main builds remain CI candidates.
+Fleet-config pins only releases that passed this main ancestry gate.
 It does not replace an existing release's assets. Fleet inventory pins the release
 and archive SHA-256; downloads come from the public release, never the private
 configuration repository or an executable fetched by the trust updater.
