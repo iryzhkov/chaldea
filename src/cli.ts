@@ -12,6 +12,7 @@ import { ProtocolIncompatibleError, discoverServerUrl, setAutoResumeLimitedThrea
 
 const USAGE = `Usage:
   chaldea quota observe [options]
+  chaldea access --help
   chaldea t3 set-auto-resume on|off [options]\n  chaldea wait|decision|waits|mcp --help
 
 quota observe: records T3 usage-limit stops and native auto-resumes in the fleet feed.
@@ -124,6 +125,10 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     if (group && ["waits","wait","decision","mcp"].includes(group)) {
       const { waitsCli } = await import("./waits/cli.ts");
       return await waitsCli(argv);
+    }
+    if (group === "access") {
+      const { accessCli } = await import("./access/cli.ts");
+      return await accessCli(argv.slice(1));
     }
     if (group === "quota" && command === "observe") return await observe(rest);
     if (group === "t3" && command === "set-auto-resume") return await setAutoResume(rest);

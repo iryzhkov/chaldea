@@ -28,7 +28,7 @@ function fake(){
 test("outbox retries identical bytes after ambiguity, receipt gates delivery; restart never duplicates commit",async()=>{
   const dir=scratchDir("wake-outbox");const path=join(dir.path,"db.sqlite");
   const t3=fake();let store=new WakeStore(path,"test-env");
-  let engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385"});
+  let engine=new WaitEngine(store,t3.port,{});
   try{
     engine.start();
     const row=await engine.register("wait",{threadId:"parent",requestId:Date.now()+":wait",condition:{kind:"time",at:iso(Date.now()-1)}});
@@ -36,13 +36,13 @@ test("outbox retries identical bytes after ambiguity, receipt gates delivery; re
     assert.equal(t3.committed.size,1);assert.equal(t3.payloads.length,2);
     assert.equal(t3.payloads[0],t3.payloads[1]);assert.equal(store.get(row.id).state,"resolved");
     await engine.stop();store.close();
-    store=new WakeStore(path,"test-env");engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385"});engine.start();
+    store=new WakeStore(path,"test-env");engine=new WaitEngine(store,t3.port,{});engine.start();
     await sleep(100);assert.equal(t3.payloads.length,2);
   }finally{await engine.stop();store.close();dir.remove();}
 });
-test("deleted parent parks a resolved wake; missing relay cannot delay the default",async()=>{
+test("deleted parent parks a resolved wake after a decision deadline",async()=>{
   const dir=scratchDir("wake-orphan");const t3=fake();const store=new WakeStore(join(dir.path,"db"),"test-env");
-  const engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385"});
+  const engine=new WaitEngine(store,t3.port,{});
   try{
     engine.start();
     const row=await engine.register("decision",{threadId:"parent",requestId:Date.now()+":decision",
@@ -50,11 +50,7 @@ test("deleted parent parks a resolved wake; missing relay cannot delay the defau
     await until(()=>store.get(row.id).outcome!==null);
     await until(()=>store.deliveries().find(d=>d.channel==="wake")?.state==="sent");
     assert.equal(JSON.parse(store.get(row.id).outcome!).defaulted,true);
-    const phone=store.deliveries().find(d=>d.item===row.id && d.channel==="phone")!;
-    assert.equal(phone.state,"undeliverable");assert.equal(phone.disposition,"relay_unprovisioned");assert.equal(phone.attempts,0);
-    for(let i=0;i<10;i++)engine.poke();
-    await sleep(350);
-    assert.deepEqual(store.deliveries().find(d=>d.id===phone.id),phone);
+    assert.equal(store.deliveries().length,1);
     const reg=store.prepare("wait",{threadId:"parent",requestId:Date.now()+":orphan",condition:{kind:"time",at:iso(Date.now()-1)}});
     const orphan=store.register(reg,"project",null);store.resolve(orphan.id,{reason:"time"});t3.remove();engine.poke();
     await until(()=>store.get(orphan.id).state==="orphaned");
@@ -65,7 +61,7 @@ test("deleted parent parks a resolved wake; missing relay cannot delay the defau
 test("fatal storage errors log once, refuse registrations and exit non-zero for systemd recovery",{timeout:10_000},async()=>{
   const dir=scratchDir("wake-storage-fatal");
   try{
-    for(const mode of ["maintenance","receipt","logger"]){
+    for(const mode of ["maintenance","receipt","logger","tracking"]){
       const path=join(dir.path,mode+".sqlite");
       const result=await new Promise<{code:number|null;signal:string|null;out:string;err:string}>((resolveChild,reject)=>{
         const child=spawn(process.execPath,[resolve("test/helpers/waits-storage-failure.ts"),path,mode],{stdio:["ignore","pipe","pipe"],timeout:5000});
@@ -88,21 +84,6 @@ test("fatal storage errors log once, refuse registrations and exit non-zero for 
       }}finally{recovered.close();}
     }
   }finally{dir.remove();}
-});
-test("legacy question phone payload falls back to the generic dependent action",async()=>{
-  const dir=scratchDir("wake-legacy-phone");const store=new WakeStore(join(dir.path,"db"),"test-env");
-  const prepare=store.prepare.bind(store);
-  // Emulate an older registration without dependentAction at the phone boundary.
-  store.prepare=(...args)=>{const reg=prepare(...args);Reflect.deleteProperty(reg.input,"dependentAction");return reg;};
-  const engine=new WaitEngine(store,fake().port,{answerBaseUrl:"http://127.0.0.1:7385",notify:async()=>{}});
-  try{
-    const row=await engine.register("decision",{threadId:"parent",requestId:Date.now()+":legacy",
-      question:"Deploy?",options:["Approve","Hold"],dependentAction:"deploy",defaultAction:"defer",deadline:iso(Date.now()+10_000)});
-    const phone=store.deliveries().find(d=>d.item===row.id && d.channel==="phone")!;
-    const payload=JSON.parse(phone.payload);
-    assert.ok(payload.content.includes("No answer: defer the dependent action"));
-    assert.ok(!payload.content.includes("undefined"));
-  }finally{await engine.stop();store.close();dir.remove();}
 });
 test("calendar timer fires an overdue absolute deadline and rearming cancels the old one",async()=>{
   const timer=new Deadlines();let fires=0;let failure=false;
@@ -148,54 +129,6 @@ test("a killed calendar helper recovers its absolute deadline with one fire",asy
   }finally{timer.clear();}
 });
 
-test("stalled relay requests never occupy wake delivery capacity",async()=>{
-  const dir=scratchDir("wake-relay-slots");const t3=fake();const store=new WakeStore(join(dir.path,"db"),"test-env");
-  let release!:()=>void;const stalled=new Promise<void>(r=>release=r);
-  const engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385",notify:()=>stalled});
-  try{
-    engine.start();
-    for(let i=0;i<8;i++)await engine.register("decision",{threadId:"parent",requestId:Date.now()+":q"+i,
-      question:"Defer?",options:["Defer","Continue"],dependentAction:"run the dependent step",defaultAction:"defer",deadline:iso(Date.now()+5000)});
-    const row=await engine.register("wait",{threadId:"parent",requestId:Date.now()+":independent",condition:{kind:"time",at:iso(Date.now()+50)}});
-    await until(()=>store.deliveries().some(d=>d.item===row.id&&d.state==="sent"));
-    assert.ok(store.deliveries().filter(d=>d.channel==="phone"&&d.state==="sending").length===2);
-    assert.equal(store.get(row.id).state,"resolved");
-  }finally{release();await engine.stop();store.close();dir.remove();}
-});
-
-test("configured relay retries use persisted bounded backoff",async()=>{
-  const dir=scratchDir("wake-relay-backoff");const t3=fake();const store=new WakeStore(join(dir.path,"db"),"test-env");
-  const attempts:number[]=[];
-  const engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385",notify:async()=>{attempts.push(Date.now());throw new Error("Fake offline relay");}});
-  try{
-    engine.start();
-    const row=await engine.register("decision",{threadId:"parent",requestId:Date.now()+":retry",
-      question:"Deploy?",options:["Approve deploy","Hold"],dependentAction:"deploy",defaultAction:"defer",deadline:iso(Date.now()+10_000)});
-    await until(()=>attempts.length>=3);
-    const phone=store.deliveries().find(d=>d.item===row.id && d.channel==="phone")!;
-    assert.equal(phone.state,"pending");assert.equal(phone.attempts,3);
-    assert.ok(attempts[1]!-attempts[0]!>=200);assert.ok(attempts[2]!-attempts[1]!>=450);
-    assert.ok(phone.next_at>Date.now());assert.ok(phone.next_at<=Date.now()+30_000);
-  }finally{await engine.stop();store.close();dir.remove();}
-});
-test("archived parent after ambiguous send is uncertain, retained and never resent after restart",async()=>{
-  const dir=scratchDir("wake-archived-ambiguous");const path=join(dir.path,"db");const t3=fake();
-  const dispatch=t3.port.dispatch;
-  t3.port.dispatch=async p=>{try{await dispatch(p);}finally{t3.archive();}};
-  let store=new WakeStore(path,"test-env");let engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385"});
-  try{
-    engine.start();
-    const row=await engine.register("wait",{threadId:"parent",requestId:Date.now()+":ambiguous",condition:{kind:"time",at:iso(Date.now()-1)}});
-    await until(()=>store.get(row.id).state==="orphaned");
-    const wake=store.deliveries().find(d=>d.item===row.id)!;
-    assert.equal(wake.state,"uncertain");assert.equal(wake.disposition,"parent_inactive");
-    assert.equal(t3.payloads.length,1);assert.equal(t3.committed.size,1);
-    store.maintain(Date.now()+43*86_400_000);assert.equal(store.get(row.id).state,"orphaned");
-    await engine.stop();store.close();
-    store=new WakeStore(path,"test-env");engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385"});engine.start();
-    await sleep(400);assert.equal(store.deliveries()[0]!.state,"uncertain");assert.equal(t3.payloads.length,1);
-  }finally{await engine.stop();store.close();dir.remove();}
-});
 test("external SQLite reader backs off once and recovers an overdue deadline, including startup",async()=>{
   const dir=scratchDir("wake-checkpoint");const path=join(dir.path,"db");const t3=fake();
   let store=new WakeStore(path,"test-env");let reader:DatabaseSync|undefined;
@@ -207,7 +140,7 @@ test("external SQLite reader backs off once and recovers an overdue deadline, in
     // Pin a previous WAL generation exactly as an external reader does.
     store.db.prepare("UPDATE meta SET value='1' WHERE key='replay_fence'").run();
     store.close();store=new WakeStore(path,"test-env");
-    engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385",report:e=>events.push(e)});engine.start();
+    engine=new WaitEngine(store,t3.port,{report:e=>events.push(e)});engine.start();
     for(let i=0;i<10;i++)engine.poke();
     await sleep(850);
     assert.equal(events.filter(e=>e==="checkpoint_blocked").length,1);
@@ -227,7 +160,7 @@ test("reader blocking receipt persistence never re-dispatches while waiting for 
     reader=new DatabaseSync(path,{readOnly:true});reader.exec("BEGIN");reader.prepare("SELECT * FROM items").all();
     store.db.prepare("UPDATE meta SET value='1' WHERE key='replay_fence'").run();
   };
-  const engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385",report:e=>events.push(e)});
+  const engine=new WaitEngine(store,t3.port,{report:e=>events.push(e)});
   try{
     engine.start();
     const row=await engine.register("wait",{threadId:"parent",requestId:Date.now()+":receipt",condition:{kind:"time",at:iso(Date.now()-1)}});
@@ -238,27 +171,4 @@ test("reader blocking receipt persistence never re-dispatches while waiting for 
     await until(()=>store.deliveries()[0]!.state==="sent");
     assert.equal(t3.payloads.length,1);assert.equal(store.get(row.id).state,"resolved");
   }finally{reader?.close();await engine.stop();store.close();dir.remove();}
-});
-
-test("checkpoint backoff during synchronous phone claims logs once for the blocked episode",async()=>{
-  const dir=scratchDir("wake-phone-checkpoint");const path=join(dir.path,"db");
-  const store=new WakeStore(path,"test-env");const t3=fake();let reader:DatabaseSync|undefined;
-  const events:string[]=[];let calls=0;let release!:()=>void;
-  const stalled=new Promise<void>(r=>release=r);
-  const engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385",report:e=>events.push(e),notify:async()=>{
-    if(calls++===0){
-      reader=new DatabaseSync(path,{readOnly:true});reader.exec("BEGIN");reader.prepare("SELECT * FROM items").all();
-      store.db.prepare("UPDATE meta SET value='1' WHERE key='replay_fence'").run();await stalled;
-    }
-  }});
-  try{
-    const now=Date.now();
-    for(let i=0;i<2;i++)store.register(store.prepare("decision",{threadId:"parent",requestId:now+":phone"+i,
-      question:"Deploy?",options:["Approve","Hold"],dependentAction:"deploy",defaultAction:"defer",deadline:iso(now+10_000)}),"project",null,"{}");
-    engine.start();await until(()=>events.includes("checkpoint_blocked"));await sleep(850);
-    assert.equal(events.filter(e=>e==="checkpoint_blocked").length,1);assert.equal(calls,1);
-    reader!.exec("ROLLBACK");reader!.close();reader=undefined;release();
-    await until(()=>store.deliveries().filter(d=>d.state==="sent").length===2);
-    assert.equal(calls,2);assert.equal(events.filter(e=>e==="checkpoint_blocked").length,1);
-  }finally{reader?.close();release();await engine.stop();store.close();dir.remove();}
 });
