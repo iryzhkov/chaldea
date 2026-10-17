@@ -25,6 +25,24 @@ export function scopeSql(scope: Scope, prefix = ""): Query {
 export class EventStore {
   readonly db: DatabaseSync; readonly path: string; readonly budget: Budget;
   alarm: string | null = null;
+  private readonly receiptWaiters = new Map<string, Set<() => void>>();
+  waitReceipt(id: string, milliseconds: number): Promise<void> {
+    // Synchronous read + registration cannot race this process's commit path.
+    if (this.receipt(id)?.state !== "pending" || milliseconds <= 0) return Promise.resolve();
+    return new Promise(resolve => {
+      const waiters = this.receiptWaiters.get(id) ?? new Set<() => void>();
+      const done = () => {
+        clearTimeout(timer); waiters.delete(done);
+        if (!waiters.size) this.receiptWaiters.delete(id);
+        resolve();
+      };
+      const timer = setTimeout(done, milliseconds);
+      waiters.add(done); this.receiptWaiters.set(id, waiters);
+    });
+  }
+  private receiptCommitted(id: string): void {
+    for (const done of this.receiptWaiters.get(id) ?? []) done();
+  }
   constructor(path: string, options: { initialize?: boolean; budget?: Partial<Budget> } = {}) {
     ensure(isAbsolute(path), "absolute_database_path_required");
     this.path = path; this.budget = { ...DEFAULT_BUDGET, ...options.budget };
@@ -188,6 +206,7 @@ export class EventStore {
       this.db.prepare("DELETE FROM outbox WHERE event_id=?").run(e.event_id);
       this.completeSequence(streamSeq);
     });
+    this.receiptCommitted(e.event_id);
   }
   cursor(name: string): number { return Number((this.db.prepare("SELECT value FROM cursors WHERE name=?").get(name) as { value: string } | undefined)?.value ?? 0); }
   setCursor(name: string, value: number): void { this.db.prepare("INSERT INTO cursors VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value").run(name, String(value)); }
@@ -225,6 +244,8 @@ export class EventStore {
       }
       this.put("quarantine_alarm", "true"); this.alarm = "quarantined_message";
     });
+    if (raw && typeof raw === "object" && "event_id" in raw && typeof raw.event_id === "string" &&
+        this.receipt(raw.event_id)?.state !== "pending") this.receiptCommitted(raw.event_id);
   }
   feed(id: number, scope: Scope): FeedRow | undefined {
     const q = scopeSql(scope, "e.");

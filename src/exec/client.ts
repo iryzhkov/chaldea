@@ -4,7 +4,7 @@ import { join, dirname } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { connect, queueHost, type Transport } from './queue.ts';
+import { connect, queueHost, probeHost, probeHosts, ProbeUnavailable, type Transport } from './queue.ts';
 import { manifest } from './manifest.ts';
 import { cleanArtifacts, BOOT_ID } from './artifacts.ts';
 import { record, prune, DAYS, type Intent } from './journal.ts';
@@ -100,12 +100,18 @@ export async function run(args: string[]): Promise<number> {
   const hosts = automatic ? await configuredHosts() : [options.host!];
   const failures: string[] = [];
   const busy: string[] = [];
+  const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
+  const probes = automatic ? await probeHosts(hosts.filter(host => !isLocalHost(host)), async host => {
+    await staleControl(config, 'chaldea-job-' + host);
+    try { await probeHost(config, host); }
+    catch (error) { if (error instanceof ProbeUnavailable) throw new RetryableFailure(error.message); throw error; }
+  }) : [];
   for (const host of hosts) {
     let reason: string;
     if (automatic && isLocalHost(host)) reason = 'local host';
     else {
       try {
-        const code = await runOnHost({ ...options, host }, automatic || !options.noQueue);
+        const code = await runOnHost({ ...options, host }, automatic || !options.noQueue, undefined, probes.find(p => p.host === host)?.error);
         if (automatic) process.stderr.write('chaldea ran on ' + host + '\n');
         return code;
       } catch (e) {
@@ -155,7 +161,7 @@ async function withStateLock<T>(state: string, action: () => Promise<T>): Promis
   } finally { await lock.close(); }
 }
 
-async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean, queued?: Transport): Promise<number> {
+async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean, queued?: Transport, probeFailure?: Error): Promise<number> {
   const snapshot = await manifest();
   const artifactRoot = join(snapshot.root, '.chaldea/artifacts');
   const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
@@ -163,7 +169,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   const controls = join(state, 'ssh');
   await fs.mkdir(controls, { recursive: true, mode: 0o700 });
   const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
-  try { await staleControl(config, 'chaldea-job-' + options.host); }
+  try { if (probeFailure) throw probeFailure; await staleControl(config, 'chaldea-job-' + options.host); }
   catch (e) {
     if (!automatic || !(e instanceof RetryableFailure)) throw e;
     const refused: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,

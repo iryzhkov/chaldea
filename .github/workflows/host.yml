@@ -10,7 +10,22 @@ permissions:
   contents: read
 
 jobs:
+  provenance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require host release commit on main
+        if: startsWith(github.ref, 'refs/tags/host-v')
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          sh scripts/check-host-release "$COMMIT"
   host:
+    needs: provenance
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -58,6 +73,7 @@ jobs:
             ${{ runner.temp }}/ch/tmp/release/manifest.json
           retention-days: 14
   exec:
+    needs: provenance
     if: startsWith(github.ref, 'refs/tags/host-v')
     uses: ./.github/workflows/exec.yml
   release:

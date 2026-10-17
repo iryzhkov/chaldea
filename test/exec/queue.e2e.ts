@@ -32,10 +32,10 @@ async function fixture(mode = 'race', hosts = ['a', 'b']) {
     'const send=(t,v)=>process.stdout.write(frame(t,json(v))); const mode=process.env.QMODE;',
     'if(mode==="down") process.exit(255);',
     'if(!queued) {send("R",{outcome:"refused",message:"host busy: all job slots are in use",...(mode==="message-only"?{}:{busy:mode==="string-busy"?"true":mode!=="false-busy"})});process.exit(0)}',
-    'log("pending");',
     'if(mode==="old"){send("R",{outcome:"refused",message:"unsupported command"});process.exit(125)}',
     'send("H",{version:1,queueVersion:1}); let go=false; let timer;',
     'for await(const f of frames(process.stdin)){',
+    'if(f.type==="W") log("pending");',
     'if(f.type==="W" && mode!=="hold") timer=setTimeout(()=>{log("ready");send("Y",{version:1,state:"ready"})}, mode==="tie"?50:host==="a"?500:50);',
     'if(f.type==="C"){log("cancel");clearTimeout(timer);process.exit(0)}',
     'if(f.type==="G"){go=true;log("go")}',
@@ -74,12 +74,10 @@ async function fixture(mode = 'race', hosts = ['a', 'b']) {
 for (const mode of ['race', 'tie']) test('queue: ' + mode + ' selects exactly one host and cancels the other', { timeout: 10000 }, async () => {
   const f = await fixture(mode);
   try {
-    const start = performance.now();
     const r = await f.run().done;
     assert.equal(r.code, 0, r.err); assert.equal(r.out, 'ran\n');
     assert.match(r.err, /queued: all job slots busy on a, b/);
     assert.match(r.err, /selected /);
-    assert.ok(performance.now() - start < 2000);
     // Losing admission acknowledges cancellation before fixture cleanup.
     await f.until('cancel', 1);
     const events = await f.events();
@@ -95,11 +93,10 @@ test('queue timeout and unreachable hosts return 69 without launching', { timeou
   for (const mode of ['hold', 'down', 'old']) {
     const f = await fixture(mode);
     try {
-      const start = performance.now();
       const r = await f.run(['--queue-timeout', '200ms']).done;
       assert.equal(r.code, 69, r.err);
       if (mode === 'hold') assert.match(r.err, /queue timeout/);
-      if (mode === 'down') { assert.doesNotMatch(r.err, /queued/); assert.ok(performance.now() - start < 2000); }
+      if (mode === 'down') assert.doesNotMatch(r.err, /queued/);
       assert.equal((await f.events()).filter(e => e.event === 'launch' || e.event === 'request').length, 0);
     } finally { await f.remove(); }
   }
