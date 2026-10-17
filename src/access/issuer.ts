@@ -30,8 +30,9 @@ export function loadHostSigningKey(path: string): KeyObject {
     return key;
   } finally { closeSync(fd); }
 }
-/** Trusted host-side primitive. Only RunLeases (admission + current authorization)
- * should call mint; never expose it as a sandbox RPC or general CLI mint command. */
+/** Trusted host-side primitive. RunLeases admits scheduled runs; the token helper
+ * admits fixed service producers by sudo UID and operator-owned grants.
+ * Never expose raw mint requests to a sandbox or a general CLI. */
 export class HostIssuer {
   private readonly privateKey: KeyObject;
   readonly publicX: string;

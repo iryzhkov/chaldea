@@ -120,6 +120,11 @@ export const description = {
       "access": "write"
     },
     {
+      "name": "access token-helper",
+      "summary": "Mint a scoped service token for a sudo-authenticated producer",
+      "access": "write"
+    },
+    {
       "name": "access verify",
       "summary": "Verify a token and update trust high-water state",
       "access": "write"
