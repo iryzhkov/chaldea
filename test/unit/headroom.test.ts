@@ -243,6 +243,27 @@ test("every rejected binding has a stable status reason without a read or repeat
   } finally { await unconfigured.close(); }
 });
 
+test("catalog rejection recovery preserves normal cadence and rate-limit backoff", async () => {
+  const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
+  for (const rateLimited of [false, true]) {
+    let now = START, reads = 0;
+    const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => now, random: () => 0.5,
+      save() {}, read: async () => { reads++; if (rateLimited) throw new BalanceReadError("rate_limited"); return response; } });
+    try {
+      m.update([provider()]); await m.tick(); assert.equal(reads, 1);
+      now += 1_000;
+      for (const rejected of [{ ...provider(), availability: "unavailable" }, { ...provider(), enabled: false }]) {
+        m.update([rejected]); await m.tick();
+        m.update([provider()]); await m.tick();
+        assert.equal(reads, 1, "availability and enablement flaps must preserve the deadline");
+      }
+      now = START + COLLECT_EVERY_MS * (rateLimited ? 2 : 1) - 1;
+      await m.tick(); assert.equal(reads, 1);
+      now++; await m.tick(); assert.equal(reads, 2);
+    } finally { await m.close(); }
+  }
+});
+
 test("read diagnostics are bounded, redact failures, and cannot overwrite a new rejection", async () => {
   const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
   let now = START, reject!: (error: Error) => void;

@@ -405,7 +405,8 @@ overrides. Instances requiring custom auth environment need a future context ada
 Equal HOME/CODEX_HOME/executable tuples share one collector across aliases; paths and
 context keys are internal and never appear in status/feed output. Reconfiguration
 invalidates the wallet before a new context can report it. Without a quota config,
-T3 windows/reset counts still work and Codex money remains unknown.
+T3 windows/reset counts still work. Codex money has an unknown value, with metric
+state `error` and reason `context_not_configured` to explain the missing binding.
 
 Rejected Codex bindings now log one `Codex balance collector` line per provider
 and reason transition, and persist the same reason in the balance metric's

@@ -305,7 +305,6 @@ export class HeadroomMonitor {
         row.credits = clean.credits; row.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         row.spendControlReached = clean.spendControlReached; row.plan = clean.plan;
         if (row.manualResets.source === "codex-app-server") row.manualResets = clean.manualResets;
-        this.#due.delete(contextKey(ctx!));
       }
     }
     this.#changed ||= before !== JSON.stringify(this.state.providers);
