@@ -1,9 +1,9 @@
 import * as fs from 'node:fs/promises';
 import { flock } from '../fs/flock.ts';
-import { homedir } from 'node:os';
+import { execConfig } from '../config/exec.ts';
 import { join } from 'node:path';
 
-export const stateDir = () => process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
+export const stateDir = () => execConfig().stateDir;
 export async function privateDirectory(path: string) {
   await fs.mkdir(path, { recursive: true, mode: 0o700 });
   const st = await fs.lstat(path);

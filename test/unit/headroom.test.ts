@@ -98,6 +98,8 @@ test("host reports exclude failed/uninstalled/stale rows and combine real transi
 
 test("quota config defaults to the observer user's .config/chaldea/quota.json", () => {
   const f = scratchDir("quota-config");
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  delete process.env.XDG_CONFIG_HOME;
   try {
     assert.deepEqual(loadHeadroomConfig(f.path), headroomConfig());
     const dir = join(f.path, ".config", "chaldea"), path = join(dir, "quota.json");
@@ -109,7 +111,10 @@ test("quota config defaults to the observer user's .config/chaldea/quota.json", 
     assert.throws(() => loadHeadroomConfig(f.path));
     const explicit = join(f.path, "explicit.json"); writeFileSync(explicit, "{}");
     assert.deepEqual(loadHeadroomConfig(f.path, explicit), headroomConfig());
-  } finally { f.remove(); }
+  } finally {
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previousXdg;
+    f.remove();
+  }
 });
 
 test("T3 projection preserves full windows/reset count and drops identity and redemption fields", () => {

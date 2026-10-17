@@ -5,6 +5,8 @@ configuration, credentials or service code. Each command has a one-line summary
 and `read`/`write` access; local pruning and trust high-water updates count as
 writes. `chaldea --help` lists every command; group help supplies full syntax.
 
+Daemon/client config, XDG paths, compatibility, JSON logs and process exit codes are documented in [configuration conventions](docs/configuration.md).
+
 Restart T3 safely with `chaldea t3 restart`; see [restart continuation](docs/restart-resume.md) for recovery behavior and configuration.
 
 Fleet compute v0: `node bin/chaldea exec [--host H] -- CMD...`. Without `--host`, try the ordered hosts in `~/.config/chaldea/exec-hosts` (one fleet inventory name per line; fleet config omits this machine). See [setup, protocol, bounds and tests](docs/exec-v0.md).

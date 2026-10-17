@@ -1,6 +1,7 @@
 import { createPrivateKey, createPublicKey, randomBytes } from "node:crypto";
 import type { KeyObject } from "node:crypto";
-import { openSync, fstatSync, readFileSync, closeSync, constants, lstatSync } from "node:fs";
+import { lstatSync } from "node:fs";
+import { readTrustedFile } from "../config/files.ts";
 import { dirname, isAbsolute } from "node:path";
 import { SignJWT } from "jose";
 import {
@@ -20,15 +21,12 @@ export function loadHostSigningKey(path: string): KeyObject {
   const dir = lstatSync(dirname(path));
   requireAccess(dir.isDirectory() && !dir.isSymbolicLink() && dir.uid === process.geteuid!() &&
     (dir.mode & 0o077) === 0, "unsafe_key_directory");
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  try {
-    const stat = fstatSync(fd);
-    requireAccess(stat.isFile() && stat.uid === process.geteuid!() && (stat.mode & 0o077) === 0 &&
-      stat.size <= 8192 && stat.nlink === 1, "unsafe_key_file");
-    const key = createPrivateKey(readFileSync(fd));
-    requireAccess(key.asymmetricKeyType === "ed25519", "invalid_signer");
-    return key;
-  } finally { closeSync(fd); }
+  let bytes: Buffer;
+  try { bytes = readTrustedFile(path, { secret: true, maxBytes: 8192 }); }
+  catch { throw new Error("unsafe_key_file"); }
+  const key = createPrivateKey(bytes);
+  requireAccess(key.asymmetricKeyType === "ed25519", "invalid_signer");
+  return key;
 }
 /** Trusted host-side primitive. RunLeases admits scheduled runs; the token helper
  * admits fixed service producers by sudo UID and operator-owned grants.

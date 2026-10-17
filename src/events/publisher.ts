@@ -1,4 +1,5 @@
 // Source-bound service publication. No static feed credential is consulted.
+import { eventsConfig } from "../config/events.ts";
 import { spawn } from "node:child_process";
 export interface Publication { key: string; source: string; host: string; payload: Record<string, unknown> }
 export interface PublisherOptions {
@@ -35,11 +36,12 @@ export async function helperToken(helper: string, event: Publication): Promise<s
 export async function publish(event: Publication, options: PublisherOptions = {}): Promise<boolean> {
   try {
     if (!/^[\x20-\x7e]{1,256}$/.test(event.key)) return false;
-    const url = new URL(options.url ?? process.env.AKASHA_URL ?? "");
+    const config = eventsConfig();
+    const url = new URL(options.url ?? config.url ?? "");
     if (url.protocol !== "https:" || url.username || url.password) return false;
     url.pathname = "/api/v1/events"; url.search = ""; url.hash = "";
     const token = await (options.token ? options.token(event) :
-      helperToken(options.helper ?? process.env.AKASHA_TOKEN_HELPER ?? "", event));
+      helperToken(options.helper ?? config.tokenHelper ?? "", event));
     const bytes = JSON.stringify(event.payload);
     if (Buffer.byteLength(bytes) > 64 * 1024) return false;
     const response = await (options.fetch ?? fetch)(url, { method: "POST", redirect: "error",

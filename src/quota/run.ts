@@ -7,9 +7,11 @@
 // off and reconnect; there is no periodic scan. A refused protocol (HTTP 426) or data
 // the pinned contracts reject stops the observer with exit status 78, which
 // the systemd unit does not restart.
-import { existsSync, statSync, readFileSync } from "node:fs";
 import { backoff, sleep } from "../retry.ts";
 import { Outbox } from "../store/outbox.ts";
+import { ConfigurationError, privateFile } from "../config/files.ts";
+import { EXIT } from "../config/exit.ts";
+export { ConfigurationError } from "../config/files.ts";
 
 import { FeedPoster, MAX_QUEUED_RECORDS, quotaKey } from "../feed/poster.ts";
 import type { Logger } from "../log.ts";
@@ -35,7 +37,7 @@ import { ProviderSwitcher } from "./switcher.ts";
 import { loadState, saveState, MAX_PENDING_BYTES, type ObserverState } from "./state.ts";
 
 /** Exit status for a configuration or protocol problem a restart cannot fix (EX_CONFIG). */
-export const EXIT_CONFIG = 78;
+export const EXIT_CONFIG = EXIT.config;
 
 const CURSOR_SAVE_INTERVAL_MS = 5_000;
 const BACKOFF_MS: ReadonlyArray<number> = [1_000, 2_000, 5_000, 10_000, 30_000, 60_000];
@@ -56,20 +58,8 @@ export interface ObserverOptions {
   readonly signal: AbortSignal;
 }
 
-export class ConfigurationError extends Error {}
-
-/** Reads a bearer from a private file; refuses files other users can read. */
-export function readToken(path: string): string {
-  if (!existsSync(path)) throw new ConfigurationError(`token file ${path} does not exist`);
-  const stat = statSync(path);
-  if ((stat.mode & 0o077) !== 0) throw new ConfigurationError(`token file ${path} must not be readable by group or others (chmod 600)`);
-  if (typeof process.getuid === "function" && stat.uid !== process.getuid()) {
-    throw new ConfigurationError(`token file ${path} must be owned by the observer's user`);
-  }
-  const token = readFileSync(path, "utf8").trim();
-  if (token === "") throw new ConfigurationError(`token file ${path} is empty`);
-  return token;
-}
+/** Compatibility name for callers; one descriptor-checked reader owns the policy. */
+export const readToken = privateFile;
 
 /** Advisory config failures cannot stop or reconnect the authoritative shell stream. */
 async function followUsage(options: ConnectOptions & { signal: AbortSignal }, monitor: HeadroomMonitor, logger: Logger): Promise<void> {

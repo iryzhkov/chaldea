@@ -1,7 +1,7 @@
 // Read-only Codex app-server client. Never starts a model thread or accepts arbitrary RPCs.
 import { spawn } from "node:child_process";
-import { isAbsolute, join, resolve } from "node:path";
-import { readFileSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
+import { quotaConfig } from "../config/quota.ts";
 
 export interface CodexContext {
   readonly providers: ReadonlyArray<string>;
@@ -54,13 +54,8 @@ export function headroomConfig(raw: unknown = {}): HeadroomConfig {
 }
 /** Missing default config leaves balance unknown; explicit paths and malformed files fail closed. */
 export function loadHeadroomConfig(home: string, path?: string): HeadroomConfig {
-  let raw: unknown;
-  try { raw = JSON.parse(readFileSync(path ?? join(home, ".config", "chaldea", "quota.json"), "utf8")); }
-  catch (error) {
-    if (path === undefined && (error as NodeJS.ErrnoException).code === "ENOENT") return headroomConfig();
-    throw error;
-  }
-  return headroomConfig(raw);
+  const c = quotaConfig(home, path);
+  return headroomConfig({ contexts: c.contexts, lowHeadroomPercent: c.lowHeadroomPercent });
 }
 export const contextKey = (c: CodexContext): string => JSON.stringify([c.home, c.codexHome, c.command]);
 

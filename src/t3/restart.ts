@@ -6,7 +6,9 @@ import { chmodSync, mkdirSync, readFileSync, watch } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { openDb, tx, migrate } from "../store/sqlite.ts";
-import { homedir } from "node:os";
+import { paths, configPath } from "../config/paths.ts";
+import { ConfigurationError, readJson } from "../config/files.ts";
+import { scopedEventsConfigured } from "../config/events.ts";
 import { FeedPoster } from "../feed/poster.ts";
 import type { Logger } from "../log.ts";
 import { readToken } from "../quota/run.ts";
@@ -22,18 +24,18 @@ export interface RestartConfig {
   journalPath: string;
 }
 export function restartConfig(path?: string): RestartConfig {
-  const value = path === undefined ? {} : JSON.parse(readFileSync(path, "utf8"));
+  const value = readJson(path ?? configPath("restart"), path === undefined);
   const config = {
     enabled: value.enabled ?? true,
     command: value.command ?? ["systemctl", "--user", "restart", "t3code.service"],
     timeoutMs: value.timeoutMs ?? 90_000,
-    journalPath: value.journalPath ?? join(homedir(), ".local/state/chaldea/t3-restarts.sqlite"),
+    journalPath: value.journalPath ?? join(paths().state, "t3-restarts.sqlite"),
   };
   if (typeof config.enabled !== "boolean" || !Array.isArray(config.command) ||
       config.command.length === 0 || !config.command.every((s: unknown) => typeof s === "string" && s.length > 0) ||
-      !Number.isSafeInteger(config.timeoutMs) || config.timeoutMs < 1000 || config.timeoutMs > 300_000 ||
-      typeof config.journalPath !== "string") throw new Error("Invalid restart configuration");
-  return config;
+      typeof config.timeoutMs !== "number" || !Number.isSafeInteger(config.timeoutMs) || config.timeoutMs < 1000 || config.timeoutMs > 300_000 ||
+      typeof config.journalPath !== "string") throw new ConfigurationError("Invalid restart configuration");
+  return config as RestartConfig;
 }
 
 export function runtimeEpoch(baseDir: string): string | null {
@@ -213,7 +215,7 @@ export async function recoverPlannedRestarts(options: RestartOptions, journal: R
           journal.phase(options.t3BaseDir, intent, "resumed");
         }
       }
-      if (process.env.AKASHA_URL === undefined && process.env.AKASHA_TOKEN_HELPER === undefined &&
+      if (!scopedEventsConfigured() &&
           !journal.claimLegacyFeed(options.t3BaseDir, intent)) continue;
       poster.enqueue({
         kind: "restart_resumed", severity: "info", threadId: intent.thread,
