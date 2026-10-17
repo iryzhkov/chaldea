@@ -1,5 +1,7 @@
 // Quota state owns durability; this worker only handles asynchronous delivery.
 import { spawn } from "node:child_process";
+import { Outbox } from "../store/outbox.ts";
+import { backoff } from "../retry.ts";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import type { QuotaRecord } from "../quota/observer.ts";
@@ -106,7 +108,7 @@ async function legacyAttempt(options: FeedPosterOptions, record: QuotaRecord): P
 export class FeedPoster {
   readonly #options: FeedPosterOptions;
   readonly #akasha: boolean;
-  readonly #queue = new Map<string, { record: QuotaRecord; ack?: () => boolean | void }>();
+  readonly #queue: Outbox<{ record: QuotaRecord; ack?: () => boolean | void }>;
   #draining: Promise<void> | null = null;
   #timer: NodeJS.Timeout | null = null;
   #closed = false;
@@ -117,28 +119,29 @@ export class FeedPoster {
     this.#akasha = options.mode === "akasha" || (options.mode !== "legacy" &&
       (options.publisher !== undefined || options.deliver !== undefined ||
        process.env.AKASHA_URL !== undefined || process.env.AKASHA_TOKEN_HELPER !== undefined));
+    this.#queue = new Outbox(new Map(), this.#akasha ? "resend" : "dedupe");
   }
   enqueue(record: QuotaRecord, ack?: () => boolean | void): void {
     const key = quotaKey(record);
     if (this.#queue.has(key)) return;
     if (!record.headroom && this.#queue.size >= MAX_QUEUED_RECORDS) {
-      const advisory = [...this.#queue].find(([, item]) => item.record.headroom !== undefined);
-      if (advisory) this.#queue.delete(advisory[0]); // Its owner retains/coalesces the durable advisory intent.
+      const advisory = this.#queue.entries().find(([, item]) => item.record.headroom !== undefined);
+      if (advisory) this.#queue.discard(advisory[0]); // Its owner retains/coalesces the durable advisory intent.
     }
     if (this.#queue.size >= MAX_QUEUED_RECORDS) {
       this.#options.logger.warn("feed worker full; durable intent retained"); return;
     }
-    this.#queue.set(key, { record, ...(ack ? { ack } : {}) });
+    this.#queue.enqueue(key, { record, ...(ack ? { ack } : {}) });
     this.#kick();
   }
   /** Remove a superseded advisory intent after its replacement is durable. */
-  discard(key: string): void { this.#queue.delete(key); }
+  discard(key: string): void { this.#queue.discard(key); }
   #kick(): void {
     if (this.#closed || this.#draining) return;
     this.#draining = this.#drain().finally(() => {
       this.#draining = null;
       if (!this.#closed && this.#queue.size > 0 && !this.#timer) {
-        this.#timer = setTimeout(() => { this.#timer = null; this.#kick(); }, this.#options.retryMs ?? 30_000);
+        this.#timer = setTimeout(() => { this.#timer = null; this.#kick(); }, this.#options.retryMs ?? backoff(0, { base: 30_000, cap: 30_000 }));
         this.#timer.unref();
       }
     });
@@ -149,29 +152,23 @@ export class FeedPoster {
   async #drain(): Promise<void> {
     const attempted = new Set<string>();
     while (!this.#closed) {
-      const pending = [...this.#queue].filter(([key]) => !attempted.has(key));
+      const pending = this.#queue.entries().filter(([key]) => !attempted.has(key));
       const next = pending.find(([, item]) => !item.record.headroom) ?? pending[0];
       if (!next) return;
       const [key, item] = next;
       attempted.add(key);
-      let ok = false;
+      let acknowledging = false;
       try {
-        if (this.#akasha) ok = await (this.#options.deliver ?? ((e) => publish(e, this.#options.publisher)))(quotaPublication(item.record, this.#options.host));
-        else {
-          // Legacy feedd has no receipt contract: claim durably before its
-          // one attempt, preserving the pre-cutover at-most-once policy.
-          if (item.ack?.() === false) continue;
-          this.#queue.delete(key);
-          await legacyAttempt(this.#options, item.record);
-          continue;
-        }
+        const ok = await this.#queue.deliver(key, async value => {
+          if (this.#akasha) return (this.#options.deliver ?? ((e) => publish(e, this.#options.publisher)))(quotaPublication(value.record, this.#options.host));
+          await legacyAttempt(this.#options, value.record); return true;
+        }, value => { acknowledging = true; return value.ack?.(); });
+        if (ok && this.#akasha) this.#options.logger.info("posted feed record", { kind: item.record.kind });
+        else if (!ok && this.#akasha) this.#options.logger.warn("event delivery deferred; durable intent retained", { kind: item.record.kind });
+      } catch (error) {
+        if (this.#akasha && acknowledging) throw error;
+        this.#options.logger.warn("event delivery deferred; durable intent retained", { kind: item.record.kind });
       }
-      catch {}
-      if (ok) {
-        // The acknowledgement atomically removes the state's pending payload.
-        item.ack?.(); this.#queue.delete(key);
-        this.#options.logger.info("posted feed record", { kind: item.record.kind });
-      } else this.#options.logger.warn("event delivery deferred; durable intent retained", { kind: item.record.kind });
     }
   }
 }

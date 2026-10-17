@@ -8,6 +8,8 @@
 // the pinned contracts reject stops the observer with exit status 78, which
 // the systemd unit does not restart.
 import { existsSync, statSync, readFileSync } from "node:fs";
+import { backoff, sleep } from "../retry.ts";
+import { Outbox } from "../store/outbox.ts";
 
 import { FeedPoster, MAX_QUEUED_RECORDS, quotaKey } from "../feed/poster.ts";
 import type { Logger } from "../log.ts";
@@ -69,19 +71,6 @@ export function readToken(path: string): string {
   return token;
 }
 
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    if (signal.aborted) return resolve();
-    const timer = setTimeout(done, ms);
-    function done() {
-      clearTimeout(timer);
-      signal.removeEventListener("abort", done);
-      resolve();
-    }
-    signal.addEventListener("abort", done, { once: true });
-  });
-}
-
 /** Advisory config failures cannot stop or reconnect the authoritative shell stream. */
 async function followUsage(options: ConnectOptions & { signal: AbortSignal }, monitor: HeadroomMonitor, logger: Logger): Promise<void> {
   let attempt = 0;
@@ -90,7 +79,7 @@ async function followUsage(options: ConnectOptions & { signal: AbortSignal }, mo
     catch { /* Decode, auth and transport failures are all contained in this lane. */ }
     finally { monitor.inactive(); }
     if (options.signal.aborted) return;
-    const delay = BACKOFF_MS[Math.min(attempt++, BACKOFF_MS.length - 1)]!;
+    const delay = backoff(attempt++, { base: 1000, cap: 60_000, delays: BACKOFF_MS });
     logger.warn("T3 quota reporting unavailable; shell observation continues", { retryInMs: delay });
     await sleep(delay, options.signal);
   }
@@ -112,6 +101,7 @@ export class EventSink {
   #retryTimer: NodeJS.Timeout | null = null;
   #retryAttempt = 0;
   readonly #pending: Array<QuotaRecord> = [];
+  readonly #outbox: Outbox<QuotaRecord>;
   readonly #discarded = new Set<string>();
 
   readonly state: ObserverState;
@@ -128,11 +118,12 @@ export class EventSink {
     retryDelaysMs: ReadonlyArray<number> = BACKOFF_MS,
   ) {
     this.state = state;
+    this.#outbox = new Outbox(state.pendingDelivery, "resend");
     this.statePath = statePath;
     this.poster = poster;
     this.logger = logger;
     this.retryDelaysMs = retryDelaysMs;
-    this.#pending.push(...state.pendingDelivery.values());
+    this.#pending.push(...this.#outbox.values());
   }
 
   get dirty(): boolean {
@@ -176,7 +167,7 @@ export class EventSink {
     // Their claims are durable now.
     for (const record of this.#pending.splice(0)) {
       this.poster.enqueue(record, () => {
-        this.state.pendingDelivery.delete(quotaKey(record));
+        this.#outbox.discard(quotaKey(record));
         this.save();
         return !this.dirty;
       });
@@ -185,7 +176,8 @@ export class EventSink {
 
   #scheduleRetry(): void {
     if (this.#retryTimer !== null) return;
-    const delay = this.retryDelaysMs[Math.min(this.#retryAttempt, this.retryDelaysMs.length - 1)]!;
+    const delay = backoff(this.#retryAttempt, { base: 1000, cap: 60_000, delays: this.retryDelaysMs,
+      jitter: this.retryDelaysMs === BACKOFF_MS ? 0.5 : 0 });
     this.#retryAttempt += 1;
     this.#retryTimer = setTimeout(() => {
       this.#retryTimer = null;
@@ -203,7 +195,7 @@ export class EventSink {
   }
 
   #discardHeadroom(key: string): void {
-    this.state.pendingDelivery.delete(key);
+    this.#outbox.discard(key);
     const index = this.#pending.findIndex(r => quotaKey(r) === key);
     if (index >= 0) this.#pending.splice(index, 1);
     else this.#discarded.add(key); // Only already-enqueued keys need poster removal (bounded by its queue).
@@ -213,8 +205,8 @@ export class EventSink {
     for (const record of records) {
       this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
       const key = quotaKey(record);
-      if (this.state.pendingDelivery.has(key)) continue;
-      const advisory = [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
+      if (this.#outbox.has(key)) continue;
+      const advisory = this.#outbox.entries().filter(([, r]) => r.headroom !== undefined);
       if (record.headroom) {
         for (const [oldKey, old] of advisory) {
           if (old.kind === record.kind) this.#discardHeadroom(oldKey);
@@ -222,9 +214,9 @@ export class EventSink {
       }
       // Advisory reporting never consumes capacity needed by a transition. Keep at most
       // 3 advisory intents (one host record per kind) and evict them first on either the count or byte bound.
-      const overflow = () => this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
-        Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES;
-      const headroom = () => [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
+      const overflow = () => this.#outbox.size >= MAX_QUEUED_RECORDS ||
+        Buffer.byteLength(JSON.stringify([...this.#outbox.values(), record])) > MAX_PENDING_BYTES;
+      const headroom = () => this.#outbox.entries().filter(([, r]) => r.headroom !== undefined);
       while (overflow() || record.headroom !== undefined && headroom().length >= 3) {
         const oldest = headroom()[0];
         if (!oldest) break;
@@ -235,7 +227,7 @@ export class EventSink {
         this.logger.error("pending record dropped: durable delivery queue capacity exceeded", { kind: record.kind, thread: record.threadId, run: record.runId });
         continue;
       }
-      this.state.pendingDelivery.set(key, record);
+      this.#outbox.enqueue(key, record);
       this.#pending.push(record);
     }
   }
@@ -287,7 +279,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
   let exitCode = 0;
   while (!signal.aborted) {
     let connected = false;
-    let delay = BACKOFF_MS[Math.min(attempt, BACKOFF_MS.length - 1)]!;
+    let delay = backoff(attempt, { base: 1000, cap: 60_000, delays: BACKOFF_MS });
     try {
       const token = readToken(options.tokenFile);
       const serverUrl = options.serverUrl ?? discoverServerUrl(options.t3BaseDir);
@@ -343,7 +335,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
         await Promise.allSettled([usage, shell]);
       }
       logger.warn("T3 ended the shell stream; reconnecting");
-      delay = BACKOFF_MS[0]!;
+      delay = backoff(0, { base: 1000, cap: 60_000, delays: BACKOFF_MS });
     } catch (error) {
       if (error instanceof AbortedError || signal.aborted) break;
       if (error instanceof ProtocolIncompatibleError || error instanceof ConfigurationError) {

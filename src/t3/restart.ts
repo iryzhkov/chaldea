@@ -4,7 +4,8 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, watch } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { openDb, tx, migrate } from "../store/sqlite.ts";
 import { homedir } from "node:os";
 import { FeedPoster } from "../feed/poster.ts";
 import type { Logger } from "../log.ts";
@@ -50,25 +51,25 @@ export class RestartJournal {
   readonly db: DatabaseSync;
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(path);
+    this.db = openDb(path);
+    try {
     chmodSync(path, 0o600);
-    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-      CREATE TABLE IF NOT EXISTS restarts (
+    this.db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;");
+    migrate(this.db, [() => {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS restarts (
         scope TEXT NOT NULL, thread TEXT NOT NULL, run TEXT NOT NULL, epoch TEXT NOT NULL,
         provider TEXT NOT NULL, model TEXT NOT NULL, subagent INTEGER NOT NULL,
         payload TEXT NOT NULL, phase TEXT NOT NULL DEFAULT 'captured', posted INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(scope, thread, run));`);
-    this.transaction(() => {
       const columns = this.db.prepare("PRAGMA table_info(restarts)").all().map(c => c.name);
       for (const [name, type] of [["invocation", "TEXT"], ["recovery_epoch", "TEXT"],
         ["retry_at", "INTEGER NOT NULL DEFAULT 0"], ["captured_at", "INTEGER NOT NULL DEFAULT 0"], ["expires_at", "INTEGER NOT NULL DEFAULT 0"]])
         if (!columns.includes(name!)) this.db.exec(`ALTER TABLE restarts ADD COLUMN ${name} ${type}`);
-    });
+    }]);
+    } catch (error) { this.db.close(); throw error; }
   }
   transaction(write: () => void): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try { write(); this.db.exec("COMMIT"); }
-    catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    tx(this.db, write);
   }
   abortInvocation(invocation: string): void {
     this.db.prepare("UPDATE restarts SET phase = 'aborted', retry_at = 0 WHERE invocation = ? AND phase IN ('captured', 'dispatching')")

@@ -1,7 +1,9 @@
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
+import { openPrivateDb, tx, meta, migrate } from "../store/sqlite.ts";
+import { Outbox, sqliteOutbox } from "../store/outbox.ts";
 import type { SQLInputValue } from "node:sqlite";
-import { constants, openSync, closeSync, lstatSync, mkdirSync, statSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import { statSync } from "node:fs";
+import { isAbsolute } from "node:path";
 import { randomUUID } from "node:crypto";
 import { canonical, ensure, hash, MAX_ENVELOPE, NEW_FEED_ID, validateEnvelope } from "./schema.ts";
 import type { Envelope, FeedRow } from "./schema.ts";
@@ -25,6 +27,7 @@ export function scopeSql(scope: Scope, prefix = ""): Query {
 export class EventStore {
   readonly db: DatabaseSync; readonly path: string; readonly budget: Budget;
   alarm: string | null = null;
+  private readonly outbox: Outbox<Pending>;
   private readonly receiptWaiters = new Map<string, Set<() => void>>();
   waitReceipt(id: string, milliseconds: number): Promise<void> {
     // Synchronous read + registration cannot race this process's commit path.
@@ -48,19 +51,15 @@ export class EventStore {
     this.path = path; this.budget = { ...DEFAULT_BUDGET, ...options.budget };
     ensure(this.budget.quarantine >= 256 && this.budget.main >= 4 * 1024 ** 2 && this.budget.wal >= 4 * MAX_ENVELOPE &&
       Object.entries(this.budget).every(([k, n]) => Number.isSafeInteger(n) && n > 0 && n <= DEFAULT_BUDGET[k as keyof Budget]), "invalid_budget");
-    if (options.initialize) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    const dir = lstatSync(dirname(path));
-    ensure(dir.isDirectory() && !dir.isSymbolicLink() && dir.uid === process.geteuid!() && (dir.mode & 0o077) === 0, "unsafe_database_directory");
-    const fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW |
-      (options.initialize ? constants.O_CREAT | constants.O_EXCL : 0), 0o600); closeSync(fd);
-    const stat = lstatSync(path);
-    ensure(stat.isFile() && stat.nlink === 1 && stat.uid === process.geteuid!() && (stat.mode & 0o077) === 0 &&
-      (options.initialize || stat.size > 0), "unsafe_database");
-    this.db = new DatabaseSync(path);
+    this.db = openPrivateDb(path, {
+      initialize: options.initialize === true, directoryError: "unsafe_database_directory",
+      fileError: "unsafe_database", singleLink: true,
+    }, ensure);
     try {
       this.db.exec("PRAGMA busy_timeout=1000; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
       if (options.initialize) {
         this.db.exec("PRAGMA page_size=4096; PRAGMA auto_vacuum=INCREMENTAL;");
+        migrate(this.db, [() => {
         this.db.exec(`
           CREATE TABLE meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE receipts(event_id TEXT PRIMARY KEY,request_hash TEXT NOT NULL,envelope_hash TEXT NOT NULL,
@@ -97,15 +96,21 @@ export class EventStore {
           CREATE TABLE deliveries(seq INTEGER PRIMARY KEY);
         `);
         this.put("format", "akasha-v1"); this.put("epoch", randomUUID()); this.put("feed_next", String(NEW_FEED_ID)); this.put("floor", "0");
+        }]);
       }
       ensure(this.get("format") === "akasha-v1", "invalid_database_format");
       ensure(this.scalar("PRAGMA page_size") === 4096 && this.scalar("PRAGMA page_count") * 4096 <= this.budget.main, "database_capacity", 503);
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=0;");
       this.db.exec("PRAGMA max_page_count=" + Math.floor(this.budget.main / 4096));
+      migrate(this.db, [() => {}]);
     } catch (e) { this.db.close(); throw e; }
+    this.outbox = new Outbox(sqliteOutbox(this.db, {
+      table: "outbox", key: "event_id", columns: ["event_id", "envelope", "bytes"],
+      encode: (p: Pending) => [p.event_id, p.envelope, p.bytes], decode: r => r as unknown as Pending,
+    }), "resend");
   }
-  get(name: string): string | undefined { return (this.db.prepare("SELECT value FROM meta WHERE name=?").get(name) as { value: string } | undefined)?.value; }
-  put(name: string, value: string): void { this.db.prepare("INSERT INTO meta VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value").run(name, value); }
+  get(name: string): string | undefined { return meta(this.db).get(name); }
+  put(name: string, value: string): void { meta(this.db).put(name, value); }
   scalar(sql: string, ...params: SQLInputValue[]): number { return Number(Object.values(this.db.prepare(sql).get(...params)!)[0] ?? 0); }
   walBytes(): number { try { return statSync(this.path + "-wal").size; } catch { return 0; } }
   checkpoint(): void {
@@ -117,9 +122,7 @@ export class EventStore {
     // Every write, including projection/pruning, reserves WAL space first. No long-lived read transactions.
     if (this.walBytes() + estimate * 4 + 128 * 1024 >= this.budget.wal) this.checkpoint();
     ensure(this.walBytes() + estimate * 4 + 128 * 1024 < this.budget.wal, "wal_capacity", 503);
-    this.db.exec("BEGIN IMMEDIATE");
-    try { const value = fn(); this.db.exec("COMMIT"); return value; }
-    catch (e) { this.db.exec("ROLLBACK"); throw e; }
+    return tx(this.db, fn);
   }
   capacity(bytes: number, outbox = false): void {
     const used = (this.scalar("PRAGMA page_count") - this.scalar("PRAGMA freelist_count")) * 4096;
@@ -151,7 +154,7 @@ export class EventStore {
       this.capacity(bytes, true);
       this.db.prepare("INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(event.event_id, requestHash, hash(event),
         "pending", id, event.issuer, event.profile, event.project, event.source, event.host, now + 180 * DAY);
-      this.db.prepare("INSERT INTO outbox(event_id,envelope,bytes) VALUES(?,?,?)").run(event.event_id, envelope, bytes);
+      this.outbox.enqueue(event.event_id, { event_id: event.event_id, envelope, bytes, attempts: 0 });
       if (id !== null && legacyId === undefined) this.put("feed_next", String(id + 1));
       guard?.(); return this.receipt(event.event_id)!;
     });
@@ -203,7 +206,7 @@ export class EventStore {
         }
         this.db.prepare("UPDATE receipts SET state=? WHERE event_id=?").run(expiry > now ? "visible" : "tombstone", e.event_id);
       }
-      this.db.prepare("DELETE FROM outbox WHERE event_id=?").run(e.event_id);
+      this.outbox.discard(e.event_id);
       this.completeSequence(streamSeq);
     });
     this.receiptCommitted(e.event_id);
