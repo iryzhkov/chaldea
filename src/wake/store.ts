@@ -4,18 +4,19 @@ import { ownDatabase } from "./owner.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { DAY, MAX_AGE, validate, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
+import { MAX_AGE, validate, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
 
 export interface Item {
-  id: string; kind: "wait" | "decision"; parent: string; project: string; request_key: string; request_at: number;
+  id: string; kind: "wait" | "decision" | "native"; parent: string; project: string; request_key: string; request_at: number;
   hash: string; input: string; deadline: number; target_run: string | null; cursor: number;
-  state: "parked" | "resolved" | "cancelled" | "orphaned"; disposition: string | null;
+  state: "parked" | "resolved" | "cancelled" | "orphaned" | "needs_attention"; disposition: string | null;
   outcome: string | null; created: number; terminal: number | null;
 }
 export interface Delivery {
-  id: string; item: string; channel: "wake" | "phone"; payload: string;
-  state: "pending" | "sending" | "sent" | "suppressed" | "blocked" | "uncertain" | "undeliverable"; disposition: string | null; attempts: number; next_at: number; expires: number | null;
+  id: string; item: string; channel: "wake" | "native"; payload: string;
+  state: "pending" | "sending" | "sent" | "suppressed" | "blocked" | "uncertain"; disposition: string | null; attempts: number; next_at: number; expires: number | null;
 }
+export interface NativePolicy { item: string; request_id: string | null; bind_until: number; baseline: string; questions: string|null; turn_item:string|null; created?:number }
 export interface Registration { id: string; kind: Item["kind"]; input: Input; deadline: number; requestAt: number; hash: string }
 const DB_LIMIT = 64 * 1024 * 1024;
 export class CheckpointBlockedError extends Error {
@@ -48,15 +49,25 @@ export class WakeStore {
         channel TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL, expires INTEGER, disposition TEXT,
         UNIQUE(item,channel));
+      CREATE TABLE IF NOT EXISTS native_decisions(
+        item TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE,
+        request_id TEXT UNIQUE, bind_until INTEGER NOT NULL, baseline TEXT NOT NULL, questions TEXT, turn_item TEXT);
       CREATE INDEX IF NOT EXISTS items_state ON items(state,deadline);
       CREATE INDEX IF NOT EXISTS outbox_due ON outbox(state,next_at);
     `);
     if (!(this.db.prepare("PRAGMA table_info(outbox)").all() as Array<{name:string}>).some(c=>c.name==="disposition"))
       this.db.exec("ALTER TABLE outbox ADD COLUMN disposition TEXT");
+    if (!(this.db.prepare("PRAGMA table_info(native_decisions)").all() as Array<{name:string}>).some(c=>c.name==="questions"))
+      this.db.exec("ALTER TABLE native_decisions ADD COLUMN questions TEXT");
+    if (!(this.db.prepare("PRAGMA table_info(native_decisions)").all() as Array<{name:string}>).some(c=>c.name==="turn_item"))
+      this.db.exec("ALTER TABLE native_decisions ADD COLUMN turn_item TEXT");
     const env = this.meta("environment");
     if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('replay_fence','0')").run();
+    // Remove the retired notification channel before replaying any delivery.
+    // The outbox uses unconstrained TEXT channels, so no table rebuild is needed.
+    this.db.prepare("DELETE FROM outbox WHERE channel='phone'").run();
     // 'sending' means an ambiguous RPC after restart. Retry the identical stored payload.
     this.db.prepare("UPDATE outbox SET state='pending' WHERE state='sending'").run();
     try { this.maintain(Date.now()); } catch(error) { if (!(error instanceof CheckpointBlockedError)) throw error; }
@@ -97,13 +108,23 @@ export class WakeStore {
     if (row && row.hash !== reg.hash) throw new Error("requestId reused with changed payload");
     return row;
   }
-  register(reg: Registration, project: string, targetRun: string | null, phonePayload?: string, now = Date.now()): Item {
+  register(reg: Registration, project: string, targetRun: string | null, now = Date.now(), nativeBaseline: string[] = [], nativeQuestions:string|null=null, nativeItem:string|null=null): Item {
     return this.transaction(() => {
       const existing = this.existing(reg); if (existing) return existing;
       if (reg.requestAt <= Number(this.meta("replay_fence"))) throw new Error("requestId retired by retention fence");
       if (this.bytes() > DB_LIMIT - 1024 * 1024) throw new Error("Disk pressure: registration parked");
-      const count = (this.db.prepare("SELECT count(*) AS n FROM items WHERE state='parked' AND kind=?").get(reg.kind) as {n:number}).n;
+      const count = (this.db.prepare("SELECT count(*) AS n FROM items WHERE state='parked' AND (CASE WHEN kind='wait' THEN 'wait' ELSE 'decision' END)=?").get(reg.kind === "wait" ? "wait" : "decision") as {n:number}).n;
       if (count >= 128) throw new Error("Active " + reg.kind + " limit (128)");
+      if (reg.kind === "native") {
+        const preparing=this.db.prepare("SELECT i.id FROM items i JOIN native_decisions n ON n.item=i.id WHERE i.parent=? AND i.state='parked' AND n.request_id IS NULL").get(reg.input.threadId);
+        if (preparing) throw new Error("A native preparation is already waiting on this thread");
+        if ("runtimeRequestId" in reg.input && reg.input.runtimeRequestId &&
+            this.db.prepare("SELECT item FROM native_decisions WHERE request_id=?").get(reg.input.runtimeRequestId))
+          throw new Error("Runtime request is already tracked");
+        if (nativeQuestions && Buffer.byteLength(nativeQuestions)>4096)throw new Error("Native question schema exceeds cap");
+        if (nativeBaseline.length > 128 || Buffer.byteLength(JSON.stringify(nativeBaseline))>4096)
+          throw new Error("Recent native request baseline exceeds cap");
+      }
       if (reg.kind === "wait" && this.active().some(i => i.kind === "wait" && i.parent === reg.input.threadId))
         throw new Error("One active wait per thread");
       if ("condition" in reg.input && reg.input.condition.kind === "thread") {
@@ -120,11 +141,9 @@ export class WakeStore {
       }
       this.db.prepare("INSERT INTO items(id,kind,parent,project,request_key,request_at,hash,input,deadline,target_run,state,created) VALUES(?,?,?,?,?,?,?,?,?,?,'parked',?)")
         .run(reg.id,reg.kind,reg.input.threadId,project,reg.input.requestId,reg.requestAt,reg.hash,JSON.stringify(reg.input),reg.deadline,targetRun,now);
-      if (phonePayload) {
-        if (Buffer.byteLength(phonePayload) > 4096) throw new Error("Phone payload exceeds cap");
-        this.db.prepare("INSERT INTO outbox(id,item,channel,payload,state,next_at,expires) VALUES(?,?,'phone',?,'pending',?,?)")
-          .run("chaldea-decision:" + this.environment + ":" + reg.id,reg.id,phonePayload,now,Math.min(reg.deadline,now+DAY));
-      }
+      if (reg.kind === "native") this.db.prepare("INSERT INTO native_decisions(item,request_id,bind_until,baseline,questions,turn_item) VALUES(?,?,?,?,?,?)")
+        .run(reg.id,"runtimeRequestId" in reg.input ? reg.input.runtimeRequestId ?? null : null,
+          Math.min(reg.deadline,now+10*60_000),JSON.stringify(nativeBaseline),nativeQuestions,nativeItem);
       return this.get(reg.id);
     });
   }
@@ -145,12 +164,15 @@ export class WakeStore {
       const id = row.id;
       if (cursor !== undefined) this.db.prepare("UPDATE items SET cursor=max(cursor,?) WHERE id=?").run(cursor,id);
       if (row.state !== "parked") return this.get(id);
-      const commandId = "chaldea-" + row.kind + ":" + id + ":wake";
+      const label = row.kind === "wait" ? "wait" : "decision";
+      const commandId = "chaldea-" + label + ":" + id + ":wake";
       const input = JSON.parse(row.input) as DecisionInput;
       const summary = row.kind === "decision" && outcome.reason === "deadline"
         ? "no answer by the deadline: " + outcome.action + " " + (input.dependentAction ?? input.question)
-        : JSON.stringify(outcome);
-      const text = "Chaldea wake (" + row.kind + " " + id + "): " + summary + "\nchaldea " + row.kind + " status " + id;
+        : row.kind === "native"
+          ? "native question needs attention (" + outcome.detail + "); no safe automatic answer confirmed. " + outcome.action + " " + input.dependentAction + ". Answer in T3."
+          : JSON.stringify(outcome);
+      const text = "Chaldea wake (" + label + " " + id + "): " + summary + "\nchaldea " + label + " status " + id;
       const payload = JSON.stringify({
         type:"message.dispatch",commandId,messageId:commandId,threadId:row.parent,
         createdBy:"agent",creationSource:"server",attachments:[],dispatchMode:{type:"queue_after_active"},
@@ -159,7 +181,6 @@ export class WakeStore {
       if (Buffer.byteLength(payload) > 4096) throw new Error("Wake exceeds 4 KiB");
       this.db.prepare("UPDATE items SET state='resolved',outcome=?,terminal=? WHERE id=?").run(JSON.stringify(outcome),now,id);
       this.db.prepare("INSERT INTO outbox(id,item,channel,payload,state,next_at) VALUES(?,?,'wake',?,'pending',?)").run(commandId,id,payload,now);
-      this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND channel='phone' AND state='pending'").run(id);
       return this.get(id);
   }
   answer(id: string, answer: string, source: AnswerSource, now?: number): Item {
@@ -182,6 +203,61 @@ export class WakeStore {
     if (answer === undefined || source === undefined) return row;
     return this.resolveLocked(row,{reason:"answered",answer,defaulted:false,source},now);
   }
+  native(id: string): NativePolicy {
+    const row=this.db.prepare("SELECT * FROM native_decisions WHERE item=?").get(id) as NativePolicy|undefined;
+    if (!row) throw new Error("Not a native decision");return row;
+  }
+  nativeTracking(parent:string):NativePolicy[]{
+    return this.db.prepare("SELECT n.*,i.created FROM native_decisions n JOIN items i ON i.id=n.item WHERE i.parent=? AND i.state=\'parked\'").all(parent) as unknown as NativePolicy[];
+  }
+  bindNative(id: string, requestId: string, now=Date.now(), questions:string|null=null, itemId:string|null=null): boolean {
+    return this.transaction(() => {
+      const row=this.get(id),policy=this.native(id);
+      if (row.state !== "parked" || policy.request_id !== null) return false;
+      if (this.db.prepare("SELECT item FROM native_decisions WHERE request_id=?").get(requestId)) {
+        this.finishNativeLocked(row,{reason:"already_tracked"},now);return false;
+      }
+      if(questions && Buffer.byteLength(questions)>4096)throw new Error("Native question schema exceeds cap");
+      this.db.prepare("UPDATE native_decisions SET request_id=?,questions=?,turn_item=? WHERE item=?").run(requestId,questions,itemId,id);
+      return true;
+    });
+  }
+  captureNative(id:string,questions:string|null,itemId:string|null):void{
+    if(questions && Buffer.byteLength(questions)>4096)throw new Error("Native question schema exceeds cap");
+    this.transaction(()=>this.db.prepare("UPDATE native_decisions SET questions=coalesce(questions,?),turn_item=coalesce(turn_item,?) WHERE item=?").run(questions,itemId,id));
+  }
+  queueNative(id: string, payload: string, now=Date.now()): boolean {
+    return this.transaction(() => {
+      if (this.get(id).state !== "parked") return false;
+      if (Buffer.byteLength(payload)>4096) throw new Error("Native response exceeds cap");
+      const result=this.db.prepare("INSERT OR IGNORE INTO outbox(id,item,channel,payload,state,next_at) VALUES(?,?,'native',?,'pending',?)")
+        .run("chaldea-native:"+id+":default",id,payload,now);
+      return result.changes>0;
+    });
+  }
+  finishNative(id: string, outcome: Outcome, delivered=false, now=Date.now()): void {
+    this.transaction(() => {
+      const row=this.get(id);
+      this.finishNativeLocked(row,outcome,now);
+      this.db.prepare("UPDATE outbox SET state=?,disposition=? WHERE item=? AND channel='native' AND state IN ('pending','sending','uncertain')")
+        .run(delivered ? "sent" : "suppressed",delivered ? null : "answered_in_t3",id);
+    });
+  }
+  private finishNativeLocked(row: Item, outcome: Outcome, now: number): void {
+    if (row.kind !== "native") throw new Error("Not a native decision");
+    if (row.state === "parked") this.db.prepare("UPDATE items SET state='resolved',outcome=?,terminal=? WHERE id=?").run(JSON.stringify(outcome),now,row.id);
+    else if (row.outcome === null) this.db.prepare("UPDATE items SET outcome=? WHERE id=?").run(JSON.stringify(outcome),row.id);
+  }
+  nativeAttention(id: string, outcome: Outcome, responseState="suppressed", now=Date.now()): void {
+    this.transaction(() => {
+      const row=this.get(id);
+      if (row.state !== "parked") return;
+      this.resolveLocked(row,outcome,now);
+      this.db.prepare("UPDATE items SET state='needs_attention',disposition=? WHERE id=?").run(outcome.detail ?? "native_attention",id);
+      this.db.prepare("UPDATE outbox SET state=?,disposition=? WHERE item=? AND channel='native' AND state IN ('pending','sending')")
+        .run(responseState,outcome.detail ?? "native_attention",id);
+    });
+  }
   cursor(id: string, sequence: number): void {
     this.transaction(() => this.db.prepare("UPDATE items SET cursor=max(cursor,?) WHERE id=?").run(sequence,id));
   }
@@ -201,7 +277,7 @@ export class WakeStore {
   orphan(id: string, reason: string, now = Date.now()): void {
     this.transaction(() => {
       this.db.prepare("UPDATE items SET state='orphaned',disposition=?,terminal=? WHERE id=?").run(reason,now,id);
-      this.db.prepare("UPDATE outbox SET state='uncertain',disposition=? WHERE item=? AND channel='wake' AND attempts>0 AND state IN ('pending','sending')").run(reason,id);
+      this.db.prepare("UPDATE outbox SET state='uncertain',disposition=? WHERE item=? AND channel IN ('wake','native') AND attempts>0 AND state IN ('pending','sending')").run(reason,id);
       this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND state IN ('pending','blocked')").run(id);
     });
   }
@@ -216,9 +292,6 @@ export class WakeStore {
       this.db.prepare("UPDATE outbox SET state='blocked' WHERE id=? AND state='sending'").run(id);
       this.db.prepare("UPDATE items SET disposition='delivery_rejected' WHERE id=(SELECT item FROM outbox WHERE id=?)").run(id);
     });
-  }
-  undeliverable(id: string): void {
-    this.transaction(() => { this.db.prepare("UPDATE outbox SET state='undeliverable',disposition='relay_unprovisioned' WHERE id=? AND channel='phone' AND state='pending'").run(id); });
   }
   sent(id: string): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='sent' WHERE id=?").run(id); }); }
   retry(id: string, at: number): void { this.transaction(() => { this.db.prepare("UPDATE outbox SET state='pending',next_at=? WHERE id=? AND state IN ('pending','sending')").run(at,id); }); }
