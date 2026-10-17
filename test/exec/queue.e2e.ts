@@ -31,7 +31,7 @@ async function fixture(mode = 'race', hosts = ['a', 'b']) {
     'const log=e=>fs.appendFileSync(process.env.QLOG,JSON.stringify({host,event:e})+"\\n");',
     'const send=(t,v)=>process.stdout.write(frame(t,json(v))); const mode=process.env.QMODE;',
     'if(mode==="down") process.exit(255);',
-    'if(!queued) {send("R",{outcome:"refused",message:"host busy: all job slots are in use",busy:true});process.exit(0)}',
+    'if(!queued) {send("R",{outcome:"refused",message:"host busy: all job slots are in use",...(mode==="message-only"?{}:{busy:mode==="string-busy"?"true":mode!=="false-busy"})});process.exit(0)}',
     'log("pending");',
     'if(mode==="old"){send("R",{outcome:"refused",message:"unsupported command"});process.exit(125)}',
     'send("H",{version:1,queueVersion:1}); let go=false; let timer;',
@@ -116,4 +116,14 @@ test('SIGKILL while queued launches nothing; explicit --host queues only there',
     assert.ok(events.every(e => e.host === 'b'));
     assert.equal(events.filter(e => e.event === 'launch' || e.event === 'request').length, 0);
   } finally { r.child.kill('SIGKILL'); await f.remove(); }
+});
+
+for (const mode of ['message-only', 'string-busy', 'false-busy']) test('queue requires typed busy=true: ' + mode, async () => {
+  const f = await fixture(mode, ['a']);
+  try {
+    const r = await f.run(['--queue-timeout', '200ms']).done;
+    assert.equal(r.code, 69, r.err);
+    assert.doesNotMatch(r.err, /queued:/);
+    assert.deepEqual(await f.events(), []);
+  } finally { await f.remove(); }
 });

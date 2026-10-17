@@ -1,0 +1,51 @@
+#!/usr/bin/python3 -I
+"""Create a new fixed-size ext4 image atomically. Never format an existing file."""
+import argparse
+import os
+from pathlib import Path
+import pwd
+import shutil
+import subprocess
+
+def create(image, size, owner):
+    if size < 512 * 1024 ** 2:
+        raise ValueError("job image must be at least 512 MiB")
+    image = Path(image)
+    if image.exists() or image.is_symlink():
+        if image.is_symlink() or not image.is_file() or image.stat().st_size != size:
+            raise ValueError("existing image differs; refusing to resize or format it")
+        return False
+    if shutil.disk_usage(image.parent).free < size:
+        raise ValueError("backing filesystem lacks free space for the full job image; refusing creation")
+    filesystem = subprocess.check_output(
+        ["findmnt", "-n", "-o", "FSTYPE", "--target", str(image.parent)], text=True, timeout=2).strip()
+    temporary = image.with_name(image.name + ".new")
+    uid, gid = owner
+    # One crash leftover is bounded by the same image size; never clobber it.
+    fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        if filesystem == "btrfs":
+            # Set No_COW while the new file is empty, before ext4 writes extents.
+            subprocess.run(["chattr", "+C", str(temporary)], check=True)
+        os.ftruncate(fd, size)
+        subprocess.run(["mkfs.ext4", "-q", "-F", "-m", "0", "-E",
+                        "root_owner=" + str(uid) + ":" + str(gid), str(temporary)], check=True)
+        os.fsync(fd)
+        os.rename(temporary, image)
+        directory = os.open(image.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        os.close(fd)
+        temporary.unlink(missing_ok=True)
+    return True
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", required=True)
+    parser.add_argument("--bytes", required=True, type=int)
+    args = parser.parse_args()
+    account = pwd.getpwnam("chaldea-job")
+    print("created" if create(args.image, args.bytes, (account.pw_uid, account.pw_gid)) else "unchanged")

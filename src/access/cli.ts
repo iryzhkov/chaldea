@@ -1,3 +1,4 @@
+import { clockHealth } from "./clock.ts";
 import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { AccessState, Clock, TrustStore } from "./trust.ts";
@@ -48,18 +49,7 @@ export async function accessCli(
         .some(k => !values[k as keyof typeof values])) { io.err(USAGE); return 64; }
     audienceName(values.audience);
     state = new AccessState(values["state-file"]!, { initialize: values["initialize-state"] === true });
-    const clock = new Clock(state, () => {
-      const now = Math.floor(Date.now() / 1000);
-      const health = object(strictJson(readTrusted(values["clock-health-file"]!, 1024)));
-      exact(health, ["healthy", "offsetSeconds", "checked_at"]); seconds(health.checked_at);
-      requireAccess(health.checked_at <= now && now - health.checked_at <= 30 &&
-        typeof health.offsetSeconds === "number", "clock_health_stale");
-      return {
-        unixSeconds: now, monotonicSeconds: Number(process.hrtime.bigint()) / 1e9,
-        bootId: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
-        healthy: health.healthy === true, offsetSeconds: health.offsetSeconds,
-      };
-    });
+    const clock = clockHealth(state, () => readTrusted(values["clock-health-file"]!, 1024));
     const anchors = strictJson(readTrusted(values["anchor-file"]!, 16384));
     requireAccess(Array.isArray(anchors), "invalid_anchors");
     const trust = new TrustStore(state, clock, anchors as TrustAnchor[]);

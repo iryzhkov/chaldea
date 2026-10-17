@@ -1,0 +1,963 @@
+#!/usr/bin/python3 -I
+"""Chaldea SSH job protocol 1. Standard library only; no client shell."""
+import argparse
+from contextlib import contextmanager, ExitStack
+import fcntl
+import hashlib
+import ipaddress
+import json
+import math
+import os
+from pathlib import Path
+import re
+import resource
+import selectors
+import shutil
+import signal
+import stat
+import struct
+import subprocess
+import sys
+import time
+import tempfile
+import uuid
+
+# Installed beside this program; also read directly by the TypeScript client.
+PROTOCOL = json.loads(Path(__file__).with_name("exec-protocol.json").read_text())
+VERSION = PROTOCOL["version"]
+QUEUE_VERSION = PROTOCOL["queueVersion"]
+LIMITS = PROTOCOL["limits"]
+PATHS = PROTOCOL["paths"]
+FILE_MODES = PROTOCOL["fileModes"]
+FRAME_TYPES = PROTOCOL["frames"]
+MAX_FRAME = LIMITS["maxFrame"]
+MAX_SNAPSHOT = LIMITS["maxSnapshot"]
+MAX_ARTIFACT = LIMITS["maxArtifact"]
+MAX_OUTPUT = LIMITS["maxOutput"]
+CAP = 20 * 1024 ** 3
+RESERVE = 256 * 1024 * 1024
+CHUNK = LIMITS["chunk"]
+
+
+def safe_path(name):
+    if (not isinstance(name, str) or not name or len(name.encode()) > LIMITS["maxPathBytes"]
+            or any(c in name for c in PATHS["forbiddenCharacters"])
+            or any(p in PATHS["forbiddenComponents"]
+                   or any(p.startswith(prefix) for prefix in PATHS["reservedPrefixes"])
+                   for p in name.split("/"))):
+        raise ValueError("unsafe relative path")
+    return name
+
+
+def encode(value):
+    return json.dumps(value, separators=(",", ":")).encode()
+
+
+def send(kind, data=b""):
+    if kind not in FRAME_TYPES or len(data) > MAX_FRAME:
+        raise ValueError("frame too large")
+    sys.stdout.buffer.write(kind.encode() + struct.pack("!I", len(data)) + data)
+    sys.stdout.buffer.flush()
+
+
+def exact(size):
+    data = bytearray()
+    while len(data) < size:
+        part = os.read(0, size - len(data))
+        if not part:
+            raise ConnectionError("connection dropped during upload")
+        data.extend(part)
+    return bytes(data)
+
+
+def receive():
+    header = exact(5)
+    size = struct.unpack("!I", header[1:])[0]
+    if size > MAX_FRAME or chr(header[0]) not in FRAME_TYPES:
+        raise ValueError("invalid frame")
+    return chr(header[0]), exact(size)
+
+
+def validate(request):
+    if not isinstance(request, dict) or request.get("version") != VERSION:
+        raise ValueError("unsupported job protocol")
+    if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", request.get("jobId", "")):
+        raise ValueError("invalid job id")
+    argv = request.get("argv")
+    if (not isinstance(argv, list) or not 1 <= len(argv) <= LIMITS["maxArgv"]
+            or any(not isinstance(a, str) or "\0" in a for a in argv)
+            or not argv[0] or len(encode(argv)) > LIMITS["maxArgvBytes"]):
+        raise ValueError("invalid command argv")
+    if request.get("cwd") != "":
+        safe_path(request.get("cwd"))
+    if not isinstance(request.get("gpu"), bool):
+        raise ValueError("invalid GPU flag")
+    artifacts = request.get("artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) > LIMITS["maxArtifacts"]:
+        raise ValueError("invalid artifact list")
+    for name in artifacts:
+        safe_path(name)
+    if len(set(artifacts)) != len(artifacts):
+        raise ValueError("duplicate artifact")
+    files = request.get("files")
+    if not isinstance(files, list) or len(files) > LIMITS["maxFiles"]:
+        raise ValueError("invalid manifest")
+    names = set()
+    total = 0
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid manifest entry")
+        name = safe_path(entry.get("path"))
+        size = entry.get("size")
+        if (name in names or type(size) is not int or size < 0
+                or entry.get("mode") not in FILE_MODES.values()
+                or not re.fullmatch("[0-9a-f]{64}", entry.get("sha256", ""))):
+            raise ValueError("invalid manifest entry")
+        names.add(name)
+        total += size
+    if total > MAX_SNAPSHOT:
+        raise ValueError("snapshot exceeds 64 MiB")
+    return request
+
+
+STEAM_PATTERN = r"(^|/)reaper(?:\s|$).*SteamLaunch\s+AppId=\d+"
+MINECRAFT_PATTERN = r"(?:net\.minecraft(?:\.|/)|net\.fabricmc\.loader.*[Kk]not|[/.]minecraft(?:-modded)?(?:/|\s|$))"
+
+
+class Refused(ValueError):
+    pass
+
+
+class Busy(Refused):
+    pass
+
+
+class Preempted(ValueError):
+    pass
+
+
+def process_table(user):
+    # /proc/PID/cmdline of other users may be protected. ps obtains the public
+    # process table; never log its command lines (they may contain credentials).
+    result = subprocess.check_output(
+        ["ps", "-u", user, "-ww", "-o", "pid=,ppid=,comm=,args="], text=True, timeout=2)
+    rows = []
+    for line in result.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) == 4:
+            rows.append((int(parts[0]), int(parts[1]), parts[2], parts[3]))
+    return rows
+
+
+def gaming(config, rows=None):
+    rows = process_table(config["desktop_user"]) if rows is None else rows
+    steam = re.compile(config.get("steam_game_pattern", STEAM_PATTERN))
+    minecraft = re.compile(config.get("minecraft_pattern", MINECRAFT_PATTERN))
+    roots = {pid for pid, _, _, args in rows if steam.search(args)}
+    descendants = set(roots)
+    while True:
+        added = {pid for pid, parent, _, _ in rows if parent in descendants} - descendants
+        if not added:
+            break
+        descendants.update(added)
+    return any(pid in descendants or (comm.startswith("java") and minecraft.search(args))
+               for pid, _, comm, args in rows)
+
+
+def idle_policy(config):
+    if config.get("policy", "always") == "always":
+        return
+    if config.get("policy") != "idle":
+        raise Refused("unknown host acceptance policy")
+    if gaming(config):
+        raise Busy("host busy: a Steam game or Minecraft is running")
+
+
+def remove_tree(path, deadline=None):
+    """Iterative unlinkat walk: no constructed deep paths or recursion limit."""
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    stack = []
+    deadline = time.monotonic() + 1 if deadline is None else deadline
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        os.chmod(path.name, 0o700, dir_fd=parent, follow_symlinks=False)
+        root = os.open(path.name, flags, dir_fd=parent)
+        stack.append((root, parent, path.name, iter(os.listdir(root))))
+        while stack:
+            if time.monotonic() > deadline:
+                raise TimeoutError('cleanup budget exhausted')
+            fd, ancestor, name, names = stack[-1]
+            child = next(names, None)
+            if child is None:
+                os.close(fd)
+                stack.pop()
+                os.rmdir(name, dir_fd=ancestor)
+                continue
+            info = os.stat(child, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                os.chmod(child, 0o700, dir_fd=fd, follow_symlinks=False)
+                nested = os.open(child, flags, dir_fd=fd)
+                stack.append((nested, fd, child, iter(os.listdir(nested))))
+            else:
+                os.unlink(child, dir_fd=fd)
+    finally:
+        for fd, _, _, _ in reversed(stack):
+            os.close(fd)
+        os.close(parent)
+
+
+def cleanup(root):
+    # Unremovable leftovers consume the fixed image, but cannot wedge every
+    # future request. Admission checks image free space after this bounded pass.
+    deadline = time.monotonic() + 1
+    for path in root.iterdir():
+        if time.monotonic() > deadline:
+            print("chaldea: cleanup budget exhausted; leftovers remain bounded", file=sys.stderr)
+            break
+        if (path.name in ("admission.lock", "lost+found")
+                or re.fullmatch(r"admission-[0-9]+\.lock|slot-[0-9]+", path.name)):
+            continue
+        try:
+            if path.is_dir() and not path.is_symlink():
+                remove_tree(path, deadline)
+            else:
+                path.unlink()
+        except OSError:
+            print("chaldea: could not remove an old workspace; retained within image bound", file=sys.stderr)
+
+
+def admission(root, config):
+    if config.get("require_mount", True) and not os.path.ismount(root):
+        raise Refused("job storage unavailable: image is not mounted; host remains available")
+    cap = int(config.get("state_cap_bytes", CAP))
+    reserve = max(int(config.get("min_free_bytes", RESERVE)), 0)
+    usage = shutil.disk_usage(root)
+    pending_inputs = MAX_SNAPSHOT * slot_count(config)
+    if cap < MAX_SNAPSHOT or (config.get('require_mount', True) and usage.total - usage.free + pending_inputs >= cap):
+        raise Refused("host state over cap; new jobs refused")
+    if usage.free < reserve + pending_inputs:
+        raise Refused("job image full or below free-space reserve; new jobs refused")
+
+
+def unpack(request, workspace):
+    for entry in request["files"]:
+        path = workspace / entry["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        remaining = entry["size"]
+        digest = hashlib.sha256()
+        with path.open("xb") as out:
+            while remaining:
+                kind, data = receive()
+                if kind != "B" or not data or len(data) > min(CHUNK, remaining):
+                    raise ValueError("invalid snapshot data")
+                out.write(data)
+                digest.update(data)
+                remaining -= len(data)
+        if digest.hexdigest() != entry["sha256"]:
+            raise ValueError("snapshot digest mismatch")
+        path.chmod(entry["mode"])
+    if receive() != ("E", b""):
+        raise ValueError("missing upload end")
+
+
+def toolchain_environment(config):
+    """Use only the root-owned role configuration, never client-supplied paths."""
+    root = config.get("toolchain_root")
+    defaults = config.get("toolchain_defaults", {})
+    if root is None and not defaults:
+        return [], []
+    if (not isinstance(root, str) or not root.startswith("/")
+            or str(Path(root)) != root or root in ("/", "/usr", "/home")
+            or set(defaults) != {"node", "go", "rust", "uv"}):
+        raise ValueError("invalid toolchain configuration")
+    directories = []
+    for tool in ("node", "go", "rust", "uv"):
+        version = defaults[tool]
+        if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            raise ValueError("toolchain versions must be pinned X.Y.Z releases")
+        directory = Path(root) / tool / version / "bin"
+        if not directory.is_dir():
+            raise ValueError("configured toolchain is not installed: " + tool + "@" + version)
+        directories.append(str(directory))
+    return ["--ro-bind", root, root], directories
+
+
+def sandbox(request, workspace, config):
+    home = workspace / ".chaldea-home"
+    temp = workspace / ".chaldea-tmp"
+    home.mkdir(mode=0o700)
+    temp.mkdir(mode=0o700)
+    cmd = ["/usr/bin/bwrap", "--unshare-all", "--unshare-user", "--share-net", "--die-with-parent",
+           "--new-session", "--cap-drop", "ALL", "--ro-bind", "/usr", "/usr"]
+    if "--disable-userns" in subprocess.check_output(["/usr/bin/bwrap", "--help"], text=True):
+        cmd += ["--disable-userns"]
+    for name in ("bin", "sbin", "lib", "lib64"):
+        path = Path("/") / name
+        if path.is_symlink():
+            cmd += ["--symlink", os.readlink(path), str(path)]
+        elif path.exists():
+            cmd += ["--ro-bind", str(path), str(path)]
+    for name in ("/etc/hosts", "/etc/nsswitch.conf",
+                 "/etc/ssl/certs", "/etc/ca-certificates", "/etc/localtime",
+                 "/etc/ld.so.cache", "/etc/alternatives"):
+        if Path(name).exists():
+            cmd += ["--ro-bind", name, name]
+    identity = workspace.parent / (workspace.name + ".identity")
+    for name in ("passwd", "group"):
+        cmd += ["--ro-bind", str(identity / name), "/etc/" + name]
+    resolv = workspace / ".chaldea-resolv"
+    host_addresses = set(config.get("_host_addresses", []))
+    dns = []
+    for line in Path("/etc/resolv.conf").read_text().splitlines():
+        fields = line.split()
+        if len(fields) > 1 and fields[0] == "nameserver":
+            import ipaddress
+            address = ipaddress.ip_address(fields[1])
+            if (not address.is_loopback and str(address) not in host_addresses
+                    and not any(address in ipaddress.ip_network(network)
+                                for network in config.get("_blocked_subnets", []))):
+                dns.append(str(address))
+    resolv.write_text("".join("nameserver " + address + "\n" for address in (dns or ["1.1.1.1", "9.9.9.9"])))
+    cmd += ["--ro-bind", str(resolv), "/etc/resolv.conf",
+            "--proc", "/proc", "--dev", "/dev",
+            "--size", str(int(config.get("shm_bytes", 64 * 1024 ** 2))),
+            "--tmpfs", "/dev/shm", "--dir", "/run",
+            "--bind", str(workspace), "/work", "--bind", str(home), "/home/job",
+            "--bind", str(temp), "/tmp", "--chdir", "/work/" + request["cwd"]]
+    toolchain_mounts, toolchain_bins = toolchain_environment(config)
+    cmd += toolchain_mounts
+    env = {"HOME": "/home/job", "USER": "job", "LOGNAME": "job",
+           "PATH": ":".join(toolchain_bins + ["/usr/bin", "/bin"]), "LANG": "C.UTF-8", "TERM": "dumb",
+           "TAR_OPTIONS": "--no-same-owner", "npm_config_cache": "/home/job/.cache/npm",
+           "CARGO_HOME": "/home/job/.cargo", "GOPATH": "/home/job/go",
+           "GOMODCACHE": "/home/job/go/pkg/mod", "GOCACHE": "/home/job/.cache/go-build",
+           "GOTOOLCHAIN": "local", "UV_CACHE_DIR": "/home/job/.cache/uv",
+           "UV_PYTHON_INSTALL_DIR": "/home/job/.local/share/uv/python",
+           "TMPDIR": "/tmp", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0",
+           "XDG_CONFIG_HOME": "/home/job/.config", "XDG_CACHE_HOME": "/home/job/.cache",
+           "XDG_DATA_HOME": "/home/job/.local/share", "XDG_STATE_HOME": "/home/job/.local/state"}
+    if request["gpu"]:
+        devices = config.get("gpu_devices", [])
+        icd = config.get("nvidia_icd", "")
+        if not devices or not icd or not Path(icd).is_file():
+            raise ValueError("GPU unavailable: NVIDIA device paths and ICD must be configured")
+        for name in devices:
+            path = Path(name).resolve(strict=True)
+            if not str(path).startswith("/dev/") or not stat.S_ISCHR(path.stat().st_mode):
+                raise ValueError("invalid GPU device")
+            cmd += ["--dev-bind", str(path), str(path)]
+        if not icd.startswith("/usr/"):
+            cmd += ["--ro-bind", icd, icd]
+        env.update(VK_DRIVER_FILES=icd, VK_ICD_FILENAMES=icd, CUDA_VISIBLE_DEVICES="0")
+    cmd += ["--remount-ro", "/", "--", *request["argv"]]
+    return cmd, env
+
+
+def kill_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.wait(timeout=5)
+
+
+def host_addresses():
+    rows = json.loads(subprocess.check_output(["ip", "-j", "address", "show"], timeout=2))
+    return sorted({address["local"].split("%")[0] for row in rows for address in row["addr_info"]})
+
+
+def connected_subnets(rows=None, defaults=None):
+    if rows is None:
+        rows = json.loads(subprocess.check_output(["ip", "-j", "address", "show"], timeout=2))
+    if defaults is None:
+        defaults = []
+        for family in ("-4", "-6"):
+            defaults += json.loads(subprocess.check_output(
+                ["ip", "-j", family, "route", "show", "default"], timeout=2))
+    interfaces = {route["dev"] for route in defaults if "dev" in route}
+    interfaces.update(hop["dev"] for route in defaults for hop in route.get("nexthops", []) if "dev" in hop)
+    networks = set()
+    for row in rows:
+        if row["ifname"] in interfaces or "LOOPBACK" in row.get("flags", []):
+            continue
+        for address in row["addr_info"]:
+            if address.get("scope") == "link":
+                continue
+            networks.add(ipaddress.ip_network(address["local"].split("%")[0] + "/" +
+                                               str(address["prefixlen"]), strict=False))
+    return sorted(map(str, networks))
+
+
+def network_rules(addresses, subnets):
+    groups = {4: [], 6: []}  # guest loopback stays local to its private netns
+    for address in addresses:
+        value = ipaddress.ip_address(address)
+        if not value.is_loopback:
+            groups[value.version].append(ipaddress.ip_network(str(value)))
+    for subnet in subnets:
+        value = ipaddress.ip_network(subnet)
+        groups[value.version].append(value)
+    rules = "table inet chaldea { chain output { type filter hook output priority 0; policy accept;\n"
+    for version, networks in groups.items():
+        if networks:
+            family = "ip" if version == 4 else "ip6"
+            values = ", ".join(map(str, ipaddress.collapse_addresses(networks)))
+            rules += family + " daddr { " + values + " } reject\n"
+    return rules + "}\n}\n"
+
+
+def network_guard(group):
+    """EOF survives simultaneous server/supervisor death, unlike their handlers."""
+    # Only the supervisor owns the write end; transport close_fds prevents
+    # pasta or the job keeping it alive, even if pasta clears PDEATHSIG.
+    if os.read(0, 1) != b"D":
+        os.killpg(group, signal.SIGKILL)
+
+
+def network_supervisor(path):
+    """Keep the parent-death contract outside pasta, which may clear it."""
+    import ctypes
+    if os.getpgrp() != os.getpid():
+        os.setsid()
+    group = os.getpid()
+
+    def stop(_signum=None, _frame=None):
+        os.killpg(group, signal.SIGKILL)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, stop)
+    launch = json.loads(Path(path).read_text())
+    if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+        raise RuntimeError("cannot establish supervisor death signal")
+    if os.getppid() != launch["parent_pid"]:
+        stop()
+    # Foreground pasta stays in this group; killing it also kills its PID
+    # namespace leader, including jobs that started their own sessions.
+    def transport_death():
+        if (ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0) != 0
+                or os.getppid() != group):
+            os._exit(125)
+
+    guard = subprocess.Popen(["/usr/bin/python3", "-I", str(Path(__file__).resolve()),
+                              "--network-guard", str(group)], stdin=subprocess.PIPE)
+    try:
+        result = subprocess.run(launch["transport"], close_fds=True, preexec_fn=transport_death)
+        return result.returncode if result.returncode >= 0 else 128 - result.returncode
+    finally:
+        guard.stdin.write(b"D")
+        guard.stdin.close()
+        guard.wait(timeout=5)
+
+
+def network_child(path):
+    """Trusted setup in pasta's private user/netns, before bwrap drops caps."""
+    # Older pasta clears PDEATHSIG before exec. Restore it so killing the
+    # transport also kills this PID-namespace leader and all nested jobs.
+    import ctypes
+    if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        raise RuntimeError("cannot establish transport death signal")
+    launch = json.loads(Path(path).read_text())
+    subprocess.run(["/usr/sbin/nft", "-f", "-"],
+                   input=network_rules(launch["addresses"], launch["subnets"]),
+                   text=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    status = os.open(str(path) + ".status", os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    os.set_inheritable(status, True)
+    command = launch["command"]
+    index = command.index("--")
+    command[index:index] = ["--json-status-fd", str(status)]
+    os.execve(command[0], command, launch["env"])
+
+
+def launched(launch):
+    try:
+        return any("child-pid" in json.loads(line) for line in
+                   Path(str(launch) + ".status").read_text()[:4096].splitlines())
+    except (OSError, ValueError):
+        return False
+
+
+def host_job_pid(pid, pasta_pid, proc=Path("/proc")):
+    """Translate bwrap's PID inside pasta, restricted to transport descendants."""
+    pending = [pasta_pid]
+    while pending:
+        parent = pending.pop()
+        try:
+            children = (proc / str(parent) / "task" / str(parent) / "children").read_text().split()
+        except OSError:
+            continue
+        for child in children:
+            host = int(child)
+            pending.append(host)
+            try:
+                status = (proc / child / "status").read_text()
+            except OSError:
+                continue
+            match = re.search(r"^NSpid:\s+(.*)$", status, re.M)
+            ids = [int(value) for value in match[1].split()] if match else []
+            # pasta creates one PID namespace; bwrap creates the next. IDs in
+            # the pasta namespace are unique even for deeper descendants.
+            if len(ids) >= 3 and ids[1] == pid:
+                return host
+    return None
+
+
+def job_signal(launch, signum, pasta_pid):
+    try:
+        lines = Path(str(launch) + ".status").read_text()[:4096].splitlines()
+        pid = next(json.loads(line)["child-pid"] for line in lines if "child-pid" in line)
+        host = host_job_pid(pid, pasta_pid) if isinstance(pid, int) and pid > 1 else None
+        if host is not None and os.getpgid(host) == host:
+            os.killpg(host, signum)
+    except (OSError, ValueError, StopIteration):
+        pass
+
+
+def check_tools(pasta="/usr/bin/pasta"):
+    version = subprocess.check_output(["/usr/bin/bwrap", "--version"], text=True, timeout=2)
+    match = re.search(r"(\d+)\.(\d+)", version)
+    if not match or tuple(map(int, match.groups())) < (0, 9):
+        raise Refused("bubblewrap >= 0.9 is required for size-limited tmpfs")
+    # passt 2025-05-03 uses _exit() without flushing stdout for --help.
+    # An intentionally unknown option prints complete usage to unbuffered stderr.
+    help_text = subprocess.run([pasta, "--chaldea-option-probe"], capture_output=True, text=True, timeout=2)
+    help_text = help_text.stdout + help_text.stderr
+    for option in ("--foreground", "--dns", "--config-net", "--no-map-gw", "--map-host-loopback", "--no-splice"):
+        if option not in help_text:
+            raise Refused("installed pasta lacks required option " + option)
+    return help_text
+
+
+def prepare_launch(request, workspace, config):
+    # Siblings are outside every writable guest mount and cleaned with the slot.
+    # Never import the host account database or expose a writable backing inode.
+    identity = workspace.parent / (workspace.name + ".identity")
+    identity.mkdir(mode=0o700)
+    for name, content in (("passwd", "job:x:0:0::/home/job:/bin/sh\n"),
+                          ("group", "job:x:0:\n")):
+        path = identity / name
+        path.write_text(content)
+        path.chmod(0o444)
+    config = {**config, "_host_addresses": host_addresses(), "_blocked_subnets": connected_subnets()}
+    command, env = sandbox(request, workspace, config)
+    launch = workspace.parent / (request["jobId"] + ".launch")
+    pasta = config.get("pasta_binary", "/usr/bin/pasta")
+    # Older distro pasta creates an extra PID namespace. Translate bwrap's
+    # status PID on the host instead of requiring the newer --no-pidns option.
+    wrapped = [pasta, "--foreground", "--quiet", "--config-net", "--no-map-gw",
+               "--map-host-loopback", "none", "--no-splice", "--dns", "none",
+               "-t", "none", "-u", "none", "-T", "none", "-U", "none"]
+    # The guest already has a sanitized resolv.conf; do not auto-discover DNS
+    # for unused DHCP/NDP metadata (which warns on loopback-only host stubs).
+    if "--conf-path" in check_tools(pasta):
+        wrapped += ["-c", str(workspace.parent / ".pasta.sock")]
+    wrapped += ["--", "/usr/bin/python3", "-I", str(Path(__file__).resolve()),
+                "--network-child", str(launch)]
+    launch.write_text(json.dumps({"command": command, "env": env,
+                                 "addresses": config["_host_addresses"], "subnets": config["_blocked_subnets"],
+                                 "transport": wrapped, "parent_pid": os.getpid()}))
+    return ["/usr/bin/python3", "-I", str(Path(__file__).resolve()),
+            "--network-supervisor", str(launch)], launch
+
+
+def slot_count(config):
+    slots = config.get("slots", 1)
+    if type(slots) is not int or not 1 <= slots <= 64:
+        raise ValueError("slots must be an integer from 1 to 64")
+    return slots
+
+
+@contextmanager
+def admission_lock(root, slots=1, all_slots=False):
+    # Keep slot zero's existing name so maintenance still excludes old servers.
+    # Lock files are permanent: unlinking one would create a second lock domain.
+    if all_slots:
+        # Old slot locks remain permanent across count reductions.
+        slots = max([slots] + [int(match[1]) + 1 for path in root.iterdir()
+                               if (match := re.fullmatch(r"admission-([0-9]+)\.lock", path.name))])
+    with ExitStack() as held:
+        for slot in range(slots):
+            path = root / ("admission.lock" if slot == 0 else f"admission-{slot}.lock")
+            lock = path.open("a")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                if all_slots:
+                    raise Busy("host busy: a job slot is in use; retry explicitly") from None
+                continue
+            held.enter_context(lock)
+            if not all_slots:
+                # Single-slot hosts retain their existing on-disk layout.
+                directory = root if slots == 1 else root / f"slot-{slot}"
+                directory.mkdir(mode=0o700, exist_ok=True)
+                yield directory
+                return
+        if not all_slots:
+            raise Busy("host busy: all job slots are in use; retry explicitly")
+        yield root
+
+
+
+# Helpers block in flock on descriptors retained by the server, so helper death
+# cannot release a running job's lock; losing helpers are reaped before fd close.
+SLOT_WAITER = """
+import ctypes,fcntl,os,signal,sys
+ctypes.CDLL(None).prctl(1, signal.SIGKILL, 0, 0, 0)
+if os.getppid() != int(sys.argv[2]):
+    sys.exit(0)
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)
+print("ready", flush=True)
+sys.stdin.buffer.read()
+"""
+
+
+@contextmanager
+def queued_admission(root, config, seconds):
+    deadline = time.monotonic() + seconds
+    waiters = []
+    locks = []  # shared open-file descriptions survive helper death
+    with selectors.DefaultSelector() as selector:
+        selector.register(0, selectors.EVENT_READ, "client")
+        try:
+            slots = slot_count(config)
+            for slot in range(slots):
+                path = root / ("admission.lock" if slot == 0 else f"admission-{slot}.lock")
+                lock = path.open("a")
+                locks.append(lock)
+                child = subprocess.Popen([sys.executable, "-I", "-c", SLOT_WAITER, str(lock.fileno()), str(os.getpid())],
+                                         pass_fds=(lock.fileno(),), stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                waiters.append(child)
+                selector.register(child.stdout, selectors.EVENT_READ, slot)
+            chosen = None
+            next_idle = deadline
+            while True:
+                now = time.monotonic()
+                if now >= deadline:
+                    raise Refused("queue timeout")
+                if chosen is not None and now >= next_idle:
+                    try:
+                        idle_policy(config)
+                    except Busy:
+                        next_idle = time.monotonic() + 5
+                    else:
+                        break
+                for key, _ in selector.select(max(0, min(deadline, next_idle) - time.monotonic())):
+                    if key.data == "client":
+                        # C (cancel), EOF, or any other pre-go input: launch nothing.
+                        raise ConnectionError("queue cancelled or client disconnected")
+                    slot = key.data
+                    selector.unregister(key.fileobj)
+                    if key.fileobj.readline() != b"ready\n":
+                        raise Refused("slot waiter failed")
+                    if chosen is None:
+                        chosen = slot
+                        for index, child in enumerate(waiters):
+                            if index != chosen:
+                                selector.unregister(child.stdout)
+                                child.terminate()
+                                child.wait()
+                                locks[index].close()
+                        next_idle = 0  # check the game gate once the slot is granted
+                        break
+            admission(root, config)
+            send("Y", encode({"version": QUEUE_VERSION, "state": "ready"}))
+            signal.alarm(max(1, math.ceil(deadline - time.monotonic()) + 2))
+            kind, body = receive()
+            if kind != "G" or body:
+                raise ConnectionError("queue cancelled before go")
+            # The game may have appeared while the client chose among hosts.
+            idle_policy(config)
+            directory = root if slots == 1 else root / f"slot-{chosen}"
+            directory.mkdir(mode=0o700, exist_ok=True)
+            yield directory
+        finally:
+            for child in waiters:
+                child.terminate()
+            for child in waiters:
+                child.wait()
+                child.stdin.close()
+                child.stdout.close()
+            for lock in locks:
+                lock.close()
+
+
+@contextmanager
+def job_admission(root, config, queued):
+    if queued:
+        send("H", encode({"version": VERSION, "queueVersion": QUEUE_VERSION}))
+        signal.alarm(120)
+        kind, body = receive()
+        value = json.loads(body)
+        seconds = value.get("timeoutSeconds") if isinstance(value, dict) else None
+        if (not isinstance(value, dict) or kind != "W" or value.get("version") != QUEUE_VERSION or type(seconds) not in (int, float)
+                or not 0 < seconds <= LIMITS["maxQueueSeconds"]):
+            raise Refused("unsupported queue request")
+        signal.alarm(math.ceil(seconds) + 2)
+        with queued_admission(root, config, seconds) as slot_root:
+            yield slot_root
+    else:
+        with admission_lock(root, slot_count(config)) as slot_root:
+            send("H", encode({"version": VERSION}))
+            yield slot_root
+
+
+def smoke_test(config):
+    """Run the same trusted launch path as jobs, as the actual job account."""
+    root = Path(config["state_root"])
+    admission(root, config)
+    with admission_lock(root, slot_count(config), all_slots=True), tempfile.TemporaryDirectory(prefix="smoke-", dir=root) as temporary:
+        workspace = Path(temporary) / "work"
+        workspace.mkdir()
+        probe = """
+import errno, grp, os, pathlib, pwd, subprocess, sys
+assert pwd.getpwuid(0).pw_name == 'job'
+assert pwd.getpwuid(0).pw_dir == '/home/job'
+assert pwd.getpwuid(0).pw_shell == '/bin/sh'
+assert [entry.pw_name for entry in pwd.getpwall()] == ['job']
+assert [entry.gr_name for entry in grp.getgrall()] == ['job']
+assert subprocess.check_output(['id', '-un'], text=True).strip() == 'job'
+assert subprocess.check_output(['id', '-gn'], text=True).strip() == 'job'
+assert subprocess.check_output(['getent', 'passwd', '0'], text=True) == 'job:x:0:0::/home/job:/bin/sh\\n'
+assert subprocess.check_output(['getent', 'group', '0'], text=True) == 'job:x:0:\\n'
+subprocess.run(['ssh', '-V'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+ssh = subprocess.check_output(['ssh', '-G', 'localhost'], text=True, stderr=subprocess.DEVNULL)
+assert 'user job' in ssh.splitlines()
+for name, expected in [('passwd', 'job:x:0:0::/home/job:/bin/sh\\n'), ('group', 'job:x:0:\\n')]:
+    path = pathlib.Path('/etc') / name
+    assert path.read_text() == expected
+    assert os.statvfs(path).f_flag & os.ST_RDONLY
+    try:
+        path.open('a').close()
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EROFS)
+    else:
+        raise AssertionError(str(path) + ' is writable')
+assert os.statvfs('/dev/shm').f_blocks * os.statvfs('/dev/shm').f_frsize == int(sys.argv[1])
+print('sandbox-smoke-ok')
+"""
+        request = {"jobId": str(uuid.uuid4()), "argv": ["/usr/bin/python3", "-c", probe,
+                   str(int(config.get("shm_bytes", 64 * 1024**2)))],
+                   "cwd": "", "gpu": False}
+        wrapped, launch = prepare_launch(request, workspace, config)
+        process = subprocess.Popen(wrapped, env={"PATH": "/usr/bin:/bin", "HOME": str(workspace)},
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=15)
+            if process.returncode or not launched(launch) or stdout.strip() != "sandbox-smoke-ok":
+                raise Refused("installed pasta/bwrap smoke failed: " + stderr[-2048:])
+        finally:
+            kill_group(process)
+            process.stdout.close()
+            process.stderr.close()
+    print("sandbox-smoke-ok")
+
+
+def execute(request, workspace, config):
+    wrapped, launch = prepare_launch(request, workspace, config)
+    parent = os.getpid()
+    def parent_death():
+        import ctypes
+        if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+            os._exit(125)
+        if os.getppid() != parent:
+            os._exit(125)
+    process = subprocess.Popen(wrapped, env={"PATH": "/usr/bin:/bin", "HOME": str(workspace)},
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, start_new_session=True, close_fds=True, preexec_fn=parent_death)
+    global JOB_STARTED
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(0, selectors.EVENT_READ, "input")
+            selector.register(process.stdout, selectors.EVENT_READ, "O")
+            selector.register(process.stderr, selectors.EVENT_READ, "S")
+            # pidfd keeps stdin monitored after stdout/stderr have both closed.
+            pidfd = os.pidfd_open(process.pid)
+            selector.register(pidfd, selectors.EVENT_READ, "exit")
+            output = 0
+            pipes = 2
+            exited = False
+            deadline = time.monotonic() + min(int(config.get("max_seconds", 21600)), 21600)
+            next_idle = time.monotonic() + 5 if config.get("policy") == "idle" else deadline
+            preempted = False
+            kill_at = deadline
+            try:
+                while not exited or pipes:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise ValueError("job exceeded runtime bound")
+                    if now >= next_idle:
+                        next_idle = now + 5
+                        try:
+                            busy = gaming(config)
+                        except Exception:
+                            busy = True  # fail closed if process inspection fails
+                        if busy and not preempted:
+                            preempted = True
+                            job_signal(launch, signal.SIGTERM, process.pid)
+                            kill_at = now + 10
+                    if preempted and now >= kill_at:
+                        job_signal(launch, signal.SIGKILL, process.pid)
+                        kill_group(process)
+                        raise Preempted("job preempted: a Steam game or Minecraft started")
+                    timeout = max(0, min(deadline, next_idle, kill_at) - now)
+                    for key, _ in selector.select(timeout):
+                        if key.data == "input":
+                            os.read(0, 1)
+                            raise ConnectionError("client disconnected or sent unexpected input")
+                        if key.data == "exit":
+                            selector.unregister(pidfd)
+                            exited = True
+                            continue
+                        data = os.read(key.fd, CHUNK)
+                        if not data:
+                            selector.unregister(key.fileobj)
+                            pipes -= 1
+                        else:
+                            output += len(data)
+                            if output > MAX_OUTPUT:
+                                raise ValueError("job exceeded 64 MiB output bound")
+                            send(key.data, data)
+                code = process.wait()
+                if not launched(launch):
+                    raise Refused('job sandbox/network setup failed before command launch')
+                if preempted:
+                    raise Preempted("job preempted: a Steam game or Minecraft started")
+                return code if code >= 0 else min(255, 128 - code)
+            finally:
+                os.close(pidfd)
+    finally:
+        JOB_STARTED = JOB_STARTED or launched(launch)
+        job_signal(launch, signal.SIGKILL, process.pid)
+        kill_group(process)
+        process.stdout.close()
+        process.stderr.close()
+        launch.unlink(missing_ok=True)
+        Path(str(launch) + ".status").unlink(missing_ok=True)
+        Path(str(workspace.parent / ".pasta.sock")).unlink(missing_ok=True)
+
+
+def artifact_file(workspace, name):
+    # Job is dead, including descendants, before artifact traversal begins.
+    path = workspace
+    for part in safe_path(name).split("/"):
+        path = path / part
+        if path.is_symlink():
+            raise ValueError("artifact symlinks are forbidden")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    file = os.fdopen(fd, "rb")
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        file.close()
+        raise ValueError("artifacts must be regular files")
+    return file
+
+
+def artifacts(request, workspace):
+    total = 0
+    for name in request["artifacts"]:
+        with artifact_file(workspace, name) as file:
+            size = os.fstat(file.fileno()).st_size
+            total += size
+            if total > MAX_ARTIFACT:
+                raise ValueError("artifacts exceed 64 MiB aggregate cap")
+            send("A", encode({"path": name, "size": size}))
+            while data := file.read(CHUNK):
+                send("B", data)
+
+
+def interrupted(_signum, _frame):
+    raise ConnectionError("job connection terminated")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="/etc/chaldea-job.json")
+    parser.add_argument("--network-child")
+    parser.add_argument("--network-supervisor")
+    parser.add_argument("--network-guard", type=int)
+    parser.add_argument("--check-tools", action="store_true")
+    parser.add_argument("--smoke-test", action="store_true")
+    args = parser.parse_args()
+    if args.network_guard is not None:
+        network_guard(args.network_guard)
+        return
+    if args.network_supervisor:
+        sys.exit(network_supervisor(args.network_supervisor))
+    if args.network_child:
+        network_child(args.network_child)
+        return
+    if args.check_tools:
+        check_tools()
+        return
+    if args.smoke_test:
+        smoke_test(json.loads(Path(args.config).read_text()))
+        return
+    queued = os.environ.get("SSH_ORIGINAL_COMMAND") == PROTOCOL["commands"]["queue"]
+    if os.environ.get("SSH_ORIGINAL_COMMAND") not in PROTOCOL["commands"].values():
+        raise ValueError("only versioned chaldea exec protocol requests are allowed; no shell")
+    if os.environ.get("SSH_AUTH_SOCK"):
+        raise ValueError("forwarded SSH agents are forbidden")
+    os.umask(0o077)
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    signal.signal(signal.SIGALRM, interrupted)
+    # Bounds cover upload, post-exit artifact transfer and blocked output writes.
+    signal.alarm(21720)
+    config = json.loads(Path(args.config).read_text())
+    root = Path(config["state_root"])
+    if not root.is_absolute() or root.is_symlink():
+        raise ValueError("invalid state root")
+    if config.get("require_mount", True) and not os.path.ismount(root):
+        raise Refused("job storage unavailable: image is not mounted; host remains available")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with job_admission(root, config, queued) as slot_root:
+        cleanup(slot_root)
+        signal.alarm(120)
+        kind, body = receive()
+        if kind != "Q":
+            raise ValueError("expected job request")
+        request = validate(json.loads(body))
+        idle_policy(config)
+        admission(root, config)
+        workspace = slot_root / request["jobId"]
+        workspace.mkdir(mode=0o700)
+        try:
+            unpack(request, workspace)
+            if request["cwd"] and not (workspace / request["cwd"]).is_dir():
+                raise ValueError("command working directory missing from snapshot")
+            # The mounted ext4 image bounds aggregate writes; also bound each file.
+            resource.setrlimit(resource.RLIMIT_FSIZE, (CAP, CAP))
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+            signal.alarm(21720)
+            code = execute(request, workspace, config)
+            artifacts(request, workspace)
+        finally:
+            cleanup(slot_root)
+        # Result follows bounded cleanup; unremovable leftovers stay image-bounded.
+        send("X", encode({"exitCode": code}))
+
+
+JOB_STARTED = False
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (Exception, KeyboardInterrupt) as exc:
+        if "--smoke-test" in sys.argv and isinstance(exc, Busy):
+            print("chaldea: sandbox smoke test deferred to the next run: host busy", file=sys.stderr)
+            sys.exit(0)
+        if "--check-tools" in sys.argv or "--smoke-test" in sys.argv:
+            print("chaldea: apply-time sandbox check failed: " + str(exc), file=sys.stderr)
+            sys.exit(1)
+        if any(flag in sys.argv for flag in ("--network-child", "--network-supervisor", "--network-guard")):
+            # Bootstrap failures are not command stdout or remote exit 125.
+            print("chaldea: network/sandbox bootstrap failed: " + type(exc).__name__, file=sys.stderr)
+            sys.exit(125)
+        try:
+            # Never log argv, environment, snapshot bytes, or raw OS exceptions.
+            message = str(exc) if isinstance(exc, (ValueError, ConnectionError)) else type(exc).__name__
+            send("R", encode({"message": message[:1024], "busy": isinstance(exc, Busy), "outcome": "preempted" if isinstance(exc, Preempted) else "uncertain" if JOB_STARTED else "refused"}))
+        except (BrokenPipeError, OSError):
+            pass
+        sys.exit(125)

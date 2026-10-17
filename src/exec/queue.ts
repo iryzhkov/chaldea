@@ -1,12 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { frames, send, json, VERSION } from './protocol.ts';
+import { frame, frames, send, json, VERSION, QUEUE_VERSION, COMMANDS } from './protocol.ts';
 
 export type Transport = {
   ssh: ChildProcessWithoutNullStreams;
   incoming: ReturnType<typeof frames>;
   exit: Promise<number | null>;
 };
-export function connect(config: string, host: string, command = 'chaldea-exec-v0'): Transport {
+export function connect(config: string, host: string, command = COMMANDS.exec): Transport {
   const ssh = spawn('ssh', ['-F', config, '-T', '-a', '-x',
     '-o', 'BatchMode=yes', '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
     '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'RequestTTY=no',
@@ -22,7 +22,7 @@ export function connect(config: string, host: string, command = 'chaldea-exec-v0
 }
 function stop(t: Transport) {
   // Cancel is best effort; closing stdin also cancels on every protocol path.
-  if (!t.ssh.stdin.destroyed) t.ssh.stdin.end(Buffer.from([67, 0, 0, 0, 0]));
+  if (!t.ssh.stdin.destroyed) t.ssh.stdin.end(frame('C'));
   const timer = setTimeout(() => t.ssh.kill('SIGTERM'), 1000);
   timer.unref();
   t.ssh.once('close', () => clearTimeout(timer));
@@ -51,13 +51,13 @@ export async function queueHost(config: string, hosts: string[], seconds: number
     try {
       await check(host);
       if (finished) return;
-      transport = connect(config, host, 'chaldea-exec-queue-v1');
+      transport = connect(config, host, COMMANDS.queue);
       active.add(transport);
       const hello = await transport.incoming.next();
       if (hello.done || hello.value.type !== 'H') throw new Error('queue unsupported or host unavailable');
       const h = JSON.parse(hello.value.data.toString());
-      if (h.version !== VERSION || h.queueVersion !== 1) throw new Error('queue unsupported');
-      await send(transport.ssh.stdin, 'W', json({ version: 1, timeoutSeconds: Math.max(.001, (deadline - performance.now()) / 1000) }));
+      if (h.version !== VERSION || h.queueVersion !== QUEUE_VERSION) throw new Error('queue unsupported');
+      await send(transport.ssh.stdin, 'W', json({ version: QUEUE_VERSION, timeoutSeconds: Math.max(.001, (deadline - performance.now()) / 1000) }));
       const ready = await transport.incoming.next();
       if (ready.done || ready.value.type !== 'Y' || JSON.parse(ready.value.data.toString()).state !== 'ready') {
         throw new Error('queue refused');

@@ -8,7 +8,7 @@ import { connect, queueHost, type Transport } from './queue.ts';
 import { manifest } from './manifest.ts';
 import { cleanArtifacts, BOOT_ID } from './artifacts.ts';
 import { record, prune, DAYS, type Intent } from './journal.ts';
-import { send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, type Request } from './protocol.ts';
+import { send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, LIMITS, type Refusal, type Request } from './protocol.ts';
 
 export function argumentsFor(args: string[]) {
   let host: string | undefined; let gpu = false; let noQueue = false; let queueTimeout = 3600; const artifacts: string[] = [];
@@ -23,14 +23,14 @@ export function argumentsFor(args: string[]) {
     else if (flag === '--queue-timeout') {
       const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(args[i++] ?? '');
       queueTimeout = match ? Number(match[1]) * (({ ms: .001, s: 1, m: 60, h: 3600 } as Record<string, number>)[match[2] ?? 's']!) : NaN;
-      if (!Number.isFinite(queueTimeout) || queueTimeout <= 0 || queueTimeout > 86400) throw new Error('invalid queue timeout (0 < duration <= 24h)');
+      if (!Number.isFinite(queueTimeout) || queueTimeout <= 0 || queueTimeout > LIMITS.maxQueueSeconds) throw new Error('invalid queue timeout (0 < duration <= 24h)');
     }
     else throw new Error('unknown option: ' + flag);
   }
   const argv = args.slice(i + 1);
   if ((host !== undefined && !validHost(host)) || args[i] !== '--' || !argv.length ||
-      argv.length > 256 || argv.some(x => x.includes('\0')) || Buffer.byteLength(JSON.stringify(argv)) > 16384 ||
-      artifacts.length > 32 || new Set(artifacts).size !== artifacts.length) throw new Error('invalid exec arguments');
+      argv.length > LIMITS.maxArgv || argv.some(x => x.includes('\0')) || Buffer.byteLength(JSON.stringify(argv)) > LIMITS.maxArgvBytes ||
+      artifacts.length > LIMITS.maxArtifacts || new Set(artifacts).size !== artifacts.length) throw new Error('invalid exec arguments');
   return { host, gpu, artifacts, argv, noQueue, queueTimeout };
 }
 
@@ -61,11 +61,11 @@ class RemoteFailure extends Error {
   outcome: Intent['outcome'];
   busy: boolean;
   constructor(data: Buffer) {
-    const value = JSON.parse(data.toString());
+    const value = JSON.parse(data.toString()) as Refusal;
     const outcome = ['refused', 'preempted'].includes(value.outcome) ? value.outcome : 'uncertain';
     super('host ' + outcome + ': ' + String(value.message).slice(0, 1024));
     this.outcome = outcome;
-    this.busy = outcome === 'refused' && (value.busy === true || /^(host busy:|busy$)/.test(String(value.message)));
+    this.busy = outcome === 'refused' && value.busy === true;
   }
 }
 export async function staleControl(config: string, host: string) {

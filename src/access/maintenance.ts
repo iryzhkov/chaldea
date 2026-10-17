@@ -1,3 +1,4 @@
+import { clockHealth } from "./clock.ts";
 import { constants, openSync, closeSync, fstatSync, lstatSync, readFileSync, writeFileSync, fsyncSync, renameSync, unlinkSync, readSync, fchmodSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { randomUUID, createPublicKey } from "node:crypto";
@@ -36,15 +37,7 @@ export function atomicPublicFile(path: string, bytes: string): void {
   } finally { try { unlinkSync(tmp); } catch { /* already renamed */ } }
 }
 export function healthClock(state: AccessState, path: string): Clock {
-  return new Clock(state, () => {
-    const now = Math.floor(Date.now() / 1000), h = object(strictJson(trustedBytes(path, 1024)));
-    exact(h, ["healthy", "offsetSeconds", "checked_at"]); seconds(h.checked_at);
-    requireAccess(h.checked_at <= now && now - h.checked_at <= 30 &&
-      typeof h.offsetSeconds === "number", "clock_health_stale");
-    return { unixSeconds: now, monotonicSeconds: Number(process.hrtime.bigint()) / 1e9,
-      bootId: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(),
-      healthy: h.healthy === true, offsetSeconds: h.offsetSeconds };
-  });
+  return clockHealth(state, () => trustedBytes(path, 1024));
 }
 export interface Health { healthy: boolean; offsetSeconds: number; checked_at: number }
 /** chronyc -n tracking, LC_ALL=C. A local fallback reference is never external health.

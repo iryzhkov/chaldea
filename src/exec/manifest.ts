@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import { resolve, dirname, relative } from 'node:path';
 import { createHash } from 'node:crypto';
-import { MAX_SNAPSHOT, safePath, type Entry } from './protocol.ts';
+import { MAX_SNAPSHOT, LIMITS, PATHS, FILE_MODES, safePath, type Entry } from './protocol.ts';
 
 export type Snapshot = { root: string; cwd: string; files: (Entry & { data: Buffer })[] };
 const git = (cwd: string, args: string[]) => execFileSync('git', ['-C', cwd, ...args], { maxBuffer: 16 * 1024 * 1024 });
@@ -16,13 +16,13 @@ export async function manifest(cwd = process.cwd()): Promise<Snapshot> {
   const exclude = resolve(root, git(root, ['rev-parse', '--git-path', 'info/exclude']).toString().trim());
   await fs.mkdir(dirname(exclude), { recursive: true });
   let ignored = ''; try { ignored = await fs.readFile(exclude, 'utf8'); } catch (e: any) { if (e.code !== 'ENOENT') throw e; }
-  if (!ignored.split('\n').includes('/.chaldea/')) await fs.appendFile(exclude, '\n/.chaldea/\n');
+  if (!ignored.split('\n').includes(PATHS.snapshotExclude)) await fs.appendFile(exclude, '\n' + PATHS.snapshotExclude + '\n');
 
   async function scan() {
     const names = git(root, ['ls-files', '-c', '-o', '--exclude-standard', '-z']);
     if (!Buffer.from(names.toString('utf8')).equals(names)) throw new Error('non-UTF-8 filename');
     const paths = [...new Set(names.toString('utf8').split('\0').filter(Boolean))].sort();
-    if (paths.length > 10000) throw new Error('manifest exceeds 10000 files');
+    if (paths.length > LIMITS.maxFiles) throw new Error('manifest exceeds 10000 files');
     let total = 0;
     const files: Snapshot['files'] = [];
     for (const path of paths) {
@@ -52,7 +52,7 @@ export async function manifest(cwd = process.cwd()): Promise<Snapshot> {
             throw new Error('worktree changed during snapshot');
           }
           total += data.length;
-          files.push({ path, size: data.length, mode: before.mode & 0o111 ? 0o755 : 0o644,
+          files.push({ path, size: data.length, mode: before.mode & 0o111 ? FILE_MODES.executable : FILE_MODES.regular,
             sha256: createHash('sha256').update(data).digest('hex'), data });
         } finally { await handle.close(); }
       } catch (e: any) {

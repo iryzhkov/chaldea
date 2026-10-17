@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import { watch } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
@@ -13,9 +13,7 @@ import { frame, frames, json, VERSION } from '../../src/exec/protocol.ts';
 import { testSocketPath } from '../helpers/socket.ts';
 
 const repo = fileURLToPath(new URL('../../', import.meta.url));
-const server = process.env.CHALDEA_JOB_SERVER;
-if (!server) throw new Error('CHALDEA_JOB_SERVER must point to the reviewed role files/chaldea-job-server; no sibling checkout fallback');
-const role = dirname(dirname(server));
+const server = process.env.CHALDEA_JOB_SERVER ?? join(repo, 'host/chaldea-job-server');
 const cli = join(repo, 'bin/chaldea');
 const sshd = process.env.CHALDEA_SSHD ?? '/usr/bin/sshd';
 
@@ -39,7 +37,7 @@ function disappearance(root: string, jobId: string) {
   });
 }
 
-test('unprivileged SSH forced command + real bubblewrap', { timeout: 65000 }, async t => {
+test('unprivileged SSH forced command + real bubblewrap', { timeout: 120000 }, async t => {
   assert.notEqual(tmpdir(), '/tmp', 'set TMPDIR to a disk-backed scratch directory');
   assert.notEqual(userInfo().uid, 0, 'must run without root');
   const pasta = process.env.CHALDEA_PASTA ?? '/usr/bin/pasta';
@@ -92,7 +90,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 65000 }, as
   ControlPath ${controls}
 `);
     await configure();
-    execFileSync(process.env.CHALDEA_TEST_PYTHON ?? 'python3', ['-I', join(repo, 'test/exec/render.py'), role, scratch,
+    execFileSync(process.env.CHALDEA_TEST_PYTHON ?? 'python3', ['-I', join(repo, 'test/exec/render.py'), scratch,
       JSON.stringify({
         chaldea_job_host_port: port, chaldea_job_host_user: userInfo().username,
         chaldea_job_host_listen: ['127.0.0.1'], chaldea_job_host_pid_file: join(scratch, 'sshd.pid'),

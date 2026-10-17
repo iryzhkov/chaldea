@@ -20,15 +20,19 @@ WAL, SHM, seed and backup files. Ancestors and config/adapters must be outside r
 sandbox write access. Use local disk, never NFS/NAS. One service process/writer per
 event store. Set the service umask to 0077 (the CLI also sets it).
 
-An example config (all keys and paths are placeholders, no generated keys):
+The access paths below are rendered from `chaldea_access_paths` in
+[chaldea-fleet-config inventory](https://github.com/iryzhkov/chaldea-fleet-config/blob/main/inventory/group_vars/all.yml).
+Use `verifier_state`, `bundle`, and `clock_health` for `access_state`, `bundle_file`,
+and `clock_health_file`; the example illustrates that mapping. Other keys are placeholders.
+Do not independently configure another trust-bundle extension or clock location.
 
 ```json
 {
   "database": "/var/lib/akasha/events.db",
-  "access_state": "/var/lib/akasha-access/state.db",
+  "access_state": "/var/lib/akasha/access-state.db",
   "anchors": [{"kid":"deployment-1","public_key":{"kty":"OKP","crv":"Ed25519","x":"DEPLOYMENT_PUBLIC_KEY_BASE64URL"}}],
-  "bundle_file": "/var/lib/akasha-trust/current.jws",
-  "clock_health_file": "/var/lib/akasha-trust/clock-health.json",
+  "bundle_file": "/var/lib/chaldea-access-trust-public/bundle.jws",
+  "clock_health_file": "/run/chaldea-access-trust/clock-health.json",
   "registry": [{
     "issuer":"chaldea:agent-a","source":"chaldea.daily-health.agent-a","host":"agent-a",
     "source_id":"agent-a-daily-health","profile":"daily-health","project":"homelab",

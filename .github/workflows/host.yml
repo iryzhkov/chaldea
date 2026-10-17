@@ -1,0 +1,81 @@
+name: host artifact
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['host-*']
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26.10.0
+      - name: Isolate test and build state
+        run: |
+          mkdir -p "$RUNNER_TEMP/ch/home" "$RUNNER_TEMP/ch/tmp"
+          echo "HOME=$RUNNER_TEMP/ch/home" >> "$GITHUB_ENV"
+          echo "TMPDIR=$RUNNER_TEMP/ch/tmp" >> "$GITHUB_ENV"
+      - run: npm ci --ignore-scripts
+      - name: Install host test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends e2fsprogs
+          python3 -m venv "$TMPDIR/venv"
+          "$TMPDIR/venv/bin/pip" install --require-hashes --only-binary=:all: -r host/requirements-test.txt
+      - name: Host behaviour tests
+        run: |
+          test "$HOME" = "$RUNNER_TEMP/ch/home"
+          PATH="$TMPDIR/venv/bin:$PATH" python3 -m pytest -q -p no:cacheprovider host/tests
+      - name: Build deterministic artifact
+        env:
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('host-{0}', github.sha) }}
+        run: |
+          npm run host:build -- "$VERSION" "$TMPDIR/release"
+          npm run host:build -- "$VERSION" "$TMPDIR/repeat"
+          cmp "$TMPDIR/release/chaldea-host.tar.gz" "$TMPDIR/repeat/chaldea-host.tar.gz"
+          cmp "$TMPDIR/release/manifest.json" "$TMPDIR/repeat/manifest.json"
+      - name: Test bundled entry points
+        run: |
+          mkdir "$TMPDIR/unpack"
+          tar -xzf "$TMPDIR/release/chaldea-host.tar.gz" -C "$TMPDIR/unpack"
+          node "$TMPDIR/unpack/host/access-maintenance.mjs" --help | grep -F "Usage: chaldea access"
+          AKASHA_STATE_FILE="$TMPDIR/collector.db" AKASHA_SPOOL="$TMPDIR/empty" AKASHA_TIMER_SPOOL="$TMPDIR/empty-timers" node "$TMPDIR/unpack/host/akasha-collector.mjs"
+      - name: Upload candidate artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chaldea-host
+          path: |
+            ${{ runner.temp }}/ch/tmp/release/chaldea-host.tar.gz
+            ${{ runner.temp }}/ch/tmp/release/manifest.json
+          retention-days: 14
+  exec:
+    if: startsWith(github.ref, 'refs/tags/host-v')
+    uses: ./.github/workflows/exec.yml
+  release:
+    if: startsWith(github.ref, 'refs/tags/host-v')
+    needs: [host, exec]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: chaldea-host
+          path: release
+      - name: Publish immutable host release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('host-{0}', github.sha) }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          gh release create "$VERSION" --target "$COMMIT" --title "$VERSION" --notes "Pinned host programs; verify manifest.json and the inventory SHA-256 before installing." release/chaldea-host.tar.gz release/manifest.json

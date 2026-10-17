@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Run a fleet timer and record one safe outcome per systemd invocation."""
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+JOBS = ("chaldea-fleet-pull", "chaldea-retention")
+MAX_RECORDS = 50
+MAX_BYTES = 131072
+FEED_TIMEOUT = 8
+STATE = Path.home() / ".local/state/chaldea"
+
+
+def read_json(path, default):
+    try:
+        if path.stat().st_size > MAX_BYTES:
+            return default
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    temporary = path.with_suffix(".new")
+    with open(temporary, "w", opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
+        json.dump(data, stream, separators=(",", ":"))
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def run_path(job):
+    return STATE / (job + "-run.json")
+
+
+def safe_state(job, invocation):
+    data = read_json(run_path(job), {})
+    return data if isinstance(data, dict) and data.get("invocation") == invocation else {}
+
+
+def release_names(checkout=None):
+    """Only version identifiers, never arbitrary paths or command output."""
+    releases = []
+    current = Path.home() / ".local/share/agent-tools/current"
+    name = current.resolve().name
+    if re.fullmatch(r"[a-f0-9]{64}", name):
+        releases.append("agent-tools@" + name[:12])
+    for tool in ("claude", "codex", "npm-opencode-cli", "opencode"):
+        latest = Path.home() / ".local/share/mise/installs" / tool / "latest"
+        version = latest.resolve().name
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}(?:[-+][a-zA-Z0-9.]+)?", version):
+            releases.append(tool + "@" + version)
+    if checkout:
+        try:
+            result = subprocess.run(["git", "-C", checkout, "rev-parse", "HEAD"],
+                                    capture_output=True, text=True, timeout=2)
+            value = result.stdout.strip()
+            if result.returncode == 0 and re.fullmatch(r"[a-f0-9]{40,64}", value):
+                releases.append("fleet-config@" + value[:12])
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return releases
+
+
+def feed_delivery(record):
+    if record["severity"] == "info" and record["changed"] == 0:
+        return "quiet"
+    config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+    key = Path(os.environ.get("FEED_KEY_FILE", str(config / "feed/key")))
+    if not os.environ.get("FEED_TOKEN") and not (key.is_file() and os.access(key, os.R_OK) and key.stat().st_size):
+        return "no-credential"
+    source = "chaldea-fleet" if record["job"] == "chaldea-fleet-pull" else "chaldea-retention"
+    title = f'{record["host"]}: {record["job"]} {record["outcome"]}; changed={record["changed"]}'
+    if record.get("task"):
+        title += "; task=" + record["task"]
+    if record.get("reason"):
+        title += "; " + record["reason"]
+    if record["releases"]:
+        title += "; releases=" + ",".join(record["releases"])
+        if record.get("releases_omitted"):
+            title += f' (+{record["releases_omitted"]} more)'
+    # Neither feed output nor raw child output is copied to the journal/status.
+    # A separate session lets the timeout kill curl and other descendants too.
+    process = None
+    try:
+        process = subprocess.Popen(["feed", "post", title, "--source", source,
+                                    "--host", record["host"], "--severity", record["severity"]],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        return "posted" if process.wait(timeout=FEED_TIMEOUT) == 0 else "feed-failed"
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        return "feed-timeout"
+    except OSError:
+        return "feed-unavailable"
+
+
+def delivery_mode():
+    config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "chaldea/timer-reporting.json"
+    mode = read_json(config, {"delivery": "feed"}).get("delivery")
+    if mode not in ("feed", "queue"):
+        raise ValueError("invalid timer delivery mode")
+    return mode
+
+
+def queue_delivery(record):
+    """A bounded local enqueue only; network delivery belongs to the collector."""
+    if record["severity"] == "info" and record["changed"] == 0:
+        return "quiet"
+    spool = STATE / "timer-spool"
+    spool.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = spool / (record["job"] + "." + record["invocation"] + ".jsonl")
+    if path.exists():
+        return "queued"
+    # Eight MiB of immutable local inputs; status, database and rollback journal
+    # have separate budgets keeping all new host state below 64 MiB.
+    data = {k: record[k] for k in ("job", "invocation", "host", "timestamp", "outcome",
+                                     "changed", "task", "reason", "releases", "releases_omitted", "notes") if k in record}
+    encoded = (json.dumps(data, separators=(",", ":")) + "\n").encode()
+    # Only this lock owner writes inputs. Incomplete atomic writes are not events.
+    for stale in spool.glob("*.new"):
+        stale.unlink()
+    block = max(4096, os.statvfs(spool).f_frsize)
+    used = spool.stat().st_blocks * 512 + sum(
+        max(p.stat().st_size, p.stat().st_blocks * 512)
+        for p in spool.iterdir() if p.is_file())
+    reserve = ((len(encoded) + block - 1) // block) * block + block
+    count_path = STATE / "timer-spool-count.json"
+    counts = read_json(count_path, {})
+    if used + reserve > 8 * 1024 * 1024 or sum(1 for _ in spool.iterdir()) >= 1024:
+        counts["dropped"] = min(int(counts.get("dropped", 0)) + 1, 2**53 - 1)
+        write_json(count_path, counts)
+        return "queue-full"
+    temporary = path.with_suffix(".new")
+    with open(temporary, "wb", opener=lambda p, flags: os.open(p, flags, 0o600)) as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    directory = os.open(spool, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    return "queued"
+
+
+def record_outcome(job, invocation, status, fallback_reason="", checkout=None):
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (STATE / "fleet-status.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = STATE / "fleet-status.json"
+        records = read_json(path, [])
+        if not isinstance(records, list):
+            records = []
+        records = [r for r in records if isinstance(r, dict)]
+        if any(r.get("invocation") == invocation and r.get("job") == job for r in records):
+            return
+        state = safe_state(job, invocation)
+        changed = state.get("changed", 0)
+        changed = max(0, min(changed, 1000000)) if type(changed) is int else 0
+        failed = status != 0
+        record = dict(invocation=invocation, job=job, host=socket.gethostname().split(".")[0],
+                      timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                      outcome="failed" if failed else "changed" if changed else "unchanged",
+                      severity="fail" if failed else "info", changed=changed,
+                      releases=release_names(checkout) if job == "chaldea-fleet-pull" else [],
+                      task=state.get("task", "ansible-pull setup" if job == "chaldea-fleet-pull" else "retention startup") if failed else "",
+                      reason=(state.get("reason") or fallback_reason) if failed else "",
+                      delivery="pending")
+        for release in state.get("releases", [])[:12]:
+            if isinstance(release, str) and re.fullmatch(r"[a-zA-Z0-9@._+:/-]{1,100}", release):
+                record["releases"].append(release)
+        release_count = state.get("release_count", len(record["releases"]))
+        if type(release_count) is int:
+            record["releases_omitted"] = max(0, min(release_count, 1000000) - len(record["releases"]))
+        leftovers = state.get("tmp_leftovers", 0)
+        if type(leftovers) is int and leftovers > 0:
+            record["notes"] = [f"temporary entries left after best-effort cleanup: {min(leftovers, 1000000)}"]
+        record["task"] = str(record["task"])[:160]
+        record["reason"] = str(record["reason"])[:160]
+        records = records[-(MAX_RECORDS - 1):] + [record]
+        mode = delivery_mode()
+        if mode == "queue":
+            # Durable immutable input first; a crash reuses this queue key.
+            try:
+                record["delivery"] = queue_delivery(record)
+            except OSError:
+                record["delivery"] = "queue-failed"
+        while len(json.dumps(records).encode()) > MAX_BYTES and len(records) > 1:
+            records.pop(0)
+        # Feed mode claims the invocation before any ambiguous network POST.
+        # OnFailure must never retry that operation after a crash.
+        write_json(path, records)
+        print(json.dumps(record, separators=(",", ":")), flush=True)
+        if mode == "feed":
+            record["delivery"] = feed_delivery(record)
+            write_json(path, records)
+
+
+
+def invocation_id(failure=False):
+    name = "MONITOR_INVOCATION_ID" if failure else "INVOCATION_ID"
+    value = os.environ.get(name, "")
+    if re.fullmatch(r"[a-f0-9]{32}", value):
+        return value
+    if failure:
+        raise ValueError("systemd MONITOR_INVOCATION_ID missing")
+    return uuid.uuid4().hex
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("run", "failure"))
+    parser.add_argument("--job", choices=JOBS, required=True)
+    parser.add_argument("--checkout")
+    argv = list(sys.argv[1:] if argv is None else argv)
+    split = argv.index("--") if "--" in argv else len(argv)
+    command = argv[split + 1:]
+    args = parser.parse_args(argv[:split])
+    invocation = invocation_id(args.mode == "failure")
+    if args.mode == "failure":
+        result = os.environ.get("MONITOR_SERVICE_RESULT", "")
+        reason = {
+            "timeout": "systemd timeout", "signal": "systemd signal",
+            "core-dump": "systemd core dump", "oom-kill": "systemd OOM kill",
+            "exit-code": "process exited unsuccessfully", "resources": "systemd resource failure",
+            "start-limit-hit": "systemd start limit",
+        }.get(result, "systemd service failure")
+        record_outcome(args.job, invocation, 1, reason)
+        return 0
+    if not command:
+        parser.error("run requires a command after --")
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state = dict(invocation=invocation, changed=0, releases=[], task="ansible-pull setup" if args.job == JOBS[0] else "retention startup")
+    write_json(run_path(args.job), state)
+    environment = os.environ.copy()
+    environment["CHALDEA_RUN_STATE"] = str(run_path(args.job))
+    if args.job == JOBS[0]:
+        environment["ANSIBLE_CALLBACK_PLUGINS"] = str(Path.home() / ".local/share/chaldea/timer-reporting")
+        environment["ANSIBLE_CALLBACKS_ENABLED"] = "chaldea_outcome"
+        environment["ANSIBLE_LOAD_CALLBACK_PLUGINS"] = "1"
+    try:
+        # Only the safe callback/retention summary reaches the timer journal.
+        status = subprocess.run(command, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
+    except OSError:
+        status = 127
+    try:
+        state = safe_state(args.job, invocation)
+        if status == 0 and not state.get("complete"):
+            status = 1
+            reason = "outcome summary missing"
+        else:
+            reason = f"process exited with status {status}" if status >= 0 else f"process killed by signal {-status}"
+        record_outcome(args.job, invocation, status, reason, args.checkout)
+    except Exception:
+        # Reporting must not turn a successful job into a failure. A failure
+        # before the claim is recoverable by OnFailure for unsuccessful jobs.
+        print("chaldea timer: local reporting failed", file=sys.stderr)
+    return status if status >= 0 else 128 - status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

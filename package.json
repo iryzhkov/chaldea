@@ -20,7 +20,8 @@
     "test:e2e": "scripts/with-scratch node --test --test-concurrency=1 'test/e2e/*.test.ts'",
     "exec:check": "tsc -p tsconfig.exec.json",
     "exec:test": "node --test test/exec/*.test.ts",
-    "exec:e2e": "node --test test/exec/e2e.ts"
+    "exec:e2e": "node --test test/exec/e2e.ts",
+    "host:build": "node scripts/build-host.mjs"
   },
   "dependencies": {
     "@nats-io/jetstream": "3.4.0",
@@ -30,6 +31,7 @@
     "ws": "8.22.0"
   },
   "devDependencies": {
+    "esbuild": "0.25.0",
     "@types/node": "26.6.5",
     "@types/ws": "8.18.2",
     "typescript": "7.0.2"

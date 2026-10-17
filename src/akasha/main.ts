@@ -1,3 +1,4 @@
+import { clockHealth, HEALTH_FIELDS } from "../access/clock.ts";
 import { constants, openSync, closeSync, fstatSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { AccessState, Clock, TrustStore, TRUST_POLL_SECONDS } from "../access/trust.ts";
@@ -49,13 +50,8 @@ export async function main(args: string[]): Promise<number> {
       process.stdout.write(JSON.stringify({ ok: true, rows: result }) + "\n"); return 0;
     }
     state = new AccessState(string("access_state"));
-    const clock = new Clock(state, () => {
-      const now = Math.floor(Date.now() / 1000), h = parse(trustedFile(string("clock_health_file"), 1024));
-      fields(h, ["healthy", "offsetSeconds", "checked_at"]);
-      ensure(Number.isSafeInteger(h.checked_at) && (h.checked_at as number) <= now &&
-        now - (h.checked_at as number) <= 30 && typeof h.offsetSeconds === "number", "clock_health_stale");
-      return { unixSeconds: now, monotonicSeconds: Number(process.hrtime.bigint()) / 1e9,
-        bootId: readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(), healthy: h.healthy === true, offsetSeconds: h.offsetSeconds };
+    const clock = clockHealth(state, () => trustedFile(string("clock_health_file"), 1024), {
+      decode: parse, fields: h => fields(h, HEALTH_FIELDS), check: ensure,
     });
     ensure(Array.isArray(c.anchors), "anchors_required");
     const trust = new TrustStore(state, clock, c.anchors as TrustAnchor[]);

@@ -60,7 +60,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     'log("connected");',
     'if (mode === "connect-hang") { process.execve(process.env.FAKE_REAL_SSH, [process.env.FAKE_REAL_SSH, ...args], process.env); }',
     'if (mode === "unreachable") process.exit(255);',
-    'if (mode === "busy") { send("R", {outcome:"refused",message:"busy"}); process.exit(0); }',
+    'if (mode === "busy") { send("R", {outcome:"refused",message:"busy",busy:true}); process.exit(0); }',
     'send("H", {version: mode === "invalid" ? 2 : VERSION});',
     'let request;',
     'for await (const item of frames(process.stdin)) {',
