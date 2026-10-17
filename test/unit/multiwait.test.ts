@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { join } from "node:path";
 import { WakeStore } from "../../src/wake/store.ts";
 import { WaitEngine } from "../../src/waits/engine.ts";
+import { Deadlines } from "../../src/waits/deadlines.ts";
 import { WAIT_TOOLS } from "../../src/mcp.ts";
 import { scratchDir } from "../helpers/scratch.ts";
 import type { WaitT3, WaitSnapshot } from "../../src/t3/waits.ts";
@@ -89,6 +90,70 @@ test("combined wake freezes membership before send and replays byte-identically 
     assert.ok(JSON.parse(next.payload).text.includes(late.id));
     f.store.sent(next.id);f.reopen();assert.deepEqual(f.store.dispatchable(),[]);
   }finally{f.close();}
+});
+test("legacy outbox migration replays attempted bytes before batching new wakes",()=>{
+  const f=fixture();
+  try{
+    const a=add(f.store,"legacy-attempted"),b=add(f.store,"legacy-new"),c=add(f.store,"legacy-new2");
+    for(const row of [a,b,c])f.store.resolve(row.id,{reason:"time"},undefined,now);
+    const old=f.store.deliveries().find(d=>d.item===a.id)!;
+    // Reproduce the pre-multiwait schema and a crash during an ambiguous send.
+    f.store.db.prepare("UPDATE outbox SET state='sending',attempts=1 WHERE id=?").run(old.id);
+    f.store.db.exec("ALTER TABLE outbox DROP COLUMN batch_id");
+    f.reopen();
+    const recovered=f.store.dispatchable();
+    assert.equal(recovered.length,1);assert.equal(recovered[0]!.id,old.id);
+    const replay=f.store.claim(old.id)!;
+    assert.equal(replay.payload,old.payload);assert.equal(replay.batch_id,null);
+    assert.equal(replay.attempts,2);
+    assert.ok(f.store.deliveries().filter(d=>d.id!==old.id).every(d=>d.attempts===0&&d.batch_id===null));
+    f.store.sent(old.id);
+    const next=f.store.claim(f.store.dispatchable()[0]!.id)!;
+    assert.notEqual(next.id,old.id);
+    assert.ok(JSON.parse(next.payload).text.includes(b.id));assert.ok(JSON.parse(next.payload).text.includes(c.id));
+    assert.ok(!JSON.parse(next.payload).text.includes(a.id));
+    f.store.sent(next.id);f.reopen();
+    assert.ok(f.store.deliveries().every(d=>d.state==="sent"));
+  }finally{f.close();}
+});
+test("a long undelivered backlog remains one combined message with every outcome",()=>{
+  const f=fixture();
+  try{
+    const rows=Array.from({length:40},(_,i)=>{
+      const row=add(f.store,"backlog"+i);
+      f.store.resolve(row.id,{reason:"completed",runId:"r".repeat(256)},undefined,now);
+      return row;
+    });
+    assert.ok(f.store.deliveries().every(d=>Buffer.byteLength(d.payload)<=4096));
+    const claimed=f.store.claim(f.store.dispatchable()[0]!.id)!;
+    assert.ok(Buffer.byteLength(claimed.payload)>4096);
+    const text=JSON.parse(claimed.payload).text;
+    for(const row of rows)assert.ok(text.includes(row.id+": "+f.store.get(row.id).outcome));
+    f.store.sent(claimed.id);
+    assert.equal(f.store.deliveries().length,40);
+    assert.ok(f.store.deliveries().every(d=>d.state==="sent"));
+  }finally{f.close();}
+});
+test("decision retry keeps its own timer while a wait on the same parent is in flight", {timeout:10_000},async t=>{
+  const f=fixture(),gate=Promise.withResolvers<void>(),armed:Array<number|undefined>=[];
+  t.mock.method(Deadlines.prototype,"arm",(at:number|undefined)=>{armed.push(at);});
+  const t3:WaitT3={
+    async environment(){return "env";},
+    async snapshot(id){await gate.promise;return {id,project:"project",archived:false,deleted:false,settled:false,runs:[],pendingRuns:[],children:[]};},
+    async observe(_id,signal){if(!signal.aborted)await new Promise<void>(r=>signal.addEventListener("abort",()=>r(),{once:true}));},
+    async dispatch(){},
+  };
+  const engine=new WaitEngine(f.store,t3);
+  try{
+    const a=add(f.store,"timer");f.store.resolve(a.id,{reason:"time"},undefined,now);
+    const decision=f.store.register(f.store.prepare("decision",{threadId:"parent",requestId:now+":timer-decision",
+      question:"Run?",options:["Run","Defer"],dependentAction:"run",defaultAction:"defer",deadline:iso(now+86_400_000)},now),"project",null,now);
+    f.store.answer(decision.id,"Run","cli",now);
+    const d=f.store.deliveries().find(d=>d.item===decision.id)!;
+    const retryAt=Date.now()+30_000;f.store.retry(d.id,retryAt);
+    engine.start();
+    assert.equal(armed.at(-1),retryAt);
+  }finally{gate.resolve();await engine.stop();f.close();}
 });
 test("cancellation before batching and rejection/orphan dispositions apply to each member",()=>{
   for(const action of ["block","orphan"] as const){

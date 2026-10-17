@@ -223,7 +223,9 @@ export class WaitEngine {
         const input=JSON.parse(i.input) as WaitInput;
         if (input.condition?.kind === "time") times.push(Date.parse(input.condition.at));
       }
-      for (const d of this.store.dispatchable()) if (!this.inflight.has(d.id) && !this.wakeParents.has(this.store.get(d.item).parent)) {
+      for (const d of this.store.dispatchable()) if (!this.inflight.has(d.id)) {
+        const item=this.store.get(d.item);
+        if (d.channel === "wake" && item.kind === "wait" && this.wakeParents.has(item.parent)) continue;
         // Completion of an in-flight request triggers the next drain; no busy timer loop.
         if (d.next_at > now || this.hasSlot(d.channel)) times.push(d.next_at);
         if (d.expires !== null) times.push(d.expires);

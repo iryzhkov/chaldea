@@ -8,7 +8,7 @@ and no recurring condition-polling loop. The answer page defaults to loopback.
 ## One wake, and the approved T3 0.1.0 deviation
 
 Each resolved wait/fallback question commits its outcome and one wake row in
-the same SQLite transaction. Up to eight active waits per thread are allowed; pending wait wakes combine into one queued message listing each wait ID and outcome, with membership and shared payload frozen before the first delivery attempt and each wait retaining its own delivery record. Command and message IDs are
+the same SQLite transaction. Up to eight active waits per thread are allowed; pending wait wakes combine into one queued message listing each wait ID and outcome, with membership and shared payload frozen before the first delivery attempt and each wait retaining its own delivery record and the combined message using its leader's command/message IDs. Command and message IDs are
 `chaldea-wait:<id>:wake` or `chaldea-decision:<id>:wake`. Delivery uses
 `message.dispatch`, `dispatchMode:{type:"queue_after_active"}`, empty attachments,
 and short text:
@@ -335,8 +335,8 @@ re-dispatch; a crash still replays the immutable command/receipt protocol.
 New work is rejected under disk pressure. No unresolved/uncertain/blocked wake
 is pruned.
 
-Defaults: 128 active waits (one per thread), 128 pending native/fallback decisions combined, at most 10,000
-terminal tombstones and 42 days; wake/native response payload 4 KiB, normalized registration
+Defaults: 128 active waits in total (at most eight per thread), 128 pending native/fallback decisions combined, at most 10,000
+terminal tombstones and 42 days; individual wake/native response payload 4 KiB (combined wait messages include all pending members and can be larger), normalized registration
 3 KiB, native answer schema 4 KiB, recent-request baseline 4 KiB, native request ID 2 KiB, dependent action
 512 bytes, question 1 KiB, 2–8 options of 256 bytes. No raw T3 event is persisted.
 Request keys use `<13-digit epoch milliseconds>:<unique key>`; new keys older
