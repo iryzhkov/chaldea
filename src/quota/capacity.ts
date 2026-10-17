@@ -77,7 +77,7 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   c.burnTargetPerHour = Math.max(0, remaining - config.reserveFraction) / hours;
   c.observedBurnPerHour = burnRate(p, w, now, config.recentWindowMs);
   const heavyRate = c.observedBurnPerHour === null ? null : c.observedBurnPerHour * config.heavyMultiplier;
-  c.projectedHeavyUse = heavyRate === null ? null : heavyRate * hours;
+  c.projectedHeavyUse = heavyRate === null || heavyRate <= 0 ? null : heavyRate * hours;
   const reserves = config.providers[p.alias] ?? {};
   let expiring = false;
   const near = (at: string | null | undefined) => unexpired(at, now) && Date.parse(at!) - now <= config.expiryHorizonMs;
@@ -119,7 +119,7 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
     return finish("use-it", "window under-paced; quota will expire unused at the native reset");
   if (c.projectedHeavyUse !== null && remaining + c.reserveWeeks - config.reserveFraction >= c.projectedHeavyUse)
     return finish("unlimited", `remaining quota plus reserves cover projected heavy use until native reset, retaining ${config.reserveFraction * 100}% reserve`);
-  if (c.observedBurnPerHour === null) c.reasons.push("recent burn rate unknown; reserves cannot establish unlimited capacity");
+  if (c.projectedHeavyUse === null) c.reasons.push("positive recent burn rate unknown; reserves cannot establish unlimited capacity");
   return finish("paced", `use within burn target to retain ${config.reserveFraction * 100}% at native reset`);
 }
 export function classifyCapacities(state: Pick<ObserverState, "headroom" | "parked">, now: number, config: CapacityConfig = DEFAULT_CAPACITY): Record<string, Capacity> {
@@ -138,6 +138,15 @@ export function retainBurnSample(row: ProviderHeadroom, nextAt: string): void {
   const history = row.burnHistory ?? [];
   const last = history.at(-1);
   if (last && Date.parse(old.observedAt) - Date.parse(last.observedAt) < 5 * 60000) return;
-  row.burnHistory = [...history, { observedAt: old.observedAt, windows: old.value }]
+  const samples = [...history, { observedAt: old.observedAt, windows: old.value }]
     .filter(s => Date.parse(nextAt) - Date.parse(s.observedAt) <= 48 * 3600000).slice(-288);
+  // <=1 MiB across the observer\u0027s 64-provider cap, leaving room for its durable outbox.
+  let bytes = 2;
+  const kept: BurnSample[] = [];
+  for (const sample of samples.toReversed()) {
+    bytes += Buffer.byteLength(JSON.stringify(sample)) + 1;
+    if (bytes > 16 * 1024) break;
+    kept.push(sample);
+  }
+  row.burnHistory = kept.toReversed();
 }

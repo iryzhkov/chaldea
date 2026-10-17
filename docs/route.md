@@ -48,12 +48,15 @@ fraction minus fraction of native window time left is at least 0.10; otherwise
 it prefers Codex. Missing/stale pacing keeps the role default.
 
 The observer keeps up to 288 previous window observations per provider, sampled
-at least five minutes apart and retained for 48 hours. Burn uses the most recent
+at least five minutes apart and retained for 48 hours, with a 16 KiB per-provider
+history budget. Burn uses the most recent
 24 hours, requires at least five minutes of comparable observations, and stops
 at a reset or refill. The heavy projection is observed fractional quota burn
 per hour times the configured multiplier times hours until native reset.
-Burn target is `max(0, remaining - 0.05) / hours to reset`. Missing burn cannot
-establish unlimited capacity.
+Burn target is `max(0, remaining - 0.05) / hours to reset`. Missing or zero burn cannot
+establish unlimited capacity. Claude collector/operator windows do not yet retain
+burn samples in observer state, so their refill timing stays unknown unless
+comparable observer samples exist.
 
 A Codex reset would restart full quota with a new one-week deadline, but its
 advisory value is only the time from projected exhaustion to the original native
@@ -81,6 +84,10 @@ credentials, or calls any purchase, reset-redemption or refresh method.
 A stopped provider remains stopped even with reserves.
 
 ## Configuration
+
+Pacing and minimum-remaining thresholds default to capacity.json for both status
+and routing. Explicit route.json overrides apply to both the pacing and capacity
+calculation within routing; status continues to use capacity.json.
 
 Routing configuration is `~/.config/chaldea/route.json`, optional and separate
 from the observer's `quota.json`. Use `--config PATH` for CLI or

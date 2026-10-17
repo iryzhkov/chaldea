@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { recommend } from "../../src/route/policy.ts";
+import { classifyCapacity } from "../../src/quota/capacity.ts";
+import { newProvider } from "../../src/quota/headroom.ts";
 import { PAIRS, routeInput } from "../../src/route/types.ts";
 import type { Analytics, Quota } from "../../src/route/types.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
@@ -90,6 +92,23 @@ test("Slopalytics breaks unknown-pacing ties by completion then minutes, never o
   const a = analytics(stats(95, 3, 2, 3), stats(95, 3, 2, 1));
   assert.equal(recommend({ role: "builder" }, { ...base, analytics: a }).model, "gpt-6.1-sol");
   assert.equal(recommend({ role: "builder" }, { ...base, analytics: a, quota: { claudeAgent: weekly(62) } }).model, "claude-opus-5-5");
+});
+test("unknown Claude capacity ties paced Codex and preserves every role default", () => {
+  const unknown = classifyCapacity(newProvider("claudeAgent", "claudeAgent"), false, now);
+  const paced = { ...unknown, class: "paced" as const, reasons: ["fixture paced"] };
+  for (const role of Object.keys(PAIRS) as Array<keyof typeof PAIRS>) {
+    const r = recommend({ role }, { ...base, quota: { codex: weekly(40) }, capacity: { claudeAgent: unknown, codex: paced } });
+    assert.equal(r.providerInstanceId, "claudeAgent", role);
+  }
+});
+test("statistics cannot remove the only eligible review or stopped-peer fallback", () => {
+  const a = analytics(stats(75, 15, 10));
+  a.models["claude-fable-5-1"] = stats(75, 15, 10);
+  a.models["gpt-6-astra"] = stats(95, 3, 2);
+  assert.equal(recommend({ role: "critical-review", authorProvider: "codex" },
+    { ...base, analytics: a }).model, "claude-fable-5-1");
+  assert.equal(recommend({ role: "builder" }, { ...base, analytics: a,
+    quota: { codex: { ...weekly(60), activeStop: true } } }).model, "claude-opus-5-5");
 });
 test("freshly downloaded old report and stale cache are ignored with ages/reason", () => {
   for (const a of [

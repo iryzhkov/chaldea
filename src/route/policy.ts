@@ -64,7 +64,8 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     eligible = candidates.filter(c => {
       const s = a.models[c.model];
       const peer = a.models[pair[c.driver === "claudeAgent" ? 1 : 0]];
-      const drop = s && peer && s.turns >= config.minimumTurns && peer.turns >= config.minimumTurns &&
+      const hasEligiblePeer = candidates.some(other => other.driver !== c.driver);
+      const drop = hasEligiblePeer && s && peer && s.turns >= config.minimumTurns && peer.turns >= config.minimumTurns &&
         s.failedRate + s.interruptedRate - peer.failedRate - peer.interruptedRate > config.failureMargin;
       if (drop) reasons.push(`${c.model}: Slopalytics failure+interrupt rate exceeds peer by more than ${Math.round(config.failureMargin * 100)} points, avoid`);
       return !drop;
@@ -80,12 +81,11 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   eligible.sort((x, y) => {
     const rank = (id: string) => {
       const kind = data.capacity?.[id]?.class;
-      return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : kind === "paced" ? 2 : null;
+      return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
     };
     const xr = rank(x.providerInstanceId), yr = rank(y.providerInstanceId);
     if (xr !== null && yr !== null && xr !== yr) return xr - yr;
-    // Known capacity precedes an unknown fallback; equal classes use pacing.
-    if (data.capacity && (xr === null) !== (yr === null)) return xr === null ? 1 : -1;
+    // Unknown and paced tie, preserving the role default when Claude pacing is unknown.
     // Known quota preference takes precedence over a statistical tie-break.
     if (hasPace && x.driver !== y.driver) return x.driver === preferred ? -1 : 1;
     if (x.driver === y.driver && x.pace !== y.pace) return (y.pace ?? -Infinity) - (x.pace ?? -Infinity);

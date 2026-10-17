@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { loadCapacityConfig } from "../quota/capacity-config.ts";
 import { join } from "node:path";
 import { DEFAULT_POLICY } from "./types.ts";
 import type { PolicyConfig, QuotaWindow } from "./types.ts";
@@ -19,8 +20,7 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
     claudeUsage: { enabled: false, providerInstanceId: "claudeAgent", credentialFile: join(home, ".claude/.credentials.json") },
     claudeWeeklyTarget: null,
   };
-  if (!existsSync(path)) return defaults;
-  const r = readJson(path, 64 * 1024) as Record<string, unknown>;
+  const r = (existsSync(path) ? readJson(path, 64 * 1024) : {}) as Record<string, unknown>;
   if (!r || typeof r !== "object" || Array.isArray(r) ||
     Object.keys(r).some(k => !Object.hasOwn(defaults, k))) throw new Error("Invalid route configuration keys");
   const c = { ...defaults };
@@ -59,5 +59,8 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
     c.claudeWeeklyTarget = { observedAt: v.observedAt, window: { kind: "weekly", remainingPercent: v.remainingPercent,
       resetsAt: v.resetsAt, windowDurationMins: 10080 } };
   }
+  const capacity = loadCapacityConfig(home, c.capacityConfigFile);
+  if (r.paceMargin === undefined) c.paceMargin = capacity.paceMargin;
+  if (r.minimumRemaining === undefined) c.minimumRemaining = capacity.minimumRemaining;
   return c;
 }

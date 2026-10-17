@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
-import { writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync } from "node:fs";
 import { route } from "../../src/route/runtime.ts";
 import { loadRouteConfig } from "../../src/route/config.ts";
 import { emptyState, saveState } from "../../src/quota/state.ts";
@@ -42,6 +42,32 @@ test("operator weekly fallback lasts until reset, collector failures degrade wit
     assert.match(r.reasons.join(" "), /under-paced/);
     assert.equal(r.dataAges.quota.claudeAgent, 86400);
     assert.match(r.reasons.join(" "), /collection failed/);
+  } finally { d.remove(); }
+});
+test("enabled collector skips credential access when its catalog binding is absent", async () => {
+  const d = routeScratch();
+  try {
+    const configPath = join(d.path, "route.json"), cacheDir = join(d.path, "cache");
+    writeFileSync(configPath, JSON.stringify({ cacheDir, claudeUsage: { enabled: true } }));
+    const requests: string[] = [];
+    const r = await route({ role: "builder" }, { home: d.path, configPath, now,
+      catalog: async () => catalog.filter(p => p.providerInstanceId === "codex"),
+      fetcher: async url => { requests.push(String(url)); throw new Error("fixture offline"); } });
+    assert.equal(r.providerInstanceId, "codex");
+    assert.ok(!requests.some(url => url.includes("api.anthropic.com")));
+    assert.equal(existsSync(join(cacheDir, "claude-usage.json")), false);
+  } finally { d.remove(); }
+});
+test("capacity thresholds are shared defaults; route overrides also govern capacity ranking", async () => {
+  const d = routeScratch();
+  try {
+    const capacityConfigFile = join(d.path, "capacity.json"), configPath = join(d.path, "route.json");
+    writeFileSync(capacityConfigFile, JSON.stringify({ paceMargin: .05, minimumRemaining: .07 }));
+    writeFileSync(configPath, JSON.stringify({ capacityConfigFile }));
+    assert.equal(loadRouteConfig(d.path, configPath).paceMargin, .05);
+    assert.equal(loadRouteConfig(d.path, configPath).minimumRemaining, .07);
+    writeFileSync(configPath, JSON.stringify({ capacityConfigFile, paceMargin: .03 }));
+    assert.equal(loadRouteConfig(d.path, configPath).paceMargin, .03);
   } finally { d.remove(); }
 });
 test("config defaults safe, validates fractions/keys/collector/target", () => {

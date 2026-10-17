@@ -27,8 +27,11 @@ export async function cached<T>(path: string, interval: number, now: number,
   const load = (): Cache<T> => {
     try {
       const raw = readJson(path) as Cache<unknown>;
-      if (!Number.isFinite(raw.attemptedAt) || raw.attemptedAt > now || raw.attemptedAt < 0) throw new Error();
-      return { attemptedAt: raw.attemptedAt, fetchedAt: raw.fetchedAt, value: raw.value === null ? null : validate(raw.value) };
+      if (!Number.isFinite(raw.attemptedAt) || raw.attemptedAt < 0) throw new Error();
+      // Preserve the reservation across clock regression and cached-value schema changes.
+      let value: T | null = null;
+      try { if (raw.value !== null) value = validate(raw.value); } catch { /* Unknown data, reserved attempt. */ }
+      return { attemptedAt: raw.attemptedAt, fetchedAt: typeof raw.fetchedAt === "string" && Number.isFinite(Date.parse(raw.fetchedAt)) ? raw.fetchedAt : null, value };
     } catch { return { attemptedAt: 0, fetchedAt: null, value: null }; }
   };
   let state = load();

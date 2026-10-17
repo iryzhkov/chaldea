@@ -59,11 +59,12 @@ export async function route(value: unknown, options: {
       catalog = routeCatalog((await switchPort({ serverUrl: url, token: readToken(config.tokenFile) }).catalog()).providers);
     } catch { throw new Error("T3 catalog unavailable; no routing recommendation"); }
   }
-  const usage = await collectClaudeUsage({ ...config.claudeUsage, cacheFile: join(config.cacheDir, "claude-usage.json"), now,
-    ...(options.fetcher ? { fetcher: options.fetcher } : {}) });
-  if (usage.reason) reasons.push(usage.reason);
   const id = config.claudeUsage.providerInstanceId;
-  if (catalog.some(p => p.providerInstanceId === id && p.driverKind === "claudeAgent")) {
+  const claudeBound = catalog.some(p => p.providerInstanceId === id && p.driverKind === "claudeAgent" && p.canRunChildTask);
+  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: join(config.cacheDir, "claude-usage.json"), now,
+    ...(options.fetcher ? { fetcher: options.fetcher } : {}) });
+  if (usage.reason) reasons.push(claudeBound ? usage.reason : "Claude collector binding absent or unavailable; skipped");
+  if (claudeBound) {
     const prior = quota[id] ?? { observedAt: null, windows: [], activeStop: false };
     if (usage.value && now - Date.parse(usage.value.observedAt) < config.quotaMaxAgeMs) {
       quota[id] = { ...usage.value, activeStop: prior.activeStop };
@@ -88,7 +89,9 @@ export async function route(value: unknown, options: {
         observedAt: q.observedAt, value: q.windows.map(w => ({ ...w, id: (w as { id?: string }).id ?? w.kind, usedPercent: 100 - w.remainingPercent })) };
       return row;
     }) } };
-  const capacity = classifyCapacities(capacityState, now, loadCapacityConfig(options.home ?? homedir(), config.capacityConfigFile));
+  const capacityConfig = { ...loadCapacityConfig(options.home ?? homedir(), config.capacityConfigFile),
+    paceMargin: config.paceMargin, minimumRemaining: config.minimumRemaining };
+  const capacity = classifyCapacities(capacityState, now, capacityConfig);
   const result = recommend(input, { catalog, quota, analytics: analytics.value, now, config, capacity });
   result.reasons.unshift(...reasons);
   return result;

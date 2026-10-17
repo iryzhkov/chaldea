@@ -54,7 +54,7 @@ test("CLI and existing MCP route against real T3 cached catalog; no wait service
     const cli = spawnSync(process.execPath, ["bin/chaldea", "route", "--role", "builder"], { encoding: "utf8", env, timeout: 20000 });
     assert.equal(cli.status, 0, cli.stderr);
     const target = JSON.parse(cli.stdout);
-    assert.ok(["claude-opus-5-5", "gpt-6.1-sol"].includes(target.model));
+    assert.equal(target.model, "claude-opus-5-5");
     const frames = [{ jsonrpc: "2.0", id: 1, method: "tools/list" },
       { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder" } } },
       { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder", effortOverride: "max" } } }];

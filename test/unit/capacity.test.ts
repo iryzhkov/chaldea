@@ -73,6 +73,16 @@ test("recent burn resets on refill, respects configurable heavy multiplier, no w
   p.burnHistory = [{ observedAt: iso(now - 3600000), windows: [{ ...p.included.value![0]!, remainingPercent: 10 }] }];
   assert.equal(classifyCapacity(p, false, now).observedBurnPerHour, null);
 });
+test("idle samples never establish unlimited; history has a per-provider byte budget", () => {
+  const idle = provider("codex", 15, 0);
+  assert.equal(classifyCapacity(idle, false, now).class, "paced");
+  const p = provider("codex", 40);
+  for (let i = 1; i <= 100; i++) applyT3(p, { usageLimits: { checkedAt: iso(now + i * 300000),
+    windows: Array.from({ length: 32 }, (_, j) => ({ id: "window_" + j, kind: "weekly",
+      usedPercent: 60, windowDurationMins: 10080, resetsAt: iso(now + 7 * 86400000) })) } } as never);
+  assert.ok(Buffer.byteLength(JSON.stringify(p.burnHistory)) <= 16 * 1024);
+  assert.ok(p.burnHistory!.length > 1);
+});
 test("observer retains bounded samples without changing feed cadence; validation rejects oversized history", () => {
   const p = provider("codex", 20, .01);
   applyT3(p, { usageLimits: { checkedAt: iso(now + 600000), windows: [{ id: "week", kind: "weekly", usedPercent: 81, windowDurationMins: 10080, resetsAt: p.included.value![0]!.resetsAt! }] } } as never);

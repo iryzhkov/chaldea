@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
-import { writeFileSync, readFileSync, symlinkSync, statSync } from "node:fs";
+import { writeFileSync, readFileSync, symlinkSync, statSync, utimesSync } from "node:fs";
 import { aggregate, collectAnalytics } from "../../src/route/analytics.ts";
 import { collectClaudeUsage, CLAUDE_USAGE_URL, CLAUDE_CADENCE_MS } from "../../src/route/claude-usage.ts";
 import { getJson } from "../../src/route/cache.ts";
@@ -87,6 +87,26 @@ test("failure, expired credentials and symlinks never refresh/write/leak; failur
     symlinkSync(credentialFile, join(d.path, "link.json"));
     await collectClaudeUsage({ ...options, credentialFile: join(d.path, "link.json"), cacheFile: join(d.path, "link-cache.json") });
     assert.equal(calls, 1);
+  } finally { d.remove(); }
+});
+test("lock contention, stale-lock cleanup, clock regression and changed cache data preserve cadence", async () => {
+  const d = routeScratch();
+  try {
+    const cacheFile = join(d.path, "usage.json"), lock = cacheFile + ".lock";
+    writeFileSync(lock, "");
+    utimesSync(lock, new Date(now), new Date(now));
+    let calls = 0;
+    const fetcher: typeof fetch = async () => { calls++; throw new Error("fixture"); };
+    const options = { enabled: true, credentialFile: join(d.path, "missing"), cacheFile, now, fetcher };
+    assert.match((await collectClaudeUsage(options)).reason!, /already reserved/);
+    utimesSync(lock, new Date(now - 2 * CLAUDE_CADENCE_MS), new Date(now - 2 * CLAUDE_CADENCE_MS));
+    assert.match((await collectClaudeUsage(options)).reason!, /already reserved/);
+    assert.equal(calls, 0);
+    writeFileSync(cacheFile, JSON.stringify({ attemptedAt: now, fetchedAt: {}, value: { obsolete: true } }));
+    assert.equal((await collectClaudeUsage({ ...options, now: now - 1000 })).value, null);
+    assert.equal((await collectClaudeUsage({ ...options, now: now + 1000 })).value, null);
+    assert.equal(calls, 0);
+    assert.equal(JSON.parse(readFileSync(cacheFile, "utf8")).attemptedAt, now);
   } finally { d.remove(); }
 });
 test("new cache concurrency reserves before network, malformed and huge HTTP bodies fail boundedly", async () => {
