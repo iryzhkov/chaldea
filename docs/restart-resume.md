@@ -54,6 +54,8 @@ project/server settings, strong provider session requirements and chain cap
 still apply; Chaldea does not bypass those for unplanned restarts. If native
 recovery is disabled, an unplanned interruption remains a documented gap.
 
+A further disposable secret-card probe found an upstream boundary: with native restart recovery enabled, one graceful group shutdown resumed a run whose secret card had been pending, although Chaldea admitted no journal row and dispatched nothing. Native uses equality between card-cancellation and run-cancellation times; a provider disconnect can cancel the card earlier. Chaldea conservatively blocks pending, cancelled and timed-out secret cards for the source run. Its switch cannot control native T3 recovery. Consequently this patch cannot certify the pinned native path as safe for every pending-secret shutdown ordering; disabling native recovery avoids that native behavior but leaves unplanned recovery unavailable.
+
 ## Planned restarts
 
 Run `chaldea t3 restart`. Default service command:
@@ -64,6 +66,8 @@ systemctl --user restart t3code.service
 
 Before running that command, Chaldea captures fresh projections of active turns
 into `~/.local/state/chaldea/t3-restarts.sqlite` (SQLite WAL, synchronous FULL).
+Capture gathers every projection first, then commits the complete invocation in one transaction. If capture fails, no intent is armed. A failed service command while the runtime identity is unchanged aborts that invocation, so a later unplanned death cannot activate it. Recovery pins the first changed runtime identity and never carries an intent to another boot.
+
 Each row retains thread ID, run ID, provider, model, immutable command bytes and
 a hash of the local runtime file. The journal is scoped to the T3 base directory.
 A read/capture failure prevents the restart. A restart-command failure returns
@@ -74,8 +78,8 @@ retries (90 seconds by default). T3's new advertised port is rediscovered.
 After restart, both the command and the quota observer's synchronized reconnect
 can recover those rows. An old runtime identity cannot trigger recovery.
 Fresh projections exclude archived/deleted/settled threads, pending or
-shutdown-expired user questions, explicit interrupts, failures including quota,
-newer runs, and provider changes. Only the captured run's server-cancelled state
+shutdown-expired user questions and secret cards, explicit interrupts, failures including quota,
+newer runs, snoozed threads, maintenance commands, chains of three automatic restart continuations, and provider changes. Only the captured run's server-cancelled state
 can receive a new continuation. Existing native/manual progress takes precedence.
 
 The normal `message.dispatch` command starts a user turn containing:
@@ -92,6 +96,8 @@ projection readback confirms a message/run before recording success.
 The restart-continuation link also invokes T3's serialized source-run and
 Stop checks, preventing a stale continuation from superseding a newer run.
 
+Runs starting after capture are outside this planned snapshot; only native recovery covers that narrow window. A planned run continued by native T3 is also reported as `restart_resumed`.
+
 One `restart_resumed` record per continued planned run uses the existing
 `chaldea-quota` feed poster and deterministic transition key. Scoped Akasha
 delivery retries the same key and persists acknowledgement in the restart
@@ -101,7 +107,7 @@ can lose the feed record. Feed failure never causes another task continuation.
 
 The observer needs an `orchestration:read` + `orchestration:operate` token to
 recover pending planned runs; a read-only token can still observe quota events
-but cannot dispatch a pending continuation. No settings-write scope is needed.
+but cannot dispatch a pending continuation. Authentication/scope failures defer that intent for two minutes; other ambiguous errors retry after five seconds, independently of the shell stream. Each intent fails independently, and provider-disabled or durable command refusals are terminal. The observer keeps recording quota events throughout. No settings-write scope is needed.
 
 ## Configuration
 

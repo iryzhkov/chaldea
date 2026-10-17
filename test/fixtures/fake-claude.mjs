@@ -135,12 +135,41 @@ function answerControl(request) {
       account: { tokenSource: "claude.ai", subscriptionType: "max", apiProvider: "firstParty" },
     };
   } else if (subtype === "mcp_set_servers") {
-    response = { added: Object.keys(request.request?.servers ?? {}), removed: [], errors: {} };
+    configuredMcp = request.request?.servers ?? {};
+    response = { added: Object.keys(configuredMcp), removed: [], errors: {} };
   }
   log({ kind: "control", subtype });
   emit({ type: "control_response", response: { subtype: "success", request_id: request.request_id, response } });
 }
 
+let configuredMcp = {};
+const mcpConfigIndex = args.indexOf("--mcp-config");
+if (mcpConfigIndex >= 0) {
+  try {
+    const raw = args[mcpConfigIndex + 1];
+    configuredMcp = JSON.parse(raw.startsWith("{") ? raw : readFileSync(raw, "utf8")).mcpServers ?? {};
+  } catch {}
+}
+async function requestFixtureSecret() {
+  const server = Object.values(configuredMcp).find(s => typeof s.url === "string" && s.url.includes("127.0.0.1"));
+  if (!server) { log({ kind: "secret_failed", reason: "no_fixture_mcp" }); return; }
+  const headers = { ...server.headers, "content-type": "application/json", accept: "application/json, text/event-stream" };
+  const initialized = await fetch(server.url, { method: "POST", headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize",
+      params: { protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: "restart-fixture", version: "1" } } }) });
+  const session = initialized.headers.get("mcp-session-id");
+  if (session) headers["mcp-session-id"] = session;
+  await initialized.body?.cancel();
+  await fetch(server.url, { method: "POST", headers,
+    body: JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) }).then(r => r.body?.cancel());
+  log({ kind: "secret_requested" });
+  const response = await fetch(server.url, { method: "POST", headers,
+    body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/call",
+      params: { name: "request_secret", arguments: { label: "Disposable fixture credential",
+        reason: "Wait for a user; no real secret is used.", clientRequestId: "restart-secret-fixture" } } }) });
+  log({ kind: "secret_result", status: response.status });
+  await response.body?.cancel();
+}
 const pendingQuestions=new Map();
 function nativeQuestion(message,permission=false){
   // Echo the prompt exactly as the real SDK does before a blocking tool callback.
@@ -172,6 +201,11 @@ function answerUser(message) {
   systemInit();
   if(text.includes("chaldea-native-question")||text.includes("chaldea-native-permission")){
     nativeQuestion(message,text.includes("chaldea-native-permission"));return;
+  }
+  if (text.includes("chaldea-native-secret")) {
+    assistant("Waiting for a disposable secret card.");
+    void requestFixtureSecret().catch(() => log({ kind: "secret_failed", reason: "transport" }));
+    return;
   }
   if (text.includes("chaldea-restart-hold")) {
     log({ kind: "turn", outcome: "held" });

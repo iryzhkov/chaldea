@@ -1,5 +1,6 @@
 // T3-specific restart reads and command construction stay at the adapter boundary.
 import * as Effect from "effect/Effect";
+import * as DateTime from "effect/DateTime";
 import { AbortedError, connectShell, toSwitchThread, withClient,
   type ConnectOptions, type ModelChoice, type ShellThread } from "./adapter.ts";
 
@@ -32,15 +33,24 @@ export async function restartProjection(options: ConnectOptions, threadId: strin
     Effect.map(p => {
       const thread = toSwitchThread(p);
       const run = p.runs.find(r => r.id === (runId ?? thread.activeRunId ?? thread.latestRunId));
+      let chain = 0;
+      for (let r = run; r?.restartContinuationOfRunId && chain < 3; chain++)
+        r = p.runs.find(candidate => candidate.id === r!.restartContinuationOfRunId);
+      const sourceMessage = p.messages.find(m => m.id === run?.userMessageId);
+      const blocked = chain >= 3 ||
+        (p.thread.snoozedUntil != null && DateTime.toEpochMillis(p.thread.snoozedUntil) > Date.now()) ||
+        (sourceMessage?.attachments.length === 0 && ["/compact", "/logout"].includes(sourceMessage.text.trim().toLowerCase()));
       return {
-        thread, run,
+        thread, run, blocked,
         continued: runId !== undefined && (p.messages.some(m => m.id === restartMessageId(runId)) ||
           p.runs.some(r => r.restartContinuationOfRunId === runId)),
         interrupted: p.turnItems.some(i => i.runId === run?.id && i.type === "run_interrupt_request"),
         // A live callback can expire during shutdown; that is still an unanswered question.
         waitingForUser: p.runtimeRequests.some(r => p.nodes.some(n => n.id === r.nodeId && n.runId === run?.id) &&
           r.kind !== "dynamic_tool_call" && r.kind !== "auth_refresh" &&
-          (r.status === "pending" || r.status === "expired" || r.status === "cancelled")),
+          (r.status === "pending" || r.status === "expired" || r.status === "cancelled")) ||
+          p.turnItems.some(i => i.runId === run?.id && i.type === "secret_request" &&
+            ["pending", "cancelled", "timed_out"].includes(i.secretStatus)),
       };
     }),
     Effect.catchTag("OrchestrationV2GetThreadProjectionError", () => Effect.succeed(undefined)),

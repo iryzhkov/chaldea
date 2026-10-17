@@ -38,7 +38,7 @@ async function restart(rest: ReadonlyArray<string>): Promise<number> {
     "feed-command": { type: "string" },
     help: { type: "boolean", short: "h" },
   }, allowPositionals: true, strict: true });
-  if (values.help) { process.stdout.write("chaldea t3 restart [--t3-base-dir DIR] [--token-file PATH] [--restart-config PATH] [--server-url URL]\\n"); return 0; }
+  if (values.help) { process.stdout.write("chaldea t3 restart [--t3-base-dir DIR] [--token-file PATH] [--restart-config PATH] [--server-url URL]\n"); return 0; }
   if (positionals.length) throw new Error("t3 restart takes no positional arguments");
   const { restartConfig, restartT3 } = await import("./t3/restart.ts");
   try {
@@ -51,7 +51,7 @@ async function restart(rest: ReadonlyArray<string>): Promise<number> {
     });
     return 0;
   } catch (error) {
-    process.stderr.write(`chaldea: ${error instanceof Error ? error.message : String(error)}\\n`);
+    process.stderr.write(`chaldea: ${error instanceof Error ? error.message : String(error)}\n`);
     return 1;
   }
 }

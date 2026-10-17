@@ -2,14 +2,14 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { test } from "node:test";
 import * as Effect from "effect/Effect";
 import { startDisposableT3, t3Version } from "../helpers/disposable-t3.ts";
 import { dispatchMessage, FEED_RECORDER, readFeed, ShellWatcher, waitFor, writePrivateFile } from "../helpers/e2e.ts";
 import { scratchDir, SCRATCH_ROOT } from "../helpers/scratch.ts";
 import { createLogger } from "../../src/log.ts";
-import { captureRestart, recoverPlannedRestarts, RestartJournal, restartConfig } from "../../src/t3/restart.ts";
+import { captureRestart, recoverPlannedRestarts, RestartJournal, restartConfig, restartT3 } from "../../src/t3/restart.ts";
 import { restartMessageId, restartProjection } from "../../src/t3/restart-port.ts";
 import { withClient } from "../../src/t3/adapter.ts";
 import type { QuotaRecord } from "../../src/quota/observer.ts";
@@ -38,10 +38,17 @@ async function fixture(native = false) {
     dir, t3, token, tokenFile, thread, config, options, journal, records, poster, command, projection,
     async start(text = "chaldea-restart-hold") {
       await dispatchMessage(t3, token, thread, text, "restart-first");
-      await waitFor("provider receives first turn", () => t3.fakeClaudeEvents().some(e => e.kind === "turn" || e.kind === "native_question"), 30_000);
+      await waitFor("provider receives first turn", () => t3.fakeClaudeEvents().some(e => e.kind === "turn" || e.kind === "native_question" || e.kind === "secret_requested"), 30_000);
+      if (text.includes("chaldea-native-secret")) {
+        const deadline = Date.now() + 10_000;
+        while (!(await projection())?.waitingForUser) {
+          if (Date.now() > deadline) throw new Error("Secret card did not appear: " + JSON.stringify(t3.fakeClaudeEvents().filter(e => e.kind !== "spawn")));
+          await new Promise(r => setTimeout(r, 100));
+        }
+      }
       return (await projection())!.run!;
     },
-    async restart() { await watcher.close(); await t3.stopServer(); await t3.startServer(); },
+    async restart(prepare?: () => void) { await watcher.close(); await t3.stopServer(); prepare?.(); await t3.startServer(); },
     async close() { journal.close(); await watcher.close(); await t3.stop(); dir.remove(); },
   };
 }
@@ -111,6 +118,110 @@ for (const boundary of ["dispatching", "resumed"]) test(`observer recovers proce
       assert.equal(p.messages.filter(m => m.id === restartMessageId(run.id)).length, 1);
       assert.equal(readFeed(feed).filter(e => e.body.kind === "restart_resumed").length, 1);
     } finally { await observer.stop(); }
+  } finally { await f.close(); }
+});
+
+test("failed restart command cannot arm a later unplanned restart", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  try {
+    await f.start();
+    f.config.command = [process.execPath, "-e", "process.exit(19)"];
+    await assert.rejects(restartT3(f.options), /restart command failed/);
+    assert.equal(f.journal.entries(f.t3.baseDir).length, 0);
+    await f.restart();
+    await recoverPlannedRestarts(f.options, f.journal, f.poster);
+    assert.equal((await f.projection())!.thread.latestRunId, (await f.projection())!.run!.id);
+    const p = await withClient({ serverUrl: f.t3.serverUrl, token: f.token },
+      c => c["orchestration.getThreadProjection"]({ threadId: f.thread } as never));
+    assert.equal(p.runs.length, 1);
+  } finally { await f.close(); }
+});
+
+test("provider disabled during restart is terminal and never retries a continuation", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  try {
+    await f.start(); await captureRestart(f.options, f.journal);
+    await f.restart(() => {
+      const settings = JSON.parse(readFileSync(f.t3.settingsPath, "utf8"));
+      settings.providerInstances.claudeAgent.enabled = false;
+      writeFileSync(f.t3.settingsPath, JSON.stringify(settings));
+    });
+    await recoverPlannedRestarts(f.options, f.journal, f.poster);
+    assert.equal(f.journal.entries(f.t3.baseDir).length, 0);
+    assert.equal(f.records.length, 0);
+  } finally { await f.close(); }
+});
+
+test("capture is atomic if journalling a later thread fails", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  try {
+    await f.start();
+    const capture = f.journal.capture.bind(f.journal);
+    f.journal.capture = (...args) => { capture(...args); throw new Error("simulated later capture failure"); };
+    await assert.rejects(captureRestart(f.options, f.journal), /later capture failure/);
+    assert.equal(f.journal.entries(f.t3.baseDir).length, 0);
+    await f.restart();
+    await recoverPlannedRestarts(f.options, f.journal, f.poster);
+    assert.equal(f.records.length, 0);
+  } finally { await f.close(); }
+});
+
+test("read-only recovery is isolated from quota observation and backs off", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  const { ObserverProcess } = await import("../helpers/e2e.ts");
+  let observer: InstanceType<typeof ObserverProcess> | undefined;
+  try {
+    await f.start(); await captureRestart(f.options, f.journal); await f.restart();
+    const config = join(f.dir.path, "observer-config.json"), feed = join(f.dir.path, "feed.jsonl");
+    writeFileSync(config, JSON.stringify(f.config));
+    const readonly = join(f.dir.path, "read-token");
+    writePrivateFile(readonly, f.t3.issueToken(["orchestration:read"]));
+    observer = new ObserverProcess({ t3BaseDir: f.t3.baseDir, tokenFile: readonly,
+      statePath: join(f.dir.path, "quota.json"), feedLog: feed, scratch: f.dir.path, restartConfig: config });
+    await waitFor("scope failure without stream loss", () => observer!.lines.some(l => l.message === "planned restart continuation deferred"), 30_000);
+    assert.ok(f.journal.entries(f.t3.baseDir).every(i => i.retry_at > Date.now() + 100_000));
+    await dispatchMessage(f.t3, f.token, f.thread, f.t3.trigger, "after-readonly-recovery");
+    await waitFor("live quota record", () => readFeed(feed).some(e => e.body.kind === "quota_reset_unknown"), 30_000);
+    assert.equal(observer.subscriptions(), 1);
+    assert.equal(f.records.length, 0);
+  } finally { await observer?.stop(); await f.close(); }
+});
+
+for (const native of [false, true]) test(`Chaldea never admits a secret card (native=${native})`, { skip, timeout: 120_000 }, async () => {
+  const f = await fixture(native);
+  try {
+    await f.start("chaldea-native-secret");
+    await captureRestart(f.options, f.journal);
+    assert.equal(f.journal.entries(f.t3.baseDir).length, 0, "pending secret is never admitted");
+    await f.restart(); await recoverPlannedRestarts(f.options, f.journal, f.poster);
+    const p = await withClient({ serverUrl: f.t3.serverUrl, token: f.token },
+      c => c["orchestration.getThreadProjection"]({ threadId: f.thread } as never));
+    if (!native) assert.equal(p.runs.length, 1);
+    // Native 0.1.0 can race secret cancellation against shutdown; any linked
+    // continuation here is native: Chaldea has no captured row or feed record.
+    assert.equal(p.messages.filter(m => m.id.startsWith("message:restart-continuation:")).length, 0);
+    console.log(JSON.stringify({ nativeSecretProbe: native, runsAfterRestart: p.runs.length }));
+    assert.equal(f.records.length, 0);
+  } finally { await f.close(); }
+});
+
+test("secret card created after capture also blocks recovery after shutdown cancels it", { skip, timeout: 120_000 }, async () => {
+  const f = await fixture();
+  try {
+    const run = await f.start(); await captureRestart(f.options, f.journal);
+    await f.command({ type: "message.dispatch", commandId: "late-secret", messageId: "late-secret",
+      threadId: f.thread, text: "chaldea-native-secret", attachments: [],
+      dispatchMode: { type: "steer_active", targetRunId: run.id }, createdBy: "user", creationSource: "web" });
+    const deadline = Date.now() + 15_000;
+    while (!(await f.projection())?.waitingForUser) {
+      if (Date.now() > deadline) throw new Error("Late secret card did not appear");
+      await new Promise(r => setTimeout(r, 100));
+    }
+    assert.equal(f.journal.entries(f.t3.baseDir).length, 1);
+    await f.restart(); await recoverPlannedRestarts(f.options, f.journal, f.poster);
+    const p = await withClient({ serverUrl: f.t3.serverUrl, token: f.token },
+      c => c["orchestration.getThreadProjection"]({ threadId: f.thread } as never));
+    assert.equal(p.runs.length, 1); assert.equal(f.records.length, 0);
   } finally { await f.close(); }
 });
 
