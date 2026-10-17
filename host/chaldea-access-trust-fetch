@@ -8,9 +8,9 @@ import stat
 import subprocess
 import sys
 
-REMOTE = "ssh://git@github.com/iryzhkov/chaldea-fleet-config.git"
+REMOTE = "ssh://git@github.com/iryzhkov/chaldea-trust.git"
 REF = "refs/heads/trust-source"
-BUNDLE = "access-trust/bundle.jws"
+BUNDLE = "bundle.jws"
 MAX_BUNDLE = 262144
 
 
@@ -34,6 +34,8 @@ def trusted_runtime(path):
 
 
 def fetch(config):
+    if config["repository"] != REMOTE or config["bundle_path"] != BUNDLE:
+        raise ValueError("trust transport pin mismatch")
     trusted_runtime(config["node"])
     trusted_runtime(config["runtime"])
     state = Path(config["state"])
@@ -50,7 +52,8 @@ def fetch(config):
         "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C",
         "GIT_SSH_COMMAND": shlex.join([
             "/usr/bin/ssh", "-F", "/dev/null", "-o", "BatchMode=yes",
-            "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=yes",
+            "-o", "IdentitiesOnly=yes", "-o", "IdentityAgent=none",
+            "-o", "StrictHostKeyChecking=yes",
             "-o", "UserKnownHostsFile=" + config["known_hosts"],
             "-o", "GlobalKnownHostsFile=/dev/null", "-o", "UpdateHostKeys=no",
             "-o", "ConnectTimeout=10", "-o", "CheckHostIP=no",
@@ -71,6 +74,9 @@ def fetch(config):
     git("--git-dir=" + str(cache), "fetch", "--depth=1", "--no-tags",
         "--no-recurse-submodules", REMOTE, "+refs/heads/main:" + REF)
     commit = git("--git-dir=" + str(cache), "rev-parse", "--verify", REF).decode().strip()
+    entry = git("--git-dir=" + str(cache), "ls-tree", commit, "--", BUNDLE).decode()
+    if not entry.startswith("100644 blob ") or not entry.rstrip().endswith("\t" + BUNDLE):
+        raise ValueError("nonregular bundle")
     obj = commit + ":" + BUNDLE
     size = int(git("--git-dir=" + str(cache), "cat-file", "-s", obj))
     if size < 1 or size > MAX_BUNDLE:

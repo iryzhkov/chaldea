@@ -372,6 +372,10 @@ def prune_go_cache(args, held):
         log(f"go cache: {gib(size)} within {gib(limit)}")
     elif in_use(cache.resolve(), held):
         log(f"go cache: {gib(size)} over {gib(limit)} but a build is using it; kept")
+    elif touched_since(cache, time.time() - args.protect_hours * 3600):
+        # A shared cache writer need not hold a file open at our process snapshot.
+        # Honor the same protection window as worktrees and temporary entries.
+        log(f"go cache: {gib(size)} over {gib(limit)} but recently modified; kept")
     elif args.dry_run:
         log(f"go cache: {gib(size)} over {gib(limit)}; would run go clean -cache ({size} bytes)")
     else:

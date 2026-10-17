@@ -1,5 +1,7 @@
 // Sanitized, independently timestamped quota observations. No provider/account payload is persisted wholesale.
 import { createHash } from "node:crypto";
+import { retainBurnSample } from "./capacity.ts";
+import type { BurnSample } from "./capacity.ts";
 import { resolve } from "node:path";
 import type { SwitchProvider } from "../t3/adapter.ts";
 import type { QuotaRecord } from "./observer.ts";
@@ -30,6 +32,7 @@ export interface ExtraUsage { readonly usedMinor: number | null; readonly capMin
 export interface ProviderHeadroom {
   readonly alias: string;
   readonly driver: string;
+  burnHistory?: ReadonlyArray<BurnSample>;
   binding?: "asserted" | "verified";
   plan: Metric<string>;
   included: Metric<ReadonlyArray<Window>>;
@@ -86,6 +89,10 @@ export function validateHeadroom(value: unknown): HeadroomState {
   }
   for (const p of s.providers) {
     if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
+        p.burnHistory !== undefined && (!Array.isArray(p.burnHistory) || p.burnHistory.length > 288 ||
+          !p.burnHistory.every((s: any) => object(s) && iso(s.observedAt) && Array.isArray(s.windows) && s.windows.length <= 32 &&
+            s.windows.every((w: any) => object(w) && safeId(w.id) && percent(w.remainingPercent) && percent(w.usedPercent) &&
+              (w.resetsAt === null || iso(w.resetsAt))))) ||
         p.binding !== undefined && !["asserted", "verified"].includes(p.binding) ||
         !["plan", "included", "credits", "manualResets", "extraUsage", "ordinaryUsageAllowed", "spendControlReached"].every(k => metric(p[k])) ||
         p.included.value !== null && (!Array.isArray(p.included.value) || p.included.value.length > 32 ||
@@ -113,7 +120,10 @@ export function applyT3(row: ProviderHeadroom, p: SwitchProvider): void {
       kind: ["session", "weekly", "monthly", "other"].includes(w.kind ?? "") ? w.kind! : "other",
       usedPercent: w.usedPercent, remainingPercent: 100 - w.usedPercent,
       windowDurationMins: count(w.windowDurationMins) ? w.windowDurationMins : null, resetsAt: iso(w.resetsAt) }));
-    if (windows.every(w => percent(w.usedPercent)) && windows.length > 0) row.included = observed(windows, "t3", at);
+    if (windows.every(w => percent(w.usedPercent)) && windows.length > 0) {
+      retainBurnSample(row, at);
+      row.included = observed(windows, "t3", at);
+    }
   }
   // A window-only event must not advance reset inventory's successful observation time.
   if (u.resetCredits !== undefined && count(u.resetCredits.availableCount) && u.unavailable === undefined && newer(row.manualResets)) {
@@ -251,6 +261,7 @@ export class HeadroomMonitor {
       const next = row?.driver === p.driver ? row : newProvider(p.instanceId, p.driver);
       if (!priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p)) {
         const clean = newProvider(p.instanceId, p.driver);
+        delete next.burnHistory;
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;

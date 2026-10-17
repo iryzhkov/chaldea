@@ -19,8 +19,8 @@ TrustStore.install commits before exposing signed bytes. The deployment private
 PKCS8 key uses loadHostSigningKey's owner/mode checks. Its public key is the
 deployment anchor, never an issuer. No private key belongs in Git or on a run host.
 
-Publish only the resulting compact envelope as access-trust/bundle.jws in the
-existing private fleet Git repository. Verifiers fetch main every 120s with their
+Publish only the resulting compact envelope as bundle.jws in the
+private iryzhkov/chaldea-trust data repository. Verifiers fetch main every 120s with their
 own read-only deploy key and pinned SSH host key. The byte-only downloader never
 checks out or executes remote code. Signature verification uses an independently
 pinned Ed25519 deployment anchor; transport credentials cannot grant authority.
