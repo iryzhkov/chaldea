@@ -36,3 +36,42 @@ test('a busy local host reports a durable refusal without attempting SSH', { tim
     await fs.rm(state, { recursive: true, force: true });
   }
 });
+
+
+test('lock open and flock operation errors fail clearly with 255, without a busy refusal', { timeout: 10000 }, async () => {
+  const cli = fileURLToPath(new URL('../../bin/chaldea', import.meta.url));
+  for (const kind of ['open', 'flock']) {
+    const state = await fs.mkdtemp(join(tmpdir(), 'lock-error-'));
+    try {
+      const fixture = join(state, 'failing-flock');
+      await fs.writeFile(fixture, '#!/bin/sh\nexit 71\n', { mode: 0o700 });
+      if (kind === 'open') await fs.mkdir(join(state, 'artifacts-test.lock'));
+      const args = [cli, 'exec', '--host', 'test', '--', 'true'];
+      // Replace only the external utility in the execve request. The shipped
+      // lock script, error handling, PID and exit behavior execute unchanged.
+      const inject = [
+        'const execve = process.execve;',
+        'process.execve = (file, args, env) => {',
+        '  if (file === "/bin/sh") args[2] = args[2].replace("/usr/bin/flock", \'"$CHALDEA_TEST_FLOCK"\');',
+        '  return execve(file, args, env);',
+        '};',
+        'process.argv = [process.execPath, ...' + JSON.stringify(args) + '];',
+        'await import(' + JSON.stringify(new URL('../../bin/chaldea', import.meta.url).href) + ');',
+      ].join('\n');
+      const child = spawn(process.execPath, kind === 'flock' ? ['--input-type=module', '-e', inject] : args, {
+        env: { ...process.env, CHALDEA_STATE_DIR: state, CHALDEA_SSH_CONFIG: join(state, 'nonexistent'),
+          CHALDEA_TEST_FLOCK: fixture, CHALDEA_ACCOUNT_LOCKED: '', CHALDEA_ACCOUNT_REFUSED: '' },
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+      let out = ''; let err = '';
+      child.stdout!.on('data', x => { out += x; }); child.stderr!.on('data', x => { err += x; });
+      const [code] = await once(child, 'close');
+      assert.equal(code, 255, err); assert.equal(out, '');
+      assert.match(err, kind === 'open' ? /cannot open local host lock/ : /local host lock failed \(flock exit 71\)/);
+      assert.doesNotMatch(err, /another local chaldea exec/);
+      await assert.rejects(fs.access(join(state, 'journal')), { code: 'ENOENT' });
+    } finally {
+      await fs.rm(state, { recursive: true, force: true });
+    }
+  }
+});

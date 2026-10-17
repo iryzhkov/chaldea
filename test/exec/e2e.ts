@@ -112,7 +112,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 45000 }, as
     await t.test('apply-time smoke uses the exact installed pasta/bwrap launch', async () => {
       const result = execFileSync('/usr/bin/python3', ['-I', server, '--config', config, '--smoke-test'], { encoding: 'utf8', timeout: 20000 });
       assert.equal(result.trim(), 'sandbox-smoke-ok');
-      assert.deepEqual(await fs.readdir(jobroot), []);
+      assert.deepEqual((await fs.readdir(jobroot)).filter(name => name !== 'admission.lock'), []);
     });
 
     await t.test('live stdout/stderr, exit status, artifacts, cleanup, multiplexed start under 2 seconds', async () => {
