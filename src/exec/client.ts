@@ -1,6 +1,6 @@
-import { spawn, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
@@ -8,6 +8,9 @@ import { connect, queueHost, probeHost, probeHosts, ProbeUnavailable, type Trans
 import { manifest } from './manifest.ts';
 import { cleanArtifacts, BOOT_ID } from './artifacts.ts';
 import { record, prune, DAYS, type Intent } from './journal.ts';
+import { stateDir, withStateLock } from './state.ts';
+import { openLog, cleanLogs, logPath, LOG_CAP } from './logs.ts';
+import { history, artifactTarget } from './history.ts';
 import { send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, LIMITS, type Refusal, type Request } from './protocol.ts';
 
 export function argumentsFor(args: string[]) {
@@ -95,6 +98,7 @@ async function configuredHosts() {
 }
 
 export async function run(args: string[]): Promise<number> {
+  if (['show', 'list', 'fetch'].includes(args[1] ?? '')) return history(args.slice(1));
   const options = argumentsFor(args);
   const automatic = options.host === undefined;
   const hosts = automatic ? await configuredHosts() : [options.host!];
@@ -112,7 +116,6 @@ export async function run(args: string[]): Promise<number> {
     else {
       try {
         const code = await runOnHost({ ...options, host }, automatic || !options.noQueue, undefined, probes.find(p => p.host === host)?.error);
-        if (automatic) process.stderr.write('chaldea ran on ' + host + '\n');
         return code;
       } catch (e) {
         if (!(e instanceof RetryableFailure) || (!automatic && options.noQueue)) throw e;
@@ -132,7 +135,6 @@ export async function run(args: string[]): Promise<number> {
         process.stderr.write('chaldea selected ' + selected.host + '\n');
         try {
           const code = await runOnHost({ ...options, host: selected.host }, false, selected.transport);
-          process.stderr.write('chaldea ran on ' + selected.host + '\n');
           return code;
         } finally { selected.transport.ssh.stdin.destroy(); selected.transport.ssh.kill('SIGTERM'); }
       }
@@ -146,25 +148,10 @@ export async function run(args: string[]): Promise<number> {
   return EXIT_UNAVAILABLE;
 }
 
-// Only local accounting is serialized. The remote server owns job admission.
-async function withStateLock<T>(state: string, action: () => Promise<T>): Promise<T> {
-  await fs.mkdir(state, { recursive: true, mode: 0o700 });
-  const lock = await fs.open(join(state, 'accounting.lock'), 'a', 0o600);
-  try {
-    // Async wait also works for concurrent run() calls within one process.
-    const child = spawn('/usr/bin/flock', ['-x', '3'], { stdio: ['ignore', 'ignore', 'pipe', lock.fd] });
-    const code = await new Promise<number | null>((resolve, reject) => {
-      child.once('error', reject); child.once('close', resolve);
-    });
-    if (code !== 0) throw new Error('local accounting lock failed (flock exit ' + code + ')');
-    return await action();
-  } finally { await lock.close(); }
-}
-
 async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean, queued?: Transport, probeFailure?: Error): Promise<number> {
   const snapshot = await manifest();
   const artifactRoot = join(snapshot.root, '.chaldea/artifacts');
-  const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
+  const state = stateDir();
   const journal = join(state, 'journal');
   const controls = join(state, 'ssh');
   await fs.mkdir(controls, { recursive: true, mode: 0o700 });
@@ -173,26 +160,34 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   catch (e) {
     if (!automatic || !(e instanceof RetryableFailure)) throw e;
     const refused: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
-      started: new Date().toISOString(), outcome: 'refused' };
+      started: new Date().toISOString(), ended: new Date().toISOString(), outcome: 'refused' };
+    refused.logPath = logPath(state, refused.jobId);
     await withStateLock(state, async () => {
       await prune(journal, DAYS, 999);
       if ((await fs.readdir(journal)).filter(x => x.endsWith('.json')).length >= 1000) throw new Error('journal at its 1000-entry cap; inspect retained outcomes before dispatch');
+      await cleanLogs(state, LOG_CAP);
+      const log = await openLog(state, refused.jobId); await log.close();
       await record(journal, refused);
     });
+    process.stderr.write('chaldea job ' + refused.jobId + ' log ' + refused.logPath + '\n');
     throw new RetryableFailure(e.message + '; inspect journal ' + join(journal, refused.jobId + '.json'), e.reason);
   }
   const jobId = randomUUID();
   const intent: Intent = { jobId, host: options.host, argv: options.argv,
     started: new Date().toISOString(), pid: process.pid, bootId: BOOT_ID, outcome: 'uncertain',
     worktree: snapshot.root, artifactDir: join(artifactRoot, jobId),
-    artifactReserve: options.artifacts.length ? MAX_ARTIFACT : 0 };
+    artifactReserve: options.artifacts.length ? MAX_ARTIFACT : 0,
+    logPath: logPath(state, jobId), requestedArtifacts: options.artifacts, artifactPaths: [] };
   // This fsync completes before the first possible remote side effect. Nothing
   // ever automatically retries an uncertain intent, including on a later invocation.
+  let log!: Awaited<ReturnType<typeof openLog>>;
   await withStateLock(state, async () => {
     await fs.mkdir(journal, { recursive: true, mode: 0o700 });
     await cleanArtifacts(journal, options.host, intent.artifactReserve);
     await prune(journal, DAYS, 999);
     if ((await fs.readdir(journal)).filter(x => x.endsWith('.json')).length >= 1000) throw new Error('journal at its 1000-entry cap; inspect retained outcomes before dispatch');
+    await cleanLogs(state, LOG_CAP);
+    log = await openLog(state, jobId);
     await record(journal, intent);
   });
   process.stderr.write('chaldea job ' + jobId + '\n');
@@ -246,24 +241,19 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       if (['O', 'S', 'A', 'B', 'X'].includes(type)) started = true;
       if (type === 'O' || type === 'S') {
         if (artifactRemaining) throw new Error('interrupted artifact');
+        await log.output(type, data);
         const output = type === 'O' ? process.stdout : process.stderr;
         if (!output.write(data)) await once(output, 'drain');
       } else if (type === 'A') {
         if (artifactRemaining) throw new Error('truncated artifact');
-        if (artifact) { await artifact.close(); artifact = undefined; }
+        if (artifact) { await artifact.sync(); await artifact.close(); artifact = undefined; }
         const meta = JSON.parse(data.toString()); safePath(meta.path);
         if (!options.artifacts.includes(meta.path) || seen.has(meta.path) ||
             !Number.isSafeInteger(meta.size) || meta.size < 0 || (received += meta.size) > MAX_ARTIFACT) {
           throw new Error('invalid artifact metadata');
         }
         seen.add(meta.path);
-        for (const directory of [dirname(artifactRoot), artifactRoot]) {
-          await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-          const st = await fs.lstat(directory);
-          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error('artifact directory must not be a symlink');
-        }
-        const target = join(destination, meta.path);
-        await fs.mkdir(dirname(target), { recursive: true, mode: 0o700 });
+        const target = await artifactTarget(snapshot.root, jobId, meta.path);
         artifact = await fs.open(target, 'wx', 0o600);
         artifactRemaining = meta.size;
       } else if (type === 'B') {
@@ -283,9 +273,8 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
     await upload;
     const sshCode = await exit;
     if (result === undefined || sshCode !== 0) throw new Error('connection lost before a confirmed result');
-    if (artifact) { await artifact.sync(); await artifact.close(); artifact = undefined; }
     intent.outcome = 'finished'; intent.exitCode = result;
-    await withStateLock(state, () => record(journal, intent, false));
+    process.stderr.write('chaldea ran on ' + options.host + '\n');
     return result;
   } catch (e) {
     stop();
@@ -294,17 +283,29 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       e instanceof RetryableFailure ? 'connection-failed' : 'uncertain', requestSent, started, interrupted);
     if (retry || (e instanceof RemoteFailure && e.outcome !== 'uncertain' && (!automatic || e.outcome === 'preempted'))) {
       intent.outcome = retry ? 'refused' : (e as RemoteFailure).outcome;
-      await withStateLock(state, () => record(journal, intent, false));
     }
     const message = (e as Error).message + '; outcome ' + intent.outcome + '; inspect journal ' + join(journal, jobId + '.json');
     if (retry) throw new RetryableFailure(message, (e as Error).message, e instanceof RemoteFailure && e.busy);
     throw new Error(message);
   } finally {
     process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
-    if (artifact) await artifact.close();
+    const writes = await Promise.allSettled([
+      artifact ? (async () => { try { await artifact!.sync(); } finally { await artifact!.close(); } })() : Promise.resolve(),
+      log.close(),
+    ]);
+    if (writes.some(write => write.status === 'rejected')) {
+      intent.outputSyncFailed = true;
+      process.stderr.write('chaldea: local output sync failed; retaining job outcome\n');
+    }
+    intent.ended = new Date().toISOString();
+    intent.logTruncated = log.truncated;
+    intent.artifactPaths = [...seen].slice(0, artifactRemaining ? -1 : undefined).map(name => join(destination, name));
     await withStateLock(state, async () => {
+      await record(journal, intent, false);
       await prune(journal);
       await cleanArtifacts(journal, options.host);
+      await cleanLogs(state);
     });
+    process.stderr.write('chaldea job ' + jobId + ' log ' + intent.logPath + '\n');
   }
 }

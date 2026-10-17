@@ -106,10 +106,13 @@ that job; there is no idle background game-gate poll.
 
 - Snapshot: 64 MiB, 10,000 files; request metadata: 1 MiB.
 - Artifacts: at most 32 explicitly named regular files, 64 MiB aggregate per job.
-- Output: 64 MiB combined stdout/stderr, streamed without a persisted host log.
+- Output: 64 MiB combined stdout/stderr, streamed and saved locally with stream markers.
+  Local logs are capped at 64 MiB per job (including markers) and 2 GiB total,
+  oldest first, under the journal's 14-day retention. Live writers reserve their
+  full cap before dispatch. A truncated log is marked in the journal/show output.
 - Runtime: six hours; upload: two minutes. The server's configured slot count
   bounds concurrent jobs; a full host refuses immediately.
-- Workspaces, successful or failed: deleted immediately. Stale workspaces after
+- Workspaces, successful or failed: deleted after bounded recovery capture. Stale workspaces after
   an uncatchable server crash are removed on the next admitted connection/start,
   under the acquired slot lock, within a one-second cleanup budget. Unremovable leftovers
   are logged and stay inside the image bound without wedging later jobs.
@@ -131,7 +134,57 @@ that job; there is no idle background game-gate poll.
   lock and new accounting lock do not coordinate, so mixed versions must not
   share a state directory while jobs are running.
 - Local client journal: mode 0600, fsynced before SSH dispatch and atomically
-  replaced after confirmed completion; 14 days / 1,000 entries, no output logs.
+  replaced after completion/interruption; 14 days / 1,000 entries. Entries record
+  host, start/end times, outcome, exit code when known, log path and completed artifact paths.
+
+After a failure, inspect the original job instead of running it again:
+
+```sh
+chaldea exec list                     # newest 100 journal entries first
+chaldea exec show <job-id>            # metadata and last 200 log lines
+chaldea exec show <job-id> --full      # complete retained local log
+chaldea exec fetch <job-id>           # recover from the original host, without executing work
+```
+
+Each invocation prints its job ID and log path to stderr when it finishes.
+Logs live at `~/.local/state/chaldea/exec/logs/<job-id>.log`, mode 0600,
+under the private 0700 exec state directory; stdout/stderr carry stream markers.
+Logs contain what the job printed; a job that prints a secret will retain it.
+Journal pruning removes the corresponding log and artifacts; size pressure may
+evict a log earlier, in which case `show` says so.
+
+A non-zero exit already returns named artifacts if the protocol completes.
+On non-zero exit, preemption, or a lost client, the host also saves output and
+only the explicitly named regular artifact files in `<state_root>/.retained/<job-id>/`,
+outside every guest mount. Artifact paths are checked for symlinks/special files;
+the existing 32-file/64 MiB aggregate cap applies. Missing, unsafe or over-cap
+artifacts are reported as unavailable while other requested files remain recoverable.
+The host stores no argv, environment or snapshot in recovery data. Recovery writes
+are best-effort under storage I/O failures: streaming and the actual exit status
+still complete, metadata is retried after workspace cleanup frees space, and a
+degraded recovery is reported by fetch. Any holder of the host's job SSH key can
+fetch a known job UUID under the existing shared job-account trust boundary.
+
+Host recovery lasts three days from completion, with startup/admission/fetch pruning
+and oldest-first eviction at 2 GiB / 1,000 jobs inside the existing 20 GiB image
+budget. Active jobs and fetch readers hold locks; active jobs reserve output plus
+artifact capacity. A successful job removes its host copy after the result is sent to SSH. If the
+connection drops after that write but before the client receives it, the local
+outcome can remain uncertain with no retained host copy.
+A failed result delivery also retains the copy. A hard host/server crash may leave
+incomplete recovery; fetch refuses it rather than claiming a result.
+
+Fetch uses the journal's original host and worktree through the same SSH
+forced-command transport, command `chaldea-exec-fetch-v1`. Shared
+`host/exec-protocol.json` defines fetchVersion 1 and frames: H announces
+fetchVersion; F requests version/jobId; M returns bounded recovery metadata;
+L carries the marked log; A/B return artifacts; X confirms retrieval.
+It reserves no execution slot and never uploads a snapshot or command. Old servers
+receive no job request and the client reports a clear fetch-upgrade refusal.
+Fetch stages and validates log/artifact bytes before replacing local copies and
+updating the original journal entry; a failed fetch preserves the prior outcome.
+Local accounting stays locked during the bounded two-minute fetch transfer.
+An unknown exit code remains unknown, including after interrupted execution.
 
 The local journal lives in `~/.local/state/chaldea/exec/journal/<job-id>.json`.
 Its initial outcome is deliberately `uncertain`, and only a confirmed clean result
@@ -140,7 +193,7 @@ interrupts a running job is `preempted`. Remote exit 125 passes through; local
 Chaldea failures use 255. A remote 255 has a finished journal entry. Auto-mode exhaustion uses 69 (a remote 69 still has a finished journal entry).
 A crash before dispatch, during upload/execution, after
 remote cleanup or before journal completion never triggers another run. Inspect
-an uncertain entry; an explicit new invocation is a new job.
+it with `chaldea exec show <job-id>` or `fetch`; an explicit new invocation is a new job.
 
 SSH uses `~/.ssh/chaldea-job.conf` only, a dedicated private key, IdentityAgent none,
 ControlMaster auto and ControlPersist 60. No user's agent is consulted. Multiplexing

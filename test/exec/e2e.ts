@@ -125,7 +125,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 120000 }, a
       assert.ok(ended - live > 400, 'stdout must arrive while command is still running');
       const id = /chaldea job ([0-9a-f-]+)/.exec(result.err)![1];
       assert.equal(await fs.readFile(join(work, '.chaldea/artifacts', id, 'out/result'), 'utf8'), 'dirty worktree');
-      assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+      assert.deepEqual((await fs.readdir(jobroot)).filter(name => !['.retained', '.retention.lock'].includes(name)), ['admission.lock']);
       const started = performance.now(); let latency = 0;
       const second = run(['--', 'printf', 'second-live']);
       second.stdout!.once('data', () => { latency = performance.now() - started; });
@@ -139,7 +139,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 120000 }, a
     });
 
     await t.test('full single-slot server reports a durable refusal', async () => {
-      const first = run(['--', 'python3', '-c', 'import time; print("locked",flush=True); time.sleep(100)']);
+      const first = run(['--artifact', 'lost-result', '--', 'python3', '-c', 'import pathlib,time; pathlib.Path("lost-result").write_text("recovered-over-ssh"); print("locked",flush=True); time.sleep(100)']);
       let stderr = ''; first.stderr!.on('data', x => { stderr += x; });
       await Promise.race([once(first.stdout!, 'data'), once(first, 'close').then(() => { throw new Error(stderr); })]);
       const result = await collected(run(['--', 'printf', 'must-not-run']));
@@ -151,6 +151,13 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 120000 }, a
       const removed = disappearance(jobroot, id);
       const exited = once(first, 'close'); first.kill('SIGKILL');
       await exited; await removed;
+      const fetched = await collected(spawn(process.execPath, [cli, 'exec', 'fetch', id],
+        { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] }));
+      assert.equal(fetched.code, 0, fetched.err);
+      assert.match(fetched.out, /Outcome: uncertain/);
+      assert.equal(await fs.readFile(join(work, '.chaldea/artifacts', id, 'lost-result'), 'utf8'), 'recovered-over-ssh');
+      const recovered = JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8'));
+      assert.match(await fs.readFile(recovered.logPath, 'utf8'), /locked/);
     });
 
     await t.test('SSH shell, command injection, PTY, remote/local forwarding and agent are refused', async () => {
@@ -210,7 +217,7 @@ print('isolation-ok')
       const result = await collected(run(['--', 'python3', '-c',
         'import os; os.mkdir("locked"); os.chmod("locked",0); os.chmod(".",0); raise SystemExit(9)']));
       assert.equal(result.code, 9, result.err);
-      assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+      assert.deepEqual((await fs.readdir(jobroot)).filter(name => !['.retained', '.retention.lock'].includes(name)), ['admission.lock']);
     });
 
     await t.test('lost client kills the entire job group and keeps durable outcome uncertain', async () => {
@@ -248,7 +255,7 @@ print('isolation-ok')
       }
       const intent = JSON.parse(await fs.readFile(join(state, 'journal', id + '.json'), 'utf8'));
       assert.equal(intent.outcome, 'uncertain');
-      assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+      assert.deepEqual((await fs.readdir(jobroot)).filter(name => !['.retained', '.retention.lock'].includes(name)), ['admission.lock']);
     });
 
     await t.test('target forced-server crash leaves uncertainty, kills the job and next startup recovers', async () => {
@@ -274,7 +281,7 @@ print('isolation-ok')
         try { assert.match(await fs.readFile('/proc/' + pid + '/stat', 'utf8'), /\) Z /); }
         catch (error: any) { if (error.code !== 'ENOENT') throw error; }
       }
-      assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+      assert.deepEqual((await fs.readdir(jobroot)).filter(name => !['.retained', '.retention.lock'].includes(name)), ['admission.lock']);
     });
 
     await t.test('private network hides host TCP listeners, every host address and abstract sockets', async () => {
@@ -354,7 +361,7 @@ print('dns-config-ok')
       await fs.writeFile(join(leftover, 'interrupted'), 'reboot leftover');
       const result = await collected(run(['--', 'printf', 'after-reboot']));
       assert.equal(result.code, 0, result.err); assert.equal(result.out, 'after-reboot');
-      assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+      assert.deepEqual((await fs.readdir(jobroot)).filter(name => !['.retained', '.retention.lock'].includes(name)), ['admission.lock']);
     });
 
     await t.test('stale control socket is replaced without rerunning an uncertain job', async () => {
@@ -411,7 +418,7 @@ print('dns-config-ok')
         await configure(extra);
         const result = await collected(run(['--', 'true']));
         assert.equal(result.code, 255); assert.match(result.err, /over cap|image full/);
-        assert.deepEqual(await fs.readdir(jobroot), ['admission.lock']);
+        assert.deepEqual((await fs.readdir(jobroot)).filter(name => !['.retained', '.retention.lock'].includes(name)), ['admission.lock']);
       }
       await configure();
     });
