@@ -41,6 +41,8 @@ export interface DisposableT3Options {
   readonly resetDelaySeconds?: number;
   /** Writes `autoResumeLimitedThreads` into this instance's settings.json. */
   readonly autoResume: boolean;
+  /** Optional native restart recovery setting; omission tests the upstream default. */
+  readonly restartContinuation?: boolean;
   readonly codex?: "available" | "exhausted";
   readonly claudeModel?: string;
 }
@@ -57,7 +59,7 @@ export interface DisposableT3 {
   /** Starts the server on this base directory; resolves once it accepts WebSocket upgrades. */
   startServer(): Promise<void>;
   /** Stops the server (and its provider children) but keeps the base directory. */
-  stopServer(): Promise<void>;
+  stopServer(signal?: NodeJS.Signals): Promise<void>;
   issueToken(scopes: ReadonlyArray<string>): string;
   fakeClaudeEvents(): Array<Record<string, unknown>>;
   /** Stops the server and removes the fixture. */
@@ -166,6 +168,7 @@ export function prepareDisposableT3(options: DisposableT3Options): DisposableT3 
     JSON.stringify(
       {
         autoResumeLimitedThreads: options.autoResume,
+        ...(options.restartContinuation === undefined ? {} : { continueThreadsAfterServerUpdate: options.restartContinuation }),
         enableProviderUpdateChecks: false,
         defaultModelSelection: { instanceId: "claudeAgent", model: options.claudeModel ?? "claude-sonnet-4-6" },
         providerInstances: {
@@ -214,7 +217,7 @@ export function prepareDisposableT3(options: DisposableT3Options): DisposableT3 
     }
   };
 
-  const stopServer = async () => {
+  const stopServer = async (signal: NodeJS.Signals = "SIGTERM") => {
     const running = child;
     child = null;
     currentUrl = null;
@@ -232,7 +235,7 @@ export function prepareDisposableT3(options: DisposableT3Options): DisposableT3 
         // Already gone.
       }
     };
-    signalGroup("SIGTERM");
+    signalGroup(signal);
     const timeout = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref());
     await Promise.race([exited, timeout(10_000)]);
     signalGroup("SIGKILL");

@@ -50,7 +50,7 @@ export class ObserverProcess {
   readonly lines: Array<Record<string, unknown>> = [];
 
   /** Pass `serverUrl`, or `t3BaseDir` to discover the URL as the installed unit does. */
-  constructor(options: { serverUrl?: string; t3BaseDir?: string; tokenFile: string; statePath: string; feedLog: string; scratch: string; switching?: boolean; crashAfterHold?: boolean }) {
+  constructor(options: { serverUrl?: string; t3BaseDir?: string; tokenFile: string; statePath: string; feedLog: string; scratch: string; switching?: boolean; restartConfig?: string; crashAfterHold?: boolean }) {
     const target = options.serverUrl !== undefined ? ["--server-url", options.serverUrl] : ["--t3-base-dir", options.t3BaseDir ?? ""];
     const helper = join(options.scratch, "akasha-test-token");
     writeFileSync(helper, "#!/bin/sh\nprintf \'%s\\n\' test.lease.signature\n", { mode: 0o700 });
@@ -62,6 +62,7 @@ export class ObserverProcess {
         "quota",
         "observe",
         ...(options.switching ? ["--enable-provider-switch"] : []),
+        ...(options.restartConfig ? ["--restart-config", options.restartConfig] : []),
         ...target,
         "--token-file",
         options.tokenFile,

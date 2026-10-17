@@ -21,6 +21,8 @@ function shortId(id: string): string {
 export function title(record: QuotaRecord): string {
   const thread = shortId(record.threadId);
   switch (record.kind) {
+    case "restart_resumed":
+      return `restart_resumed: ${record.provider} thread ${thread}`;
     case "quota_parked":
       return `quota_parked: ${record.provider} thread ${thread} until ${record.resetAt}`;
     case "quota_reset_unknown":
