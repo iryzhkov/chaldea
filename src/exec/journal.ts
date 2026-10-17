@@ -2,7 +2,7 @@ import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { removeArtifacts, active as liveIntent } from './artifacts.ts';
 
-export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; exitCode?: number };
+export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number };
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 

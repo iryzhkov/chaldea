@@ -34,23 +34,39 @@ function feedQuery(q: URLSearchParams, scope: Scope, now: number, grepEnabled = 
 export function* feedRows(store: EventStore, q: URLSearchParams, scope: Scope, now: number): Generator<FeedRow> {
   const max = limit(q), base = feedQuery(q, scope, now), candidate = feedQuery(q, scope, now, false);
   const grep = q.get("grep")?.trim();
-  let last: FeedRow | undefined, matched = 0, scanned = 0, rejectedBytes = 0, workMs = 0;
-  while (matched < max) {
-    const started = performance.now();
+  if (!max) return;
+  type FeedId = { id: number; created_at: string };
+  let last: FeedId | undefined, matched = 0, scanned = 0, rejectedBytes = 0, workMs = 0;
+  const select = "SELECT f.id,f.created_at FROM feed_entries f JOIN events e USING(event_id) WHERE " + candidate.sql;
+  const first = store.db.prepare(select + " ORDER BY f.created_at DESC,f.id DESC LIMIT ?");
+  const after = store.db.prepare(select + " AND (f.created_at,f.id)<(?,?) ORDER BY f.created_at DESC,f.id DESC LIMIT ?");
+  const read = store.db.prepare("SELECT f.id,f.created_at,f.host,f.source,f.severity,f.title,f.body,f.tags,f.link " +
+    "FROM feed_entries f JOIN events e USING(event_id) WHERE f.id=? AND " + candidate.sql);
+  const match = grep ? store.db.prepare("SELECT 1 FROM feed_entries f JOIN events e USING(event_id) WHERE f.id=? AND " + base.sql) : undefined;
+  const checkBudget = () => {
     if (grep) ensure(scanned < 10000 && rejectedBytes < 32 * 1024 ** 2 && workMs < 250, "query_scan_budget", 503);
-    const where = last ? " AND (f.created_at<? OR (f.created_at=? AND f.id<?))" : "";
-    const params = last ? [...candidate.params, last.created_at, last.created_at, last.id] : candidate.params;
-    // Scan bounded candidates, evaluating LIKE only on a single primary-key row.
-    // No reader or unbounded body scan survives a yield/network wait.
-    const row = store.db.prepare("SELECT f.id,f.created_at,f.host,f.source,f.severity,f.title,f.body,f.tags,f.link " +
-      "FROM feed_entries f JOIN events e USING(event_id) WHERE " + candidate.sql + where +
-      " ORDER BY f.created_at DESC,f.id DESC LIMIT 1").get(...params) as unknown as FeedRow | undefined;
-    if (!row) return;
-    const authorizedMatch = store.db.prepare("SELECT 1 FROM feed_entries f JOIN events e USING(event_id) WHERE f.id=? AND " + base.sql)
-      .get(row.id, ...base.params);
-    workMs += performance.now() - started; scanned++; last = row;
-    if (!authorizedMatch) { rejectedBytes += Buffer.byteLength(row.body); continue; }
-    matched++; yield row;
+  };
+  while (matched < max) {
+    checkBudget();
+    const started = performance.now(), size = grep ? Math.min(max + 1, 10000 - scanned) : max + 1;
+    // Sort at most once per bounded candidate page, retaining IDs only. The tuple
+    // seek follows feed_time ordering without a keyset OR. No reader crosses a yield.
+    const ids = (last ? after.all(...candidate.params, last.created_at, last.id, size) :
+      first.all(...candidate.params, size)) as FeedId[];
+    workMs += performance.now() - started;
+    if (!ids.length) return;
+    for (const id of ids) {
+      checkBudget();
+      const started = performance.now();
+      // Recheck scope and filters in SQL after each yield; LIKE sees one PK row.
+      const row = read.get(id.id, ...candidate.params) as unknown as FeedRow | undefined;
+      const authorizedMatch = row && (!match || match.get(id.id, ...base.params));
+      workMs += performance.now() - started; scanned++; last = id;
+      if (!row) continue;
+      if (!authorizedMatch) { rejectedBytes += Buffer.byteLength(row.body); continue; }
+      matched++; yield row;
+      if (matched === max) return;
+    }
   }
 }
 interface Cursor { v: number; epoch: string; seq: number; binding: string }

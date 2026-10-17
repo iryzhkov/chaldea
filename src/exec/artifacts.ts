@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { Intent } from './journal.ts';
+import { MAX_ARTIFACT } from './protocol.ts';
 export const ARTIFACT_DAYS = 14 * 86400000;
 export const HOST_CAP = 20 * 1024 ** 3;
 export const BOOT_ID = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
@@ -37,18 +38,19 @@ async function size(path: string): Promise<number> {
     return (await Promise.all((await fs.readdir(path)).map(name => size(join(path, name))))).reduce((a, b) => a + b, 0);
   } catch (e: any) { if (e.code === 'ENOENT') return 0; throw e; }
 }
-// A per-host flock held by cli.ts serializes reservation/dispatch and accounting,
-// including calls from other worktrees. Its kernel lock disappears on crash/reboot.
+// The short state-wide accounting flock covers reservation, journal updates and
+// cleanup across worktrees and targets. It is never held during remote execution.
 export async function cleanArtifacts(journal: string, host: string, incoming = 0, cap = HOST_CAP, now = Date.now()) {
   const entries: { entry: Intent; bytes: number }[] = [];
   for (const name of await fs.readdir(journal)) {
     if (!name.endsWith('.json')) continue;
     const entry: Intent = JSON.parse(await fs.readFile(join(journal, name), 'utf8'));
-    if (entry.host !== host) continue;
+    if (entry.host.toLowerCase() !== host.toLowerCase()) continue;
     const path = artifactLocation(entry); if (!path) continue;
     await parents(path);
     if (!active(entry) && Date.parse(entry.started) < now - ARTIFACT_DAYS) await removeArtifacts(entry);
-    else entries.push({ entry, bytes: await size(path) });
+    else entries.push({ entry, bytes: active(entry) ?
+      Math.max(await size(path), entry.artifactReserve ?? MAX_ARTIFACT) : await size(path) });
   }
   let total = entries.reduce((sum, row) => sum + row.bytes, 0);
   for (const row of entries.sort((a, b) => Date.parse(a.entry.started) - Date.parse(b.entry.started))) {
