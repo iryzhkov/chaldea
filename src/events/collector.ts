@@ -29,17 +29,19 @@ export function toolPayload(raw: Record<string, unknown>, line: Buffer, toolSour
   const ts = safeString(raw.ts, 64);
   if (!Number.isFinite(Date.parse(ts))) throw new Error("invalid_time");
   const data: Record<string, unknown> = { ts: new Date(ts).toISOString(), raw_line_hash: sha(line), tool_source: safeString(toolSource) };
-  for (const key of ["session", "proc", "client", "tool", "outcome"]) data[key] = safeString(String(raw[key] ?? "") || "unknown");
+  for (const key of ["session", "proc", "client", "tool"]) data[key] = safeString(String(raw[key] ?? "") || "unknown");
+  data.outcome = safeString(String(raw.outcome ?? (raw.ok === true ? "ok" : "internal")));
   if (!Number.isSafeInteger(raw.seq) || Number(raw.seq) < 0 || typeof raw.ok !== "boolean") throw new Error("invalid_field");
   data.seq = raw.seq; data.ok = raw.ok;
-  if (!Array.isArray(raw.args) || raw.args.length > 128 ||
-    !raw.args.every(a => typeof a === "string" && (a === "?" || /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(a)))) throw new Error("invalid_args");
-  data.args = raw.args;
+  const args = raw.args === undefined ? [] : raw.args;
+  if (!Array.isArray(args) || args.length > 128 ||
+    !args.every(a => typeof a === "string" && (a === "?" || /^[A-Za-z_][A-Za-z0-9_-]{0,63}$/.test(a)))) throw new Error("invalid_args");
+  data.args = args;
   // Only declared fixed classes are copied. Unknown producer error classes
   // become stable fingerprints, so arbitrary text (even a bare bearer) cannot escape.
   const classes = new Set(["usage", "unknown-command", "unknown-option", "missing-argument", "no-credential",
     "refused", "unreadable", "conflict", "not-found", "unreachable", "timeout", "error",
-    "internal", "transport", "state", "invalid_argument", "not_found", "permission_denied"]);
+    "internal", "transport", "state", "invalid_argument", "not_found", "permission_denied", "invalid", "local-io"]);
   if (raw.err) data.err = typeof raw.err === "string" && classes.has(raw.err) ? raw.err : "fingerprint/" + sha(String(raw.err));
   for (const key of ["exit", "ms"]) if (raw[key] !== undefined && raw[key] !== null) {
     if (!Number.isSafeInteger(raw[key]) || (key === "ms" && Number(raw[key]) < 0)) throw new Error("invalid_number");
@@ -49,21 +51,27 @@ export function toolPayload(raw: Record<string, unknown>, line: Buffer, toolSour
   return { v: 1, kind: "tool_call", source: host + ".toolfeedback", host,
     occurred_at: data.ts, severity: raw.ok ? "info" : "warn", data };
 }
-function files(root: string): string[] {
+function files(root: string, timer = false): string[] {
   const result: string[] = [];
-  function visit(path: string, depth: number): void {
-    if (depth > 5 || result.length >= 5000) return;
-    let entries;
-    try { entries = readdirSync(path, { withFileTypes: true }); } catch { return; }
-    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      if (result.length >= 5000) return;
-      const p = join(path, e.name);
-      if (e.isDirectory()) visit(p, depth + 1);
-      else if (e.isFile() && e.name.endsWith(".jsonl")) result.push(p);
+  let entries;
+  try { entries = readdirSync(root, { withFileTypes: true }); } catch { return result; }
+  for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+    if (result.length >= 5000) break;
+    if (timer) {
+      if (e.isFile() && e.name.endsWith(".jsonl")) result.push(join(root, e.name));
+    } else if (e.isDirectory()) {
+      // Existing toolfeedback input is exactly TOOL/FILE.jsonl. In particular,
+      // root transcripts.jsonl and transcript trees are local analysis indexes.
+      for (const child of readdirSync(join(root, e.name), { withFileTypes: true })) {
+        if (result.length >= 5000) break;
+        if (child.isFile() && child.name.endsWith(".jsonl") && child.name !== "transcripts.jsonl")
+          result.push(join(root, e.name, child.name));
+      }
     }
   }
-  visit(root, 0); return result;
+  return result.sort();
 }
+
 function cursorAt(fd: number, base: Cursor, offset: number): Cursor {
   const st = fstatSync(fd, { bigint: true });
   return { ...base, offset, size: Number(st.size), modified: String(st.mtimeNs),
@@ -80,7 +88,7 @@ function generation(fd: number, old: Cursor | null): Cursor {
     prefixLength, prefix: sha(bytes(fd, 0, prefixLength)), tail: sha(""), size, modified: String(st.mtimeNs) };
 }
 /** Timer input is already redacted by the wrapper; allowlist again at the boundary. */
-function timerPublication(raw: Record<string, unknown>, host: string): Publication {
+export function timerPublication(raw: Record<string, unknown>, host: string): Publication {
   const job = safeString(raw.job), invocation = safeString(raw.invocation);
   if (!["chaldea-fleet-pull", "chaldea-retention"].includes(job) || !/^[a-f0-9]{32}$/.test(invocation) || raw.host !== host)
     throw new Error("invalid_timer");
@@ -114,7 +122,7 @@ export async function collect(options: CollectorOptions): Promise<void> {
   }
   // Pruning is independent of delivery health: an outage cannot disable retention.
   for (const [root, timer] of [[options.spool, false], ...(options.timers ? [[options.timers, true]] : [])] as [string, boolean][]) {
-    for (const path of files(root)) {
+    for (const path of files(root, timer)) {
       const st = lstatSync(path); if (now - st.mtimeMs <= 90 * DAY) continue;
       const file = (timer ? "timer/" : "tool/") + relative(root, path), fd = openSync(path, "r");
       try {
@@ -128,7 +136,7 @@ export async function collect(options: CollectorOptions): Promise<void> {
   }
   if (!await drain()) return;
   for (const [root, timer] of [[options.spool, false], ...(options.timers ? [[options.timers, true]] : [])] as [string, boolean][]) {
-    for (const path of files(root)) {
+    for (const path of files(root, timer)) {
       if (budget <= 0) return;
       const rel = relative(root, path), file = (timer ? "timer/" : "tool/") + rel;
       const st = lstatSync(path);
@@ -156,9 +164,9 @@ export async function collect(options: CollectorOptions): Promise<void> {
             else event = { key: cursor.generation + "/" + rel + "/" + cursor.offset, source: options.host + ".toolfeedback", host: options.host,
               payload: toolPayload(raw, line, rel.split("/")[0]!, options.host, options.roots) };
             if (Buffer.byteLength(event.key) > 256) throw new Error("key_too_long");
-          } catch {
+          } catch (error) {
             budget--;
-            outbox.transaction(() => { outbox.count("rejected"); outbox.checkpoint(file, next); });
+            outbox.transaction(() => { outbox.count(error instanceof Error && error.message === "foreign_host" ? "foreign_host" : "rejected"); outbox.checkpoint(file, next); });
             cursor = next; continue;
           }
           if (!outbox.admit(event, file, next)) return;

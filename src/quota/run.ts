@@ -152,6 +152,7 @@ export class EventSink {
       this.poster.enqueue(record, () => {
         this.state.pendingDelivery.delete(quotaKey(record));
         this.save();
+        return !this.dirty;
       });
     }
   }
@@ -183,7 +184,7 @@ export class EventSink {
       if (this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
           Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES) {
         this.state.deliveryDropped++;
-        this.logger.error("pending record dropped: the state file has been unwritable too long", { kind: record.kind, thread: record.threadId, run: record.runId });
+        this.logger.error("pending record dropped: durable delivery queue capacity exceeded", { kind: record.kind, thread: record.threadId, run: record.runId });
         continue;
       }
       this.state.pendingDelivery.set(key, record);
@@ -191,7 +192,7 @@ export class EventSink {
     }
   }
 
-  /** Final save at shutdown; records still pending are dropped with an error. */
+  /** Final save; unsaved records are reported, durable delivery intents remain. */
   close(): void {
     this.save();
     if (this.#retryTimer !== null) {

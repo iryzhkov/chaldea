@@ -1,4 +1,5 @@
 // Quota state owns durability; this worker only handles asynchronous delivery.
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
 import type { QuotaRecord } from "../quota/observer.ts";
@@ -62,7 +63,7 @@ export function quotaPublication(record: QuotaRecord, host: string): Publication
   } };
 }
 export interface FeedPosterOptions {
-  /** Retained for CLI compatibility; structured publication never invokes feed. */
+  /** Used only in legacy mode, chosen before any delivery attempt. */
   readonly command: string;
   readonly host: string;
   readonly logger: Logger;
@@ -70,15 +71,48 @@ export interface FeedPosterOptions {
   readonly publisher?: PublisherOptions;
   readonly deliver?: (event: Publication) => Promise<boolean>;
   readonly retryMs?: number;
+  readonly mode?: "legacy" | "akasha";
+}
+/** Before configured cutover retain the legacy one-attempt semantics. An
+ * ambiguous legacy result is never retried; scoped mode never calls this path. */
+async function legacyAttempt(options: FeedPosterOptions, record: QuotaRecord): Promise<void> {
+  await new Promise<void>(resolve => {
+    const child = spawn(options.command, ["post", title(record), "--severity", record.severity,
+      "--source", FEED_SOURCE, "--host", options.host, "--tag", FEED_TAGS, "--body-file", "-"],
+      { stdio: ["pipe", "ignore", "pipe"], detached: true,
+        env: { ...process.env, FEED_IDEMPOTENCY_KEY: quotaKey(record) } });
+    let stderrBytes = 0, settled = false;
+    child.stderr.on("data", (b: Buffer) => { stderrBytes += b.length; });
+    const timer = setTimeout(() => { try { process.kill(-child.pid!, "SIGKILL"); } catch {} },
+      options.attemptTimeoutMs ?? ATTEMPT_TIMEOUT_MS);
+    const finish = (ok: boolean) => {
+      if (settled) return; settled = true; clearTimeout(timer);
+      if (!ok) options.logger.warn("legacy feed attempt failed; record not retried", { kind: record.kind, stderrBytes });
+      else options.logger.info("posted feed record", { kind: record.kind });
+      resolve();
+    };
+    child.once("error", () => finish(false));
+    child.once("close", code => finish(code === 0));
+    child.stdin.on("error", () => {});
+    child.stdin.end(body(record, options.host));
+  });
 }
 export class FeedPoster {
   readonly #options: FeedPosterOptions;
-  readonly #queue = new Map<string, { record: QuotaRecord; ack?: () => void }>();
+  readonly #akasha: boolean;
+  readonly #queue = new Map<string, { record: QuotaRecord; ack?: () => boolean | void }>();
   #draining: Promise<void> | null = null;
   #timer: NodeJS.Timeout | null = null;
   #closed = false;
-  constructor(options: FeedPosterOptions) { this.#options = options; }
-  enqueue(record: QuotaRecord, ack?: () => void): void {
+  constructor(options: FeedPosterOptions) {
+    this.#options = options;
+    // Configuration selects the mode once. Even incomplete scoped configuration
+    // queues on failure; no auth result can select the legacy command.
+    this.#akasha = options.mode === "akasha" || (options.mode !== "legacy" &&
+      (options.publisher !== undefined || options.deliver !== undefined ||
+       process.env.AKASHA_URL !== undefined || process.env.AKASHA_TOKEN_HELPER !== undefined));
+  }
+  enqueue(record: QuotaRecord, ack?: () => boolean | void): void {
     const key = quotaKey(record);
     if (this.#queue.has(key)) return;
     if (this.#queue.size >= MAX_QUEUED_RECORDS) {
@@ -104,7 +138,17 @@ export class FeedPoster {
     for (const [key, item] of this.#queue) {
       if (this.#closed) return;
       let ok = false;
-      try { ok = await (this.#options.deliver ?? ((e) => publish(e, this.#options.publisher)))(quotaPublication(item.record, this.#options.host)); }
+      try {
+        if (this.#akasha) ok = await (this.#options.deliver ?? ((e) => publish(e, this.#options.publisher)))(quotaPublication(item.record, this.#options.host));
+        else {
+          // Legacy feedd has no receipt contract: claim durably before its
+          // one attempt, preserving the pre-cutover at-most-once policy.
+          if (item.ack?.() === false) continue;
+          this.#queue.delete(key);
+          await legacyAttempt(this.#options, item.record);
+          continue;
+        }
+      }
       catch {}
       if (ok) {
         // The acknowledgement atomically removes the state's pending payload.

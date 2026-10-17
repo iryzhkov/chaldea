@@ -17,7 +17,7 @@ export class Outbox {
       Number(this.db.prepare("PRAGMA max_page_count").get()!.max_page_count) !== 4096) throw new Error("unsupported_page_size");
     this.db.exec(`CREATE TABLE IF NOT EXISTS pending(key TEXT PRIMARY KEY, event TEXT NOT NULL, file TEXT NOT NULL, cursor TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS cursors(file TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, value INTEGER NOT NULL);\n      INSERT OR IGNORE INTO counters VALUES (\'capacity\',0),(\'oversize\',0),(\'delivered\',0),(\'deferred\',0),(\'rejected\',0),(\'expired_unshipped\',0);`);
+      CREATE TABLE IF NOT EXISTS counters(name TEXT PRIMARY KEY, value INTEGER NOT NULL);\n      INSERT OR IGNORE INTO counters VALUES (\'capacity\',0),(\'oversize\',0),(\'delivered\',0),(\'deferred\',0),(\'rejected\',0),(\'expired_unshipped\',0),(\'foreign_host\',0);`);
   }
   transaction<T>(fn: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");

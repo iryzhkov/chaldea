@@ -72,7 +72,7 @@ test("tool input is allowlisted, another host is counted and skipped; no operand
     writeFileSync(f.path, JSON.stringify({ ...record, host: "agent-b" }) + "\n" + line());
     const seen: Publication[] = [];
     await collect({ spool: f.spool, host: "agent-a", outbox: db, deliver: async e => { seen.push(e); return true; } });
-    assert.equal(seen.length, 1); assert.equal(db.counters().rejected, 1);
+    assert.equal(seen.length, 1); assert.equal(db.counters().foreign_host, 1);
   } finally { db.close(); f.remove(); }
 });
 test("outbox physically caps the database and refuses new admission without evicting pending data", () => {

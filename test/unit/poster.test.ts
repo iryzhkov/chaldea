@@ -19,7 +19,7 @@ test("an ambiguous delivery remains queued and retries the same payload and key"
   const poster = new FeedPoster({ command: "/must/not/be/run", host: "agent-a", logger, retryMs: 10,
     deliver: async e => { seen.push(JSON.stringify(e)); return up; } });
   try {
-    poster.enqueue(record, () => ack++);
+    poster.enqueue(record, () => { ack++; });
     await poster.idle(); assert.equal(ack, 0); up = true;
     await new Promise(r => setTimeout(r, 40)); await poster.idle();
     assert.equal(ack, 1); assert.ok(seen.length >= 2); assert.equal(new Set(seen).size, 1);
@@ -30,7 +30,7 @@ test("delivery does not block enqueue; a full worker retains the caller's durabl
   const poster = new FeedPoster({ command: "", host: "agent-a",
     logger: { ...logger, warn() { warnings++; } },
     deliver: () => new Promise(resolve => { finish = resolve; }) });
-  poster.enqueue(record, () => ack++);
+  poster.enqueue(record, () => { ack++; });
   for (let i = 0; i < MAX_QUEUED_RECORDS + 5; i++) poster.enqueue({ ...record, threadId: "t" + i });
   assert.equal(ack, 0); assert.ok(warnings > 0);
   poster.close(); finish(false); await poster.idle();
