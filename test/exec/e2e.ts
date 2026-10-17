@@ -311,6 +311,7 @@ print('dns-config-ok')
 `;
       const result = await collected(run(['--', 'python3', '-c', code]));
       assert.equal(result.code, 0, result.err); assert.match(result.out, /dns-config-ok/);
+      assert.doesNotMatch(result.err, /Couldn't get any nameserver address/);
     });
 
     await t.test('outbound DNS and HTTPS work when the host has internet', async context => {

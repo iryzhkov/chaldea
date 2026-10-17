@@ -7,8 +7,8 @@ jobs:
     runs-on: [self-hosted, chaldea]
     env:
       TMPDIR: /home/igor/.cache/chaldea-scratch/laneC/ci-${{ github.run_id }}
-      # Debian nft path and the supervisor for pasta's parent-death signal reset.
-      CHALDEA_FLEET_REF: 3c4555e2107350a5a2e595b9e308a15e336d8a93
+      # Debian nft path, pasta parent-death supervisor and loopback-stub DNS warning fix.
+      CHALDEA_FLEET_REF: 9e3db40d77897f6cd1306d25a7a0731840b91b27
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
