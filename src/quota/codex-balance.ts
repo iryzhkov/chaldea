@@ -8,6 +8,7 @@ export interface CodexContext {
   readonly home: string;
   readonly codexHome: string;
   readonly command: string;
+  readonly assertRuntimeHome?: boolean;
 }
 export interface HeadroomConfig {
   readonly contexts: ReadonlyArray<CodexContext>;
@@ -23,7 +24,7 @@ export function headroomConfig(raw: unknown = {}): HeadroomConfig {
   const parsed = contexts.map((entry): CodexContext => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("invalid quota credential context");
     const v = entry as Record<string, unknown>;
-    if (Object.keys(v).some(k => !["providers", "home", "codexHome", "command"].includes(k))) throw new Error("unknown credential context option");
+    if (Object.keys(v).some(k => !["providers", "home", "codexHome", "command", "assertRuntimeHome"].includes(k))) throw new Error("unknown credential context option");
     if (!Array.isArray(v.providers) || v.providers.length === 0 || v.providers.length > 64 ||
         !v.providers.every(p => typeof p === "string" && /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(p) && !seen.has(p))) {
       throw new Error("credential context needs unique provider aliases");
@@ -35,7 +36,10 @@ export function headroomConfig(raw: unknown = {}): HeadroomConfig {
     if (v.command !== undefined && (typeof v.command !== "string" || !isAbsolute(v.command) || v.command.includes("\0"))) {
       throw new Error("Codex command must be an absolute installed executable");
     }
-    return { providers: v.providers, home: resolve(v.home as string), codexHome: resolve(v.codexHome as string),
+    if (v.assertRuntimeHome !== undefined && typeof v.assertRuntimeHome !== "boolean") {
+      throw new Error("assertRuntimeHome must be a boolean");
+    }
+    return { assertRuntimeHome: v.assertRuntimeHome === true, providers: v.providers, home: resolve(v.home as string), codexHome: resolve(v.codexHome as string),
       command: v.command as string | undefined ?? "codex" };
   });
   const low = c.lowHeadroomPercent ?? 10;
@@ -43,7 +47,7 @@ export function headroomConfig(raw: unknown = {}): HeadroomConfig {
   // The same effective context has one collector even when listed in several entries.
   const grouped = new Map<string, CodexContext>();
   for (const ctx of parsed) {
-    const key = contextKey(ctx), previous = grouped.get(key);
+    const key = JSON.stringify([contextKey(ctx), ctx.assertRuntimeHome]), previous = grouped.get(key);
     grouped.set(key, { ...ctx, providers: [...(previous?.providers ?? []), ...ctx.providers] });
   }
   return { contexts: [...grouped.values()], lowHeadroomPercent: low };

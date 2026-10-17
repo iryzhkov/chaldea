@@ -298,7 +298,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
       const local = ["127.0.0.1", "[::1]", "localhost"].includes(new URL(serverUrl).hostname);
       monitor ??= new HeadroomMonitor({
         state: state.headroom, config: options.reporting ?? headroomConfig(), local,
-        diagnostic: detail => logger.info("Codex balance collector", { provider: detail.provider, reason: detail.reason }),
+        diagnostic: detail => logger.info("Codex balance collector", detail),
         save: records => { sink.record(records); sink.save(); },
       });
       monitor.options.local = local;

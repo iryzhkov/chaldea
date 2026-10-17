@@ -30,6 +30,7 @@ export interface ExtraUsage { readonly usedMinor: number | null; readonly capMin
 export interface ProviderHeadroom {
   readonly alias: string;
   readonly driver: string;
+  binding?: "asserted" | "verified";
   plan: Metric<string>;
   included: Metric<ReadonlyArray<Window>>;
   credits: Metric<Wallet>;
@@ -85,6 +86,7 @@ export function validateHeadroom(value: unknown): HeadroomState {
   }
   for (const p of s.providers) {
     if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
+        p.binding !== undefined && !["asserted", "verified"].includes(p.binding) ||
         !["plan", "included", "credits", "manualResets", "extraUsage", "ordinaryUsageAllowed", "spendControlReached"].every(k => metric(p[k])) ||
         p.included.value !== null && (!Array.isArray(p.included.value) || p.included.value.length > 32 ||
           !p.included.value.every((w: any) => object(w) && safeId(w.id) && percent(w.usedPercent) && percent(w.remainingPercent))) ||
@@ -162,7 +164,7 @@ export function routingLanes(row: ProviderHeadroom, nowMs: number) {
 }
 export function statusSnapshot(state: HeadroomState, nowMs: number) {
   return { version: 1, generatedAt: new Date(nowMs).toISOString(), providers: state.providers.map(row => ({
-    alias: row.alias, driver: row.driver, plan: metricNow(row.plan, nowMs),
+    alias: row.alias, driver: row.driver, ...(row.binding ? { binding: row.binding } : {}), plan: metricNow(row.plan, nowMs),
     ...routingLanes(row, nowMs),
   })) };
 }
@@ -175,6 +177,7 @@ export function humanStatus(state: HeadroomState, nowMs: number): string {
   };
   return state.providers.map(row => [
     `${row.alias}${row.plan.value ? " (" + row.plan.value + ")" : ""}:`,
+    ...(row.binding ? ["  binding: " + row.binding] : []),
     "  plan: " + describe(row.plan, String),
     "  included windows: " + describe(row.included, windows => windows.map(w =>
       `${w.id} ${w.usedPercent}% used / ${w.remainingPercent}% remaining; duration ${w.windowDurationMins ?? "unknown"} min; reset ${w.resetsAt ?? "unknown"}`).join("; ")),
@@ -201,7 +204,7 @@ function rejection(p: SwitchProvider | undefined, ctx: CodexContext, local: bool
   if (p.auth.status !== "authenticated") return "auth_not_authenticated";
   if (p.auth.type !== "chatgpt") return "auth_type_not_chatgpt";
   if (p.quotaContextBlocked) return "instance_environment_unsupported";
-  if (p.runtimeHome === undefined) return "runtime_home_unknown";
+  if (p.runtimeHome === undefined) return ctx.assertRuntimeHome ? undefined : "runtime_home_unknown";
   if (resolve(p.runtimeHome) !== ctx.codexHome) return "runtime_home_mismatch";
 }
 
@@ -211,7 +214,7 @@ export interface HeadroomMonitorOptions {
   state: HeadroomState; config: HeadroomConfig; local: boolean;
   save: (records: ReadonlyArray<QuotaRecord>) => void;
   read?: BalanceReader; now?: () => number; random?: () => number;
-  diagnostic?: (detail: { provider: string; reason: BalanceReason }) => void;
+  diagnostic?: (detail: { provider: string; reason: BalanceReason; binding?: "asserted" }) => void;
 }
 export class HeadroomMonitor {
   #providers: ReadonlyArray<SwitchProvider> = [];
@@ -222,7 +225,7 @@ export class HeadroomMonitor {
   #due = new Map<string, number>();
   #failures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
-  #reported = new Map<string, BalanceReason>();
+  #reported = new Map<string, string>();
   #started = new Set<string>();
   readonly #abort = new AbortController();
   readonly options: HeadroomMonitorOptions;
@@ -273,18 +276,20 @@ export class HeadroomMonitor {
     return this.#flight;
   }
   #report(provider: string, reason: BalanceReason): void {
-    if (this.#reported.get(provider) === reason) return;
-    this.#reported.set(provider, reason);
-    try { this.options.diagnostic?.({ provider, reason }); } catch { /* Logging cannot stop collection. */ }
+    const binding = this.state.providers.find(p => p.alias === provider)?.binding;
+    const signature = JSON.stringify([reason, binding]);
+    if (this.#reported.get(provider) === signature) return;
+    this.#reported.set(provider, signature);
+    try { this.options.diagnostic?.({ provider, reason, ...(binding === "asserted" ? { binding } : {}) }); } catch { /* Logging cannot stop collection. */ }
   }
   #diagnose(): void {
     const bindings = new Map(this.options.config.contexts.flatMap(ctx => ctx.providers.map(alias => [alias, ctx] as const)));
     const before = JSON.stringify(this.state.providers);
     for (const [alias, ctx] of bindings) {
       const reason = rejection(this.#providers.find(p => p.instanceId === alias), ctx, this.options.local);
-      if (reason) this.#report(alias, reason);
-      if (!this.state.providers.some(p => p.alias === alias) && this.state.providers.length < 64) {
-        this.state.providers.push(newProvider(alias, "codex"));
+      if (!this.state.providers.some(p => p.alias === alias)) {
+        if (this.state.providers.length < 64) this.state.providers.push(newProvider(alias, "codex"));
+        else if (reason) this.#report(alias, reason);
       }
     }
     // Retain only current aliases and configured bindings, not historical catalog entries.
@@ -296,15 +301,22 @@ export class HeadroomMonitor {
       if (!ctx && row.driver !== "codex") continue;
       const p = this.#providers.find(p => p.instanceId === row.alias);
       const reason = ctx ? rejection(p, ctx, this.options.local) : "context_not_configured";
+      // Keep provenance visible even while a temporary rejection marks cached metrics as errors.
+      if (ctx && p?.driver === "codex" && p.runtimeHome === undefined && ctx.assertRuntimeHome) row.binding = "asserted";
+      else if (ctx && p?.runtimeHome !== undefined && resolve(p.runtimeHome) === ctx.codexHome) row.binding = "verified";
+      else delete row.binding;
       if (reason) {
         if (row.driver === "codex") failCodex(row, reason);
         else row.credits = { ...row.credits, error: reason };
         this.#report(row.alias, reason);
-      } else if (SKIP_REASONS.some(r => r === row.credits.error)) {
-        const clean = newProvider(row.alias, row.driver);
-        row.credits = clean.credits; row.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
-        row.spendControlReached = clean.spendControlReached; row.plan = clean.plan;
-        if (row.manualResets.source === "codex-app-server") row.manualResets = clean.manualResets;
+      } else {
+        // Identity changes are cleared in update(). Eligibility flaps keep the same observations.
+        const resume = <T>(m: Metric<T>): Metric<T> => SKIP_REASONS.some(r => r === m.error) ||
+          m.value === null && m.error === null ? { ...m,
+            state: m.value === null ? "unknown" : "fresh", error: m.value === null ? "read_scheduled" : null } : m;
+        row.credits = resume(row.credits); row.ordinaryUsageAllowed = resume(row.ordinaryUsageAllowed);
+        row.spendControlReached = resume(row.spendControlReached); row.plan = resume(row.plan);
+        if (row.manualResets.source === "codex-app-server") row.manualResets = resume(row.manualResets);
       }
     }
     this.#changed ||= before !== JSON.stringify(this.state.providers);
@@ -317,22 +329,26 @@ export class HeadroomMonitor {
   }
   async #collect(): Promise<void> {
     this.#diagnose();
-    if (this.options.local) for (const ctx of this.options.config.contexts) {
-      const key = contextKey(ctx), now = this.now();
+    // Policies may differ across aliases sharing one executable/HOME tuple.
+    const contexts = new Map(this.options.config.contexts.map(ctx => [contextKey(ctx), ctx]));
+    if (this.options.local) for (const [key, ctx] of contexts) {
+      const now = this.now();
       if ((this.#due.get(key) ?? 0) > now || this.#abort.signal.aborted || !this.#active) continue;
-      const matching = this.#providers.filter(p => ctx.providers.includes(p.instanceId) && rejection(p, ctx, this.options.local) === undefined);
+      const matching = this.options.config.contexts.filter(c => contextKey(c) === key).flatMap(binding =>
+        this.#providers.filter(p => binding.providers.includes(p.instanceId) && rejection(p, binding, this.options.local) === undefined)
+          .map(p => ({ p, binding })));
       if (matching.length === 0) continue; // unknown context never falls back to this shell's login
       try {
         if (!this.#started.has(key)) {
           this.#started.add(key);
-          for (const p of matching) this.#report(p.instanceId, "read_started");
+          for (const { p } of matching) this.#report(p.instanceId, "read_started");
         }
         const raw = await (this.options.read ?? readCodexBalance)(ctx, this.#abort.signal);
         if (this.#abort.signal.aborted) return;
         const at = new Date(this.now()).toISOString();
         // Match again after await: aliases can be reconfigured during a read.
-        for (const p of matching) {
-          const row = this.#currentRow(p, ctx);
+        for (const { p, binding } of matching) {
+          const row = this.#currentRow(p, binding);
           if (!row) continue;
           const accountId = object(raw)?.accountId;
           if (p.quotaAccountKey && (typeof accountId !== "string" ||
@@ -344,8 +360,8 @@ export class HeadroomMonitor {
       } catch (error) {
         if (this.#abort.signal.aborted) return;
         this.#failures.set(key, Math.min(5, (this.#failures.get(key) ?? 0) + 1));
-        for (const p of matching) {
-          const row = this.#currentRow(p, ctx);
+        for (const { p, binding } of matching) {
+          const row = this.#currentRow(p, binding);
           if (!row) continue;
           const reason = error instanceof BalanceReadError ? error.code : "read_failed";
           failCodex(row, reason);

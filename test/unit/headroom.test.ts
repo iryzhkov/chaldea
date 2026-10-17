@@ -32,16 +32,17 @@ const provider = (alias = "codex", runtimeHome = "/scratch/codex"): SwitchProvid
     resetCredits: { availableCount: 1, nextExpiresAt: "2026-11-01T00:00:00Z" } },
 });
 
-test("host startup with 18 instances reports only two enabled providers once per quarter-hour", async () => {
+for (const asserted of [false, true]) test(`host startup with 18 instances and asserted=${asserted} stays at one combined snapshot per quarter-hour`, async () => {
   let now = Math.floor(START / STALE_AFTER_MS) * STALE_AFTER_MS;
   const records: QuotaRecord[] = [];
-  const config = headroomConfig({ contexts: [{ providers: ["p0", "p1"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
+  const config = headroomConfig({ contexts: [{ providers: ["p0", "p1"], home: "/scratch/home", codexHome: "/scratch/codex", assertRuntimeHome: asserted }] });
   const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true,
     now: () => now, random: () => 0.5, read: async () => response, save: batch => records.push(...batch) });
-  const catalog = () => Array.from({ length: 18 }, (_, i) => ({
-    ...provider("p" + i), enabled: i < 2,
-    usageLimits: { ...provider().usageLimits!, checkedAt: new Date(now).toISOString() },
-  }));
+  const catalog = () => Array.from({ length: 18 }, (_, i) => {
+    const { runtimeHome, ...p } = provider("p" + i);
+    return { ...p, ...(asserted ? {} : { runtimeHome: runtimeHome! }), enabled: i < 2,
+      usageLimits: { ...provider().usageLimits!, checkedAt: new Date(now).toISOString() } };
+  });
   try {
     m.update(catalog()); await m.tick();
     assert.equal(records.length, 1, "startup establishes a silent change/low baseline");
@@ -51,6 +52,8 @@ test("host startup with 18 instances reports only two enabled providers once per
     for (let minute = 1; minute <= 45; minute++) {
       now += 60_000; m.update(catalog()); await m.tick();
       assert.equal(records.length, 1 + Math.floor(minute / 15));
+      assert.ok(records.every(r => r.headroom?.providers.length === 2));
+      assert.ok(records.every(r => r.headroom?.providers.every(p => p.binding === (asserted ? "asserted" : "verified"))));
     }
     assert.ok(records.every(r => r.kind === "quota_headroom_snapshot"));
   } finally { await m.close(); }
@@ -211,6 +214,90 @@ test("missing published runtime home reports one sanitized rejection and recover
   } finally { await m.close(); }
 });
 
+test("operator assertion is explicit, visible, and cannot override published homes or other guards", async () => {
+  const entry = { providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" };
+  assert.equal(headroomConfig({ contexts: [entry] }).contexts[0]?.assertRuntimeHome, false);
+  assert.equal(headroomConfig({ contexts: [{ ...entry, assertRuntimeHome: false }] }).contexts[0]?.assertRuntimeHome, false);
+  for (const value of ["true", 1, null]) {
+    assert.throws(() => headroomConfig({ contexts: [{ ...entry, assertRuntimeHome: value }] }), /must be a boolean/);
+  }
+  const config = headroomConfig({ contexts: [{ ...entry, assertRuntimeHome: true }] });
+  const { runtimeHome, ...missingHome } = provider();
+  const diagnostics: unknown[] = [];
+  let reads = 0;
+  const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => START,
+    random: () => 0.5, save() {}, diagnostic: d => diagnostics.push(d),
+    read: async () => { reads++; return response; } });
+  try {
+    m.update([missingHome]); await m.tick();
+    assert.equal(reads, 1);
+    assert.equal(statusSnapshot(m.state, START).providers[0]?.binding, "asserted");
+    assert.match(humanStatus(m.state, START), /binding: asserted/);
+    assert.deepEqual(diagnostics, [
+      { provider: "codex", reason: "read_started", binding: "asserted" },
+      { provider: "codex", reason: "read_completed", binding: "asserted" },
+    ]);
+    m.update([{ ...missingHome, enabled: false }]); await m.tick();
+    assert.equal(statusSnapshot(m.state, START).providers[0]?.binding, "asserted");
+    assert.match(humanStatus(m.state, START), /binding: asserted/);
+    assert.equal(m.state.providers[0]?.credits.value?.balance, response.rateLimitsByLimitId.codex.credits.balance);
+    m.update([missingHome]); await m.tick(); assert.equal(reads, 1);
+    assert.equal(m.state.providers[0]?.credits.observedAt, AT);
+    m.update([provider("codex", "/different-account")]); await m.tick();
+    assert.equal(reads, 1); assert.equal(m.state.providers[0]?.credits.error, "runtime_home_mismatch");
+    assert.equal(m.state.providers[0]?.credits.value, null);
+    assert.equal(m.state.providers[0]?.credits.observedAt, null);
+    // Returning to an asserted binding is a new identity and must wait for the existing deadline.
+    m.update([missingHome]); await m.tick();
+    assert.equal(reads, 1); assert.equal(m.state.providers[0]?.credits.error, "read_scheduled");
+    assert.equal(m.state.providers[0]?.credits.value, null);
+    assert.equal(m.state.providers[0]?.credits.observedAt, null);
+    m.update([provider()]); await m.tick();
+    assert.equal(statusSnapshot(m.state, START).providers[0]?.binding, "verified");
+  } finally { await m.close(); }
+  for (const [local, p, reason] of [
+    [false, missingHome, "remote_t3"],
+    [true, { ...missingHome, quotaContextBlocked: true }, "instance_environment_unsupported"],
+    [true, { ...missingHome, auth: { status: "unauthenticated" } }, "auth_not_authenticated"],
+    [true, { ...missingHome, auth: { status: "authenticated", type: "apiKey" } }, "auth_type_not_chatgpt"],
+  ] as const) {
+    const guarded = new HeadroomMonitor({ state: emptyHeadroom(), config, local, now: () => START,
+      save() {}, read: async () => assert.fail("assertion bypassed a guard") });
+    try {
+      guarded.update([p]); await guarded.tick();
+      assert.equal(guarded.state.providers[0]?.credits.error, reason);
+    } finally { await guarded.close(); }
+  }
+});
+
+test("mixed assertion policies share one read without opting other aliases in", async () => {
+  const entry = { home: "/scratch/home", codexHome: "/scratch/codex" };
+  for (const reverse of [false, true]) {
+    const contexts = [
+      { ...entry, providers: ["asserted"], assertRuntimeHome: true },
+      { ...entry, providers: ["default", "verified"] },
+    ];
+    const config = headroomConfig({ contexts: reverse ? contexts.reverse() : contexts });
+    let reads = 0, now = START;
+    const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => now,
+      random: () => 0.5, save() {}, read: async () => { reads++; return response; } });
+    const catalog = ["asserted", "default", "verified"].map(alias => {
+      const { runtimeHome, ...p } = provider(alias);
+      return { ...p, ...(alias === "verified" ? { runtimeHome: runtimeHome! } : {}) };
+    });
+    try {
+      m.update(catalog); await m.tick();
+      const rows = new Map(m.state.providers.map(p => [p.alias, p]));
+      assert.equal(reads, 1);
+      assert.equal(rows.get("asserted")?.credits.value?.balance, response.rateLimitsByLimitId.codex.credits.balance);
+      assert.equal(rows.get("verified")?.credits.value?.balance, response.rateLimitsByLimitId.codex.credits.balance);
+      assert.equal(rows.get("default")?.credits.error, "runtime_home_unknown");
+      assert.equal(rows.get("default")?.credits.value, null);
+      now += COLLECT_EVERY_MS; await m.tick(); assert.equal(reads, 2);
+    } finally { await m.close(); }
+  }
+});
+
 test("every rejected binding has a stable status reason without a read or repeated logs", async () => {
   const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
   const cases: Array<{ reason: string; p?: SwitchProvider; local?: boolean }> = [
@@ -256,6 +343,30 @@ test("catalog rejection recovery preserves normal cadence and rate-limit backoff
         m.update([rejected]); await m.tick();
         m.update([provider()]); await m.tick();
         assert.equal(reads, 1, "availability and enablement flaps must preserve the deadline");
+        const row = m.state.providers[0]!;
+        for (const key of ["credits", "ordinaryUsageAllowed", "spendControlReached", "plan", "manualResets"] as const) {
+          const metric = row[key];
+          if (!rateLimited) {
+            assert.equal(metric.observedAt, AT, key);
+            assert.equal(metric.error, null, key);
+          }
+        }
+        const json = statusSnapshot(m.state, now).providers[0]!.creditFunded.credits;
+        const human = humanStatus(m.state, now);
+        if (rateLimited) {
+          assert.equal(json.value, null); assert.equal(json.observedAt, null);
+          assert.equal(json.error, "read_scheduled");
+          assert.match(human, /reason read_scheduled/);
+        } else {
+          assert.equal(json.value?.balance, response.rateLimitsByLimitId.codex.credits.balance);
+          assert.equal(json.observedAt, AT); assert.equal(json.error, null);
+          assert.match(human, /61951\.0098125000 credits/);
+          assert.match(human, /observed 2026-10-17T17:57:35\.000Z/);
+          assert.equal(row.ordinaryUsageAllowed.value, false);
+          assert.equal(row.spendControlReached.value, false);
+          assert.equal(row.plan.value, "pro");
+          assert.equal(row.manualResets.value?.availableCount, 1);
+        }
       }
       now = START + COLLECT_EVERY_MS * (rateLimited ? 2 : 1) - 1;
       await m.tick(); assert.equal(reads, 1);
@@ -414,6 +525,7 @@ test("status CLI reads only the snapshot (human and JSON) without a T3 connectio
     const path = join(f.path, "state.json"), state = emptyState(), row = newProvider("codex", "codex");
     const rejected = newProvider("codex_skipped", "codex"); failCodex(rejected, "runtime_home_unknown");
     applyT3(row, provider()); applyCodex(row, response, AT); state.headroom.providers = [row, rejected];
+    row.binding = "asserted";
     saveState(path, state, START);
     for (const json of [false, true]) {
       const child = spawn(process.execPath, ["src/cli.ts", "quota", "status", "--state-file", path, ...(json ? ["--json"] : [])],
@@ -426,8 +538,10 @@ test("status CLI reads only the snapshot (human and JSON) without a T3 connectio
       if (json) {
         assert.equal(JSON.parse(stdout).providers[0].creditFunded.credits.value.balance, "61951.0098125000");
         assert.equal(JSON.parse(stdout).providers[1].creditFunded.credits.error, "runtime_home_unknown");
+        assert.equal(JSON.parse(stdout).providers[0].binding, "asserted");
       } else {
         assert.match(stdout, /61951.0098125000 credits/); assert.match(stdout, /manual resets: 1/);
+        assert.match(stdout, /binding: asserted/);
         assert.match(stdout, /aggregate credits: unknown \[error; codex-app-server; reason runtime_home_unknown;/);
       }
     }
