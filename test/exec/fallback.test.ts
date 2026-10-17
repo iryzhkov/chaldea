@@ -4,12 +4,22 @@ import { argumentsFor, hostsFor, isLocalHost, fallbackAllowed } from '../../src/
 
 test('host is optional, but an explicit host and command must be valid', () => {
   assert.deepEqual(argumentsFor(['exec', '--gpu', '--artifact', 'out', '--', 'echo', '$HOME']),
-    { host: undefined, gpu: true, artifacts: ['out'], argv: ['echo', '$HOME'] });
+    { host: undefined, gpu: true, artifacts: ['out'], argv: ['echo', '$HOME'], noQueue: false, queueTimeout: 3600 });
   for (const args of [
     ['exec', '--host'], ['exec', '--host', '', '--', 'true'],
     ['exec', '--host', '--', 'true'], ['exec', '--host', '-x', '--', 'true'],
     ['exec', '--'], ['exec', 'true'], ['exec', '--host', 'a', '--'],
   ]) assert.throws(() => argumentsFor(args));
+});
+
+test('queue defaults, duration units and bounds', () => {
+  for (const [text, seconds] of [['250ms', .25], ['2s', 2], ['3m', 180], ['1h', 3600], ['12', 12]] as const) {
+    assert.equal(argumentsFor(['exec', '--queue-timeout', text, '--', 'true']).queueTimeout, seconds);
+  }
+  assert.equal(argumentsFor(['exec', '--no-queue', '--', 'true']).noQueue, true);
+  for (const text of ['', '0', '-1', 'NaN', 'Infinity', '25h', '5x']) {
+    assert.throws(() => argumentsFor(['exec', '--queue-timeout', text, '--', 'true']));
+  }
 });
 
 test('fleet order is preserved, duplicates removed, and self matches the short hostname only', () => {

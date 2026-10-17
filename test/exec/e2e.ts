@@ -65,7 +65,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 65000 }, as
   function ssh(args: string[], overrides: NodeJS.ProcessEnv = {}) {
     return spawn('ssh', ['-F', sshConfig, '-o', 'BatchMode=yes', '-o', 'IdentityAgent=' + (overrides.SSH_AUTH_SOCK ?? 'none'), ...args], { env: { ...env, ...overrides }, stdio: ['pipe', 'pipe', 'pipe'] });
   }
-  const run = (args: string[]) => spawn(process.execPath, [cli, 'exec', '--host', 'test', ...args], { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const run = (args: string[]) => spawn(process.execPath, [cli, 'exec', '--no-queue', '--host', 'test', ...args], { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] });
   async function configure(extra: object = {}) {
     await fs.writeFile(config, JSON.stringify({ state_root: jobroot, require_mount: false, pasta_binary: pasta, ...extra }));
   }

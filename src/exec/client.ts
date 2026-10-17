@@ -4,27 +4,34 @@ import { join, dirname } from 'node:path';
 import { homedir, hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
+import { connect, queueHost, type Transport } from './queue.ts';
 import { manifest } from './manifest.ts';
 import { cleanArtifacts, BOOT_ID } from './artifacts.ts';
 import { record, prune, DAYS, type Intent } from './journal.ts';
-import { frames, send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, type Request } from './protocol.ts';
+import { send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, type Request } from './protocol.ts';
 
 export function argumentsFor(args: string[]) {
-  let host: string | undefined; let gpu = false; const artifacts: string[] = [];
+  let host: string | undefined; let gpu = false; let noQueue = false; let queueTimeout = 3600; const artifacts: string[] = [];
   let i = args[0] === 'exec' ? 1 : -1;
-  if (i < 0) throw new Error('usage: chaldea exec [--host H] [--artifact PATH] [--gpu] -- CMD...');
+  if (i < 0) throw new Error('usage: chaldea exec [--host H] [--queue-timeout 1h] [--no-queue] [--artifact PATH] [--gpu] -- CMD...');
   while (i < args.length && args[i] !== '--') {
     const flag = args[i++];
     if (flag === '--host') { host = args[i++]; if (!host) throw new Error('invalid exec arguments'); }
     else if (flag === '--artifact') { const path = args[i++]; safePath(path); artifacts.push(path); }
     else if (flag === '--gpu') gpu = true;
+    else if (flag === '--no-queue') noQueue = true;
+    else if (flag === '--queue-timeout') {
+      const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(args[i++] ?? '');
+      queueTimeout = match ? Number(match[1]) * (({ ms: .001, s: 1, m: 60, h: 3600 } as Record<string, number>)[match[2] ?? 's']!) : NaN;
+      if (!Number.isFinite(queueTimeout) || queueTimeout <= 0 || queueTimeout > 86400) throw new Error('invalid queue timeout (0 < duration <= 24h)');
+    }
     else throw new Error('unknown option: ' + flag);
   }
   const argv = args.slice(i + 1);
   if ((host !== undefined && !validHost(host)) || args[i] !== '--' || !argv.length ||
       argv.length > 256 || argv.some(x => x.includes('\0')) || Buffer.byteLength(JSON.stringify(argv)) > 16384 ||
       artifacts.length > 32 || new Set(artifacts).size !== artifacts.length) throw new Error('invalid exec arguments');
-  return { host, gpu, artifacts, argv };
+  return { host, gpu, artifacts, argv, noQueue, queueTimeout };
 }
 
 const validHost = (host: string) => /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(host);
@@ -42,7 +49,8 @@ export function isLocalHost(host: string, local = hostname()) {
 }
 class RetryableFailure extends Error {
   reason: string;
-  constructor(message: string, reason = message) { super(message); this.reason = reason; }
+  busy: boolean;
+  constructor(message: string, reason = message, busy = false) { super(message); this.reason = reason; this.busy = busy; }
 }
 export function fallbackAllowed(outcome: Intent['outcome'] | 'connection-failed', requestSent: boolean, started: boolean, interrupted = false) {
   return !interrupted && ((outcome === 'connection-failed' && !requestSent) || (outcome === 'refused' && !started));
@@ -51,11 +59,13 @@ const oneLine = (text: string) => text.replace(/[\r\n]+/g, ' ');
 
 class RemoteFailure extends Error {
   outcome: Intent['outcome'];
+  busy: boolean;
   constructor(data: Buffer) {
     const value = JSON.parse(data.toString());
     const outcome = ['refused', 'preempted'].includes(value.outcome) ? value.outcome : 'uncertain';
     super('host ' + outcome + ': ' + String(value.message).slice(0, 1024));
     this.outcome = outcome;
+    this.busy = outcome === 'refused' && (value.busy === true || /^(host busy:|busy$)/.test(String(value.message)));
   }
 }
 export async function staleControl(config: string, host: string) {
@@ -89,21 +99,42 @@ export async function run(args: string[]): Promise<number> {
   const automatic = options.host === undefined;
   const hosts = automatic ? await configuredHosts() : [options.host!];
   const failures: string[] = [];
+  const busy: string[] = [];
   for (const host of hosts) {
     let reason: string;
     if (automatic && isLocalHost(host)) reason = 'local host';
     else {
       try {
-        const code = await runOnHost({ ...options, host }, automatic);
+        const code = await runOnHost({ ...options, host }, automatic || !options.noQueue);
         if (automatic) process.stderr.write('chaldea ran on ' + host + '\n');
         return code;
       } catch (e) {
-        if (!automatic || !(e instanceof RetryableFailure)) throw e;
+        if (!(e instanceof RetryableFailure) || (!automatic && options.noQueue)) throw e;
+        if (e.busy) busy.push(host);
         reason = oneLine(e.reason);
       }
     }
     failures.push(host + ' (' + reason + ')');
     process.stderr.write('chaldea skipped ' + host + ': ' + reason + '\n');
+  }
+  if (!options.noQueue && busy.length) {
+    process.stderr.write('chaldea queued: all job slots busy on ' + busy.join(', ') + '\n');
+    const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
+    try {
+      const selected = await queueHost(config, busy, options.queueTimeout, host => staleControl(config, 'chaldea-job-' + host));
+      if (selected) {
+        process.stderr.write('chaldea selected ' + selected.host + '\n');
+        try {
+          const code = await runOnHost({ ...options, host: selected.host }, false, selected.transport);
+          process.stderr.write('chaldea ran on ' + selected.host + '\n');
+          return code;
+        } finally { selected.transport.ssh.stdin.destroy(); selected.transport.ssh.kill('SIGTERM'); }
+      }
+    } catch (error) {
+      if ((error as Error).message !== 'queue timeout') throw error;
+      process.stderr.write('chaldea: queue timeout\n');
+      return EXIT_UNAVAILABLE;
+    }
   }
   process.stderr.write('chaldea: no available exec host: ' + (failures.join('; ') || 'empty host list') + '\n');
   return EXIT_UNAVAILABLE;
@@ -124,7 +155,7 @@ async function withStateLock<T>(state: string, action: () => Promise<T>): Promis
   } finally { await lock.close(); }
 }
 
-async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean): Promise<number> {
+async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean, queued?: Transport): Promise<number> {
   const snapshot = await manifest();
   const artifactRoot = join(snapshot.root, '.chaldea/artifacts');
   const state = process.env.CHALDEA_STATE_DIR ?? join(homedir(), '.local/state/chaldea/exec');
@@ -159,17 +190,13 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
     await record(journal, intent);
   });
   process.stderr.write('chaldea job ' + jobId + '\n');
-  const ssh = spawn('ssh', ['-F', config, '-T', '-a', '-x',
-    '-o', 'BatchMode=yes', '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
-    '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'RequestTTY=no',
-    '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60', '-o', 'ConnectTimeout=10',
-    'chaldea-job-' + options.host, 'chaldea-exec-v0'], { stdio: ['pipe', 'pipe', 'pipe'] });
-  const exit = new Promise<number | null>((resolve, reject) => { ssh.once('error', reject); ssh.once('close', resolve); });
+  const transport = queued ?? connect(config, options.host);
+  const ssh = transport.ssh;
+  const exit = transport.exit;
   void exit.catch(() => {}); // spawn errors can precede the first protocol read
   // Attach error handlers immediately: a host can refuse while input is uploading.
   let writeError: Error | undefined;
   ssh.stdin.on('error', e => { writeError = e; });
-  ssh.stderr.pipe(process.stderr, { end: false });
   const stop = () => { ssh.stdin.destroy(); ssh.kill('SIGTERM'); };
   let interrupted = false;
   const interrupt = () => { interrupted = true; stop(); };
@@ -181,8 +208,8 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   let requestSent = false; let started = false;
   const destination = join(artifactRoot, jobId);
   try {
-    const incoming = frames(ssh.stdout)[Symbol.asyncIterator]();
-    const hello = await incoming.next();
+    const incoming = transport.incoming;
+    const hello = queued ? { done: false, value: { type: 'H', data: json({ version: VERSION }) } } : await incoming.next();
     if (hello.done && automatic) {
       await exit.catch(() => {});
       throw new RetryableFailure('connection closed before job request');
@@ -195,6 +222,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       cwd: snapshot.cwd, artifacts: options.artifacts, files: snapshot.files.map(({ data, ...entry }) => entry) };
     upload = (async () => {
       requestSent = true; // any write attempt is uncertain, even if it fails
+      if (queued) await send(ssh.stdin, 'G');
       await send(ssh.stdin, 'Q', json(request));
       for (const file of snapshot.files) for (let offset = 0; offset < file.size; offset += CHUNK) {
         if (writeError) throw writeError;
@@ -263,7 +291,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       await withStateLock(state, () => record(journal, intent, false));
     }
     const message = (e as Error).message + '; outcome ' + intent.outcome + '; inspect journal ' + join(journal, jobId + '.json');
-    if (retry) throw new RetryableFailure(message, (e as Error).message);
+    if (retry) throw new RetryableFailure(message, (e as Error).message, e instanceof RemoteFailure && e.busy);
     throw new Error(message);
   } finally {
     process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
