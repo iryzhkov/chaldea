@@ -101,8 +101,13 @@ anchor. Its payload has exactly:
         ceilings:[{audience,profile,project,grants,source?}]}]}
 ```
 
-Maximum envelope 256 KiB, 128 keys, 64 ceilings/key, lifetime 600 seconds.
-Empty keys is valid emergency revocation. published_at <= now+30; now < expires_at,
+Maximum envelope 256 KiB, 128 keys, 64 ceilings/key, maximum lifetime **86400 seconds
+(24 hours)**. A bundle older than 24 hours fails closed; a shorter signed expiry
+still applies. This availability window lets the rest of the fleet continue through
+a trust publisher host outage: any single host may be down without breaking the
+rest of the fleet during that window.
+An emergency empty-keys bundle revokes all issuer keys as soon as it is installed.
+Require published_at <= now+30; now < expires_at,
 with **no freshness leeway**. Publisher renews independently from run hosts.
 Authenticated updater fetches at most every **120 seconds** and calls
 `TrustStore.install`; services use only the local durable bundle for requests.
@@ -132,9 +137,14 @@ at capacity, park for an operator-controlled epoch/state migration, never drop t
 Rotation: publish new public key, confirm updater receipts, activate new kid, stop old
 issuance, shorten old issue_until to the cutoff and verify_until to at most cutoff+810,
 then remove it after outstanding expiry. Emergency removal overrides all overlap.
-A compromised active signer is bounded by the independent trust lease: fresh bundles
-must remove it; a disconnected verifier fails closed within 600 seconds (+bounded
-clock offset), even if the signer keeps issuing fresh bearers.
+Removing an issuer key from the bundle takes effect within **24 hours** (+bounded
+clock offset), or sooner when a fresh bundle is installed. A compromised active
+signer may keep issuing fresh bearers until that removal is learned or the cached
+bundle expires; a disconnected verifier then fails closed. This slower issuer-key
+revocation is the cost of tolerating a trust publisher outage. Individual-run
+revocation retains its **15-minute bound** through token expiry and durable lease
+cancellation: token lifetime remains at most 780 seconds and skew at most 30 seconds;
+cancellation immediately prevents further mint/renew.
 
 ## Issuer and run lease
 
@@ -183,8 +193,8 @@ never the bearer. This diagnostic is not a service endpoint or a sandbox admissi
 
 ## Shared vectors and validation
 
-`test/fixtures/access/v1.json` and the separately frozen `v1-encoding.json` addendum
-are immutable inputs, containing public fixture keys, signed
+`test/fixtures/access/v1.json` and the separately frozen `v1-encoding.json` and
+`v1-freshness.json` addenda are immutable inputs, containing public fixture keys, signed
 bundles, compact tokens, fixed clock samples/operation and expected accept/reject.
 Private fixture keys are not shipped. It includes request vectors and ordered scenarios
 for trust freshness, removal, rotation, rollback and restart. Consumers must use the

@@ -442,6 +442,14 @@ export async function withClient<A>(
 export class WakeRejectedError extends Error {
   override readonly name = "WakeRejectedError";
 }
+/** Only a replayed durable rejection is definitive; intake/internal failures are ambiguous. */
+export async function respondChaldeaDecision(options: ConnectOptions, payload: string): Promise<boolean> {
+  return withClient(options,client => client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
+    Effect.map(() => true),
+    Effect.catchTag("OrchestrationV2DispatchCommandError",error =>
+      /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
+        ? Effect.succeed(false) : Effect.fail(error))));
+}
 export async function dispatchChaldeaWake(options: ConnectOptions, payload: string): Promise<void> {
   const accepted = await withClient(options, client =>
     client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
