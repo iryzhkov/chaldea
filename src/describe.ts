@@ -30,6 +30,11 @@ export const description = {
       "access": "write"
     },
     {
+      "name": "quota status",
+      "summary": "Show usage windows, Codex credits and manual resets",
+      "access": "read"
+    },
+    {
       "name": "t3 restart",
       "summary": "Restart local T3 and continue interrupted turns once",
       "access": "write"
