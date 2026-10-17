@@ -1,4 +1,5 @@
 import { test } from "node:test";
+import { trustedFile } from "../../src/akasha/main.ts";
 import assert from "node:assert/strict";
 import { chmodSync, linkSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -57,7 +58,7 @@ test("optional config accepts absence only and never exposes invalid input in er
     const path = join(f.path, "config.json");
     assert.deepEqual(readJson(path, true), {}); assert.throws(() => readJson(path));
     writeFileSync(path, '{"token":"DO-NOT-LOG",broken', { mode: 0o600 });
-    assert.throws(() => readJson(path, true), error => error instanceof ConfigurationError && !error.message.includes("DO-NOT-LOG"));
+    assert.throws(() => readJson(path, true), error => error instanceof ConfigurationError && error.file === path && error.reason === "parse" && !error.message.includes("DO-NOT-LOG"));
     writeFileSync(path, "[]"); assert.throws(() => readJson(path));
     writeFileSync(path, "{}"); chmodSync(path, 0o666); assert.throws(() => readJson(path, true));
   } finally { f.remove(); }
@@ -119,6 +120,25 @@ test("JSON logger owns timestamp/level/message; waits rotates old numeric and IS
       assert.equal(record.event, "started"); assert.equal(record.level, "info");
       assert.ok(!text.includes("expired")); assert.equal(typeof record.at, "string");
     }
+  } finally { f.remove(); }
+});
+test("test wrapper ignores inherited desktop XDG bases", () => {
+  const f = scratchDir("xdg-scratch");
+  try {
+    const result = spawnSync("scripts/with-scratch", [process.execPath, "--input-type=module", "-e",
+      'import { paths } from "./src/config/paths.ts"; import assert from "node:assert/strict"; for (const value of Object.values(paths())) assert.ok(value.startsWith(process.env.HOME + "/"));'],
+      { encoding: "utf8", env: { ...process.env, CHALDEA_TEST_SCRATCH: join(f.path, "isolated"),
+        XDG_CONFIG_HOME: "/real-config", XDG_STATE_HOME: "/real-state", XDG_DATA_HOME: "/real-data", XDG_RUNTIME_DIR: "/real-runtime" } });
+    assert.equal(result.status, 0, result.stderr);
+  } finally { f.remove(); }
+});
+test("Akasha trusted adapter keeps unsafe_input and waits failures use error level", () => {
+  const f = scratchDir("adapter-error");
+  try {
+    const path = join(f.path, "unsafe"); writeFileSync(path, "not-a-secret", { mode: 0o600 }); chmodSync(path, 0o666);
+    assert.throws(() => trustedFile(path, 1024), (error: any) => error.status === 400 && error.message === "unsafe_input");
+    const log = join(f.path, "log"); boundedLog(log)("watcher_needs_attention");
+    assert.equal(JSON.parse(readFileSync(log, "utf8")).level, "error");
   } finally { f.remove(); }
 });
 test("waits invalid configuration returns EX_CONFIG", async () => {

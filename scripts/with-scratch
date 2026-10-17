@@ -6,6 +6,8 @@ CHALDEA_TEST_SCRATCH=${CHALDEA_TEST_SCRATCH:-$HOME/.cache/chaldea-test}
 export HOME="${CHALDEA_TEST_SCRATCH}-home"
 export CHALDEA_TRUST_TEST_HOME="$HOME"
 export CHALDEA_TEST_SCRATCH
+# XDG must follow the scratch HOME even when the desktop exports its own bases.
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_RUNTIME_DIR
 export TMPDIR="$CHALDEA_TEST_SCRATCH/tmp"
 test "$HOME" = "$CHALDEA_TRUST_TEST_HOME"
 test "$HOME" != /home/igor

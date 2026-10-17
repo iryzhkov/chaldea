@@ -1,7 +1,7 @@
 // `chaldea` command-line entry point.
 import { description, discoveryHelp } from "./describe.ts";
 import { homedir } from "node:os";
-import { readJson } from "./config/files.ts";
+import { configFailure, readJson } from "./config/files.ts";
 import { quotaConfig } from "./config/quota.ts";
 import { paths } from "./config/paths.ts";
 import { EXIT } from "./config/exit.ts";
@@ -60,7 +60,7 @@ async function restart(rest: ReadonlyArray<string>): Promise<number> {
     });
     return 0;
   } catch (error) {
-    createLogger().error("chaldea operation failed", { error: error instanceof Error ? error.message : String(error) });
+    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
     return error instanceof ConfigurationError ? EXIT.config : EXIT.failure;
   }
 }
@@ -98,7 +98,7 @@ async function setAutoResume(rest: ReadonlyArray<string>): Promise<number> {
     process.stdout.write(`autoResumeLimitedThreads is ${now ? "on" : "off"}\n`);
     return now === (mode === "on") ? 0 : 1;
   } catch (error) {
-    createLogger().error("chaldea operation failed", { error: error instanceof Error ? error.message : String(error) });
+    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
     return error instanceof ConfigurationError || error instanceof ProtocolIncompatibleError ? EXIT_CONFIG : 1;
   }
 }
@@ -153,7 +153,7 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
       signal: controller.signal,
     });
   } catch (error) {
-    createLogger().error("chaldea operation failed", { error: error instanceof Error ? error.message : String(error) });
+    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
     return EXIT_CONFIG;
   }
 }
@@ -202,7 +202,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     if (group === "t3" && command === "restart") return await restart(rest);
     if (group === "t3" && command === "set-auto-resume") return await setAutoResume(rest);
   } catch (error) {
-    if (error instanceof ConfigurationError) { createLogger().error("configuration unavailable"); return EXIT.config; }
+    if (error instanceof ConfigurationError) { createLogger().error("configuration unavailable", { file: error.file, reason: error.reason }); return EXIT.config; }
     // parseArgs rejects unknown options.
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n${USAGE}`);
     return 64;

@@ -9,7 +9,7 @@
 // the systemd unit does not restart.
 import { backoff, sleep } from "../retry.ts";
 import { Outbox } from "../store/outbox.ts";
-import { ConfigurationError, privateFile } from "../config/files.ts";
+import { configFailure, ConfigurationError, privateFile } from "../config/files.ts";
 import { EXIT } from "../config/exit.ts";
 export { ConfigurationError } from "../config/files.ts";
 
@@ -329,7 +329,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
     } catch (error) {
       if (error instanceof AbortedError || signal.aborted) break;
       if (error instanceof ProtocolIncompatibleError || error instanceof ConfigurationError) {
-        logger.error("quota observer stopping: fail closed", { error: error.message });
+        logger.error("quota observer stopping: fail closed", { ...configFailure(error), error: error.message });
         exitCode = EXIT_CONFIG;
         break;
       }

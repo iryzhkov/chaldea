@@ -4,10 +4,12 @@ import { configPath, paths } from "./paths.ts";
 import { configString, onlyKeys, readJson, ConfigurationError } from "./files.ts";
 import { legacyEnv } from "./compat.ts";
 
+export const validHost = (host: string) => /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(host);
+
 export function execConfig() {
   const c = readJson(configPath("exec"), true), p = paths();
   onlyKeys(c, ["sshConfig", "stateDir", "hosts", "hostsFile"]);
-  if (c.hosts !== undefined && (!Array.isArray(c.hosts) || !c.hosts.every(h => typeof h === "string" && /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(h))))
+  if (c.hosts !== undefined && (!Array.isArray(c.hosts) || !c.hosts.every(h => typeof h === "string" && validHost(h))))
     throw new ConfigurationError("Invalid exec hosts");
   return {
     sshConfig: legacyEnv("CHALDEA_SSH_CONFIG", "sshConfig") ?? configString(c.sshConfig, "sshConfig", join(homedir(), ".ssh/chaldea-job.conf")),

@@ -25,6 +25,10 @@ jobs:
           mkdir -p "$RUNNER_TEMP/chaldea/home" "$RUNNER_TEMP/chaldea/tmp"
           {
             echo "HOME=$RUNNER_TEMP/chaldea/home"
+            echo "XDG_CONFIG_HOME=$RUNNER_TEMP/chaldea/home/.config"
+            echo "XDG_STATE_HOME=$RUNNER_TEMP/chaldea/home/.local/state"
+            echo "XDG_DATA_HOME=$RUNNER_TEMP/chaldea/home/.local/share"
+            echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/chaldea/home/.cache"
             echo "TMPDIR=$RUNNER_TEMP/chaldea/tmp"
             echo "CHALDEA_TEST_SCRATCH=$RUNNER_TEMP/chaldea/tests"
           } >> "$GITHUB_ENV"

@@ -53,6 +53,9 @@ helper keep their stricter existing owner/directory requirements.
 Keep tokens in separate files, mode 0600 or stricter. The shared text credential
 reader trims whitespace, refuses empty input, and caps input at 16 KiB.
 Config JSON is capped at 256 KiB; service-specific trust/key limits remain in force.
+Configuration errors carry a file path and short reason category for diagnostics,
+without including file bytes. Test wrappers clear inherited XDG variables and CI
+redirects them into the scratch HOME.
 
 ## Config keys and compatibility
 
@@ -103,7 +106,8 @@ or raw provider output as fields. Compatibility warnings contain key names only.
 
 The stderr logger retains the quota logger's 120 info/warn records per minute and
 suppression summary. Errors remain uncapped. Waits still writes its private log
-file with the existing 10 MiB/14-day limits, now through this logger; `event`
+file with the existing 10 MiB/14-day limits, now through this logger. Startup
+credential failures and watcher attention events use error level; `event`
 remains available alongside `message`. Age rotation reads both old numeric and
 new ISO timestamps. CLI result JSON, remote stdout/stderr, exec retained output
 logs and collector counter output remain data streams with their existing formats.
@@ -124,7 +128,8 @@ Existing domain result statuses remain unchanged.
 | Remote status | Exec returns the remote program's status unchanged, even if it matches a row above |
 
 Configuration-read failures in waits, Akasha and exec now use 78 rather than
-waits' generic 64, Akasha's 1 or exec's 255. Quota already used 78.
+waits' generic 64, Akasha's 1 or exec's 255. Missing/invalid Akasha config keys
+also use 78. Quota already used 78.
 Akasha's command-count usage error uses 64. Service-specific authorization,
 replay and storage errors still use 1. Exec argument errors retain 255.
 Human help and command results are unchanged; diagnostic formatting and these

@@ -1,4 +1,5 @@
-import { execConfig } from '../config/exec.ts';
+import { execConfig, validHost } from '../config/exec.ts';
+import { readTrustedFile } from '../config/files.ts';
 import { EXIT } from '../config/exit.ts';
 import { execFileSync } from 'node:child_process';
 import * as fs from 'node:fs/promises';
@@ -39,7 +40,6 @@ export function argumentsFor(args: string[]) {
   return { host, gpu, artifacts, argv, noQueue, queueTimeout };
 }
 
-const validHost = (host: string) => /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(host);
 export const EXIT_UNAVAILABLE = EXIT.unavailable;
 
 // Entries are fleet inventory names with existing chaldea-job-NAME aliases.
@@ -94,7 +94,7 @@ async function configuredHosts() {
   const c = execConfig();
   if (c.hosts !== undefined && process.env.CHALDEA_EXEC_HOSTS === undefined) return hostsFor(c.hosts.join('\n'));
   const path = c.hostsFile;
-  try { return hostsFor(await fs.readFile(path, 'utf8')); }
+  try { return hostsFor(readTrustedFile(path).toString('utf8')); }
   catch (e: any) {
     if (e.code === 'ENOENT') throw new Error(oneLine('missing exec host list ' + path + '; --host H works without it'));
     throw e;

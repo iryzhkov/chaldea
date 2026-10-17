@@ -259,13 +259,18 @@ test('stuck ControlMaster journals non-dispatch and falls through only in auto m
   } finally { await f.remove(); }
 });
 
-test('missing host list names the path and explicit-host escape hatch in one line', { timeout: 10000 }, async () => {
+test('missing host list names the path and escape hatch in one structured error', { timeout: 10000 }, async () => {
   const f = await fixture({});
   try {
     await fs.unlink(f.hostFile);
     const r = await collected(f.run());
     assert.equal(r.code, 255); assert.equal(r.out, '');
-    assert.equal(r.err, 'chaldea: missing exec host list ' + f.hostFile + '; --host H works without it\n');
+    const records = r.err.trim().split('\n').map(line => JSON.parse(line));
+    const errors = records.filter(record => record.level === 'error');
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].error, 'missing exec host list ' + f.hostFile + '; --host H works without it');
+    assert.ok(records.some(record => record.level === 'warn' && record.oldKey === 'CHALDEA_EXEC_HOSTS'));
+    assert.ok(records.every(record => new Date(record.at).toISOString() === record.at));
     assert.deepEqual(await f.events(), []);
     await assert.rejects(fs.access(join(f.state, 'journal')), { code: 'ENOENT' });
     const explicit = await collected(f.run('fake-a'));

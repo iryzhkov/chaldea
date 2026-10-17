@@ -19,5 +19,8 @@ export function boundedLog(path: string): (event: string) => void {
     } catch {}
     appendFileSync(path, line, { mode: 0o600 });
   });
-  return event => logger.info(event, { event });
+  return event => {
+    const level = ["watcher_needs_attention", "startup_credential_unavailable"].includes(event) ? "error" : "info";
+    logger[level](event, { event });
+  };
 }

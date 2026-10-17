@@ -12,7 +12,10 @@ export interface WaitConfig {
 export const defaultConfigPath = () => configPath("waits");
 export function loadConfig(path=defaultConfigPath()): WaitConfig {
   try { return parseConfig(path); }
-  catch { throw new ConfigurationError("Invalid waits configuration"); }
+  catch (error) {
+    if (error instanceof ConfigurationError) throw error;
+    throw new ConfigurationError("Invalid waits configuration", path, "schema");
+  }
 }
 function parseConfig(path: string): WaitConfig {
   const v=object(readJson(path));

@@ -17,7 +17,12 @@ import { bridge, parity, reverseExport } from "./migration/feed.ts";
 import { ensure, parse, fields } from "./schema.ts";
 
 export function trustedFile(path: string, max: number, privateFile = false): Buffer {
-  return readTrustedFile(path, { maxBytes: max, secret: privateFile, owners: [0, process.geteuid!()] });
+  try { return readTrustedFile(path, { maxBytes: max, secret: privateFile, owners: [0, process.geteuid!()] }); }
+  catch (error) {
+    // Keep the existing request-time adapter error contract.
+    if (error instanceof ConfigurationError) ensure(false, "unsafe_input");
+    throw error;
+  }
 }
 const USAGE = `Usage: akasha <serve|init|import|parity|export|backup|replay> [--config FILE]
   import/parity --snapshot FILE       consistent read-only feedd snapshot; import is bounded to 100 rows/run
@@ -53,7 +58,7 @@ export async function main(args: string[]): Promise<number> {
     const clock = clockHealth(state, () => trustedFile(string("clockHealthFile"), 1024), {
       decode: parse, fields: h => fields(h, HEALTH_FIELDS), check: ensure,
     });
-    ensure(Array.isArray(c.anchors), "anchors_required");
+    if (!Array.isArray(c.anchors)) throw new ConfigurationError("anchors_required");
     const trust = new TrustStore(state, clock, c.anchors as TrustAnchor[]);
     const refresh = async () => { await trust.install(trustedFile(string("bundleFile"), 262145).toString("utf8").trim()); };
     await refresh();
@@ -65,7 +70,7 @@ export async function main(args: string[]): Promise<number> {
     }
     const seed = c.natsSeedFile ? trustedFile(string("natsSeedFile"), 256, true) : undefined;
     const open = () => NatsBus.open(string("natsUrl"), seed ? Buffer.from(seed.toString("utf8").trim()) : undefined);
-    ensure(Array.isArray(c.registry), "registry_required");
+    if (!Array.isArray(c.registry)) throw new ConfigurationError("registry_required");
     const auth = new Authorization(c.registry as Registration[], trust, clock);
     worker = new DeliveryWorker(store, () => clock.check(), open, e => auth.validateDelivery(e));
     if (command === "replay") {
@@ -78,8 +83,8 @@ export async function main(args: string[]): Promise<number> {
     }
     ensure(command === "serve", "unknown_command");
     const ingress = new Ingress(auth, store, () => worker!.wake()), server = httpServer(ingress);
-    ensure(c.bind === "127.0.0.1" || c.bind === "::1", "loopback_ingress_required");
-    ensure(Number.isInteger(c.port) && (c.port as number) > 0 && (c.port as number) < 65536, "invalid_port");
+    if (c.bind !== "127.0.0.1" && c.bind !== "::1") throw new ConfigurationError("loopback_ingress_required");
+    if (!Number.isInteger(c.port) || (c.port as number) <= 0 || (c.port as number) >= 65536) throw new ConfigurationError("invalid_port");
     let stopped = false, sweeping: Promise<void> | undefined, sweepRetry: ReturnType<typeof setTimeout> | undefined;
     const sweep = () => { if (!sweeping) sweeping = maintain(store!, clock.check(), () => stopped).finally(() => {
       sweeping = undefined;
