@@ -1,3 +1,4 @@
+import { backoff } from "../retry.ts";
 import { connect, wsconnect, nkeyAuthenticator } from "@nats-io/transport-node";
 import type { NatsConnection, ConnectionOptions } from "@nats-io/transport-node";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
@@ -104,7 +105,7 @@ export class DeliveryWorker {
           await this.bus.publish("akasha." + e.source_id + "." + e.kind, Buffer.from(p.envelope), p.event_id);
           this.store.attempted(p.event_id, this.now(), 60);
         } catch {
-          this.store.attempted(p.event_id, this.now(), Math.min(60, 2 ** Math.min(p.attempts, 6)));
+          this.store.attempted(p.event_id, this.now(), backoff(p.attempts, { base: 1, cap: 60, exponent: 6 }));
           this.store.alarm = "publish_unavailable"; break;
         }
       }

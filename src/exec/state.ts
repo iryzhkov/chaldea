@@ -1,5 +1,5 @@
 import * as fs from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { flock } from '../fs/flock.ts';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -16,11 +16,7 @@ export async function withStateLock<T>(state: string, action: () => Promise<T>):
   await privateDirectory(state);
   const lock = await fs.open(join(state, 'accounting.lock'), 'a', 0o600);
   try {
-    const child = spawn('/usr/bin/flock', ['-x', '3'], { stdio: ['ignore', 'ignore', 'pipe', lock.fd] });
-    const code = await new Promise<number | null>((resolve, reject) => {
-      child.once('error', reject); child.once('close', resolve);
-    });
-    if (code !== 0) throw new Error('local accounting lock failed (flock exit ' + code + ')');
+    await flock(lock.fd);
     return await action();
   } finally { await lock.close(); }
 }
