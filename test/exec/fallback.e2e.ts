@@ -30,9 +30,10 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   const script = join(root, 'fake-ssh.mjs'); const log = join(root, 'attempts');
   const control = join(root, 'control');
   const sockets = new Set<net.Socket>();
+  let receivedBanner = '';
   const listener = net.createServer(socket => {
     sockets.add(socket);
-    socket.on('data', () => {}); // Consume the banner, but never answer SSH setup.
+    socket.on('data', data => { receivedBanner += data.toString(); }); // Never answer SSH setup.
     socket.on('close', () => sockets.delete(socket));
   });
   let port = 0;
@@ -86,7 +87,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     CHALDEA_EXEC_HOSTS: hostFile, CHALDEA_SSH_CONFIG: sshConfig,
     FAKE_MODES: JSON.stringify(modes), FAKE_LOG: log, FAKE_CONTROL: control, FAKE_REAL_SSH: realSsh };
   return {
-    state, hostFile,
+    state, hostFile, banner: () => receivedBanner,
     run: (host?: string, code: number | 'hold' = 0) => spawn(process.execPath,
       [cli, 'exec', ...(host ? ['--host', host] : []), '--', process.execPath, '-e', 'console.log("ran");process.exit(' + (code === 'hold' ? 0 : code) + ')', ...(code === 'hold' ? ['hold'] : [])],
       { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] }),
@@ -205,6 +206,8 @@ test('SSH setup to a silent host honors ConnectTimeout and falls through', { tim
     // timeout directly; process startup and runner scheduling are not the contract.
     const attempt = (await f.events()).find(e => e.host === 'fake-a' && e.event === 'connected');
     assert.ok(attempt.args.includes('ConnectTimeout=10'));
+    assert.match(f.banner(), /^SSH-2\.0-OpenSSH/);
+    assert.match(r.err, /Connection timed out during banner exchange/);
     assert.match(r.err, /skipped fake-a: connection closed before job request/);
     assert.match(r.err, /ran on fake-b/);
     assert.deepEqual((await f.events()).filter(e => e.event === 'requested').map(e => e.host), ['fake-b']);
