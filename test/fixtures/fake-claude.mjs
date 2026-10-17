@@ -141,9 +141,38 @@ function answerControl(request) {
   emit({ type: "control_response", response: { subtype: "success", request_id: request.request_id, response } });
 }
 
+const pendingQuestions=new Map();
+function nativeQuestion(message,permission=false){
+  // Echo the prompt exactly as the real SDK does before a blocking tool callback.
+  emit({...message,uuid:randomUUID(),session_id:sessionId});
+  const toolUseId="tool_"+randomUUID(),requestId=randomUUID();
+  const toolName=permission?"Bash":"AskUserQuestion";
+  const input=permission?{command:"echo fixture-permission",description:"Disposable permission request"}:{questions:[
+    {question:"Deploy the disposable fixture?",header:"Deploy",options:[{label:"Approve",description:"Proceed"},{label:"Hold",description:"Wait"}],multiSelect:false},
+    {question:"Run the dependent fixture action?",header:"Action",options:[{label:"Run",description:"Proceed"},{label:"Hold",description:"Wait"}],multiSelect:false}
+  ]};
+  emit({type:"assistant",message:{model,id:"msg_"+randomUUID(),type:"message",role:"assistant",
+    content:[{type:"tool_use",id:toolUseId,name:toolName,input}],stop_reason:null,stop_sequence:null,usage:usage()},
+    parent_tool_use_id:null,uuid:randomUUID(),session_id:sessionId});
+  pendingQuestions.set(requestId,{toolUseId,permission});
+  emit({type:"control_request",request_id:requestId,request:{subtype:"can_use_tool",tool_name:toolName,input,tool_use_id:toolUseId}});
+  log({kind:"native_question",permission});
+}
+function nativeAnswered(message){
+  const response=message.response,request=pendingQuestions.get(response?.request_id);
+  if(!request)return;
+  pendingQuestions.delete(response.request_id);
+  log({kind:"native_answer",permission:request.permission,response:response.response});
+  emit({type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:request.toolUseId,
+    content:JSON.stringify(response.response)}]},parent_tool_use_id:null,uuid:randomUUID(),session_id:sessionId});
+  assistant("Continued after native answer.");result("Continued after native answer.","completed");
+}
 function answerUser(message) {
   const text = messageText(message);
   systemInit();
+  if(text.includes("chaldea-native-question")||text.includes("chaldea-native-permission")){
+    nativeQuestion(message,text.includes("chaldea-native-permission"));return;
+  }
   const state = readState();
   if (!state.limited && text.includes(trigger)) {
     writeState({ ...state, limited: true });
@@ -176,6 +205,7 @@ lines.on("line", (line) => {
     if (delay) setTimeout(() => answerUser(message), Number(delay[1]));
     else answerUser(message);
   }
+  else if(message.type==="control_response")nativeAnswered(message);
   else log({ kind: "ignored", type: message.type });
 });
 lines.on("close", () => {

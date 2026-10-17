@@ -442,6 +442,12 @@ export async function withClient<A>(
 export class WakeRejectedError extends Error {
   override readonly name = "WakeRejectedError";
 }
+/** A definitive public rejection loses the pending-state race; transport ambiguity is retried. */
+export async function respondChaldeaDecision(options: ConnectOptions, payload: string): Promise<boolean> {
+  return withClient(options,client => client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
+    Effect.map(() => true),
+    Effect.catchTag("OrchestrationV2DispatchCommandError",() => Effect.succeed(false))));
+}
 export async function dispatchChaldeaWake(options: ConnectOptions, payload: string): Promise<void> {
   const accepted = await withClient(options, client =>
     client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(

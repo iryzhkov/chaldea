@@ -3,17 +3,23 @@ import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import * as DateTime from "effect/DateTime";
 import { switchIds } from "../quota/switcher.ts";
-import { withClient, dispatchChaldeaWake, type ConnectOptions, type WsClient } from "./adapter.ts";
-import type { OrchestrationV2ThreadProjection } from "../../vendor/t3-contracts/src/index.ts";
+import { withClient, dispatchChaldeaWake, respondChaldeaDecision, type ConnectOptions, type WsClient } from "./adapter.ts";
+import type { OrchestrationV2ThreadProjection, OrchestrationV2UserInputQuestion } from "../../vendor/t3-contracts/src/index.ts";
 
 export interface WaitRun {
   id: string; ordinal: number; status: string; started: string | null; workStarted: string | null;
   restartOf: string | null; continuationOf?: string; failure: string | null; root: string | null;
 }
+export interface NativeRequest {
+  id: string; kind: string; status: "pending" | "resolved" | "expired" | "cancelled";
+  capability: "live" | "message" | "not_resumable"; created: number;
+  questions: ReadonlyArray<OrchestrationV2UserInputQuestion>;
+}
 export interface WaitSnapshot {
   id: string; project: string; archived: boolean; deleted: boolean; settled: boolean;
   runs: WaitRun[];
   pendingRuns: Array<string | null>;
+  requests?: NativeRequest[];
   children: Array<{id:string; runId:string|null; childThreadId:string|null; status:string; delivery?:string}>;
 }
 export interface WaitT3 {
@@ -21,6 +27,7 @@ export interface WaitT3 {
   snapshot(id: string): Promise<WaitSnapshot | null>;
   observe(id: string, signal: AbortSignal, onSnapshot: (snapshot: WaitSnapshot | null, cursor: number) => void): Promise<void>;
   dispatch(payload: string): Promise<void>;
+  respond?(payload: string): Promise<boolean>;
 }
 const iso = (v: DateTime.Utc | null | undefined) => v == null ? null : DateTime.formatIso(v);
 export function waitSnapshot(p: OrchestrationV2ThreadProjection): WaitSnapshot {
@@ -39,6 +46,11 @@ export function waitSnapshot(p: OrchestrationV2ThreadProjection): WaitSnapshot {
       return {...(previous ? {continuationOf:previous.id} : {}),id:r.id,ordinal:r.ordinal,status:r.status,started:iso(r.startedAt),workStarted:iso(r.workStartedAt),
         restartOf:r.restartContinuationOfRunId??null,root:r.rootNodeId,
         failure:failure?.type === "error" ? failure.failure?.class??null : null};
+    }),
+    requests:p.runtimeRequests.map(r => {
+      const item=p.turnItems.find(i => i.type === "user_input_request" && i.requestId === r.id);
+      return {id:r.id,kind:r.kind,status:r.status,capability:r.responseCapability.type,
+        created:Date.parse(DateTime.formatIso(r.createdAt)),questions:item?.type === "user_input_request" ? item.questions : []};
     }),
     pendingRuns:p.runtimeRequests.filter(r => r.status === "pending").map(r => p.nodes.find(n => n.id === r.nodeId)?.runId ?? null),
     children:p.subagents.map(s => ({id:s.id,runId:s.runId,childThreadId:s.childThreadId,status:s.status,...(s.completionDelivery ? {delivery:s.completionDelivery.state} : {})})),
@@ -83,13 +95,14 @@ export function createWaitT3(options: () => ConnectOptions, expectedEnvironment:
       } as never).pipe(Stream.runForEach(item => {
         if (item.kind === "snapshot") return Effect.sync(() => onSnapshot(waitSnapshot(item.projection),item.snapshotSequence));
         if (item.kind === "event" && (/^(thread|run|subagent|runtime-request)\./.test(item.event.type) ||
-          (item.event.type === "turn-item.updated" && item.event.payload.type === "error")))
+          (item.event.type === "turn-item.updated" && ["error","user_input_request"].includes(item.event.payload.type))))
           return readProjection(c,id).pipe(
             Effect.tap(p => Effect.sync(() => onSnapshot(p,item.sequence))), Effect.asVoid);
         return Effect.void;
       }), Effect.catchTag("OrchestrationV2GetThreadProjectionError", () =>
         readProjection(c,id).pipe(Effect.tap(p=>Effect.sync(()=>onSnapshot(p,0))),Effect.asVoid))));
     },
+    async respond(payload) { return respondChaldeaDecision(await checked(),payload); },
     async dispatch(payload) {
       await dispatchChaldeaWake(await checked(), payload);
     },

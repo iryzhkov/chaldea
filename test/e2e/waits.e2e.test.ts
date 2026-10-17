@@ -145,11 +145,16 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       assert.equal(cards.size,1);assert.equal(relayPayloads[0],relayPayloads[1]);
       const url="http://127.0.0.1:"+service!.port+"/decisions/"+row.id;
       assert.equal((await fetch(url)).status,401);
-      const auth={Authorization:"Basic "+Buffer.from("chaldea:fake-answer-token").toString("base64")};
+      const auth={Authorization:"Basic "+Buffer.from("chaldea:fake-answer-token").toString("base64"),Origin:"null","Sec-Fetch-Site":"same-origin"};
       const page=await fetch(url,{headers:auth});const html=await page.text();
       assert.equal(page.status,200);assert.ok(html.includes("Run the dependent step?"));
       const csrf=/name="csrf" value="([a-f0-9]+)"/.exec(html)![1]!;
       assert.equal((await fetch(url,{method:"POST",headers:auth,body:new URLSearchParams({csrf:"bad",answer:"Run"})})).status,400);
+      for(const headers of [{...auth,"Sec-Fetch-Site":"cross-site"},{...auth,"Sec-Fetch-Site":"none"}]){
+        const refused=await fetch(url,{method:"POST",headers,body:new URLSearchParams({csrf,answer:"Run"})});
+        assert.equal(refused.status,400);assert.match((await refused.json()).error,/origin refused/);
+        assert.equal((await invoke("chaldea_decision_status",{id:row.id})).state,"parked");
+      }
       const response=await fetch(url,{method:"POST",headers:auth,body:new URLSearchParams({csrf,answer:"Run"}),redirect:"manual"});
       assert.equal(response.status,303);
       await until("answered wake",async()=>await wakeCount(row.id)===1);
@@ -187,7 +192,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       child.stdin.write(JSON.stringify({jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"chaldea_decision_ask",arguments:q}})+"\n");
       try{
         await until("MCP ask",async()=>lines().some(r=>r.id===3));
-        assert.equal(lines().find(r=>r.id===2).result.tools.length,6);
+        assert.equal(lines().find(r=>r.id===2).result.tools.length,8);
         const result=lines().find(r=>r.id===3).result;
         assert.equal(result.isError,undefined,err);
         const row=JSON.parse(result.content[0].text);

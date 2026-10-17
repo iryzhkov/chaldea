@@ -8,6 +8,10 @@ chaldea wait time --at RFC3339 --thread ID [--request-id EPOCH:KEY] [--deadline 
 chaldea wait time --after 30s --thread ID [--request-id EPOCH:KEY]
 chaldea wait thread --target ID [--run ID] --thread ID [--request-id EPOCH:KEY]
 chaldea wait status|cancel ID
+chaldea decision prepare --thread ID --dependent-action TEXT --default-action skip|defer
+  --deadline RFC3339 --request-id EPOCH:KEY
+chaldea decision track --thread ID --runtime-request ID --dependent-action TEXT
+  --default-action skip|defer --deadline RFC3339 --request-id EPOCH:KEY
 chaldea decision ask --thread ID --question TEXT --option TEXT --option TEXT
   --dependent-action TEXT --default-action skip|defer --deadline RFC3339 [--request-id EPOCH:KEY]
 chaldea decision answer ID --answer TEXT
@@ -22,7 +26,7 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
     config:{type:"string"},thread:{type:"string"},"request-id":{type:"string"},deadline:{type:"string"},
     at:{type:"string"},after:{type:"string"},target:{type:"string"},run:{type:"string"},
     question:{type:"string"},option:{type:"string",multiple:true},"dependent-action":{type:"string"},
-    "default-action":{type:"string"},answer:{type:"string"},help:{type:"boolean",short:"h"},
+    "runtime-request":{type:"string"},"default-action":{type:"string"},answer:{type:"string"},help:{type:"boolean",short:"h"},
   }});
   if(v.help){process.stdout.write(WAIT_USAGE);return 0;}
   if(group==="waits"&&p[0]==="serve"){await runWaitService(v.config);return 0;}
@@ -44,6 +48,11 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
       condition={kind:"time",at};
     }else condition={kind:"thread",threadId:v.target,...(v.run?{runId:v.run}:{})};
     method="chaldea_wait";input={threadId:v.thread,requestId,condition,...(v.deadline?{deadline:v.deadline}:{})};
+  }else if(group==="decision"&&["prepare","track"].includes(p[0]??"")){
+    if(!v["request-id"])throw new Error("--request-id required for native decision policy");
+    method=p[0]==="prepare"?"chaldea_decision_prepare":"chaldea_decision_track";
+    input={threadId:v.thread,requestId,dependentAction:v["dependent-action"],defaultAction:v["default-action"],deadline:v.deadline,
+      ...(v["runtime-request"] ? {runtimeRequestId:v["runtime-request"]} : {})};
   }else if(group==="decision"&&p[0]==="ask"){
     method="chaldea_decision_ask";input={threadId:v.thread,requestId,question:v.question,options:v.option,
       dependentAction:v["dependent-action"],defaultAction:v["default-action"],deadline:v.deadline};
