@@ -11,6 +11,7 @@ export const TOKEN_FLAGS = ["audience", "action", "source", "host", "kind"] as c
 export interface TokenRequest { audience: "akasha"; action: "append" | "read"; source: string; host: string; kind: string }
 export interface ProducerGrant extends TokenRequest { uid: number; profile: string; project: string }
 export interface HelperConfig {
+  issuer: { uid: number; key_file: string; name: string; kid: string };
   state_file: string; bundle_file: string; anchor_file: string; clock_health_file: string; grants: ProducerGrant[];
 }
 export function tokenRequest(args: readonly string[]): TokenRequest {
@@ -28,7 +29,12 @@ function validateRequest(value: unknown): TokenRequest {
   return r as unknown as TokenRequest;
 }
 export function helperConfig(value: unknown): HelperConfig {
-  const c = object(value); exact(c, ["state_file", "bundle_file", "anchor_file", "clock_health_file", "grants"]);
+  const c = object(value); exact(c, ["issuer", "state_file", "bundle_file", "anchor_file", "clock_health_file", "grants"]);
+  const i = object(c.issuer); exact(i, ["uid", "key_file", "name", "kid"]);
+  seconds(i.uid); requireAccess(Number(i.uid) > 0 && Number(i.uid) < 4294967295, "invalid_issuer_uid");
+  requireAccess(typeof i.key_file === "string" && i.key_file.startsWith("/"), "absolute_path_required");
+  identifier(i.name); identifier(i.kid);
+  requireAccess((i.name as string).startsWith("chaldea:"), "invalid_issuer_name");
   for (const field of ["state_file", "bundle_file", "anchor_file", "clock_health_file"])
     requireAccess(typeof c[field] === "string" && (c[field] as string).startsWith("/"), "absolute_path_required");
   requireAccess(Array.isArray(c.grants) && c.grants.length > 0 && c.grants.length <= 128, "invalid_producer_grants");
@@ -51,7 +57,7 @@ export async function producerToken(request: TokenRequest, uid: number, grants: 
     grants: [{ resource: grant.source, actions: [grant.action] }] });
 }
 export interface HelperRuntime {
-  uid: number; caller: string | undefined; config: () => unknown; key: string; issuer: string; kid: string;
+  uid: number; caller: string | undefined; config: () => unknown;
 }
 function rootConfig(): unknown {
   const path = "/etc/chaldea/token-helper.json";
@@ -71,15 +77,15 @@ export async function tokenHelperCli(args: readonly string[], io = {
   out: (s: string) => { process.stdout.write(s); }, err: (s: string) => { process.stderr.write(s); },
 }, runtime: HelperRuntime = {
   uid: process.geteuid!(), caller: process.env.SUDO_UID, config: rootConfig,
-  key: "/var/lib/chaldea-issuer/keys/agent-a-2026-10.pem", issuer: "chaldea:agent-a", kid: "agent-a-2026-10",
 }): Promise<number> {
   let state: AccessState | undefined;
   try {
     const request = tokenRequest(args);
     // SUDO_UID is set by sudo, never accepted from argv. No direct-user mint path.
-    requireAccess(runtime.uid === 995 && typeof runtime.caller === "string" &&
+    requireAccess(typeof runtime.caller === "string" &&
       /^(0|[1-9][0-9]{0,9})$/.test(runtime.caller), "issuer_identity_required");
     const config = helperConfig(runtime.config());
+    requireAccess(runtime.uid === config.issuer.uid, "issuer_identity_required");
     const uid = Number(runtime.caller);
     requireAccess(config.grants.some(g => g.uid === uid && TOKEN_FLAGS.every(f => g[f] === request[f])),
       "producer_not_authorized");
@@ -89,7 +95,7 @@ export async function tokenHelperCli(args: readonly string[], io = {
     requireAccess(Array.isArray(anchors), "invalid_anchors");
     const trust = new TrustStore(state, clock, anchors as TrustAnchor[]);
     await trust.install(trustedBytes(config.bundle_file, 262144).toString("utf8").trim());
-    const issuer = new HostIssuer(runtime.issuer, runtime.kid, loadHostSigningKey(runtime.key), trust, clock);
+    const issuer = new HostIssuer(config.issuer.name, config.issuer.kid, loadHostSigningKey(config.issuer.key_file), trust, clock);
     const token = await producerToken(request, uid, config.grants, issuer);
     io.out(token + "\n");
     return 0;
