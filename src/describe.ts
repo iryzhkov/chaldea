@@ -30,6 +30,11 @@ export const description = {
       "access": "write"
     },
     {
+      "name": "t3 restart",
+      "summary": "Restart local T3 and continue interrupted turns once",
+      "access": "write"
+    },
+    {
       "name": "t3 set-auto-resume",
       "summary": "Change T3 auto-resume settings",
       "access": "write"
