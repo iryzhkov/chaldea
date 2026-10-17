@@ -3,7 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import * as DateTime from "effect/DateTime";
 import { switchIds } from "../quota/switcher.ts";
-import { withClient, dispatchChaldeaWake, type ConnectOptions } from "./adapter.ts";
+import { withClient, dispatchChaldeaWake, type ConnectOptions, type WsClient } from "./adapter.ts";
 import type { OrchestrationV2ThreadProjection } from "../../vendor/t3-contracts/src/index.ts";
 
 export interface WaitRun {
@@ -44,6 +44,18 @@ export function waitSnapshot(p: OrchestrationV2ThreadProjection): WaitSnapshot {
     children:p.subagents.map(s => ({id:s.id,runId:s.runId,childThreadId:s.childThreadId,status:s.status,...(s.completionDelivery ? {delivery:s.completionDelivery.state} : {})})),
   };
 }
+/** A projection error alone is never evidence of deletion. */
+export function readProjection(client: WsClient, id: string) {
+  return client["orchestration.getThreadProjection"]({threadId:id} as never).pipe(
+    Effect.map(waitSnapshot),
+    Effect.catchTag("OrchestrationV2GetThreadProjectionError", original =>
+      client["orchestration.subscribeShell"]({}).pipe(Stream.take(1),Stream.runCollect,Effect.flatMap(items => {
+        const first=items[0];
+        if (first?.kind !== "snapshot") return Effect.fail(original);
+        const exists=[...first.snapshot.threads,...first.snapshot.archivedThreads].some(t=>t.id===id && t.deletedAt===null);
+        return exists ? Effect.fail(original) : Effect.succeed(null);
+      }))));
+}
 export function createWaitT3(options: () => ConnectOptions, expectedEnvironment: string): WaitT3 {
   const checked = async (): Promise<ConnectOptions> => {
     const opts = options();
@@ -56,8 +68,7 @@ export function createWaitT3(options: () => ConnectOptions, expectedEnvironment:
       await checked(); return expectedEnvironment;
     },
     async snapshot(id) {
-      return withClient(await checked(), c => c["orchestration.getThreadProjection"]({threadId:id} as never).pipe(
-        Effect.map(waitSnapshot), Effect.catchTag("OrchestrationV2GetThreadProjectionError", () => Effect.succeed(null))));
+      return withClient(await checked(), c => readProjection(c,id));
     },
     async observe(id, signal, onSnapshot) {
       const opts = await checked();
@@ -66,12 +77,13 @@ export function createWaitT3(options: () => ConnectOptions, expectedEnvironment:
         // Request a full projection: a missing pinned run must never be mistaken for success.
       } as never).pipe(Stream.runForEach(item => {
         if (item.kind === "snapshot") return Effect.sync(() => onSnapshot(waitSnapshot(item.projection),item.snapshotSequence));
-        if (item.kind === "event" && /^(thread|run|subagent|runtime-request|turn-item)\./.test(item.event.type))
-          return c["orchestration.getThreadProjection"]({threadId:id} as never).pipe(
-            Effect.map(waitSnapshot),Effect.catchTag("OrchestrationV2GetThreadProjectionError",() => Effect.succeed(null)),
+        if (item.kind === "event" && (/^(thread|run|subagent|runtime-request)\./.test(item.event.type) ||
+          (item.event.type === "turn-item.updated" && item.event.payload.type === "error")))
+          return readProjection(c,id).pipe(
             Effect.tap(p => Effect.sync(() => onSnapshot(p,item.sequence))), Effect.asVoid);
         return Effect.void;
-      })));
+      }), Effect.catchTag("OrchestrationV2GetThreadProjectionError", () =>
+        readProjection(c,id).pipe(Effect.tap(p=>Effect.sync(()=>onSnapshot(p,0))),Effect.asVoid))));
     },
     async dispatch(payload) {
       await dispatchChaldeaWake(await checked(), payload);

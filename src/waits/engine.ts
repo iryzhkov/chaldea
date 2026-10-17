@@ -17,8 +17,12 @@ export class WaitEngine {
   private options: EngineOptions;
   private clock = new Deadlines();
   private snapshots = new Map<string,WaitSnapshot|null>();
+  private cursors = new Map<string,number>();
   private observers = new Map<string,{abort:AbortController; retry?:NodeJS.Timeout}>();
-  private inflight = new Set<string>();
+  private inflight = new Map<string,Delivery["channel"]>();
+  private hasSlot(channel: Delivery["channel"]): boolean {
+    return [...this.inflight.values()].filter(c=>c===channel).length < (channel === "wake" ? 8 : 2);
+  }
   private stopped = false;
   private pumping = false;
   private fatal = false;
@@ -63,11 +67,7 @@ export class WaitEngine {
       try {
         await this.t3.observe(id,entry.abort.signal,(snapshot,cursor) => {
           if (this.stopped || entry.abort.signal.aborted) return;
-          attempts=0; this.snapshots.set(id,snapshot);
-          for (const i of this.store.active()) {
-            const input=JSON.parse(i.input) as WaitInput;
-            if (input.condition?.kind === "thread" && input.condition.threadId === id) this.store.cursor(i.id,cursor);
-          }
+          attempts=0; this.snapshots.set(id,snapshot); this.cursors.set(id,cursor);
           this.poke();
         });
       } catch (error) {
@@ -113,7 +113,9 @@ export class WaitEngine {
           else if (snapshot && item.target_run) outcome=completion(snapshot,item.target_run);
         }
         if (now >= item.deadline && (!outcome || input.condition.kind !== "time" || Date.parse(input.condition.at) > item.deadline)) outcome={reason:"timeout"};
-        if (outcome) { this.store.resolve(item.id,outcome,undefined,now); this.options.boundary?.("resolved",item.id); }
+        const cursor=input.condition.kind === "thread" ? this.cursors.get(input.condition.threadId) : undefined;
+        if (outcome) { this.store.resolve(item.id,outcome,cursor,now); this.options.boundary?.("resolved",item.id); }
+        else if (cursor !== undefined && cursor > item.cursor) this.store.cursor(item.id,cursor);
       }
       this.store.maintain(now);
       const needed=new Set<string>();
@@ -123,7 +125,7 @@ export class WaitEngine {
         if (i.state === "parked" && input.condition?.kind === "thread") needed.add(input.condition.threadId);
       }
       for (const [id,entry] of this.observers) if (!needed.has(id)) {
-        entry.abort.abort(); clearTimeout(entry.retry); this.observers.delete(id); this.snapshots.delete(id);
+        entry.abort.abort(); clearTimeout(entry.retry); this.observers.delete(id); this.snapshots.delete(id); this.cursors.delete(id);
       }
       for (const id of needed) this.watch(id);
       // Network operations run independently: an offline relay never delays a deadline or wake.
@@ -133,8 +135,8 @@ export class WaitEngine {
         if (d.channel === "phone" && (item.state !== "parked" || (d.expires !== null && now >= d.expires))) {
           this.store.suppress(d.id); continue;
         }
-        if (d.next_at <= now && this.inflight.size < 8 && !this.inflight.has(d.id)) {
-          this.inflight.add(d.id); void this.deliver(d).finally(() => { this.inflight.delete(d.id); this.poke(); });
+        if (d.next_at <= now && this.hasSlot(d.channel) && !this.inflight.has(d.id)) {
+          this.inflight.set(d.id,d.channel); void this.deliver(d).finally(() => { this.inflight.delete(d.id); this.poke(); });
         }
       }
       const times:number[]=[];
@@ -144,13 +146,15 @@ export class WaitEngine {
         if (input.condition?.kind === "time") times.push(Date.parse(input.condition.at));
       }
       for (const d of this.store.deliveries()) if (d.state === "pending" && !this.inflight.has(d.id)) {
-        times.push(d.next_at); if (d.expires !== null) times.push(d.expires);
+        // Completion of an in-flight request triggers the next drain; no busy timer loop.
+        if (d.next_at > now || this.hasSlot(d.channel)) times.push(d.next_at);
+        if (d.expires !== null) times.push(d.expires);
       }
       // Tombstone expiry also has a single next deadline, without model involvement.
       const terminal = this.store.db.prepare("SELECT min(terminal) AS t FROM items WHERE state<>'parked' AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked'))").get() as {t:number|null};
       if (terminal.t !== null) times.push(terminal.t + 42*86_400_000 + 1);
       this.clock.arm(times.length ? Math.max(now+1,Math.min(...times)) : undefined,() => this.poke(),
-        () => { this.fatal=true; this.options.report?.("calendar_timer_failed"); });
+        () => { this.options.report?.("calendar_timer_retry"); });
     } finally { this.pumping=false; }
   }
   private async deliver(delivery: Delivery): Promise<void> {

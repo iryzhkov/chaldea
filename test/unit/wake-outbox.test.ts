@@ -74,3 +74,42 @@ test("credentials require owner-private regular files, and cannot be read via sy
     chmodSync(path,0o644);assert.throws(()=>privateFile(path),/0600/);
   }finally{dir.remove();}
 });
+
+test("recovered ambiguous wake cannot be cancelled as if it never reached T3",()=>{
+  const dir=scratchDir("wake-cancel-recovery");const path=join(dir.path,"db");
+  let store=new WakeStore(path,"test-env");
+  try{
+    const reg=store.prepare("wait",{threadId:"parent",requestId:Date.now()+":uncertain",condition:{kind:"time",at:iso(Date.now()-1)}});
+    const row=store.register(reg,"project",null);store.resolve(row.id,{reason:"time"});
+    store.claim(store.deliveries()[0]!.id);store.close();store=new WakeStore(path,"test-env");
+    assert.equal(store.cancel(row.id).delivery,"uncertain_in_flight");
+    assert.equal(store.get(row.id).state,"resolved");
+    assert.equal(store.deliveries()[0]!.state,"pending");
+    assert.equal((store.db.prepare("PRAGMA max_page_count").get() as {max_page_count:number}).max_page_count,7936);
+    assert.equal((store.db.prepare("PRAGMA cache_spill").get() as {cache_spill:number}).cache_spill,0);
+  }finally{store.close();dir.remove();}
+});
+test("a killed calendar helper recovers its absolute deadline with one fire",async()=>{
+  const timer=new Deadlines();let fires=0;let failures=0;
+  try{
+    timer.arm(Date.now()+400,()=>fires++,()=>failures++);
+    assert.ok(timer.processId);process.kill(timer.processId,"SIGKILL");
+    await until(()=>fires===1);
+    assert.equal(failures,1);await sleep(100);assert.equal(fires,1);
+  }finally{timer.clear();}
+});
+
+test("stalled relay requests never occupy wake delivery capacity",async()=>{
+  const dir=scratchDir("wake-relay-slots");const t3=fake();const store=new WakeStore(join(dir.path,"db"),"test-env");
+  let release!:()=>void;const stalled=new Promise<void>(r=>release=r);
+  const engine=new WaitEngine(store,t3.port,{answerBaseUrl:"http://127.0.0.1:7385",notify:()=>stalled});
+  try{
+    engine.start();
+    for(let i=0;i<8;i++)await engine.register("decision",{threadId:"parent",requestId:Date.now()+":q"+i,
+      question:"Defer?",options:["Defer","Continue"],default:"Defer",defaultSafe:true,defaultAction:"defer",deadline:iso(Date.now()+5000)});
+    const row=await engine.register("wait",{threadId:"parent",requestId:Date.now()+":independent",condition:{kind:"time",at:iso(Date.now()+50)}});
+    await until(()=>store.deliveries().some(d=>d.item===row.id&&d.state==="sent"));
+    assert.ok(store.deliveries().filter(d=>d.channel==="phone"&&d.state==="sending").length===2);
+    assert.equal(store.get(row.id).state,"resolved");
+  }finally{release();await engine.stop();store.close();dir.remove();}
+});

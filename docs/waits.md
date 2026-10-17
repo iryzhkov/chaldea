@@ -41,7 +41,7 @@ Evidence is pinned official T3 v0.1.0, commit
   “Notifications must be server- or provider-created queued messages.”
 - [Orchestrator.ts:11093–11120,11244–11256](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/apps/server/src/orchestration-v2/Orchestrator.ts#L11093-L11120)
   replays durable receipts; the accepted command/events/receipt commit atomically.
-  A definite rejected receipt parks delivery as `blocked`/`delivery_rejected`;
+  A previously-rejected durable receipt parks delivery as `blocked`/`delivery_rejected`;
   it is retained for operator attention and never silently assigned a new ID.
 
 ## Calls and identity
@@ -111,7 +111,9 @@ Use native delegation completion and `watch_pull_request` for those workflows.
 Connection failure uses capped reconnect backoff, delivery failure uses persisted
 backoff, and credentials are reread on every connection/request. Protocol/schema
 drift and environment mismatch stop delivery until service restart after repair.
-No connection event sends a wake. Offline T3 delays receipt acceptance; provider
+The calendar helper retries transient failure with capped backoff. Wake and phone
+delivery use separate concurrency slots, so a stalled relay cannot consume wake
+capacity. No connection event sends a wake. Offline T3 delays receipt acceptance; provider
 execution latency is separate from registration/condition-to-receipt latency.
 
 Cancellation before resolution produces no wake. Once resolution has latched,
@@ -182,7 +184,8 @@ The deployment operator must provision:
    set `answerBaseUrl` to the externally reachable origin only if exposure is
    approved. The default loopback URL is useful locally but not on the phone.
 3. An owner-owned mode-0600 relay env file containing the literal assignment
-   `NOTIFY_RELAY_TOKEN=<credential>`. The parser does not source shell code.
+   `NOTIFY_TOKEN=<credential>` (the existing homelab-notify format);
+   `NOTIFY_RELAY_TOKEN` and an optional `export ` prefix are also accepted. The parser does not source shell code.
    omarchy-pc has no such file yet. Resolve the credential through the existing
    SOPS/notify deployment; this PR neither fetches nor copies a real secret.
    Missing relay config/credential leaves a bounded retrying phone row until
@@ -201,9 +204,11 @@ nothing on any host: omarchy-pc, agent-a, agent-b and laptop are all undeployed.
 
 ## Bounds and retention
 
-SQLite uses WAL and FULL synchronous transactions, with a 32 MiB main-file page
-ceiling and a truncate checkpoint after each transaction. A single transaction
-can add at most another main-file-sized WAL: DB+WAL stays within 64 MiB. New work
+SQLite uses WAL and FULL synchronous transactions, with a 31 MiB main-file page
+ceiling, cache spill disabled, and a truncate checkpoint before and after each
+transaction. Disabling spill bounds each transaction to one WAL frame per dirty
+page; the extra MiB leaves room for WAL frame headers under the shared 64 MiB cap.
+A blocked checkpoint refuses another write until the reader releases it. New work
 is rejected under disk pressure. No unresolved/ambiguous/blocked wake is pruned.
 
 Defaults: 128 active waits (one per thread), 128 pending decisions, at most 10,000

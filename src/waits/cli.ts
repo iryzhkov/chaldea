@@ -1,6 +1,7 @@
 import { parseArgs } from "node:util";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "./config.ts";
+import { requestTime } from "./types.ts";
 import { callService, runWaitService } from "./service.ts";
 export const WAIT_USAGE=`chaldea waits serve [--config PATH]
 chaldea wait time --at RFC3339 --thread ID [--request-id EPOCH:KEY] [--deadline RFC3339]
@@ -38,7 +39,7 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
         if(!m)throw new Error("Duration requires ms, s, m, h or d");
         const units:Record<string,number>={ms:1,s:1000,m:60000,h:3600000,d:86400000};
         // Relative time is pinned to the retry key's creation time.
-        at=new Date(Number(requestId.slice(0,13))+Number(m[1])*units[m[2]!]!).toISOString();
+        at=new Date(requestTime(requestId)+Number(m[1])*units[m[2]!]!).toISOString();
       }
       condition={kind:"time",at};
     }else condition={kind:"thread",threadId:v.target,...(v.run?{runId:v.run}:{})};

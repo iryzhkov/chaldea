@@ -25,10 +25,12 @@ export class WakeStore {
     this.path = path; this.environment = environment;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(path);
+    try {
     chmodSync(path, 0o600);
+    this.db.exec("PRAGMA busy_timeout=5000");
     this.db.exec(`
       PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
-      PRAGMA busy_timeout=5000; PRAGMA max_page_count=8192; PRAGMA journal_size_limit=0;
+      PRAGMA busy_timeout=5000; PRAGMA max_page_count=7936; PRAGMA cache_spill=OFF; PRAGMA journal_size_limit=0;
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS items(
         id TEXT PRIMARY KEY, kind TEXT NOT NULL, parent TEXT NOT NULL, project TEXT NOT NULL,
@@ -44,15 +46,21 @@ export class WakeStore {
       CREATE INDEX IF NOT EXISTS outbox_due ON outbox(state,next_at);
     `);
     const env = this.meta("environment");
-    if (env && env !== environment) { this.db.close(); throw new Error("Wake database belongs to another environment"); }
+    if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('replay_fence','0')").run();
     // 'sending' means an ambiguous RPC after restart. Retry the identical stored payload.
     this.db.prepare("UPDATE outbox SET state='pending' WHERE state='sending'").run();
     this.maintain(Date.now());
+    } catch(error) { this.db.close(); throw error; }
   }
   meta(key: string): string | undefined { return (this.db.prepare("SELECT value FROM meta WHERE key=?").get(key) as {value:string}|undefined)?.value; }
   transaction<T>(body: () => T): T {
+    // Refuse another write if an external reader prevents truncation. Disabling
+    // cache spill bounds a transaction to one WAL frame per dirty page; 31 MiB
+    // main + WAL frame headers fits below the shared 64 MiB physical cap.
+    const checkpoint=this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as {busy:number};
+    if (checkpoint.busy !== 0) throw new Error("Disk pressure: WAL checkpoint blocked; work retained");
     this.db.exec("BEGIN IMMEDIATE");
     try { const result = body(); this.db.exec("COMMIT"); return result; }
     catch (e) { this.db.exec("ROLLBACK"); throw e; }
@@ -132,9 +140,9 @@ export class WakeStore {
       this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND channel='phone' AND state='pending'").run(id);
       return this.get(id);
   }
-  answer(id: string, answer: string, now = Date.now()): Item {
-    // SQLite's writer lock arbitrates the human/deadline race, including separate processes.
-    return this.transaction(() => this.answerLocked(id,answer,now));
+  answer(id: string, answer: string, now?: number): Item {
+    // Read the clock after acquiring the writer lock: contention cannot extend a deadline.
+    return this.transaction(() => this.answerLocked(id,answer,now ?? Date.now()));
   }
   private answerLocked(id: string, answer: string, now: number): Item {
     const row = this.get(id);
@@ -150,7 +158,10 @@ export class WakeStore {
   cancel(id: string, now = Date.now()): {item: Item; delivery: string} {
     return this.transaction(() => {
       const row = this.get(id);
+      if (row.kind !== "wait") throw new Error("Only waits can be cancelled");
+      if (row.state === "cancelled" || row.state === "orphaned") return {item:row,delivery:row.state};
       const wake = this.deliveries().find(d => d.item === id && d.channel === "wake");
+      if (wake?.state === "pending" && wake.attempts > 0) return {item:row,delivery:"uncertain_in_flight"};
       if (wake?.state === "sending" || wake?.state === "sent") return {item:row,delivery:wake.state === "sending" ? "uncertain_in_flight" : "already_delivered"};
       this.db.prepare("UPDATE items SET state='cancelled',disposition='manual',terminal=? WHERE id=?").run(now,id);
       this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND state IN ('pending','blocked')").run(id);

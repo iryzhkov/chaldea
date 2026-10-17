@@ -45,8 +45,8 @@ export async function notify(config: WaitConfig, payload: string): Promise<void>
   if (!config.notifyEnvFile || !config.notifyUrl) throw new Error("Notify relay not provisioned");
   const env=privateFile(config.notifyEnvFile);
   // Literal env data only, never source/eval an env file.
-  const match=/^NOTIFY_RELAY_TOKEN=([^\r\n]+)$/m.exec(env);
-  if (!match) throw new Error("Missing NOTIFY_RELAY_TOKEN");
+  const match=/^(?:export[ \t]+)?(?:NOTIFY_TOKEN|NOTIFY_RELAY_TOKEN)=([^\r\n]+)$/m.exec(env);
+  if (!match) throw new Error("Missing NOTIFY_TOKEN (or NOTIFY_RELAY_TOKEN)");
   const token=match[1]!.replace(/^["']|["']$/g,"");
   const response=await fetch(new URL("/notify",config.notifyUrl),{
     method:"POST",headers:{"Authorization":"Bearer " + token,"Content-Type":"application/json"},

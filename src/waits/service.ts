@@ -71,9 +71,9 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
   await reserve(config.socket,ipc); // One service instance before opening SQLite.
   let store:WakeStore|undefined;let page:Server|undefined;
   try{
-    // Check the answer credential before accepting questions.
-    privateFile(config.answerTokenFile);
     const report=boundedLog(config.logFile);
+    // Check the answer credential before accepting questions; log no exception data.
+    try { privateFile(config.answerTokenFile); } catch(error) { report("startup_credential_unavailable"); throw error; }
     store=new WakeStore(config.database,config.environment);
     const t3=createWaitT3(()=>{
       const serverUrl=config.serverUrl??discoverServerUrl(config.t3BaseDir);

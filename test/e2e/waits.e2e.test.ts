@@ -59,7 +59,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       notifyEnvFile:join(dir.path,"notify.env"),logFile:join(dir.path,"state/waits.log")};
     mkdirSync(join(dir.path,"state"));
     writePrivateFile(config.tokenFile,token);writePrivateFile(config.answerTokenFile,"fake-answer-token");
-    writePrivateFile(config.notifyEnvFile!,"NOTIFY_RELAY_TOKEN=fake-relay-token");
+    writePrivateFile(config.notifyEnvFile!,"export NOTIFY_TOKEN=fake-relay-token");
     const configPath=join(dir.path,"config.json");writeFileSync(configPath,JSON.stringify(config));
     const invoke=(method:string,input:unknown)=>callService(config.socket,method,input) as Promise<Item>;
     const waitTime=()=>({threadId:parent,requestId:key(),condition:{kind:"time",at:iso(Date.now()+200)}});
@@ -78,6 +78,41 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         await sleep(150);assert.equal(await wakeCount(row.id),1);
       }
     });
+    await t.test("wake content is marked, short and queued behind active parent work",async()=>{
+      const busyId=key();
+      await dispatchMessage(t3,token,parent,"keep working chaldea-waits-delay:1800",busyId);
+      let activeRun="";
+      await until("active parent",async()=>{
+        const running=(await snapshot()).runs.find(r=>r.userMessageId==="e2e-message-"+busyId && r.status==="running");
+        activeRun=running?.id??"";return Boolean(running);
+      });
+      const before=(await snapshot()).messages.filter(m=>m.text.startsWith("Chaldea wake")).length;
+      const row=await invoke("chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()-1)}});
+      await until("queued wake receipt",async()=>await wakeCount(row.id)===1);
+      const p=await snapshot();const message=p.messages.find(m=>m.id==="chaldea-wait:"+row.id+":wake")!;
+      assert.equal(message.role,"user");
+      assert.ok(message.text.startsWith("Chaldea wake (wait "+row.id+")"));
+      assert.ok(message.text.includes('"reason":"time"'));
+      assert.ok(message.text.endsWith("chaldea wait status "+row.id));
+      assert.ok(Buffer.byteLength(message.text)<1024);
+      assert.equal(p.messages.filter(m=>m.text.startsWith("Chaldea wake")).length,before+1);
+      assert.equal(p.runs.find(r=>r.id===activeRun)?.status,"running");
+      assert.equal(p.runs.find(r=>r.userMessageId===message.id)?.status,"queued");
+      await until("active parent finishes normally",async()=>(await snapshot()).runs.find(r=>r.id===activeRun)?.status==="completed");
+      assert.equal(await wakeCount(row.id),1);
+    });
+    await t.test("CLI duration retry, status and cancellation round trip",async()=>{
+      const requestId=key();
+      const args=["wait","time","--after","10s","--thread",parent,"--request-id",requestId,"--config",configPath];
+      const first=await runCli(args,dir.path);assert.equal(first.code,0,first.stderr);
+      const row=JSON.parse(first.stdout);const second=await runCli(args,dir.path);
+      assert.equal(second.code,0,second.stderr);assert.equal(JSON.parse(second.stdout).id,row.id);
+      const status=await runCli(["wait","status",row.id,"--config",configPath],dir.path);
+      assert.equal(status.code,0,status.stderr);assert.equal(JSON.parse(status.stdout).id,row.id);
+      const cancel=await runCli(["wait","cancel",row.id,"--config",configPath],dir.path);
+      assert.equal(cancel.code,0,cancel.stderr);assert.equal(JSON.parse(cancel.stdout).delivery,"suppressed");
+      assert.equal(await wakeCount(row.id),0);
+    });
     await t.test("cancel before condition gives no wake",async()=>{
       const row=await invoke("chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+500)}});
       await invoke("chaldea_wait_cancel",{id:row.id});await sleep(700);assert.equal(await wakeCount(row.id),0);
@@ -89,7 +124,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         type:"thread.create",commandId:key(),threadId:target,projectId:project,title:"Wait target",modelSelection:{instanceId:"claudeAgent",model:"claude-sonnet-4-6"},
         runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,createdBy:"user",creationSource:"web",
       } as never) as Effect.Effect<unknown,unknown>);
-      await dispatchMessage(t3,token,target,"target-run","complete this test chaldea-waits-delay:800");
+      await dispatchMessage(t3,token,target,"complete this test chaldea-waits-delay:800","target-run");
       const targetSnap=()=>withClient({serverUrl:t3.serverUrl,token},c=>c["orchestration.getThreadProjection"]({threadId:target} as never));
       await until("target accepted run",async()=>(await targetSnap()).runs.length>0);
       const row=await invoke("chaldea_wait",{threadId:parent,requestId:key(),condition:{kind:"thread",threadId:target}});
@@ -116,6 +151,9 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       await until("answered wake",async()=>await wakeCount(row.id)===1);
       const result=JSON.parse((await invoke("chaldea_decision_status",{id:row.id})).outcome!);
       assert.deepEqual(result,{reason:"answered",answer:"Run",defaulted:false});
+      const wake=(await snapshot()).messages.find(m=>m.id==="chaldea-decision:"+row.id+":wake")!;
+      assert.equal(wake.role,"user");assert.ok(wake.text.startsWith("Chaldea wake (decision "+row.id+")"));
+      assert.ok(wake.text.endsWith("chaldea decision status "+row.id));
       await invoke("chaldea_decision_answer",{id:row.id,answer:"Defer"});assert.equal(await wakeCount(row.id),1);
       const current=await fetch(url,{headers:auth});assert.ok((await current.text()).includes("answered"));
     });
@@ -144,8 +182,19 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         const result=lines().find(r=>r.id===3).result;
         assert.equal(result.isError,undefined,err);
         const row=JSON.parse(result.content[0].text);
+        const rpc=async(id:number,name:string,args:unknown)=>{
+          child.stdin.write(JSON.stringify({jsonrpc:"2.0",id,method:"tools/call",params:{name,arguments:args}})+"\n");
+          await until("MCP response "+id,async()=>lines().some(r=>r.id===id));
+          const result=lines().find(r=>r.id===id).result;assert.equal(result.isError,undefined);
+          return JSON.parse(result.content[0].text);
+        };
+        const w=await rpc(4,"chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+10000)}});
+        assert.equal((await rpc(5,"chaldea_wait_status",{id:w.id})).id,w.id);
+        assert.equal((await rpc(6,"chaldea_wait_cancel",{id:w.id})).delivery,"suppressed");
+        assert.equal((await rpc(7,"chaldea_decision_status",{id:row.id})).id,row.id);
         const answered=await runCli(["decision","answer",row.id,"--answer","Run","--config",configPath],dir.path);
         assert.equal(answered.code,0,answered.stderr);
+        await rpc(8,"chaldea_decision_answer",{id:row.id,answer:"Run"});
         await until("MCP-created decision wake",async()=>await wakeCount(row.id)===1);
       }finally{
         child.stdin.end();
@@ -166,7 +215,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
     });
     await t.test("T3 restarts independently while the watcher keeps its durable work",async()=>{
       const row=await invoke("chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+600)}});
-      await watcher!.close();watcher=undefined;
+      await watcher?.close();watcher=undefined;
       await t3.stopServer();await sleep(700);await t3.startServer();
       await until("T3-only restart wake",async()=>await wakeCount(row.id)===1,30000);
       assert.equal(await wakeCount(row.id),1);
@@ -192,7 +241,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
     await t.test("watcher and T3 restarts recover overdue waits and questions once",async()=>{
       const time=await invoke("chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+800)}});
       const q=await invoke("chaldea_decision_ask",ask(800));
-      await service!.stop();service=undefined;await watcher!.close();watcher=undefined;
+      await service!.stop();service=undefined;await watcher?.close();watcher=undefined;
       await t3.stopServer();await sleep(900);await t3.startServer();
       service=await startWaitService(config);
       await until("overdue wait after reboot",async()=>await wakeCount(time.id)===1,30_000);

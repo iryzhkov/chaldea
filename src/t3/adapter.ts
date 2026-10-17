@@ -446,7 +446,9 @@ export async function dispatchChaldeaWake(options: ConnectOptions, payload: stri
   const accepted = await withClient(options, client =>
     client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
       Effect.map(() => true),
-      Effect.catchTag("OrchestrationV2DispatchCommandError", () => Effect.succeed(false))));
+      Effect.catchTag("OrchestrationV2DispatchCommandError", error =>
+        /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
+          ? Effect.succeed(false) : Effect.fail(error))));
   if (!accepted) throw new WakeRejectedError("T3 durably rejected this wake; operator attention required");
 }
 
