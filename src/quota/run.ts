@@ -94,17 +94,18 @@ export class EventSink {
   #retryTimer: NodeJS.Timeout | null = null;
   #retryAttempt = 0;
   readonly #pending: Array<QuotaRecord> = [];
+  readonly #discarded = new Set<string>();
 
   readonly state: ObserverState;
   readonly statePath: string;
-  readonly poster: Pick<FeedPoster, "enqueue">;
+  readonly poster: Pick<FeedPoster, "enqueue"> & Partial<Pick<FeedPoster, "discard">>;
   readonly logger: Logger;
   readonly retryDelaysMs: ReadonlyArray<number>;
 
   constructor(
     state: ObserverState,
     statePath: string,
-    poster: Pick<FeedPoster, "enqueue">,
+    poster: Pick<FeedPoster, "enqueue"> & Partial<Pick<FeedPoster, "discard">>,
     logger: Logger,
     retryDelaysMs: ReadonlyArray<number> = BACKOFF_MS,
   ) {
@@ -151,6 +152,9 @@ export class EventSink {
       this.#saveFailing = false;
       this.logger.info("state file written again", { path: this.statePath, pending: this.#pending.length });
     }
+    // Superseded advisory payloads are removed only after the new state is durable.
+    for (const key of this.#discarded) this.poster.discard?.(key);
+    this.#discarded.clear();
     // Their claims are durable now.
     for (const record of this.#pending.splice(0)) {
       this.poster.enqueue(record, () => {
@@ -180,13 +184,36 @@ export class EventSink {
     }
   }
 
+  #discardHeadroom(key: string): void {
+    this.state.pendingDelivery.delete(key);
+    const index = this.#pending.findIndex(r => quotaKey(r) === key);
+    if (index >= 0) this.#pending.splice(index, 1);
+    else this.#discarded.add(key); // Only already-enqueued keys need poster removal (bounded by its queue).
+  }
+
   record(records: ReadonlyArray<QuotaRecord>): void {
     for (const record of records) {
       this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
       const key = quotaKey(record);
       if (this.state.pendingDelivery.has(key)) continue;
-      if (this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
-          Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES) {
+      const advisory = [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
+      if (record.headroom) {
+        const alias = record.headroom.providers[0]?.alias;
+        for (const [oldKey, old] of advisory) {
+          if (old.kind === record.kind && old.headroom?.providers[0]?.alias === alias) this.#discardHeadroom(oldKey);
+        }
+      }
+      // Advisory reporting never consumes capacity needed by a transition. Keep at most
+      // 192 advisory intents (64 aliases × 3 kinds) and evict them first on either the count or byte bound.
+      const overflow = () => this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
+        Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES;
+      const headroom = () => [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
+      while (overflow() || record.headroom !== undefined && headroom().length >= 192) {
+        const oldest = headroom()[0];
+        if (!oldest) break;
+        this.#discardHeadroom(oldest[0]);
+      }
+      if (overflow()) {
         this.state.deliveryDropped++;
         this.logger.error("pending record dropped: durable delivery queue capacity exceeded", { kind: record.kind, thread: record.threadId, run: record.runId });
         continue;

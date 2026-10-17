@@ -70,6 +70,32 @@ const count = (value: unknown): value is number => typeof value === "number" && 
 const percent = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100;
 const object = (value: unknown): Record<string, any> | null => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : null;
 
+/** Refuse malformed additions once at load, preserving the observer's fail-closed state policy. */
+export function validateHeadroom(value: unknown): HeadroomState {
+  const s = object(value);
+  const metric = (v: unknown) => {
+    const m = object(v);
+    return m !== null && ["fresh", "stale", "unknown", "unsupported", "error"].includes(m.state) &&
+      typeof m.source === "string" && (m.observedAt === null || iso(m.observedAt) !== null) &&
+      (m.error === null || typeof m.error === "string") && Object.hasOwn(m, "value");
+  };
+  if (!s || !Array.isArray(s.providers) || s.providers.length > 64 ||
+      !Number.isSafeInteger(s.snapshotSlot) || !count(s.sequence) || typeof s.signature !== "string" || typeof s.low !== "string") {
+    throw new Error("invalid_headroom_state");
+  }
+  for (const p of s.providers) {
+    if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
+        !["plan", "included", "credits", "manualResets", "extraUsage", "ordinaryUsageAllowed", "spendControlReached"].every(k => metric(p[k])) ||
+        p.included.value !== null && (!Array.isArray(p.included.value) || p.included.value.length > 32 ||
+          !p.included.value.every((w: any) => object(w) && safeId(w.id) && percent(w.usedPercent) && percent(w.remainingPercent))) ||
+        p.credits.value !== null && (!object(p.credits.value) || typeof p.credits.value.hasCredits !== "boolean" || typeof p.credits.value.unlimited !== "boolean") ||
+        p.manualResets.value !== null && (!object(p.manualResets.value) || !count(p.manualResets.value.availableCount))) {
+      throw new Error("invalid_headroom_state");
+    }
+  }
+  return value as HeadroomState;
+}
+
 export function applyT3(row: ProviderHeadroom, p: SwitchProvider): void {
   const u = p.usageLimits;
   if (!u) return;
@@ -169,6 +195,7 @@ export interface HeadroomMonitorOptions {
 export class HeadroomMonitor {
   #providers: ReadonlyArray<SwitchProvider> = [];
   #active = false;
+  #changed = false;
   #flight: Promise<void> | null = null;
   #due = new Map<string, number>();
   #failures = new Map<string, number>();
@@ -184,7 +211,8 @@ export class HeadroomMonitor {
     this.#timer.unref();
   }
   update(providers: ReadonlyArray<SwitchProvider>): void {
-    const identity = (p: SwitchProvider) => JSON.stringify([p.runtimeHome, p.quotaContextBlocked, p.auth.status]);
+    const before = JSON.stringify(this.state.providers);
+    const identity = (p: SwitchProvider) => JSON.stringify([p.runtimeHome, p.quotaContextBlocked, p.quotaAccountKey, p.auth.status, p.auth.type]);
     const priorContexts = new Map(this.#providers.map(p => [p.instanceId, identity(p)]));
     this.#providers = providers;
     const previous = new Map(this.state.providers.map(p => [p.alias, p]));
@@ -202,6 +230,7 @@ export class HeadroomMonitor {
       applyT3(next, p);
       return next;
     });
+    this.#changed ||= before !== JSON.stringify(this.state.providers);
     this.#active = true;
     this.emit();
     void this.tick();
@@ -222,7 +251,7 @@ export class HeadroomMonitor {
       const key = contextKey(ctx), now = this.now();
       if ((this.#due.get(key) ?? 0) > now || this.#abort.signal.aborted || !this.#active) continue;
       const matching = this.#providers.filter(p => ctx.providers.includes(p.instanceId) && p.driver === "codex" &&
-        p.enabled && p.installed && p.auth.status === "authenticated" && p.availability !== "unavailable" && !p.quotaContextBlocked &&
+        p.enabled && p.installed && p.auth.status === "authenticated" && p.auth.type === "chatgpt" && p.availability !== "unavailable" && !p.quotaContextBlocked &&
         p.runtimeHome !== undefined && resolve(p.runtimeHome) === ctx.codexHome);
       if (matching.length === 0) continue; // unknown context never falls back to this shell's login
       try {
@@ -232,9 +261,15 @@ export class HeadroomMonitor {
         // Match again after await: aliases can be reconfigured during a read.
         for (const p of matching) {
           const current = this.#providers.find(v => v.instanceId === p.instanceId);
-          if (!current || current.runtimeHome !== p.runtimeHome || current.quotaContextBlocked || current.auth.status !== "authenticated") continue;
+          if (!current || current.runtimeHome !== p.runtimeHome || current.quotaContextBlocked ||
+              current.quotaAccountKey !== p.quotaAccountKey || current.auth.type !== "chatgpt" || current.auth.status !== "authenticated") continue;
           const row = this.state.providers.find(r => r.alias === p.instanceId);
-          if (row) applyCodex(row, raw, at);
+          if (!row) continue;
+          const accountId = object(raw)?.accountId;
+          if (p.quotaAccountKey && (typeof accountId !== "string" ||
+              createHash("sha256").update(accountId).digest("hex") !== p.quotaAccountKey)) {
+            failCodex(row, "context_mismatch");
+          } else applyCodex(row, raw, at);
         }
         this.#failures.delete(key);
       } catch (error) {
@@ -245,6 +280,7 @@ export class HeadroomMonitor {
           if (row) failCodex(row, error instanceof BalanceReadError ? error.code : "read_failed");
         }
       }
+      this.#changed = true;
       const failures = this.#failures.get(key) ?? 0;
       const jitter = 0.9 + (this.options.random ?? Math.random)() * 0.2;
       this.#due.set(key, this.now() + COLLECT_EVERY_MS * 2 ** failures * jitter);
@@ -274,6 +310,9 @@ export class HeadroomMonitor {
     if (slot !== this.state.snapshotSlot) { this.state.snapshotSlot = slot; add("quota_headroom_snapshot"); }
     if (signature !== this.state.signature) { this.state.signature = signature; add("quota_headroom_changed"); }
     if (low !== this.state.low) { this.state.low = low; if (low) add("quota_headroom_low"); }
-    this.options.save(records); // snapshot and delivery intents are persisted before poster enqueue
+    if (records.length > 0 || this.#changed) {
+      this.options.save(records); // snapshot and delivery intents are persisted before poster enqueue
+      this.#changed = false;
+    }
   }
 }

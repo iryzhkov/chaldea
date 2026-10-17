@@ -27,7 +27,7 @@ const response = { accountId: "PRIVATE_ACCOUNT", ordinaryUsageAllowed: false,
   rateLimitResetCredits: { availableCount: 1, credits: [{ id: "PRIVATE_REDEMPTION_ID" }] } };
 const provider = (alias = "codex", runtimeHome = "/scratch/codex"): SwitchProvider => ({
   instanceId: alias, driver: "codex", runtimeHome, enabled: true, installed: true, status: "ready",
-  auth: { status: "authenticated" }, models: [], usageLimits: { checkedAt: AT,
+  auth: { status: "authenticated", type: "chatgpt" }, models: [], usageLimits: { checkedAt: AT,
     windows: [{ id: "primary", kind: "weekly", usedPercent: 100, windowDurationMins: 10080, resetsAt: "2026-10-21T23:13:21Z" }],
     resetCredits: { availableCount: 1, nextExpiresAt: "2026-11-01T00:00:00Z" } },
 });
@@ -60,6 +60,7 @@ test("exact credit units, zero/null, duplicate map, permissions and independent 
   applyT3(row, { ...provider(), usageLimits: { checkedAt: later, windows: [{ usedPercent: 20 }] } });
   assert.equal(row.manualResets.observedAt, AT); assert.equal(row.credits.observedAt, AT);
   assert.equal(metricNow(row.included, START + STALE_AFTER_MS).state, "fresh");
+  assert.equal(hasQuota({ ...provider(), usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] }, headroom: routingLanes(row, START) }, START), false);
   failCodex(row, "rate_limited");
   assert.equal(metricNow(row.credits, START + STALE_AFTER_MS).state, "stale");
   assert.equal(row.credits.value?.balance, "61951.0098125000");
@@ -69,7 +70,11 @@ test("exact credit units, zero/null, duplicate map, permissions and independent 
   const lanes = routingLanes(row, START);
   assert.equal(lanes.creditFunded.admissionAllowed, false);
   assert.equal(lanes.manualResetInventory.automaticRedemptionAllowed, false);
-  assert.equal(hasQuota({ ...provider(), usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] }, headroom: lanes }, START), false);
+  const includedOnly = { ...provider(), usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] },
+    headroom: { ...lanes, included: { ...lanes.included, ordinaryUsageAllowed: { ...lanes.included.ordinaryUsageAllowed, value: true } },
+      creditFunded: { ...lanes.creditFunded, spendControlReached: { ...lanes.creditFunded.spendControlReached, value: true } } } };
+  assert.equal(hasQuota(includedOnly, START), true, "paid spend control does not deny included quota");
+  assert.equal(hasQuota({ ...provider(), usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] }, headroom: lanes }, START), true, "failed permission observation does not override fresh included windows");
   applyCodex(row, { rateLimits: { credits: { hasCredits: false, unlimited: false, balance: "0" } } }, later);
   assert.equal(row.credits.value?.balance, "0");
   applyCodex(row, { rateLimits: { credits: null } }, later);
@@ -107,7 +112,7 @@ test("one startup read per matching context, shared aliases, single-flight, jitt
 });
 test("unmatched/remote/disabled contexts never launch a collector and reconfiguration discards wallet", async () => {
   const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
-  for (const [local, p] of [[true, provider("codex", "/wrong")], [false, provider()], [true, { ...provider(), enabled: false }], [true, { ...provider(), quotaContextBlocked: true }]] as const) {
+  for (const [local, p] of [[true, provider("codex", "/wrong")], [false, provider()], [true, { ...provider(), enabled: false }], [true, { ...provider(), quotaContextBlocked: true }], [true, { ...provider(), auth: { status: "authenticated", type: "apiKey" } }]] as const) {
     const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local, now: () => START, save() {},
       read: async () => { assert.fail("unmatched collector launched"); } });
     m.update([p]); await m.tick(); assert.equal(m.state.providers[0]?.credits.value, null); await m.close();
@@ -117,6 +122,13 @@ test("unmatched/remote/disabled contexts never launch a collector and reconfigur
     read: () => new Promise(r => { release = r; }) });
   m.update([provider()]); m.update([provider("codex", "/changed")]); release(response); await m.tick();
   assert.equal(m.state.providers[0]?.credits.value, null); await m.close();
+  const wrongAccount = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => START, save() {},
+    read: async () => response });
+  wrongAccount.update([{ ...provider(), quotaAccountKey: "does-not-match" }]); await wrongAccount.tick();
+  assert.equal(wrongAccount.state.providers[0]?.credits.value, null);
+  assert.equal(wrongAccount.state.providers[0]?.credits.error, "context_mismatch");
+  assert.doesNotMatch(JSON.stringify(statusSnapshot(wrongAccount.state, START)), /does-not-match|PRIVATE|quotaAccountKey/);
+  await wrongAccount.close();
 });
 test("headroom records survive restart via the existing durable sink; quarter-hour and threshold crossings", async () => {
   const f = scratchDir("headroom-feed"), state = emptyState(), delivered: QuotaRecord[] = [];
@@ -147,6 +159,47 @@ test("headroom records survive restart via the existing durable sink; quarter-ho
       assert.doesNotMatch(body(record, "agent-a"), /PRIVATE|credentialFingerprint|nextCreditId|runtimeHome/);
     }
   } finally { await m.close(); sink.close(); f.remove(); }
+});
+test("headroom coalescing and eviction preserve the full transition queue during a delivery outage", () => {
+  const f = scratchDir("headroom-priority"), state = emptyState(), queued = new Map<string, QuotaRecord>();
+  const path = join(f.path, "state.json");
+  const sink = new EventSink(state, path, { enqueue: r => queued.set(r.runId, r),
+    discard: key => { for (const [id, r] of queued) if (quotaPublication(r, "test").key === key) queued.delete(id); } }, logger);
+  const advisory = (alias: string, i: number): QuotaRecord => ({
+    kind: "quota_headroom_snapshot", severity: "info", threadId: "headroom", runId: String(i), provider: "all", resetAt: null, subagent: false,
+    headroom: statusSnapshot({ ...emptyHeadroom(), providers: [newProvider(alias, "codex")] }, START),
+  });
+  try {
+    for (let i = 0; i < 300; i++) { sink.record([advisory("alias", i)]); sink.save(); }
+    assert.equal(state.pendingDelivery.size, 1); assert.equal(queued.size, 1);
+    for (let i = 0; i < 220; i++) { sink.record([advisory("p" + i, i + 300)]); sink.save(); }
+    assert.equal(state.pendingDelivery.size, 192); assert.equal(queued.size, 192);
+    for (let i = 0; i < 256; i++) {
+      sink.record([{ kind: "quota_parked", severity: "warn", threadId: "t" + i, runId: "run" + i,
+        provider: "codex", resetAt: AT, subagent: false }]); sink.save();
+    }
+    assert.equal(state.pendingDelivery.size, 256);
+    assert.equal([...state.pendingDelivery.values()].filter(r => r.kind === "quota_parked").length, 256);
+    assert.equal([...queued.values()].filter(r => r.kind === "quota_parked").length, 256);
+    assert.equal(state.deliveryDropped, 0);
+    assert.equal(loadState(path, START).pendingDelivery.size, 256);
+  } finally { sink.close(); f.remove(); }
+});
+test("idle scheduler ticks do not write state and malformed persisted headroom fails closed at load", async () => {
+  let writes = 0, now = START;
+  const m = new HeadroomMonitor({ state: emptyHeadroom(), config: headroomConfig(), local: true, now: () => now,
+    save: () => { writes++; } });
+  m.update([provider()]); await m.tick(); const initial = writes;
+  for (let i = 0; i < 5; i++) { now += 10_000; await m.tick(); }
+  assert.equal(writes, initial);
+  await m.close();
+  const f = scratchDir("headroom-invalid");
+  try {
+    const path = join(f.path, "state.json"), bytes = JSON.stringify({ version: 5, headroom: {} });
+    writeFileSync(path, bytes);
+    assert.throws(() => loadState(path, START), /invalid_headroom_state/);
+    assert.equal(readFileSync(path, "utf8"), bytes);
+  } finally { f.remove(); }
 });
 test("stdio fake verifies the complete allowlisted exchange and redaction; failures are bounded and sanitized", async () => {
   const f = scratchDir("codex-balance");

@@ -12,6 +12,7 @@ import { RpcClient } from "effect/rpc";
 import * as RpcSerialization from "effect/rpc/RpcSerialization";
 import * as Socket from "effect/socket/Socket";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import WebSocket from "ws";
 
@@ -115,7 +116,7 @@ export interface SwitchProvider {
   readonly installed: boolean;
   readonly status: string;
   readonly availability?: string;
-  readonly auth: { readonly status: string };
+  readonly auth: { readonly status: string; readonly type?: "chatgpt" | "apiKey" };
   readonly models: ReadonlyArray<{
     readonly slug: string;
     readonly capabilities: { readonly optionDescriptors?: ReadonlyArray<{
@@ -128,6 +129,8 @@ export interface SwitchProvider {
   readonly runtimeHome?: string;
   /** Any instance environment override needs a future explicit context adapter. */
   readonly quotaContextBlocked?: boolean;
+  /** Private comparison only: never included in status, state or feed payloads. */
+  readonly quotaAccountKey?: string;
   readonly headroom?: ReturnType<typeof import("../quota/headroom.ts").routingLanes>;
   readonly usageLimits?: {
     readonly checkedAt: string;
@@ -149,7 +152,9 @@ export interface SwitchPort {
 export function toSwitchProvider(p: import("../../vendor/t3-contracts/src/index.ts").ServerProvider): SwitchProvider {
   return {
     instanceId: p.instanceId, driver: p.driver, enabled: p.enabled, installed: p.installed,
-    status: p.status, auth: { status: p.auth.status },
+    status: p.status, auth: { status: p.auth.status,
+      ...(p.auth.type === "chatgpt" || p.auth.type === "apiKey" ? { type: p.auth.type } : {}) },
+    ...(p.auth.workspaceId ? { quotaAccountKey: createHash("sha256").update(p.auth.workspaceId).digest("hex") } : {}),
     ...(p.runtimePaths === undefined ? {} : { runtimeHome: p.runtimePaths.shadowHomePath ?? p.runtimePaths.homePath }),
     ...(p.availability === undefined ? {} : { availability: p.availability }),
     models: p.models.map((m) => ({

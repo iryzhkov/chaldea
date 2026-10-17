@@ -125,6 +125,8 @@ export class FeedPoster {
     this.#queue.set(key, { record, ...(ack ? { ack } : {}) });
     this.#kick();
   }
+  /** Remove a superseded advisory intent after its replacement is durable. */
+  discard(key: string): void { this.#queue.delete(key); }
   #kick(): void {
     if (this.#closed || this.#draining) return;
     this.#draining = this.#drain().finally(() => {

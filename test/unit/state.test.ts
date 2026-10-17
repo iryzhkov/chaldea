@@ -83,7 +83,7 @@ test("an unknown state file version is refused rather than guessed", () => {
   }
 });
 
-test("state v2 migrates to v4, preserving claims and releasing unsafe old switch intents", () => {
+test("state v2 migrates to v5, preserving claims and releasing unsafe old switch intents", () => {
   const dir = scratchDir("state-migration");
   try {
     const path = join(dir.path, "state.json");

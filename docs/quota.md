@@ -384,10 +384,11 @@ Credential matching is deliberately explicit. Add `--quota-config PATH` to
 
 The operator binds the provider aliases to that HOME/auth context. The observer
 also requires a loopback T3 URL, an enabled/installed/authenticated Codex provider,
-and an exact normalized match between codexHome and the published effective runtime
+a confirmed ChatGPT auth type, and an exact normalized match between codexHome and the published effective runtime
 home (shadowHomePath when present, otherwise homePath). Missing runtime paths,
 instance environment overrides, a remote server or an unmatched context leave the
-balance unknown. There is no fallback to the invoking shell's account. The collector
+balance unknown. If T3 supplies a workspace identity, its private hash must also
+match the read response; no identity or hash is persisted or reported. There is no fallback to the invoking shell's account. The collector
 sets HOME/CODEX_HOME explicitly and excludes inherited auth tokens and endpoint
 overrides. Instances requiring custom auth environment need a future context adapter.
 Equal HOME/CODEX_HOME/executable tuples share one collector across aliases; paths and
@@ -416,15 +417,17 @@ or reset-count changes and `quota_headroom_low` when the set of providers below
 the configured included-window remaining-percent threshold changes. Periodic records
 also age stale observations while idle inference is absent. Records are bounded,
 one provider per payload, with at most 32 windows and 64 provider aliases. Claims,
-snapshot slot and pending delivery are saved together before enqueue, so observer
+snapshot slot and pending delivery are saved together before enqueue,
+with at most the newest pending headroom intent per provider/kind (192 total);
+headroom intents are evicted before a transition can be rejected for capacity, so observer
 restarts replay durable delivery intents through the existing poster path.
 Legacy feed attempts retain their existing at-most-once semantics; scoped Akasha
 delivery retains its receipt/retry behavior. Status does not post feed records.
 
 Routing receives these three lanes as read-only inputs. Credit-funded admission
 and automatic reset redemption are always disabled in this design. Inventory
-cannot admit a provider switch; known ordinary-usage/spend-control denials remain
-denials. A future paid-routing policy would need an explicit budget, adequate
+cannot admit a provider switch; a fresh ordinary-usage denial blocks the included
+lane, while spend controls remain separate in the credit-funded lane. A future paid-routing policy would need an explicit budget, adequate
 **fresh** balance, spend-control checks and actual provider acceptance. Existing
 usage-limit stop/resume behavior remains in place.
 
@@ -565,6 +568,11 @@ five seconds while events arrive; there is no separate retention timer. Feed-ser
 the feed's own concern.
 
 ## Installing on a host
+
+This change writes observer state format 5 (and reads formats 2–4). An older binary
+will reject a format-5 state file after rollback. Preserve a pre-upgrade state
+backup for a coordinated rollback; do not delete state to bypass that refusal.
+Malformed headroom state is refused once on load, preserving existing delivery claims.
 
 Not done by this change; the orchestrator installs after review. Run as the
 user that owns the T3 service (`igor`). Each step assumes the previous one

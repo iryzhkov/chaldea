@@ -15,7 +15,7 @@
 import { statSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
 import type { QuotaRecord } from "./observer.ts";
-import { emptyHeadroom, type HeadroomState } from "./headroom.ts";
+import { emptyHeadroom, validateHeadroom, type HeadroomState } from "./headroom.ts";
 import type { SwitchIntent } from "./switcher.ts";
 export const MAX_ACTIVE_SWITCHES = 128;
 export const MAX_COMPLETED_SWITCHES = 1_000;
@@ -114,7 +114,7 @@ export function loadState(path: string, nowMs: number): ObserverState {
   if (raw?.version !== FORMAT_VERSION && raw?.version !== 4 && raw?.version !== 3 && raw?.version !== 2) throw new Error(`Unsupported state file version in ${path}`);
   const state: ObserverState = {
     cursor: typeof raw.cursor === "number" ? raw.cursor : null,
-    headroom: raw.headroom ?? emptyHeadroom(),
+    headroom: raw.headroom === undefined ? emptyHeadroom() : validateHeadroom(raw.headroom),
     posted: new Map(Object.entries(raw.posted ?? {}).filter((entry): entry is [string, number] => typeof entry[1] === "number")),
     parked: new Map(Object.entries(raw.parked ?? {}) as Array<[string, ParkedThread]>),
     pendingDelivery: new Map(Object.entries(raw.pendingDelivery ?? {}) as Array<[string, QuotaRecord]>),
