@@ -1,4 +1,5 @@
 // `chaldea` command-line entry point.
+import { description, discoveryHelp } from "./describe.ts";
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { switchConfig } from "./quota/routing.ts";
@@ -120,6 +121,14 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
 }
 
 export async function main(argv: ReadonlyArray<string>): Promise<number> {
+  if (argv.length === 1 && argv[0] === "--describe") {
+    process.stdout.write(JSON.stringify(description) + "\n");
+    return 0;
+  }
+  if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
+    process.stdout.write(discoveryHelp + "\n" + USAGE);
+    return 0;
+  }
   const [group, command, ...rest] = argv;
   try {
     if (group && ["waits","wait","decision","mcp"].includes(group)) {
