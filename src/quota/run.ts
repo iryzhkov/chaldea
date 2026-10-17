@@ -195,6 +195,19 @@ export class EventSink {
   }
 }
 
+/** Optional switch work cannot delay records or escape into the shell stream. */
+export function processObserverEvent(
+  sink: EventSink,
+  switcher: Pick<ProviderSwitcher, "handle" | "fail">,
+  event: ShellEvent,
+): void {
+  sink.handle(event);
+  const fallback = (error: unknown) => {
+    void switcher.fail(error).catch(() => sink.logger.error("switch cleanup failed; observing continues"));
+  };
+  try { void switcher.handle(event).catch(fallback); } catch (error) { fallback(error); }
+}
+
 export async function runObserver(options: ObserverOptions): Promise<number> {
   const { logger, signal } = options;
   const state = loadState(options.statePath, Date.now());
@@ -219,6 +232,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
           state, port, config: options.switching ?? switchConfig(), logger,
           save: () => { sink.save(); return !sink.dirty; },
           record: (record) => sink.record([record]),
+          onReconciled: (thread) => sink.handle({ kind: "thread", sequence: state.cursor ?? 0, thread }),
         });
       }
       switcher.reconnect(port, previousToken !== token);
@@ -229,8 +243,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
           attempt = 0;
           logger.info("subscribed to T3 shell", { afterSequence: state.cursor });
         }
-        await switcher!.handle(event);
-        sink.handle(event);
+        processObserverEvent(sink, switcher!, event);
       };
       await connectShell(
         { serverUrl, token, signal },
@@ -253,6 +266,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
     await sleep(delay, signal);
   }
   // close() never throws, so a failed final write cannot change the exit status or skip the drain.
+  await switcher?.close();
   sink.close();
   await Promise.race([poster.idle(), new Promise((r) => setTimeout(r, 30_000).unref())]);
   logger.info("quota observer stopped", { exitCode });

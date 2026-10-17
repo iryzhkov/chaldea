@@ -30,13 +30,17 @@ export function switchConfig(raw: unknown = {}): SwitchConfig {
   return { enabled: value.enabled === true, equivalences: pairs as Array<[string, string]> };
 }
 
+export const MAX_USAGE_AGE_MS = 5 * 60_000;
+
 /** No inference from elapsed resets, API billing, or missing/failed usage probes. */
-export function hasQuota(provider: SwitchProvider | undefined): provider is SwitchProvider {
+export function hasQuota(provider: SwitchProvider | undefined, nowMs = Date.now()): provider is SwitchProvider {
   const limits = provider?.usageLimits;
   return provider !== undefined && provider.enabled && provider.installed &&
     provider.availability !== "unavailable" && provider.status === "ready" &&
     provider.auth.status === "authenticated" && limits !== undefined &&
     limits.unavailable === undefined && limits.windows.length > 0 &&
+    Number.isFinite(Date.parse(limits.checkedAt)) && Date.parse(limits.checkedAt) <= nowMs &&
+    nowMs - Date.parse(limits.checkedAt) <= MAX_USAGE_AGE_MS &&
     limits.windows.every((w) => Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent < 100);
 }
 
@@ -44,6 +48,7 @@ export function equivalentTarget(
   source: ModelChoice,
   providers: ReadonlyArray<SwitchProvider>,
   config: SwitchConfig,
+  nowMs = Date.now(),
 ): ModelChoice | null {
   const index = source.instanceId === "claudeAgent" ? 0 : source.instanceId === "codex" ? 1 : -1;
   if (index === -1) return null;
@@ -51,7 +56,7 @@ export function equivalentTarget(
   if (!pair) return null;
   const instanceId = index === 0 ? "codex" : "claudeAgent";
   const provider = providers.find((p) => p.instanceId === instanceId && p.driver === instanceId);
-  if (!hasQuota(provider)) return null;
+  if (!hasQuota(provider, nowMs)) return null;
   const model = pair[1 - index]!;
   const catalogModel = provider.models.find((m) => m.slug === model);
   if (!catalogModel) return null;

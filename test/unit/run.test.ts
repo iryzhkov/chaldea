@@ -7,9 +7,9 @@ import { test } from "node:test";
 import { MAX_QUEUED_RECORDS } from "../../src/feed/poster.ts";
 import type { Logger } from "../../src/log.ts";
 import type { QuotaRecord } from "../../src/quota/observer.ts";
-import { EventSink, runObserver } from "../../src/quota/run.ts";
+import { EventSink, processObserverEvent, runObserver } from "../../src/quota/run.ts";
 import { emptyState, loadState, type ObserverState } from "../../src/quota/state.ts";
-import type { ShellEvent } from "../../src/t3/adapter.ts";
+import { ProtocolIncompatibleError, type ShellEvent } from "../../src/t3/adapter.ts";
 import { scratchDir } from "../helpers/scratch.ts";
 import { iso, limited } from "../helpers/threads.ts";
 
@@ -43,6 +43,27 @@ function blockedStatePath(dir: string): { path: string; unblock: () => void } {
 }
 
 const NEVER = [3_600_000];
+
+test("slow, throwing and protocol-failing switch paths cannot block quota records", async () => {
+  const dir = scratchDir("switch-isolation");
+  const queued: QuotaRecord[] = [], errors: unknown[] = [], logger = memoryLogger();
+  const sink = new EventSink(started(), join(dir.path, "state.json"),
+    { enqueue: (record) => void queued.push(record) }, logger);
+  try {
+    processObserverEvent(sink, { handle: () => new Promise(() => {}), fail: async (e) => { errors.push(e); } }, stopEvent(1));
+    assert.equal(queued[0]!.kind, "quota_parked", "record is durable before optional work completes");
+    const failure = new ProtocolIncompatibleError("switch projection drift");
+    processObserverEvent(sink, { handle: () => { throw failure; }, fail: async (e) => { errors.push(e); } }, stopEvent(2, "thread-b"));
+    processObserverEvent(sink, { handle: async () => { throw failure; }, fail: async (e) => { errors.push(e); } }, stopEvent(3, "thread-c"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(queued.length, 3); assert.deepEqual(errors, [failure, failure]);
+    processObserverEvent(sink, { handle: async () => { throw failure; }, fail: async () => { throw failure; } }, stopEvent(4, "thread-d"));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(queued.length, 4);
+    assert.ok(logger.lines.some(([, line]) => line.includes("observing continues")));
+  } finally { sink.close(); dir.remove(); }
+});
+
 
 test("a record whose claim could not be saved waits, and is posted once the next event saves", () => {
   const dir = scratchDir("run");

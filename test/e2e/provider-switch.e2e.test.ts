@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import * as Effect from "effect/Effect";
+import { loadState, saveState } from "../../src/quota/state.ts";
 import { switchPort, withClient } from "../../src/t3/adapter.ts";
 import { startDisposableT3, t3Version } from "../helpers/disposable-t3.ts";
 import { ObserverProcess, ShellWatcher, dispatchMessage, readFeed, sleep, waitFor, writePrivateFile } from "../helpers/e2e.ts";
@@ -10,11 +11,11 @@ import { SCRATCH_ROOT, scratchDir } from "../helpers/scratch.ts";
 
 const version = t3Version(), skip = version === "t3 v0.1.0" ? false : `needs t3 v0.1.0, found ${version}`;
 if (skip && process.env.CHALDEA_REQUIRE_E2E === "1") throw new Error(skip);
-for (const scenario of ["available", "exhausted", "crash", "read-only"] as const) {
+for (const scenario of ["available", "exhausted", "crash", "crash-before-reset", "expired-archived", "read-only"] as const) {
   test(`provider switch: ${scenario}`, { skip, timeout: 180_000 }, async () => {
     const scratch = scratchDir("switch-e2e");
     const t3 = await startDisposableT3({ scratchRoot: SCRATCH_ROOT, scenario: "reset", autoResume: true,
-      resetDelaySeconds: 12, codex: scenario === "exhausted" ? "exhausted" : "available", claudeModel: "claude-opus-5-5" });
+      resetDelaySeconds: scenario === "crash-before-reset" ? 20 : 12, codex: scenario === "exhausted" ? "exhausted" : "available", claudeModel: "claude-opus-5-5" });
     let watcher: ShellWatcher | undefined;
     const observers: ObserverProcess[] = [];
     try {
@@ -46,13 +47,14 @@ for (const scenario of ["available", "exhausted", "crash", "read-only"] as const
         await waitFor("observer subscription", () => o.subscriptions(), 30_000);
         return o;
       };
-      const first = await start(scenario === "crash");
+      const crashes = ["crash", "crash-before-reset", "expired-archived"].includes(scenario);
+      const first = await start(crashes);
       await dispatchMessage(t3, token, threadId, `Fixture work. ${t3.trigger}`, "switch-trigger");
       const stopped = await waitFor("quota stop", () => {
         const t = watcher!.threads.get(threadId); return t?.status === "failed" && t.lastErrorClass === "usage_limit" && t;
       }, 30_000);
       const reset = Date.parse(stopped.usageLimitResetAt!);
-      if (scenario === "crash") {
+      if (crashes) {
         await waitFor("observer SIGKILL after hold", () => first.signalCode === "SIGKILL", 30_000);
         const raw = JSON.parse(readFileSync(statePath, "utf8"));
         assert.equal(Object.values(raw.switches).length, 1);
@@ -61,11 +63,33 @@ for (const scenario of ["available", "exhausted", "crash", "read-only"] as const
         await waitCatalog();
         watcher = new ShellWatcher(t3.serverUrl, readToken);
         await waitFor("restored held thread", () => watcher!.threads.get(threadId), 30_000);
-        await sleep(Math.max(0, reset + 5_500 - Date.now()));
-        assert.equal(watcher.threads.get(threadId)!.latestRunId, stopped.latestRunId, "hold survives observer and T3 restart");
+        if (scenario === "crash") {
+          await sleep(Math.max(0, reset + 5_500 - Date.now()));
+          assert.equal(watcher.threads.get(threadId)!.latestRunId, stopped.latestRunId, "hold survives observer and T3 restart");
+        }
+        if (scenario === "expired-archived") {
+          await withClient({ serverUrl: t3.serverUrl, token }, (client) => client["orchestration.dispatchCommand"]({
+            type: "thread.archive", commandId: "archive-held-stop", threadId,
+          } as never));
+          const state = loadState(statePath, Date.now());
+          for (const intent of state.switches.values()) Object.assign(intent, { expiresAt: Date.now() - 1 });
+          saveState(statePath, state, Date.now());
+        }
         await start();
+        if (scenario === "expired-archived") {
+          await waitFor("deadline cleanup feed warning", () => readFeed(feedLog).some((e) =>
+            e.body.kind === "provider_switch_failed" && e.body.reason === "hold_expired"), 15_000);
+          // The public metadata RPC rejects non-null recovery updates on archived
+          // threads; the production expiry path must clear the owned hold.
+          for (let attempt = 0; attempt < 100 && (await port().thread(threadId))?.limitRecovery; attempt++) await sleep(100);
+          assert.equal((await port().thread(threadId))!.limitRecovery, null);
+          assert.equal([...loadState(statePath, Date.now()).switches.values()][0]!.phase, "cancelled");
+          await withClient({ serverUrl: t3.serverUrl, token }, (client) => client["orchestration.dispatchCommand"]({
+            type: "thread.unarchive", commandId: "unarchive-cleaned-stop", threadId,
+          } as never));
+        }
       }
-      const expectsSwitch = scenario === "available" || scenario === "crash";
+      const expectsSwitch = scenario === "available" || scenario === "crash-before-reset";
       await waitFor(expectsSwitch ? "provider_switched" : "quota_resumed", () =>
         readFeed(feedLog).some((e) => e.body.kind === (expectsSwitch ? "provider_switched" : "quota_resumed")), 40_000);
       await waitFor("completed continuation", () => {

@@ -33,6 +33,8 @@ export function title(record: QuotaRecord): string {
       return `quota_parked: ${record.provider} thread ${thread} until ${record.resetAt}`;
     case "quota_reset_unknown":
       return `quota_reset_unknown: ${record.provider} thread ${thread} parked with no reset time`;
+    case "provider_switch_failed":
+      return `provider_switch_failed: ${record.provider} thread ${thread}; native recovery fallback (${record.reason})`;
     case "provider_switched":
       return `provider_switched: ${record.fromProvider}/${record.fromModel} to ${record.toProvider}/${record.toModel} thread ${thread}`;
     case "quota_resumed":

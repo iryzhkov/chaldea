@@ -28,7 +28,7 @@ export const MAX_POSTED_KEYS = 10_000;
 /** At most this many parked threads are tracked; an evicted one loses its quota_resumed. */
 export const MAX_PARKED_THREADS = 1_000;
 
-export type RecordKind = "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched";
+export type RecordKind = "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched" | "provider_switch_failed";
 
 export interface ParkedThread {
   readonly runId: string;
@@ -51,7 +51,7 @@ export interface ObserverState {
   evictedThrough: number | null;
 }
 
-const FORMAT_VERSION = 2;
+const FORMAT_VERSION = 3;
 
 export function emptyState(): ObserverState {
   return { cursor: null, posted: new Map(), parked: new Map(), switches: new Map(), evictedThrough: null };
@@ -76,7 +76,7 @@ export function prune(state: ObserverState, nowMs: number): void {
   // Never evict an unresolved hold. Admission caps these at 128; reconnect resolves them.
   const completed = [...state.switches.entries()]
     .filter(([, intent]) => intent.phase === "switched" || intent.phase === "cancelled")
-    .sort((a, b) => a[1].createdAt - b[1].createdAt);
+    .sort((a, b) => a[1].stopAt - b[1].stopAt);
   for (const [index, [key, intent]] of completed.entries()) {
     if (nowMs - intent.createdAt > KEY_TTL_MS || index < completed.length - MAX_COMPLETED_SWITCHES) {
       state.switches.delete(key);
@@ -102,7 +102,7 @@ export function prune(state: ObserverState, nowMs: number): void {
 export function loadState(path: string, nowMs: number): ObserverState {
   if (!existsSync(path)) return emptyState();
   const raw = JSON.parse(readFileSync(path, "utf8"));
-  if (raw?.version !== FORMAT_VERSION) throw new Error(`Unsupported state file version in ${path}`);
+  if (raw?.version !== FORMAT_VERSION && raw?.version !== 2) throw new Error(`Unsupported state file version in ${path}`);
   const state: ObserverState = {
     cursor: typeof raw.cursor === "number" ? raw.cursor : null,
     posted: new Map(Object.entries(raw.posted ?? {}).filter((entry): entry is [string, number] => typeof entry[1] === "number")),
@@ -110,6 +110,20 @@ export function loadState(path: string, nowMs: number): ObserverState {
     switches: new Map(Object.entries(raw.switches ?? {}) as Array<[string, SwitchIntent]>),
     evictedThrough: typeof raw.evictedThrough === "number" ? raw.evictedThrough : null,
   };
+  if (raw.version === 2) {
+    for (const intent of state.switches.values()) {
+      if (intent.phase === "holding" || intent.phase === "dispatching" || intent.phase === "releasing") {
+        // v2 admitted history and did not record reliable hold ownership provenance.
+        // Release those intents; never replay an old continuation during migration.
+        Object.assign(intent, {
+          phase: "releasing",
+          expiresAt: Math.min(intent.expiresAt, intent.resetAt === null
+            ? intent.createdAt + 120_000 : Date.parse(intent.resetAt) + 120_000),
+          restoreAutoResume: intent.restoreAutoResume === false ? null : intent.restoreAutoResume,
+        });
+      }
+    }
+  }
   prune(state, nowMs);
   return state;
 }
