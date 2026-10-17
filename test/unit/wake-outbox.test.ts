@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { join, resolve } from "node:path";
-import { spawn } from "node:child_process";
+import childProcess, { spawn, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { syncBuiltinESMExports } from "node:module";
 import { chmodSync, writeFileSync, symlinkSync } from "node:fs";
 import { WakeStore } from "../../src/wake/store.ts";
 import { WaitEngine } from "../../src/waits/engine.ts";
@@ -85,16 +87,45 @@ test("fatal storage errors log once, refuse registrations and exit non-zero for 
     }
   }finally{dir.remove();}
 });
-test("calendar timer fires an overdue absolute deadline and rearming cancels the old one",async()=>{
-  const timer=new Deadlines();let fires=0;let failure=false;
+test("calendar rearming cancels the old helper and ignores stale completion", t=>{
+  // Drive helper completion explicitly: no race between 50/90ms sleeps and
+  // Python startup. The real timerfd path is exercised separately below.
+  const children: Array<ChildProcess & { killedByTest: boolean }> = [];
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  t.mock.method(childProcess,"spawn",(command:string,args:readonly string[])=>{
+    const child=Object.assign(new EventEmitter(),{
+      killedByTest:false,
+      kill(){this.killedByTest=true;return true;},
+    }) as unknown as ChildProcess & { killedByTest: boolean };
+    children.push(child);calls.push({command,args});return child;
+  });
+  syncBuiltinESMExports();
+  const timer=new Deadlines();let fires=0;let failures=0;
   try{
-    timer.arm(Date.now()+50,()=>fires++,()=>{failure=true;});
-    timer.arm(Date.now()+150,()=>fires++,()=>{failure=true;});
-    await sleep(90);assert.equal(fires,0);
-    await until(()=>fires===1);
-    timer.arm(Date.now()-1000,()=>fires++,()=>{failure=true;});
-    await until(()=>fires===2);assert.equal(failure,false);
-    await sleep(50);assert.equal(fires,2);
+    timer.arm(50,()=>fires++,()=>failures++);
+    timer.arm(150,()=>fires++,()=>failures++);
+    assert.equal(children.length,2);assert.equal(children[0]!.killedByTest,true);
+    assert.equal(calls[0]!.command,"python3");
+    assert.match(calls[0]!.args[0]!,/calendar\.py$/);
+    assert.equal(calls[0]!.args[1],"50");assert.equal(calls[1]!.args[1],"150");
+    children[0]!.emit("exit",0);assert.equal(fires,0);
+    timer.arm(150,()=>fires++,()=>failures++);assert.equal(children.length,2);
+    children[1]!.emit("exit",0);assert.equal(fires,1);
+    timer.arm(0,()=>fires++,()=>failures++);
+    assert.equal(calls[2]!.args[1],"1"); // Nonpositive absolute times are overdue.
+    children[2]!.emit("exit",0);assert.equal(fires,2);assert.equal(failures,0);
+    timer.arm(200,()=>fires++,()=>failures++);timer.clear();
+    assert.equal(children[3]!.killedByTest,true);
+    children[3]!.emit("exit",0);assert.equal(fires,2);
+  }finally{timer.clear();t.mock.restoreAll();syncBuiltinESMExports();}
+});
+test("real calendar helper completes an overdue absolute deadline", {timeout:15_000}, async()=>{
+  const timer=new Deadlines();
+  try{
+    await new Promise<void>((resolve,reject)=>{
+      timer.arm(Date.now()-1000,resolve,()=>reject(new Error("calendar helper failed")));
+    });
+    assert.equal(timer.processId,undefined);
   }finally{timer.clear();}
 });
 test("credentials require owner-private regular files, and cannot be read via symlinks",()=>{

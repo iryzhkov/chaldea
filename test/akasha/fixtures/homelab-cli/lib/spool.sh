@@ -195,7 +195,17 @@ spool_refuse() {
 	local class=$1
 	shift
 	spool_class "$class"
-	die "$@"
+	# The same refusal in the vocabulary of the output contract, for a
+	# --format v2 run; without one this is exactly die.
+	local contract_class=internal
+	case $class in
+	unknown-option | unknown-command | usage | missing-argument | unreadable) contract_class=usage ;;
+	unreachable) contract_class=unavailable ;;
+	timeout) contract_class=timeout ;;
+	no-credential | refused) contract_class=denied ;;
+	not-found) contract_class=not_found ;;
+	esac
+	die_class "$contract_class" "$*"
 }
 
 # spool_class names the class of a failure without refusing. It is for the

@@ -135,12 +135,15 @@ waits; expiry closes streams. No bearer/payload/request URL logging.
 Every JWT in a query string is rejected, including operator-profile JWTs. This slice chooses scoped operator-profile tokens and bearer-header HTML authentication; it implements no static operator credential fallback. Lane L must refuse scoped feed open/url before printing a URL. Responses disable caching and referrers; proxy logging
 must redact query strings/Authorization. No link is fetched by Akasha.
 
-The frozen homelab-cli `ac23a6f` fixtures under test/akasha exercise recent/list
-(7d/50 defaults), filters, --json/--full, post --body-file and stdin, --tag/--link,
-show, open/url and health. Tests supply explicit matching source/host. Lane L owns
-the updated CLI's omission of implicit identities for scoped bearers, token helper,
-persistent producer keys and corrected HTTP/JSON error exits. The old CLI's known
-successful exit on rejected --json delivery is not fixed by this server slice.
+The homelab-cli fixtures under test/akasha are pinned unchanged to
+`d0b64f63f429bc52022b79d9d36344187ddcfd0a` (PR #13); their README records provenance.
+The compatibility tests exercise recent/list (7d/50 defaults), filters,
+--json/--full, post body files/stdin, tags/links, show and health against Akasha.
+Scoped tokens come from the environment, a helper or a private token file; tests
+cover omitted identities, idempotent replay/conflict, rejected HTTP/JSON delivery
+and refusal of scoped open/url. A loopback legacy HTTP fixture separately checks
+dotless key-file credentials, legacy identity defaults and open/url. Akasha itself
+continues to require scoped credentials.
 
 ## Durable delivery, capacity and recovery
 

@@ -8,13 +8,26 @@
 
 set -uo pipefail
 
+# shellcheck disable=SC2034  # read by lib/common.sh and lib/spool.sh
 PROGRAM=${0##*/}
-SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
-LIB_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")/../lib" && pwd)
+# Resolve through the symlink that install.sh puts in ~/.local/bin.
+SCRIPT_PATH=${BASH_SOURCE[0]}
+# Follow an installed symlink to the checkout.
+if [[ -L $SCRIPT_PATH ]]; then
+	for RESOLVER in python3 /usr/bin/python3 /usr/local/bin/python3 /bin/python3 ''; do
+		[[ -n $RESOLVER ]] && command -v "$RESOLVER" >/dev/null && break
+	done
+	[[ -n $RESOLVER ]] || exit 1
+	SCRIPT_PATH=$("$RESOLVER" -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$SCRIPT_PATH" 2>/dev/null) &&
+		[[ -n $SCRIPT_PATH ]] || exit 1
+fi
+[[ $SCRIPT_PATH == /* ]] || SCRIPT_PATH=./$SCRIPT_PATH
+SCRIPT_PATH=$(cd -P -- "${SCRIPT_PATH%/*}" && pwd -P)/${SCRIPT_PATH##*/}
+LIB_DIR=${SCRIPT_PATH%/*/*}/lib
 # shellcheck source=../lib/common.sh
-source "$LIB_DIR/common.sh"
+source "$LIB_DIR/common.sh" || exit 1
 # shellcheck source=../lib/spool.sh
-source "$LIB_DIR/spool.sh"
+source "$LIB_DIR/spool.sh" || exit 1
 
 # The vocabulary the instrumentation spool is allowed to record: the commands
 # this tool publishes and the options it parses, and nothing else. A word that
@@ -24,25 +37,15 @@ source "$LIB_DIR/spool.sh"
 # shellcheck disable=SC2034  # read by lib/spool.sh
 SPOOL_VERBS='recent list post show open url health help'
 # shellcheck disable=SC2034  # read by lib/spool.sh
-SPOOL_FLAGS='since host source severity tag grep limit full json link body-file help h'
-spool_begin feed "$@"
-
-FEED_CONFIG=${FEED_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/feed/config}
-# shellcheck source=/dev/null
-[[ -r $FEED_CONFIG ]] && source "$FEED_CONFIG"
-
-FEED_URL=${FEED_URL:-http://192.168.70.223:1934}
-FEED_URL=${FEED_URL%/}
-FEED_KEY_FILE=${FEED_KEY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/feed/key}
-AS_JSON=0
+SPOOL_FLAGS='since host source severity tag grep limit full json raw format input ignore-case i link body-file help h'
 
 usage() {
-	cat <<'USAGE'
+	print_text <<'USAGE'
 Usage: feed <command> [options]
 
   recent [options]      What happened lately (default: the last 7 days).
   post <title> [opts]   Record that something happened.
-  show <id>             One entry in full.
+  show <id>             One entry in full (also --input FILE|-).
   open                  Print the web URL, token included, for a browser.
   health                Check that the feed service is up.
 
@@ -52,10 +55,13 @@ Options for recent:
   --source NAME         Only entries from this job or agent.
   --severity info|warn|fail
   --tag NAME            Only entries carrying this tag.
-  --grep TEXT           Only entries whose title or body contains TEXT.
-  --limit N             At most N entries (default: 50).
+  --grep TEXT           Only entries whose title or body contains TEXT. The
+                        search ignores case already, so -i and --ignore-case
+                        are accepted and change nothing; --grep=TEXT works too.
+  --limit N             At most N entries (1-1000, default: 50).
   --full                Include the body of each entry.
-  --json                Raw JSON, for a script or an agent.
+  --json                Raw JSON, for a script or an agent (also --raw).
+  --format v2           One homelab/v1 envelope (recent, show and health).
 
 Options for post:
   --severity info|warn|fail   Default: info.
@@ -76,40 +82,219 @@ Examples:
 USAGE
 }
 
+# Help discovery precedes config, telemetry, dependencies and all verb effects.
+# Values of recognized operand options are data, even when spelled --help.
+help_requested() {
+	while [[ ${1:-} == --json || ${1:-} == --raw || ${1:-} == --format=* ]] ||
+		[[ ${1:-} == --format && $# -ge 2 ]]; do
+		if [[ $1 == --format ]]; then shift 2; else shift; fi
+	done
+	local verb=${1:-}
+	case $verb in
+	'' | -h | --help | help) return 0 ;;
+	recent | list | post | show | open | url | health) shift ;;
+	*) return 1 ;;
+	esac
+	while (($#)); do
+		case $1 in
+		-h | --help) return 0 ;;
+		--since | --host | --source | --severity | --tag | --grep | --limit | --link | --body-file | --format | --input)
+			if (($# >= 2)); then shift 2; else shift; fi ;;
+		*) shift ;;
+		esac
+	done
+	return 1
+}
+
+if help_requested "$@"; then usage; exit 0; fi
+
+spool_begin feed "$@"
+
+FEED_CONFIG=${FEED_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/feed/config}
+# shellcheck source=/dev/null
+[[ -r $FEED_CONFIG ]] && source "$FEED_CONFIG"
+require_plain_url FEED_URL "$@"
+
+FEED_URL=${FEED_URL:-http://192.168.70.223:1934}
+FEED_URL=${FEED_URL%/}
+FEED_KEY_FILE=${FEED_KEY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/feed/key}
+AS_JSON=0
+# Internal cache is never an additional environment credential input.
+unset FEED_CREDENTIAL
+SCOPED=0
+
+
+# FEED_TOKEN_HELPER is an executable path, invoked without arguments, emitting
+# one short-lived bearer on stdout. Failure never falls through to the key file.
+# FEED_KEY_FILE may instead point at a private short-lived scoped token file.
+# FEED_IDEMPOTENCY_KEY preserves a producer's logical key across invocations.
 token() {
 	if [[ -n ${FEED_TOKEN:-} ]]; then
 		printf '%s' "$FEED_TOKEN"
 		return 0
+	fi
+	if [[ -n ${FEED_TOKEN_HELPER:-} ]]; then
+		"$FEED_TOKEN_HELPER" </dev/null 2>/dev/null ||
+			spool_refuse no-credential "feed credential helper failed"
+		return
 	fi
 	[[ -r $FEED_KEY_FILE ]] ||
 		spool_refuse no-credential "no feed token: set FEED_TOKEN or write one to $FEED_KEY_FILE (0600)"
 	tr -d '\n' <"$FEED_KEY_FILE"
 }
 
+# A dotted bearer is treated as scoped even if it is malformed. This is a
+# disclosure/defaults precaution, never client-side authorization.
+load_credential() {
+	[[ -z ${FEED_CREDENTIAL+x} ]] || return 0
+	FEED_CREDENTIAL=$(token) || return 1
+	local LC_ALL=C
+	[[ -n $FEED_CREDENTIAL && ${#FEED_CREDENTIAL} -le 16384 && $FEED_CREDENTIAL =~ ^[!-~]+$ ]] ||
+		spool_refuse no-credential "feed credential is empty or malformed"
+	SCOPED=0
+	if [[ $FEED_CREDENTIAL == *.* ]] ||
+		[[ -z ${FEED_TOKEN:-} && -n ${FEED_TOKEN_HELPER:-} ]]; then
+		SCOPED=1
+	fi
+}
+
 request() {
 	local method=$1 path=$2 body=${3:-}
+	# The token first and on its own: a refusal inside the argument list would
+	# only end that substitution, and the request would go out without one.
+	load_credential || exit 1
 	local -a args=(-s --max-time 20 -X "$method"
-		-H "Authorization: Bearer $(token)" "$FEED_URL$path")
+		-H "Authorization: Bearer $FEED_CREDENTIAL" "$FEED_URL$path")
 	[[ -n $body ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
-	curl "${args[@]}" || spool_refuse unreachable "cannot reach the feed at $FEED_URL"
+	if [[ $method == POST ]]; then
+		# curl reuses these exact headers/body on transient HTTP/transport retries.
+		# --fail discards rejection bodies, including before a successful retry.
+		args+=(--fail --retry 2 --retry-delay 1 --retry-max-time 45
+			-H "Idempotency-Key: $POST_KEY")
+	elif [[ -z ${HOMELAB_ERRORS:-} && $path == /api/entries\?* ]]; then
+		# recent must not turn a denied read into an empty success. Raw show
+		# retains its legacy 404 JSON body/status; v2 still reports not_found.
+		args+=(--fail)
+	fi
+	local rc=0
+	if [[ -z ${HOMELAB_ERRORS:-} ]]; then
+		curl "${args[@]}" || rc=$?
+		((rc == 0)) && return 0
+		((rc != 22)) || spool_refuse refused "the feed refused the request"
+		((rc != 28)) || spool_refuse timeout "the feed at $FEED_URL did not answer within 20 seconds"
+		spool_refuse unreachable "cannot reach the feed at $FEED_URL"
+	fi
+	# A --format v2 run: an HTTP failure is reported as one, with its class.
+	local response status
+	response=$(curl -w '\n%{http_code}' "${args[@]}") || rc=$?
+	((rc != 28)) || spool_refuse timeout "the feed at $FEED_URL did not answer within 20 seconds"
+	((rc == 0)) || spool_refuse unreachable "cannot reach the feed at $FEED_URL"
+	status=${response##*$'\n'}
+	case $status in
+	2??) ;;
+	401 | 403) spool_refuse refused "the feed refused the request (HTTP $status)" ;;
+	404) spool_refuse not-found "the feed has nothing at $path (HTTP 404)" ;;
+	*) spool_refuse unreachable "the feed answered HTTP $status for $path" ;;
+	esac
+	printf '%s' "${response%$'\n'*}"
+}
+
+# The options recent recognises. A --grep followed by one of these has no
+# pattern; --help is not among them, because a help-only operand is data.
+recent_option() {
+	case $1 in
+	--since | --host | --source | --severity | --tag | --grep | --grep=* | --limit | --full | --json | --raw | \
+		--format | --format=* | -i | --ignore-case) return 0 ;;
+	esac
+	return 1
+}
+
+# output_flag handles the output options every read verb shares, for the
+# option loops below: it sets OUTPUT and says how many words it used.
+output_flag() {
+	case $1 in
+	--json) [[ $OUTPUT == v2 ]] || OUTPUT=json; AS_JSON=1; FLAG_WORDS=1 ;;
+	--raw) [[ $OUTPUT == v2 ]] || OUTPUT=json; AS_JSON=1; SAW_RAW=1; FLAG_WORDS=1 ;;
+	--format=v2) OUTPUT=v2; FLAG_WORDS=1 ;;
+	--format)
+		[[ ${2:-} == v2 ]] || { OUTPUT=v2; spool_refuse usage "--format takes v2, not '${2:-}'"; }
+		OUTPUT=v2 FLAG_WORDS=2
+		;;
+	--format=*) OUTPUT=v2; spool_refuse usage "--format takes v2, not '${1#--format=}'" ;;
+	*) return 1 ;;
+	esac
 }
 
 cmd_recent() {
 	local since=7d host= source= severity= tag= grep_text= limit=50 full=0
+	local -a forwarded=()
+	# Named in the error line of a refusal below.
+	CONTRACT_COMMAND=recent
 	while (($#)); do
+		if output_flag "$@"; then
+			shift "$FLAG_WORDS"
+			continue
+		fi
 		case $1 in
-		--since) since=$2; shift 2 ;;
-		--host) host=$2; shift 2 ;;
-		--source) source=$2; shift 2 ;;
-		--severity) severity=$2; shift 2 ;;
-		--tag) tag=$2; shift 2 ;;
-		--grep) grep_text=$2; shift 2 ;;
-		--limit) limit=$2; shift 2 ;;
-		--full) full=1; shift ;;
-		--json) AS_JSON=1; shift ;;
+		--since | --host | --source | --severity | --tag)
+			# A filter with no value, or with another option where its value
+			# belongs, is refused like --grep's, never read as an unset $2.
+			if (($# < 2)) || [[ -z $2 ]] || recent_option "$2"; then
+				spool_refuse missing-argument "$1 needs a value: feed recent $1 VALUE"
+			fi
+			case $1 in
+			--since) since=$2 ;;
+			--host) host=$2 ;;
+			--source) source=$2 ;;
+			--severity) severity=$2 ;;
+			--tag) tag=$2 ;;
+			esac
+			forwarded+=("$1" "$2")
+			shift 2
+			;;
+		--grep=*)
+			grep_text=${1#--grep=}
+			[[ -n $grep_text ]] || spool_refuse missing-argument "--grep needs a pattern: feed recent --grep TEXT"
+			forwarded+=(--grep "$grep_text")
+			shift
+			;;
+		--grep)
+			shift
+			# The search already ignores case (feedd matches with SQL LIKE), so
+			# `--grep -i car` means the pattern car.
+			while [[ ${1:-} == -i || ${1:-} == --ignore-case ]]; do shift; done
+			if (($# == 0)) || recent_option "$1"; then
+				spool_refuse missing-argument "--grep needs a pattern: feed recent --grep TEXT"
+			fi
+			grep_text=$1
+			forwarded+=(--grep "$1")
+			shift
+			;;
+		-i | --ignore-case) shift ;;
+		--limit)
+			(($# >= 2)) || spool_refuse usage "--limit needs a number from 1 to 1000"
+			limit=$2
+			shift 2
+			;;
+		--limit=*) limit=${1#--limit=}; shift ;;
+		--full) full=1; forwarded+=("$1"); shift ;;
 		*) spool_refuse unknown-option "unknown option for recent: $1" ;;
 		esac
 	done
+	# A --format v2 run asks its child for one more than the limit, to tell a
+	# full page from a cut one.
+	local most=1000
+	[[ -z ${HOMELAB_CHILD:-} ]] || most=1001
+	# Digits are spelled out: in some locales [0-9] also matches '²'.
+	[[ $limit =~ ^[123456789][0123456789]{0,3}$ ]] && ((10#$limit <= most)) ||
+		spool_refuse usage "--limit must be a whole number from 1 to 1000, not '$limit'"
+
+	if [[ $OUTPUT == v2 ]]; then
+		# One more than the limit, so that a full page says it was cut short.
+		# shellcheck disable=SC2034  # read by contract_run (lib/common.sh)
+		LIMIT=$limit
+		feed_contract items '"feed:entry/\(.id)"' '.id' recent "${forwarded[@]}" --limit "$((limit + 1))"
+	fi
 
 	local query="since=$since&limit=$limit"
 	local name value
@@ -120,7 +305,7 @@ cmd_recent() {
 	[[ -n $grep_text ]] && query+="&grep=$(printf '%s' "$grep_text" | jq -sRr @uri)"
 
 	local entries
-	entries=$(request GET "/api/entries?$query") || exit 1
+	entries=$(request GET "/api/entries?$query" | redact_keys) || exit 1
 
 	if ((AS_JSON)); then
 		printf '%s\n' "$entries"
@@ -144,13 +329,19 @@ cmd_recent() {
 }
 
 cmd_post() {
-	local title= severity=info source=${USER:-agent} host tag= link= body= body_file=
-	host=$(hostname -s 2>/dev/null || hostname)
+	local title= severity=info source= host= tag= link= body= body_file=
+	local source_set=0 host_set=0
+	load_credential || exit 1
+	if ((SCOPED == 0)); then
+		source=${USER:-agent}
+		host=$(hostname -s 2>/dev/null || hostname)
+		source_set=1 host_set=1
+	fi
 	while (($#)); do
 		case $1 in
 		--severity) severity=$2; shift 2 ;;
-		--source) source=$2; shift 2 ;;
-		--host) host=$2; shift 2 ;;
+		--source) source=$2; source_set=1; shift 2 ;;
+		--host) host=$2; host_set=1; shift 2 ;;
 		--tag) tag=$2; shift 2 ;;
 		--link) link=$2; shift 2 ;;
 		--body-file) body_file=$2; shift 2 ;;
@@ -174,14 +365,31 @@ cmd_post() {
 		fi
 	fi
 
+	POST_KEY=${FEED_IDEMPOTENCY_KEY-}
+	if [[ -z ${FEED_IDEMPOTENCY_KEY+x} ]]; then
+		POST_KEY=$(cat /proc/sys/kernel/random/uuid) ||
+			spool_refuse internal "cannot generate a feed idempotency key"
+	fi
+	jq -en --arg key "$POST_KEY" '$key | explode |
+		length >= 1 and length <= 256 and all(.[]; . >= 32 and . <= 126)' >/dev/null ||
+		spool_refuse usage "FEED_IDEMPOTENCY_KEY must be 1-256 printable ASCII bytes"
+
 	local payload
 	payload=$(jq -nc --arg title "$title" --arg severity "$severity" --arg source "$source" \
 		--arg host "$host" --arg tags "$tag" --arg link "$link" --arg body "$body" \
-		'{title: $title, severity: $severity, source: $source, host: $host,
-		  tags: $tags, link: $link, body: $body}')
+		--argjson source_set "$source_set" --argjson host_set "$host_set" \
+		'{title: $title, severity: $severity, tags: $tags, link: $link, body: $body}
+		 + (if $source_set == 1 then {source: $source} else {} end)
+		 + (if $host_set == 1 then {host: $host} else {} end)') ||
+		spool_refuse internal "cannot encode the feed entry"
 
 	local created
-	created=$(request POST /api/entries "$payload") || exit 1
+	created=$(request POST /api/entries "$payload" | redact_keys) || exit 1
+	# Validate before either output path: JSON output is also a delivery claim.
+	jq -e -s 'length == 1 and (.[0] | type == "object" and (has("error") | not)
+		and (.id | type == "number" and . > 0 and . < 9007199254740992 and floor == .))' \
+		>/dev/null 2>&1 <<<"$created" ||
+		spool_refuse refused "the feed did not return a committed entry"
 	if ((AS_JSON)); then
 		printf '%s\n' "$created"
 	else
@@ -196,9 +404,30 @@ cmd_post() {
 }
 
 cmd_show() {
-	local id=${1:?usage: feed show <id>}
+	local -a ids=()
+	while (($#)); do
+		if output_flag "$@"; then
+			shift "$FLAG_WORDS"
+			continue
+		fi
+		case $1 in
+		--input) INPUT=${2:-}; [[ -n $INPUT ]] || spool_refuse usage "--input needs a file, or - for stdin"; shift 2 ;;
+		--input=*) INPUT=${1#--input=}; shift ;;
+		-*) spool_refuse unknown-option "unknown option for show: $1" ;;
+		*) ids+=("$1"); shift ;;
+		esac
+	done
+	((${#ids[@]} <= 1)) || spool_refuse usage "show takes one entry id"
+	# show always printed JSON, so --json asks for the envelope and --raw for
+	# what it printed before.
+	[[ $OUTPUT == json && ${SAW_RAW:-0} == 0 ]] && OUTPUT=v2
+	if [[ $OUTPUT == v2 ]]; then
+		feed_contract item '"feed:entry/\(.id)"' '.id' show "${ids[@]}"
+	fi
+	[[ -z $INPUT ]] || spool_refuse usage "--input needs --format v2"
+	local id=${ids[0]:?usage: feed show <id>}
 	local entry
-	entry=$(request GET "/api/entries/$id") || exit 1
+	entry=$(request GET "/api/entries/$id" | redact_keys) || exit 1
 	# The service answers an entry that does not exist with a 200 response and
 	# an "error" member, so this command exits 0 whether the entry was found or
 	# not and the exit code cannot tell the two apart. The class is therefore
@@ -207,31 +436,111 @@ cmd_show() {
 	# signal, and the class is a literal in this script.
 	if [[ $(jq -r 'if type == "object" and has("error") then "yes" else "no" end' <<<"$entry" 2>/dev/null) == yes ]]; then
 		spool_class not-found
+		# A --format v2 run reports the missing entry as what it is.
+		[[ -z ${HOMELAB_ERRORS:-} ]] || die_class not_found "no feed entry $id" "feed recent lists the entries there are"
 	fi
 	jq . <<<"$entry"
 }
 
 cmd_open() {
-	printf '%s/?token=%s\n' "$FEED_URL" "$(token)"
+	# A refused token is recorded and printed by token, and open still exits 0
+	# with an empty token, as it always has (test/feed.test.sh).
+	if [[ -z ${FEED_TOKEN:-} && -n ${FEED_TOKEN_HELPER:-} ]]; then
+		spool_refuse refused "feed open refuses scoped credentials; use feed recent"
+	fi
+	local value
+	value=$(token)
+	if [[ $value == *.* ]]; then
+		spool_refuse refused "feed open refuses scoped credentials; use feed recent"
+	fi
+	printf '%s/?token=%s\n' "$FEED_URL" "$value"
 }
 
 cmd_health() {
-	local response
-	response=$(curl -s --max-time 10 "$FEED_URL/healthz") ||
-		spool_refuse unreachable "the feed at $FEED_URL is not answering"
-	printf '%s %s\n' "$FEED_URL" "$response"
+	while (($#)); do
+		output_flag "$@" || spool_refuse unknown-option "health takes no options"
+		shift "$FLAG_WORDS"
+	done
+	# health had no JSON before: --json is the envelope, --raw the bare object.
+	[[ $OUTPUT == json && ${SAW_RAW:-0} == 0 ]] && OUTPUT=v2
+	if [[ $OUTPUT == v2 ]]; then
+		feed_contract data '' null health
+	fi
+	local response rc=0
+	if [[ $OUTPUT == text ]]; then
+		response=$(curl -s --max-time 10 "$FEED_URL/healthz") ||
+			spool_refuse unreachable "the feed at $FEED_URL is not answering"
+		if jq --stream empty >/dev/null 2>&1 <<<"$response"; then
+			response=$(redact_keys <<<"$response" 2>/dev/null) ||
+				spool_refuse internal "cannot safely parse feed health response"
+		fi
+		printf '%s %s\n' "$FEED_URL" "$response"
+		return
+	fi
+	response=$(curl -s --max-time 10 -w '\n%{http_code}' "$FEED_URL/healthz") || rc=$?
+	((rc != 28)) || spool_refuse timeout "the feed at $FEED_URL did not answer within 10 seconds"
+	((rc == 0)) || spool_refuse unreachable "the feed at $FEED_URL is not answering"
+	local status=${response##*$'\n'}
+	response=${response%$'\n'*}
+	[[ $status == 2?? ]] || spool_refuse unreachable "the feed at $FEED_URL answered HTTP $status"
+	# Validate deep JSON before fromjson can fall back to an opaque string.
+	if jq --stream empty >/dev/null 2>&1 <<<"$response"; then
+		response=$(redact_keys <<<"$response" 2>/dev/null) ||
+			spool_refuse internal "cannot safely parse feed health response"
+	fi
+	local endpoint=$FEED_URL
+	jq -cn --arg endpoint "$endpoint" --arg response "$response" \
+		'{endpoint: $endpoint, response: ($response | fromjson? // $response)}' | redact_keys
+	return
+}
+
+# feed_contract <shape> <target> <revision> <command> [args...]: run one read
+# for --format v2 through lib/common.sh and exit.
+# shellcheck disable=SC2034  # the C_* settings are read by contract_run (lib/common.sh)
+feed_contract() {
+	C_SHAPE=$1 C_TARGET=$2 C_REVISION=$3
+	shift 3
+	C_BACKEND=feed-http C_TRANSPORT=${FEED_URL%%://*} C_ENDPOINT=$FEED_URL C_KIND=''
+	[[ $1 == show ]] && C_KIND=feed:entry
+	contract_run "$@"
 }
 
 need curl jq column
 
+# The output options may come before the verb as well as after it.
+leading=()
+while [[ ${1:-} == --json || ${1:-} == --raw || ${1:-} == --format=* ]] ||
+	[[ ${1:-} == --format && $# -ge 2 ]]; do
+	if [[ $1 == --format ]]; then
+		leading+=("$1" "$2")
+		shift 2
+	else
+		leading+=("$1")
+		shift
+	fi
+done
 command=${1:-}
 (($#)) && shift || true
+set -- "$@" "${leading[@]}"
+
+# --format v2 is for reads; a write refuses it before doing anything.
+case $command in
+recent | list | show | health | '' | -h | --help | help) ;;
+*)
+	for arg in "$@"; do
+		if [[ $arg == --format || $arg == --format=* ]]; then
+			OUTPUT=v2
+			spool_refuse usage "feed $command is not a read; --format v2 covers recent, show and health"
+		fi
+	done
+	;;
+esac
 
 case $command in
 recent | list) cmd_recent "$@" ;;
 post) cmd_post "$@" ;;
 show) cmd_show "$@" ;;
-open | url) cmd_open "$@" ;;
+open | url) (($# == 0)) || spool_refuse unknown-option "open takes no options"; cmd_open ;;
 health) cmd_health "$@" ;;
 '' | -h | --help | help) usage ;;
 *) spool_refuse unknown-command "unknown command: $command (try --help)" ;;
