@@ -13,7 +13,7 @@ import { send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, type Request } from
 export function argumentsFor(args: string[]) {
   let host: string | undefined; let gpu = false; let noQueue = false; let queueTimeout = 3600; const artifacts: string[] = [];
   let i = args[0] === 'exec' ? 1 : -1;
-  if (i < 0) throw new Error('usage: chaldea exec [--host H] [--artifact PATH] [--gpu] -- CMD...');
+  if (i < 0) throw new Error('usage: chaldea exec [--host H] [--queue-timeout 1h] [--no-queue] [--artifact PATH] [--gpu] -- CMD...');
   while (i < args.length && args[i] !== '--') {
     const flag = args[i++];
     if (flag === '--host') { host = args[i++]; if (!host) throw new Error('invalid exec arguments'); }
@@ -22,7 +22,7 @@ export function argumentsFor(args: string[]) {
     else if (flag === '--no-queue') noQueue = true;
     else if (flag === '--queue-timeout') {
       const match = /^(\d+(?:\.\d+)?)(ms|s|m|h)?$/.exec(args[i++] ?? '');
-      queueTimeout = match ? Number(match[1]) * ({ ms: .001, s: 1, m: 60, h: 3600 }[match[2] ?? 's']!) : NaN;
+      queueTimeout = match ? Number(match[1]) * (({ ms: .001, s: 1, m: 60, h: 3600 } as Record<string, number>)[match[2] ?? 's']!) : NaN;
       if (!Number.isFinite(queueTimeout) || queueTimeout <= 0 || queueTimeout > 86400) throw new Error('invalid queue timeout (0 < duration <= 24h)');
     }
     else throw new Error('unknown option: ' + flag);
