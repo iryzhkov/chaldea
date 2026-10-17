@@ -30,12 +30,13 @@ export function argumentsFor(args: string[]) {
 const validHost = (host: string) => /^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$/.test(host);
 export const EXIT_UNAVAILABLE = 69;
 
-// Entries are bare names: SSH uses the existing chaldea-job-NAME aliases.
+// Entries are fleet inventory names with existing chaldea-job-NAME aliases.
 export function hostsFor(text: string) {
   const hosts = text.split(/\r?\n/).map(x => x.trim()).filter(x => x && !x.startsWith('#'));
   if (hosts.some(x => !validHost(x))) throw new Error('invalid host in exec-hosts');
   return hosts.filter((x, i) => hosts.findIndex(h => h.toLowerCase() === x.toLowerCase()) === i);
 }
+// Fleet config omits this host's inventory name; hostname matching is a backstop.
 export function isLocalHost(host: string, local = hostname()) {
   return host.toLowerCase() === local.split('.')[0].toLowerCase();
 }
@@ -66,7 +67,7 @@ export async function staleControl(config: string, host: string) {
   if (!before.isSocket()) throw new Error('SSH control path is not a socket');
   try { execFileSync('ssh', ['-F', config, '-O', 'check', host], { timeout: 1000, stdio: 'pipe' }); }
   catch (e: any) {
-    if (e.status !== 255) throw new Error('SSH control master did not answer; no job dispatched');
+    if (e.status !== 255) throw new RetryableFailure('SSH control master did not answer; no job dispatched');
     try {
       const after = await fs.lstat(path);
       if (after.ino === before.ino && after.dev === before.dev) await fs.unlink(path);
@@ -84,11 +85,19 @@ async function refuseConcurrent(options: ReturnType<typeof argumentsFor> & { hos
   throw new RetryableFailure('host ' + options.host + ' refused: another local chaldea exec is running; nothing dispatched; journal ' + join(journal, intent.jobId + '.json'), 'another local chaldea exec is running');
 }
 
+async function configuredHosts() {
+  const path = process.env.CHALDEA_EXEC_HOSTS ?? join(homedir(), '.config/chaldea/exec-hosts');
+  try { return hostsFor(await fs.readFile(path, 'utf8')); }
+  catch (e: any) {
+    if (e.code === 'ENOENT') throw new Error(oneLine('missing exec host list ' + path + '; --host H works without it'));
+    throw e;
+  }
+}
+
 export async function run(args: string[]): Promise<number> {
   const options = argumentsFor(args);
   const automatic = options.host === undefined;
-  const hosts = automatic ? hostsFor(await fs.readFile(process.env.CHALDEA_EXEC_HOSTS ??
-    join(homedir(), '.config/chaldea/exec-hosts'), 'utf8')) : [options.host!];
+  const hosts = automatic ? await configuredHosts() : [options.host!];
   const failures: string[] = [];
   for (const host of hosts) {
     let reason: string;
@@ -141,7 +150,14 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   const controls = join(state, 'ssh');
   await fs.mkdir(controls, { recursive: true, mode: 0o700 });
   const config = process.env.CHALDEA_SSH_CONFIG ?? join(homedir(), '.ssh/chaldea-job.conf');
-  await staleControl(config, 'chaldea-job-' + options.host);
+  try { await staleControl(config, 'chaldea-job-' + options.host); }
+  catch (e) {
+    if (!automatic || !(e instanceof RetryableFailure)) throw e;
+    const refused: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
+      started: new Date().toISOString(), outcome: 'refused' };
+    await record(journal, refused);
+    throw new RetryableFailure(e.message + '; inspect journal ' + join(journal, refused.jobId + '.json'), e.reason);
+  }
   const jobId = randomUUID();
   const intent: Intent = { jobId, host: options.host, argv: options.argv,
     started: new Date().toISOString(), pid: process.pid, bootId: BOOT_ID, outcome: 'uncertain',
@@ -153,7 +169,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   const ssh = spawn('ssh', ['-F', config, '-T', '-a', '-x',
     '-o', 'BatchMode=yes', '-o', 'IdentityAgent=none', '-o', 'IdentitiesOnly=yes',
     '-o', 'ClearAllForwardings=yes', '-o', 'ForwardAgent=no', '-o', 'RequestTTY=no',
-    '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60',
+    '-o', 'ControlMaster=auto', '-o', 'ControlPersist=60', '-o', 'ConnectTimeout=10',
     'chaldea-job-' + options.host, 'chaldea-exec-v0'], { stdio: ['pipe', 'pipe', 'pipe'] });
   const exit = new Promise<number | null>((resolve, reject) => { ssh.once('error', reject); ssh.once('close', resolve); });
   void exit.catch(() => {}); // spawn errors can precede the first protocol read

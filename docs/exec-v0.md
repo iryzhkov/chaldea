@@ -8,8 +8,8 @@ as `-- sh -c '...'` when the build needs one; that shell runs inside the sandbox
 SSH itself never grants a shell.
 
 Without `--host`, read `~/.config/chaldea/exec-hosts` in order. Fleet config
-writes one bare host name per line, resolving to `chaldea-job-NAME` in
-`~/.ssh/chaldea-job.conf`, for example:
+writes inventory names whose `chaldea-job-NAME` alias exists in
+`~/.ssh/chaldea-job.conf`, one name per line, for example:
 
 ```text
 agent-a
@@ -18,17 +18,20 @@ omarchy-pc
 laptop
 ```
 
-Use the laptop's actual enrolled hostname in the last line. Blank lines and
-whole-line `#` comments are allowed; duplicate names are tried once. Skip this
-machine's short hostname. Each skipped host prints its reason, and a confirmed
-job result prints the host used. Fall through only on a confirmed refusal before
+Fleet config omits each machine's own inventory name from its list; the client
+also skips its short OS hostname as a backstop. Blank lines and whole-line `#`
+comments are allowed; duplicate names are tried once. Each skipped host prints
+its reason, and a confirmed job result prints the host used. Fall through only on a confirmed refusal before
 execution (busy, gaming gate, or unavailable sandbox), a local target lock held
-by another exec, or a connection closed before sending the job request.
+by another exec, a stuck SSH ControlMaster, or a connection closed before sending
+the job request. SSH connection setup times out after 10 seconds.
+Server-refusal fallback relies on the server never sending `refused` once a job has launched.
 After any request write, connection loss stays uncertain and is never retried;
 preemption and protocol errors also stop the invocation. Every attempted host
 has its own journal entry. All targets unavailable exits **69**, with a one-line
 host/reason summary, without waiting or queuing. An explicit `--host H` attempts
-only H and keeps the existing status/error behavior.
+only H and keeps the existing status/error behavior. If the list file is missing,
+use `--host H` to target a host without it.
 
 
 Use Node **26.10.0** (`mise install`), `npm ci`, then

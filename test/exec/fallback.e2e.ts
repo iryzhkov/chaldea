@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
+import net from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 const cli = fileURLToPath(new URL('../../bin/chaldea', import.meta.url));
@@ -25,17 +26,36 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   execFileSync('git', ['init', '-q', work]);
   await fs.writeFile(join(work, 'input'), 'snapshot');
   const script = join(root, 'fake-ssh.mjs'); const log = join(root, 'attempts');
+  const control = join(root, 'control');
+  const sockets = new Set<net.Socket>();
+  const listener = net.createServer(socket => {
+    sockets.add(socket);
+    socket.on('data', () => {}); // Consume the banner, but never answer SSH setup.
+    socket.on('close', () => sockets.delete(socket));
+  });
+  let port = 0;
+  if (Object.values(modes).includes('connect-hang')) {
+    await new Promise<void>(r => listener.listen(0, '127.0.0.1', r));
+    port = (listener.address() as net.AddressInfo).port;
+  } else if (Object.values(modes).includes('stuck-control')) {
+    await new Promise<void>(r => listener.listen(control, r));
+  }
+  const sshConfig = join(root, 'ssh.conf');
+  await fs.writeFile(sshConfig, 'Host *\n  HostName 127.0.0.1\n  Port ' + port + '\n  ControlPath none\n');
+  const realSsh = execFileSync('sh', ['-c', 'command -v ssh'], { encoding: 'utf8' }).trim();
   await fs.writeFile(script, [
     "import fs from 'node:fs';",
     "import { spawnSync } from 'node:child_process';",
     'import { frame, frames, json, VERSION } from ' + JSON.stringify(protocol) + ';',
     'const args = process.argv.slice(2);',
-    'if (args.includes("-G")) { console.log("controlpath none"); process.exit(0); }',
-    'const host = args.at(-2).replace("chaldea-job-", "");',
+    'const host = (args.includes("-G") || args.includes("-O") ? args.at(-1) : args.at(-2)).replace("chaldea-job-", "");',
     'const mode = JSON.parse(process.env.FAKE_MODES)[host] ?? "ok";',
     'const log = event => fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({host,event})+"\\n");',
     'const send = (type, value) => process.stdout.write(frame(type, json(value)));',
+    'if (args.includes("-G")) { console.log("controlpath " + (mode === "stuck-control" ? process.env.FAKE_CONTROL : "none")); process.exit(0); }',
+    'if (args.includes("-O") && mode === "stuck-control") { log("control-check"); await new Promise(r => setTimeout(r, 30000)); process.exit(0); }',
     'log("connected");',
+    'if (mode === "connect-hang") { process.execve(process.env.FAKE_REAL_SSH, [process.env.FAKE_REAL_SSH, ...args], process.env); }',
     'if (mode === "unreachable") process.exit(255);',
     'if (mode === "busy") { send("R", {outcome:"refused",message:"busy"}); process.exit(0); }',
     'send("H", {version: mode === "invalid" ? 2 : VERSION});',
@@ -61,8 +81,8 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   const hostFile = join(root, 'hosts');
   await fs.writeFile(hostFile, hosts.join('\n') + '\n');
   const env = { ...process.env, PATH: root + ':' + process.env.PATH, CHALDEA_STATE_DIR: state,
-    CHALDEA_EXEC_HOSTS: hostFile, CHALDEA_SSH_CONFIG: join(root, 'ssh.conf'),
-    FAKE_MODES: JSON.stringify(modes), FAKE_LOG: log };
+    CHALDEA_EXEC_HOSTS: hostFile, CHALDEA_SSH_CONFIG: sshConfig,
+    FAKE_MODES: JSON.stringify(modes), FAKE_LOG: log, FAKE_CONTROL: control, FAKE_REAL_SSH: realSsh };
   return {
     state, hostFile,
     run: (host?: string, code = 0) => spawn(process.execPath,
@@ -71,7 +91,11 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     events: async () => (await fs.readFile(log, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(x => JSON.parse(x)),
     intents: async () => Promise.all((await fs.readdir(join(state, 'journal'))).filter(x => x.endsWith('.json')).map(async x =>
       JSON.parse(await fs.readFile(join(state, 'journal', x), 'utf8')))),
-    remove: () => fs.rm(root, { recursive: true, force: true }),
+    remove: async () => {
+      for (const socket of sockets) socket.destroy();
+      if (listener.listening) await new Promise<void>((r, reject) => listener.close(e => e ? reject(e) : r()));
+      await fs.rm(root, { recursive: true, force: true });
+    },
   };
 }
 
@@ -164,4 +188,52 @@ test('target locks allow different hosts, auto skips a busy local target, SIGKIL
   } finally {
     holder.kill('SIGKILL'); await exited; await f.remove();
   }
+});
+
+test('SSH setup to a silent host times out in ten seconds and falls through', { timeout: 25000 }, async () => {
+  const f = await fixture({ 'fake-a': 'connect-hang' });
+  const child = f.run();
+  try {
+    const start = performance.now();
+    const r = await collected(child);
+    const elapsed = performance.now() - start;
+    assert.equal(r.code, 0, r.err);
+    assert.ok(elapsed >= 9000 && elapsed < 16000, 'SSH setup elapsed ' + elapsed + ' ms');
+    assert.match(r.err, /skipped fake-a: connection closed before job request/);
+    assert.match(r.err, /ran on fake-b/);
+    assert.deepEqual((await f.events()).filter(e => e.event === 'requested').map(e => e.host), ['fake-b']);
+    assert.deepEqual((await f.intents()).map(i => [i.host, i.outcome]).sort(), [['fake-a', 'refused'], ['fake-b', 'finished']]);
+  } finally { child.kill('SIGKILL'); await f.remove(); }
+});
+
+test('stuck ControlMaster journals non-dispatch and falls through only in auto mode', { timeout: 10000 }, async () => {
+  const f = await fixture({ 'fake-a': 'stuck-control' });
+  try {
+    const automatic = await collected(f.run());
+    assert.equal(automatic.code, 0, automatic.err);
+    assert.match(automatic.err, /skipped fake-a: SSH control master did not answer; no job dispatched/);
+    assert.match(automatic.err, /ran on fake-b/);
+    assert.deepEqual((await f.intents()).map(i => [i.host, i.outcome]).sort(), [['fake-a', 'refused'], ['fake-b', 'finished']]);
+    assert.deepEqual((await f.events()).filter(e => e.event === 'connected').map(e => e.host), ['fake-b']);
+    const explicit = await collected(f.run('fake-a'));
+    assert.equal(explicit.code, 255, explicit.err);
+    assert.match(explicit.err, /SSH control master did not answer; no job dispatched/);
+    assert.doesNotMatch(explicit.err, /skipped|ran on/);
+    assert.equal((await f.intents()).length, 2);
+  } finally { await f.remove(); }
+});
+
+test('missing host list names the path and explicit-host escape hatch in one line', { timeout: 10000 }, async () => {
+  const f = await fixture({});
+  try {
+    await fs.unlink(f.hostFile);
+    const r = await collected(f.run());
+    assert.equal(r.code, 255); assert.equal(r.out, '');
+    assert.equal(r.err, 'chaldea: missing exec host list ' + f.hostFile + '; --host H works without it\n');
+    assert.deepEqual(await f.events(), []);
+    await assert.rejects(fs.access(join(f.state, 'journal')), { code: 'ENOENT' });
+    const explicit = await collected(f.run('fake-a'));
+    assert.equal(explicit.code, 0, explicit.err); assert.equal(explicit.out, 'ran\n');
+    assert.equal((await f.intents()).length, 1);
+  } finally { await f.remove(); }
 });
