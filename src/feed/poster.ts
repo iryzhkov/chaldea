@@ -157,14 +157,16 @@ export class FeedPoster {
       if (!next) return;
       const [key, item] = next;
       attempted.add(key);
+      let acknowledging = false;
       try {
         const ok = await this.#queue.deliver(key, async value => {
           if (this.#akasha) return (this.#options.deliver ?? ((e) => publish(e, this.#options.publisher)))(quotaPublication(value.record, this.#options.host));
           await legacyAttempt(this.#options, value.record); return true;
-        }, value => value.ack?.());
+        }, value => { acknowledging = true; return value.ack?.(); });
         if (ok && this.#akasha) this.#options.logger.info("posted feed record", { kind: item.record.kind });
         else if (!ok && this.#akasha) this.#options.logger.warn("event delivery deferred; durable intent retained", { kind: item.record.kind });
-      } catch {
+      } catch (error) {
+        if (this.#akasha && acknowledging) throw error;
         this.#options.logger.warn("event delivery deferred; durable intent retained", { kind: item.record.kind });
       }
     }

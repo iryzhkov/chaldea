@@ -7,7 +7,7 @@ export function backoff(attempt: number, policy: RetryPolicy = RETRY, random = M
     ? policy.delays[Math.min(n, policy.delays.length - 1)]!
     : Math.min(policy.cap, policy.base * 2 ** Math.min(n, policy.exponent ?? 30));
   const jitter = policy.jitter ?? RETRY.jitter;
-  return ceiling * (1 - jitter + jitter * random());
+  return Math.ceil(ceiling * (1 - jitter + jitter * random()));
 }
 export function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise(resolve => {

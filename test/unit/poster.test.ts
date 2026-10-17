@@ -25,6 +25,13 @@ test("an ambiguous delivery remains queued and retries the same payload and key"
     assert.equal(ack, 1); assert.ok(seen.length >= 2); assert.equal(new Set(seen).size, 1);
   } finally { poster.close(); }
 });
+test("scoped acknowledgement exceptions still escape the worker without discarding its payload", async () => {
+  const poster = new FeedPoster({ command: "", host: "agent-a", logger, deliver: async () => true });
+  try {
+    poster.enqueue(record, () => { throw new Error("ack failure"); });
+    await assert.rejects(poster.idle(), /ack failure/);
+  } finally { poster.close(); }
+});
 test("delivery does not block enqueue; a full worker retains the caller's durable intents", async () => {
   let finish!: (v: boolean) => void; let ack = 0, warnings = 0;
   const poster = new FeedPoster({ command: "", host: "agent-a",

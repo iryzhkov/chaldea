@@ -111,6 +111,20 @@ test("retry jitter respects caller caps, tables and aborts without leaving a tim
   assert.equal(backoff(0, undefined, () => 0), 125);
   assert.equal(backoff(100, undefined, () => 1), 30_000);
   assert.equal(backoff(1, { base: 1, cap: 60, delays: [1000, 5000] }, () => 0), 2500);
+  const db = new DatabaseSync(":memory:");
+  try {
+    db.exec("CREATE TABLE due(next_at INTEGER)");
+    for (const policy of [undefined, { base: 1, cap: 60, exponent: 6 }, { base: 1000, cap: 60_000, delays: [1000, 2000, 5000] }]) {
+      for (const attempt of [0, 1, 3, 20]) {
+        for (const draw of [0, 0.0137, 0.41421356, 0.999999]) {
+          const delay = backoff(attempt, policy, () => draw);
+          assert.ok(Number.isInteger(delay));
+          db.prepare("INSERT INTO due VALUES(?)").run(1_790_000_000 + delay);
+        }
+      }
+    }
+    assert.equal(db.prepare("SELECT count(*) AS n FROM due WHERE typeof(next_at)<>'integer'").get()!.n, 0);
+  } finally { db.close(); }
   const controller = new AbortController();
   const waiting = sleep(60_000, controller.signal); controller.abort(); await waiting;
   await sleep(60_000, controller.signal);
