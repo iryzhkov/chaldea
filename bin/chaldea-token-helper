@@ -1,0 +1,4 @@
+#!/bin/sh
+# Install root-owned at /usr/local/bin/chaldea-token-helper.
+# sudoers must grant only the fixed command below, with NOSETENV.
+exec /usr/bin/sudo -n -u chaldea-issuer -- /opt/chaldea/app/packaging/token-helper/issuer-command "$@"

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Only this root-owned file may appear in sudoers. sudo sets SUDO_UID.
+exec /usr/bin/env -i PATH=/usr/bin:/bin SUDO_UID="${SUDO_UID-}" /opt/chaldea/node/bin/node /opt/chaldea/app/bin/chaldea access token-helper "$@"

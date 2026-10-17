@@ -7,13 +7,15 @@ import { audienceName, exact, object, requireAccess, seconds, strictJson, verify
 
 const USAGE = `Usage:
   chaldea access initialize-state|clock-health|install-bundle|sign-bundle --help
+  chaldea-token-helper --audience akasha --action append|read --source SOURCE --host HOST --kind KIND
   chaldea access verify --token-file PATH --bundle-file PATH --anchor-file PATH
     --state-file PATH [--initialize-state] --clock-health-file PATH --audience SERVICE --resource RESOURCE --action ACTION
 
 Offline verification only. The state directory must be private (0700).
 Anchor file: JSON array [{kid,public_key:{kty:"OKP",crv:"Ed25519",x}}].
 Clock-health file: {healthy,offsetSeconds,checked_at}; monitored outside the sandbox,
-refreshed within 30 seconds. No key generation, admission or mint endpoint.
+refreshed within 30 seconds. Token helper requires the issuer UID and sudo caller grants;
+see docs/token-helper.md. No key generation or general mint endpoint.
 `;
 function readTrusted(path: string, max: number, privateFile = false): Buffer {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -28,6 +30,10 @@ export async function accessCli(
   args: readonly string[],
   io = { out: (text: string) => { process.stdout.write(text); }, err: (text: string) => { process.stderr.write(text); } },
 ): Promise<number> {
+  if (args[0] === "token-helper") {
+    const { tokenHelperCli } = await import("./helper.ts");
+    return tokenHelperCli(args.slice(1), io);
+  }
   if (["initialize-state", "clock-health", "install-bundle", "sign-bundle"].includes(args[0] ?? "")) {
     const { maintenanceCli } = await import("./maintenance.ts");
     return maintenanceCli(args);
