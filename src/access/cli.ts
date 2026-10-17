@@ -5,6 +5,7 @@ import type { TrustAnchor } from "./trust.ts";
 import { audienceName, exact, object, requireAccess, seconds, strictJson, verifyToken } from "./token.ts";
 
 const USAGE = `Usage:
+  chaldea access initialize-state|clock-health|install-bundle|sign-bundle --help
   chaldea access verify --token-file PATH --bundle-file PATH --anchor-file PATH
     --state-file PATH [--initialize-state] --clock-health-file PATH --audience SERVICE --resource RESOURCE --action ACTION
 
@@ -26,6 +27,10 @@ export async function accessCli(
   args: readonly string[],
   io = { out: (text: string) => { process.stdout.write(text); }, err: (text: string) => { process.stderr.write(text); } },
 ): Promise<number> {
+  if (["initialize-state", "clock-health", "install-bundle", "sign-bundle"].includes(args[0] ?? "")) {
+    const { maintenanceCli } = await import("./maintenance.ts");
+    return maintenanceCli(args);
+  }
   let state: AccessState | undefined;
   try {
     const { values, positionals } = parseArgs({
