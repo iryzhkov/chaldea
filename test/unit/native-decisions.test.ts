@@ -156,7 +156,7 @@ test("older native tables acquire schema and item columns without losing committ
   try{
     const row=store.register(store.prepare("native",{...input(),runtimeRequestId:"r"}),"project",null);store.close();
     const old=new DatabaseSync(path);
-    try{old.exec("ALTER TABLE native_decisions DROP COLUMN questions; ALTER TABLE native_decisions DROP COLUMN turn_item");}finally{old.close();}
+    try{old.exec("ALTER TABLE native_decisions DROP COLUMN questions; ALTER TABLE native_decisions DROP COLUMN turn_item; PRAGMA user_version=0");}finally{old.close();}
     store=new WakeStore(path,"env");const policy=store.native(row.id);
     assert.equal(policy.request_id,"r");assert.equal(policy.questions,null);assert.equal(policy.turn_item,null);
     assert.equal(store.get(row.id).state,"parked");
