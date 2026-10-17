@@ -9,7 +9,7 @@ import { startDisposableT3, t3Version } from "../helpers/disposable-t3.ts";
 import { dispatchMessage, FEED_RECORDER, readFeed, ShellWatcher, waitFor, writePrivateFile } from "../helpers/e2e.ts";
 import { scratchDir, SCRATCH_ROOT } from "../helpers/scratch.ts";
 import { createLogger } from "../../src/log.ts";
-import { captureRestart, recoverPlannedRestarts, RestartJournal, restartConfig, restartT3 } from "../../src/t3/restart.ts";
+import { captureRestart, recoverPlannedRestarts, RestartJournal, restartConfig, restartT3, runtimeEpoch, waitForRestart } from "../../src/t3/restart.ts";
 import { restartMessageId, restartProjection } from "../../src/t3/restart-port.ts";
 import { withClient } from "../../src/t3/adapter.ts";
 import type { QuotaRecord } from "../../src/quota/observer.ts";
@@ -48,7 +48,11 @@ async function fixture(native = false) {
       }
       return (await projection())!.run!;
     },
-    async restart(prepare?: () => void) { await watcher.close(); await t3.stopServer(); prepare?.(); await t3.startServer(); },
+    async restart(prepare?: () => void) {
+      const epoch = runtimeEpoch(t3.baseDir);
+      await watcher.close(); await t3.stopServer(); prepare?.(); await t3.startServer();
+      await waitForRestart(options, epoch);
+    },
     async close() { journal.close(); await watcher.close(); await t3.stop(); dir.remove(); },
   };
 }
