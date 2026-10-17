@@ -61,7 +61,7 @@ export function loadHeadroomConfig(home: string, path?: string): HeadroomConfig 
 export const contextKey = (c: CodexContext): string => JSON.stringify([c.home, c.codexHome, c.command]);
 
 export class BalanceReadError extends Error {
-  readonly code: "unavailable" | "timeout" | "protocol" | "rate_limited" | "aborted";
+  readonly code: "spawn_failed" | "unavailable" | "timeout" | "protocol" | "rate_limited" | "aborted";
   constructor(code: BalanceReadError["code"]) { super(code); this.code = code; }
 }
 
@@ -100,7 +100,7 @@ export function readCodexBalance(context: CodexContext, signal: AbortSignal, tim
     };
     const send = (message: unknown) => child.stdin.write(JSON.stringify(message) + "\n");
     child.stdin.on("error", () => stop(new BalanceReadError("unavailable")));
-    child.once("error", () => { failure = new BalanceReadError("unavailable"); finish(); });
+    child.once("error", () => { failure = new BalanceReadError("spawn_failed"); finish(); });
     child.once("close", finish);
     let initialized = false;
     child.stdout.on("data", (chunk: Buffer) => {

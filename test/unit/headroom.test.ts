@@ -187,6 +187,85 @@ test("one startup read per matching context, shared aliases, single-flight, jitt
   now += COLLECT_EVERY_MS; await failing.tick(); assert.equal(failures, 2);
   assert.equal(failing.state.providers[0]?.credits.error, "rate_limited"); await failing.close();
 });
+test("missing published runtime home reports one sanitized rejection and recovers when bound", async () => {
+  const { runtimeHome, ...missingHome } = provider();
+  const diagnostics: unknown[] = [];
+  let reads = 0;
+  const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
+  const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => START,
+    save() {}, diagnostic: d => diagnostics.push(d), read: async () => { reads++; return response; } });
+  try {
+    m.update([missingHome]); await m.tick();
+    assert.equal(reads, 0);
+    assert.equal(m.state.providers[0]?.credits.error, "runtime_home_unknown");
+    assert.deepEqual(diagnostics, [{ provider: "codex", reason: "runtime_home_unknown" }]);
+    const text = humanStatus(m.state, START).split("\n").find(line => line.includes("aggregate credits"));
+    assert.match(text!, /reason runtime_home_unknown/);
+    assert.doesNotMatch(text!, /observed never/);
+    m.update([missingHome]); await m.tick(); await m.tick();
+    assert.equal(diagnostics.length, 1);
+    m.update([provider()]); await m.tick();
+    assert.equal(reads, 1); assert.equal(m.state.providers[0]?.credits.error, null);
+    assert.equal(m.state.providers[0]?.credits.value?.balance, response.rateLimitsByLimitId.codex.credits.balance);
+    assert.doesNotMatch(JSON.stringify(diagnostics), /scratch|PRIVATE|account|codexHome|runtimeHome/);
+  } finally { await m.close(); }
+});
+
+test("every rejected binding has a stable status reason without a read or repeated logs", async () => {
+  const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
+  const cases: Array<{ reason: string; p?: SwitchProvider; local?: boolean }> = [
+    { reason: "provider_not_found" },
+    { reason: "provider_driver_mismatch", p: { ...provider(), driver: "claudeAgent" } },
+    { reason: "provider_disabled", p: { ...provider(), enabled: false } },
+    { reason: "provider_not_installed", p: { ...provider(), installed: false } },
+    { reason: "provider_unavailable", p: { ...provider(), availability: "unavailable" } },
+    { reason: "auth_not_authenticated", p: { ...provider(), auth: { status: "unauthenticated" } } },
+    { reason: "auth_type_not_chatgpt", p: { ...provider(), auth: { status: "authenticated", type: "apiKey" } } },
+    { reason: "instance_environment_unsupported", p: { ...provider(), quotaContextBlocked: true } },
+    { reason: "runtime_home_mismatch", p: provider("codex", "/PRIVATE_CONTEXT") },
+    { reason: "remote_t3", p: provider(), local: false },
+  ];
+  for (const c of cases) {
+    const diagnostics: unknown[] = [];
+    const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: c.local ?? true, now: () => START,
+      save() {}, diagnostic: d => diagnostics.push(d), read: async () => assert.fail("rejected read") });
+    try {
+      for (let i = 0; i < 3; i++) { m.update(c.p ? [c.p] : []); await m.tick(); }
+      assert.equal(m.state.providers.find(p => p.alias === "codex")?.credits.error, c.reason);
+      assert.deepEqual(diagnostics, [{ provider: "codex", reason: c.reason }]);
+      assert.doesNotMatch(JSON.stringify(statusSnapshot(m.state, START)) + JSON.stringify(diagnostics), /PRIVATE_CONTEXT|scratch/);
+    } finally { await m.close(); }
+  }
+  const unconfigured = new HeadroomMonitor({ state: emptyHeadroom(), config: headroomConfig(), local: true,
+    now: () => START, save() {}, read: async () => assert.fail("unconfigured read") });
+  try { unconfigured.update([provider()]); await unconfigured.tick();
+    assert.equal(unconfigured.state.providers[0]?.credits.error, "context_not_configured");
+  } finally { await unconfigured.close(); }
+});
+
+test("read diagnostics are bounded, redact failures, and cannot overwrite a new rejection", async () => {
+  const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
+  let now = START, reject!: (error: Error) => void;
+  const diagnostics: unknown[] = [];
+  const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => now, random: () => 0.5,
+    save() {}, diagnostic: d => diagnostics.push(d), read: () => new Promise((_, r) => { reject = r; }) });
+  try {
+    m.update([provider()]); const flight = m.tick();
+    m.update([{ ...provider(), enabled: false }]); reject(new Error("PRIVATE_TOKEN PRIVATE_ACCOUNT"));
+    await flight;
+    assert.equal(m.state.providers[0]?.credits.error, "provider_disabled");
+    assert.doesNotMatch(JSON.stringify(diagnostics), /PRIVATE/);
+  } finally { await m.close(); }
+  const quiet: unknown[] = [];
+  const healthy = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true, now: () => now, random: () => 0.5,
+    save() {}, diagnostic: d => quiet.push(d), read: async () => response });
+  try {
+    healthy.update([provider()]); await healthy.tick();
+    for (let i = 0; i < 5; i++) { now += COLLECT_EVERY_MS; await healthy.tick(); }
+    assert.deepEqual(quiet, [{ provider: "codex", reason: "read_started" }, { provider: "codex", reason: "read_completed" }]);
+  } finally { await healthy.close(); }
+});
+
 test("unmatched/remote/disabled contexts never launch a collector and reconfiguration discards wallet", async () => {
   const config = headroomConfig({ contexts: [{ providers: ["codex"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
   for (const [local, p] of [[true, provider("codex", "/wrong")], [false, provider()], [true, { ...provider(), enabled: false }], [true, { ...provider(), quotaContextBlocked: true }], [true, { ...provider(), auth: { status: "authenticated", type: "apiKey" } }]] as const) {
@@ -297,6 +376,10 @@ test("stdio fake verifies the complete allowlisted exchange and redaction; failu
     const requests = readFileSync(join(home, "requests.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l));
     assert.deepEqual(requests.map(r => r.method), ["initialize", "initialized", "account/rateLimits/read"]);
     assert.deepEqual(requests[2].params, { excludeResetCreditDetails: true, supportsLunaReserve: false });
+    await assert.rejects(readCodexBalance({ ...ctx, command: join(f.path, "missing") }, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "spawn_failed");
+    chmodSync(command, 0o600);
+    await assert.rejects(readCodexBalance(ctx, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "spawn_failed");
+    chmodSync(command, 0o700);
     scenario("error"); await assert.rejects(readCodexBalance(ctx, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "rate_limited");
     scenario("overflow"); await assert.rejects(readCodexBalance(ctx, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "protocol");
     scenario("hang"); await assert.rejects(readCodexBalance(ctx, new AbortController().signal, 100), e => e instanceof BalanceReadError && e.code === "timeout");
@@ -308,7 +391,8 @@ test("status CLI reads only the snapshot (human and JSON) without a T3 connectio
   const f = scratchDir("quota-status");
   try {
     const path = join(f.path, "state.json"), state = emptyState(), row = newProvider("codex", "codex");
-    applyT3(row, provider()); applyCodex(row, response, AT); state.headroom.providers = [row];
+    const rejected = newProvider("codex_skipped", "codex"); failCodex(rejected, "runtime_home_unknown");
+    applyT3(row, provider()); applyCodex(row, response, AT); state.headroom.providers = [row, rejected];
     saveState(path, state, START);
     for (const json of [false, true]) {
       const child = spawn(process.execPath, ["src/cli.ts", "quota", "status", "--state-file", path, ...(json ? ["--json"] : [])],
@@ -318,8 +402,13 @@ test("status CLI reads only the snapshot (human and JSON) without a T3 connectio
       const code = await new Promise(r => child.once("close", r));
       assert.equal(code, 0, stderr);
       assert.doesNotMatch(stdout + stderr, /PRIVATE|accountId|nextCreditId|credentialFingerprint|runtimeHome/);
-      if (json) assert.equal(JSON.parse(stdout).providers[0].creditFunded.credits.value.balance, "61951.0098125000");
-      else { assert.match(stdout, /61951.0098125000 credits/); assert.match(stdout, /manual resets: 1/); }
+      if (json) {
+        assert.equal(JSON.parse(stdout).providers[0].creditFunded.credits.value.balance, "61951.0098125000");
+        assert.equal(JSON.parse(stdout).providers[1].creditFunded.credits.error, "runtime_home_unknown");
+      } else {
+        assert.match(stdout, /61951.0098125000 credits/); assert.match(stdout, /manual resets: 1/);
+        assert.match(stdout, /aggregate credits: unknown \[error; codex-app-server; reason runtime_home_unknown;/);
+      }
     }
   } finally { f.remove(); }
 });

@@ -170,7 +170,8 @@ export function humanStatus(state: HeadroomState, nowMs: number): string {
   if (state.providers.length === 0) return "Quota headroom unknown: no cached provider observations.\n";
   const describe = <T>(m: Metric<T>, value: (v: T) => string): string => {
     const current = metricNow(m, nowMs);
-    return `${m.value === null ? "unknown" : value(m.value)} [${current.state}; ${m.source}; observed ${m.observedAt ?? "never"}; age ${current.ageSeconds === null ? "unknown" : current.ageSeconds + "s"}${m.error ? "; " + m.error : ""}]`;
+    const observation = m.observedAt === null && m.error ? `reason ${m.error}` : `observed ${m.observedAt ?? "never"}`;
+    return `${m.value === null ? "unknown" : value(m.value)} [${current.state}; ${m.source}; ${observation}; age ${current.ageSeconds === null ? "unknown" : current.ageSeconds + "s"}${m.error && m.observedAt !== null ? "; " + m.error : ""}]`;
   };
   return state.providers.map(row => [
     `${row.alias}${row.plan.value ? " (" + row.plan.value + ")" : ""}:`,
@@ -185,12 +186,32 @@ export function humanStatus(state: HeadroomState, nowMs: number): string {
   ].join("\n")).join("\n") + "\n";
 }
 
+const SKIP_REASONS = ["context_not_configured", "remote_t3", "provider_not_found", "provider_driver_mismatch",
+  "provider_disabled", "provider_not_installed", "provider_unavailable", "auth_not_authenticated",
+  "auth_type_not_chatgpt", "instance_environment_unsupported", "runtime_home_unknown", "runtime_home_mismatch"] as const;
+type SkipReason = typeof SKIP_REASONS[number];
+type BalanceReason = SkipReason | BalanceReadError["code"] | "read_started" | "read_completed" | "read_failed" | "context_mismatch";
+function rejection(p: SwitchProvider | undefined, ctx: CodexContext, local: boolean): SkipReason | undefined {
+  if (!local) return "remote_t3";
+  if (!p) return "provider_not_found";
+  if (p.driver !== "codex") return "provider_driver_mismatch";
+  if (!p.enabled) return "provider_disabled";
+  if (!p.installed) return "provider_not_installed";
+  if (p.availability === "unavailable") return "provider_unavailable";
+  if (p.auth.status !== "authenticated") return "auth_not_authenticated";
+  if (p.auth.type !== "chatgpt") return "auth_type_not_chatgpt";
+  if (p.quotaContextBlocked) return "instance_environment_unsupported";
+  if (p.runtimeHome === undefined) return "runtime_home_unknown";
+  if (resolve(p.runtimeHome) !== ctx.codexHome) return "runtime_home_mismatch";
+}
+
 export type BalanceReader = (context: CodexContext, signal: AbortSignal) => Promise<unknown>;
 /** Explicit clock/random seams make cadence tests deterministic, without wall-clock assertions. */
 export interface HeadroomMonitorOptions {
   state: HeadroomState; config: HeadroomConfig; local: boolean;
   save: (records: ReadonlyArray<QuotaRecord>) => void;
   read?: BalanceReader; now?: () => number; random?: () => number;
+  diagnostic?: (detail: { provider: string; reason: BalanceReason }) => void;
 }
 export class HeadroomMonitor {
   #providers: ReadonlyArray<SwitchProvider> = [];
@@ -201,6 +222,8 @@ export class HeadroomMonitor {
   #due = new Map<string, number>();
   #failures = new Map<string, number>();
   #timer: NodeJS.Timeout | undefined;
+  #reported = new Map<string, BalanceReason>();
+  #started = new Set<string>();
   readonly #abort = new AbortController();
   readonly options: HeadroomMonitorOptions;
   constructor(options: HeadroomMonitorOptions) { this.options = options; }
@@ -231,6 +254,7 @@ export class HeadroomMonitor {
       applyT3(next, p);
       return next;
     });
+    this.#diagnose();
     this.#changed ||= before !== JSON.stringify(this.state.providers);
     this.#active = true;
     // Include the bounded startup balance read in the first snapshot/baseline.
@@ -248,38 +272,85 @@ export class HeadroomMonitor {
     this.#flight = this.#collect().finally(() => { this.#flight = null; });
     return this.#flight;
   }
+  #report(provider: string, reason: BalanceReason): void {
+    if (this.#reported.get(provider) === reason) return;
+    this.#reported.set(provider, reason);
+    try { this.options.diagnostic?.({ provider, reason }); } catch { /* Logging cannot stop collection. */ }
+  }
+  #diagnose(): void {
+    const bindings = new Map(this.options.config.contexts.flatMap(ctx => ctx.providers.map(alias => [alias, ctx] as const)));
+    const before = JSON.stringify(this.state.providers);
+    for (const [alias, ctx] of bindings) {
+      const reason = rejection(this.#providers.find(p => p.instanceId === alias), ctx, this.options.local);
+      if (reason) this.#report(alias, reason);
+      if (!this.state.providers.some(p => p.alias === alias) && this.state.providers.length < 64) {
+        this.state.providers.push(newProvider(alias, "codex"));
+      }
+    }
+    // Retain only current aliases and configured bindings, not historical catalog entries.
+    for (const alias of this.#reported.keys()) {
+      if (!bindings.has(alias) && !this.state.providers.some(p => p.alias === alias)) this.#reported.delete(alias);
+    }
+    for (const row of this.state.providers) {
+      const ctx = bindings.get(row.alias);
+      if (!ctx && row.driver !== "codex") continue;
+      const p = this.#providers.find(p => p.instanceId === row.alias);
+      const reason = ctx ? rejection(p, ctx, this.options.local) : "context_not_configured";
+      if (reason) {
+        if (row.driver === "codex") failCodex(row, reason);
+        else row.credits = { ...row.credits, error: reason };
+        this.#report(row.alias, reason);
+      } else if (SKIP_REASONS.some(r => r === row.credits.error)) {
+        const clean = newProvider(row.alias, row.driver);
+        row.credits = clean.credits; row.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
+        row.spendControlReached = clean.spendControlReached; row.plan = clean.plan;
+        if (row.manualResets.source === "codex-app-server") row.manualResets = clean.manualResets;
+        this.#due.delete(contextKey(ctx!));
+      }
+    }
+    this.#changed ||= before !== JSON.stringify(this.state.providers);
+  }
+  #currentRow(p: SwitchProvider, ctx: CodexContext): ProviderHeadroom | undefined {
+    const current = this.#providers.find(v => v.instanceId === p.instanceId);
+    if (!current || rejection(current, ctx, this.options.local) !== undefined || current.runtimeHome !== p.runtimeHome ||
+        current.quotaAccountKey !== p.quotaAccountKey) return;
+    return this.state.providers.find(r => r.alias === p.instanceId);
+  }
   async #collect(): Promise<void> {
+    this.#diagnose();
     if (this.options.local) for (const ctx of this.options.config.contexts) {
       const key = contextKey(ctx), now = this.now();
       if ((this.#due.get(key) ?? 0) > now || this.#abort.signal.aborted || !this.#active) continue;
-      const matching = this.#providers.filter(p => ctx.providers.includes(p.instanceId) && p.driver === "codex" &&
-        p.enabled && p.installed && p.auth.status === "authenticated" && p.auth.type === "chatgpt" && p.availability !== "unavailable" && !p.quotaContextBlocked &&
-        p.runtimeHome !== undefined && resolve(p.runtimeHome) === ctx.codexHome);
+      const matching = this.#providers.filter(p => ctx.providers.includes(p.instanceId) && rejection(p, ctx, this.options.local) === undefined);
       if (matching.length === 0) continue; // unknown context never falls back to this shell's login
       try {
+        if (!this.#started.has(key)) {
+          this.#started.add(key);
+          for (const p of matching) this.#report(p.instanceId, "read_started");
+        }
         const raw = await (this.options.read ?? readCodexBalance)(ctx, this.#abort.signal);
         if (this.#abort.signal.aborted) return;
         const at = new Date(this.now()).toISOString();
         // Match again after await: aliases can be reconfigured during a read.
         for (const p of matching) {
-          const current = this.#providers.find(v => v.instanceId === p.instanceId);
-          if (!current || current.runtimeHome !== p.runtimeHome || current.quotaContextBlocked ||
-              current.quotaAccountKey !== p.quotaAccountKey || current.auth.type !== "chatgpt" || current.auth.status !== "authenticated") continue;
-          const row = this.state.providers.find(r => r.alias === p.instanceId);
+          const row = this.#currentRow(p, ctx);
           if (!row) continue;
           const accountId = object(raw)?.accountId;
           if (p.quotaAccountKey && (typeof accountId !== "string" ||
               createHash("sha256").update(accountId).digest("hex") !== p.quotaAccountKey)) {
-            failCodex(row, "context_mismatch");
-          } else applyCodex(row, raw, at);
+            failCodex(row, "context_mismatch"); this.#report(p.instanceId, "context_mismatch");
+          } else { applyCodex(row, raw, at); this.#report(p.instanceId, "read_completed"); }
         }
         this.#failures.delete(key);
       } catch (error) {
         if (this.#abort.signal.aborted) return;
         this.#failures.set(key, Math.min(5, (this.#failures.get(key) ?? 0) + 1));
         for (const p of matching) {
-          const row = this.state.providers.find(r => r.alias === p.instanceId);
-          if (row) failCodex(row, error instanceof BalanceReadError ? error.code : "read_failed");
+          const row = this.#currentRow(p, ctx);
+          if (!row) continue;
+          const reason = error instanceof BalanceReadError ? error.code : "read_failed";
+          failCodex(row, reason);
+          this.#report(p.instanceId, reason);
         }
       }
       this.#changed = true;

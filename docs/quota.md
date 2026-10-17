@@ -407,6 +407,24 @@ context keys are internal and never appear in status/feed output. Reconfiguratio
 invalidates the wallet before a new context can report it. Without a quota config,
 T3 windows/reset counts still work and Codex money remains unknown.
 
+Rejected Codex bindings now log one `Codex balance collector` line per provider
+and reason transition, and persist the same reason in the balance metric's
+`error` field. Human status shows `reason runtime_home_unknown` instead of
+`observed never`; JSON exposes the stable code. No paths, account identifiers,
+credential hashes or raw provider errors enter these diagnostics.
+`runtime_home_unknown` means T3 omitted published `runtimePaths`; changing
+`quota.json` cannot confirm that missing effective home. T3 must publish it
+before this collector can safely match the account. `runtime_home_mismatch`
+means `codexHome` differs from the published effective path. Other codes identify
+missing aliases, disabled/uninstalled/unavailable providers, auth type/status,
+instance environment overrides, remote T3 and missing quota context bindings.
+A missing configured alias appears in cached status within the 64-row bound.
+The first scheduled read logs `read_started`; results log `read_completed` or
+a sanitized failure code only when the outcome changes. `spawn_failed` means
+the configured executable or its working directory could not be used, including
+an executable absent from the service PATH. The existing read cadence and backoff
+are unchanged.
+
 Collection happens once when the observer receives its startup catalog, then every
 five minutes with ±10% jitter while connected to T3. A ten-second scheduler checks
 due work; reads are single-flight across the collector, sequential across contexts,
