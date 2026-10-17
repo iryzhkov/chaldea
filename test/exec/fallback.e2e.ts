@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir, hostname } from 'node:os';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
@@ -22,7 +22,9 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   assert.notEqual(tmpdir(), '/tmp');
   const root = await fs.mkdtemp(join(tmpdir(), 'fallback-'));
   const work = join(root, 'work'); const state = join(root, 'state');
-  await fs.mkdir(work); await fs.mkdir(state);
+  const home = join(root, 'home');
+  assert.ok(home.startsWith(resolve(tmpdir()) + '/'), 'fixture HOME must be scratch');
+  await fs.mkdir(home); await fs.mkdir(work); await fs.mkdir(state);
   execFileSync('git', ['init', '-q', work]);
   await fs.writeFile(join(work, 'input'), 'snapshot');
   const script = join(root, 'fake-ssh.mjs'); const log = join(root, 'attempts');
@@ -69,7 +71,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     '  if (item.type !== "E") continue;',
     '  if (mode === "preempted") { send("R", {outcome:"preempted",message:"gaming"}); process.exit(0); }',
     '  log("started");',
-    '  if (mode === "hold") { process.stdout.write(frame("O", Buffer.from("locked"))); continue; }',
+    '  if (mode === "hold" && request.argv.at(-1) === "hold") { process.stdout.write(frame("O", Buffer.from("locked"))); continue; }',
     '  if (mode === "late-refusal") { process.stdout.write(frame("O", Buffer.from("started"))); send("R", {outcome:"refused",message:"too late"}); process.exit(0); }',
     '  const result = spawnSync(request.argv[0], request.argv.slice(1));',
     '  if (result.stdout?.length) process.stdout.write(frame("O", result.stdout));',
@@ -80,13 +82,13 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
   await fs.writeFile(join(root, 'ssh'), '#!/bin/sh\nexec ' + quote(process.execPath) + ' ' + quote(script) + ' "$@"\n', { mode: 0o700 });
   const hostFile = join(root, 'hosts');
   await fs.writeFile(hostFile, hosts.join('\n') + '\n');
-  const env = { ...process.env, PATH: root + ':' + process.env.PATH, CHALDEA_STATE_DIR: state,
+  const env = { ...process.env, HOME: home, PATH: root + ':' + process.env.PATH, CHALDEA_STATE_DIR: state,
     CHALDEA_EXEC_HOSTS: hostFile, CHALDEA_SSH_CONFIG: sshConfig,
     FAKE_MODES: JSON.stringify(modes), FAKE_LOG: log, FAKE_CONTROL: control, FAKE_REAL_SSH: realSsh };
   return {
     state, hostFile,
-    run: (host?: string, code = 0) => spawn(process.execPath,
-      [cli, 'exec', ...(host ? ['--host', host] : []), '--', process.execPath, '-e', 'console.log("ran");process.exit(' + code + ')'],
+    run: (host?: string, code: number | 'hold' = 0) => spawn(process.execPath,
+      [cli, 'exec', ...(host ? ['--host', host] : []), '--', process.execPath, '-e', 'console.log("ran");process.exit(' + (code === 'hold' ? 0 : code) + ')', ...(code === 'hold' ? ['hold'] : [])],
       { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] }),
     events: async () => (await fs.readFile(log, 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(x => JSON.parse(x)),
     intents: async () => Promise.all((await fs.readdir(join(state, 'journal'))).filter(x => x.endsWith('.json')).map(async x =>
@@ -166,23 +168,26 @@ test('auto skips self without SSH or an intent', { timeout: 10000 }, async () =>
   } finally { await f.remove(); }
 });
 
-test('target locks allow different hosts, auto skips a busy local target, SIGKILL releases the lock', { timeout: 20000 }, async () => {
+test('same target accepts overlapping local execs; accounting lock is released during jobs', { timeout: 20000 }, async () => {
   const f = await fixture({ 'fake-a': 'hold' });
-  const holder = f.run('fake-a');
+  const holder = f.run('fake-a', 'hold');
   const exited = once(holder, 'close'); let err = '';
   holder.stderr!.on('data', x => { err += x; });
   try {
     await Promise.race([once(holder.stdout!, 'data'), exited.then(() => { throw new Error(err); })]);
     const same = await collected(f.run('FAKE-A'));
-    assert.equal(same.code, 255, same.err); assert.match(same.err, /another local chaldea exec/);
+    assert.equal(same.code, 0, same.err); assert.equal(same.out, 'ran\n');
     const other = await collected(f.run('fake-b'));
     assert.equal(other.code, 0, other.err);
     const automatic = await collected(f.run());
     assert.equal(automatic.code, 0, automatic.err);
-    assert.match(automatic.err, /skipped fake-a: another local/);
-    assert.match(automatic.err, /ran on fake-b/);
+    assert.match(automatic.err, /ran on fake-a/);
+    assert.doesNotMatch(automatic.err, /skipped/);
+    const intents = await f.intents();
+    assert.equal(intents.filter(i => i.outcome === 'uncertain').length, 1);
+    assert.equal(intents.filter(i => i.outcome === 'finished').length, 3);
     holder.kill('SIGKILL'); await exited;
-    const lock = await fs.open(join(f.state, 'artifacts-fake-a.lock'), 'a');
+    const lock = await fs.open(join(f.state, 'accounting.lock'), 'a');
     try { execFileSync('/usr/bin/flock', ['-n', '3'], { stdio: ['ignore', 'pipe', 'pipe', lock.fd] }); }
     finally { await lock.close(); }
   } finally {
@@ -198,7 +203,7 @@ test('SSH setup to a silent host times out in ten seconds and falls through', { 
     const r = await collected(child);
     const elapsed = performance.now() - start;
     assert.equal(r.code, 0, r.err);
-    assert.ok(elapsed >= 9000 && elapsed < 16000, 'SSH setup elapsed ' + elapsed + ' ms');
+    assert.ok(elapsed >= 9000 && elapsed < 16000, 'SSH setup elapsed ' + elapsed + ' ms: ' + r.err);
     assert.match(r.err, /skipped fake-a: connection closed before job request/);
     assert.match(r.err, /ran on fake-b/);
     assert.deepEqual((await f.events()).filter(e => e.event === 'requested').map(e => e.host), ['fake-b']);
