@@ -9,7 +9,7 @@ chaldea wait time --after 30s --thread ID [--request-id EPOCH:KEY]
 chaldea wait thread --target ID [--run ID] --thread ID [--request-id EPOCH:KEY]
 chaldea wait status|cancel ID
 chaldea decision ask --thread ID --question TEXT --option TEXT --option TEXT
-  --default TEXT --default-safe --default-action skip|defer --deadline RFC3339 [--request-id EPOCH:KEY]
+  --dependent-action TEXT --default-action skip|defer --deadline RFC3339 [--request-id EPOCH:KEY]
 chaldea decision answer ID --answer TEXT
 chaldea decision status ID
 chaldea mcp [--config PATH]
@@ -21,8 +21,8 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
   const {values:v,positionals:p}=parseArgs({args,allowPositionals:true,options:{
     config:{type:"string"},thread:{type:"string"},"request-id":{type:"string"},deadline:{type:"string"},
     at:{type:"string"},after:{type:"string"},target:{type:"string"},run:{type:"string"},
-    question:{type:"string"},option:{type:"string",multiple:true},default:{type:"string"},
-    "default-safe":{type:"boolean"},"default-action":{type:"string"},answer:{type:"string"},help:{type:"boolean",short:"h"},
+    question:{type:"string"},option:{type:"string",multiple:true},"dependent-action":{type:"string"},
+    "default-action":{type:"string"},answer:{type:"string"},help:{type:"boolean",short:"h"},
   }});
   if(v.help){process.stdout.write(WAIT_USAGE);return 0;}
   if(group==="waits"&&p[0]==="serve"){await runWaitService(v.config);return 0;}
@@ -46,8 +46,8 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
     method="chaldea_wait";input={threadId:v.thread,requestId,condition,...(v.deadline?{deadline:v.deadline}:{})};
   }else if(group==="decision"&&p[0]==="ask"){
     method="chaldea_decision_ask";input={threadId:v.thread,requestId,question:v.question,options:v.option,
-      default:v.default,defaultSafe:v["default-safe"]===true,defaultAction:v["default-action"],deadline:v.deadline};
-  }else if(group==="decision"&&p[0]==="answer"){method="chaldea_decision_answer";input={id:p[1],answer:v.answer};}
+      dependentAction:v["dependent-action"],defaultAction:v["default-action"],deadline:v.deadline};
+  }else if(group==="decision"&&p[0]==="answer"){method="chaldea_decision_answer_cli";input={id:p[1],answer:v.answer};}
   else if(p[0]==="status"&&(group==="wait"||group==="decision")){method=group==="wait"?"chaldea_wait_status":"chaldea_decision_status";input={id:p[1]};}
   else if(group==="wait"&&p[0]==="cancel"){method="chaldea_wait_cancel";input={id:p[1]};}
   else throw new Error(WAIT_USAGE);

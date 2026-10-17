@@ -2,7 +2,7 @@ import { WakeStore, type Item, type Registration, type Delivery } from "../wake/
 import type { WaitT3, WaitSnapshot } from "../t3/waits.ts";
 import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
-import type { WaitInput, DecisionInput } from "./types.ts";
+import type { WaitInput, DecisionInput, AnswerSource } from "./types.ts";
 
 export interface EngineOptions {
   answerBaseUrl: string;
@@ -50,11 +50,18 @@ export class WaitEngine {
   private phone(reg: Registration): string {
     const q = reg.input as DecisionInput;
     return JSON.stringify({id:"chaldea-decision:" + this.store.environment + ":" + reg.id,
-      title:"Chaldea decision",content:q.question + "\nDefault (" + q.defaultAction + "): " + q.default + "\nDeadline: " + q.deadline,
+      title:"Chaldea decision",content:q.question + "\nNo answer: " + q.defaultAction + " " + q.dependentAction + "\nDeadline: " + q.deadline,
       priority:"default",url:new URL("/decisions/" + reg.id,this.options.answerBaseUrl).toString()});
   }
-  answer(id: string, answer: string): Item {
-    const row=this.store.answer(id,answer); this.options.boundary?.("resolved",id); this.poke(); return row;
+  answer(id: string, answer: string, source: AnswerSource): Item {
+    const row=this.store.answer(id,answer,source); this.options.boundary?.("resolved",id); this.poke(); return row;
+  }
+  async answerFromThread(id: string, answer: string, threadId: string): Promise<Item> {
+    if (this.store.get(id).parent === threadId) throw new Error("Asking thread cannot answer its own decision");
+    await this.t3.environment();
+    const caller=await this.t3.snapshot(threadId);
+    if (!caller || caller.deleted || caller.archived || caller.settled) throw new Error("Answering thread is absent, archived or settled on this T3");
+    return this.answer(id,answer,`mcp:${threadId}`);
   }
   cancel(id: string): ReturnType<WakeStore["cancel"]> { const result=this.store.cancel(id); this.poke(); return result; }
   private watch(id: string): void {
@@ -99,7 +106,7 @@ export class WaitEngine {
         }
         if (item.kind === "decision") {
           if (now >= item.deadline) {
-            this.store.answer(item.id,(JSON.parse(item.input) as DecisionInput).default,now);
+            this.store.expire(item.id,now);
             this.options.boundary?.("resolved",item.id);
           }
           continue;

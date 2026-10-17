@@ -64,7 +64,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
     const invoke=(method:string,input:unknown)=>callService(config.socket,method,input) as Promise<Item>;
     const waitTime=()=>({threadId:parent,requestId:key(),condition:{kind:"time",at:iso(Date.now()+200)}});
     const ask=(ms=3000)=>({threadId:parent,requestId:key(),question:"Run the dependent step?",options:["Defer","Run"],
-      default:"Defer",defaultSafe:true,defaultAction:"defer",deadline:iso(Date.now()+ms)});
+      dependentAction:"run the dependent step",defaultAction:"defer",deadline:iso(Date.now()+ms)});
     service=await startWaitService(config);
 
     await t.test("time and already-true waits commit one wake under two seconds",async()=>{
@@ -150,20 +150,20 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       assert.equal(response.status,303);
       await until("answered wake",async()=>await wakeCount(row.id)===1);
       const result=JSON.parse((await invoke("chaldea_decision_status",{id:row.id})).outcome!);
-      assert.deepEqual(result,{reason:"answered",answer:"Run",defaulted:false});
+      assert.deepEqual(result,{reason:"answered",answer:"Run",defaulted:false,source:"page"});
       const wake=(await snapshot()).messages.find(m=>m.id==="chaldea-decision:"+row.id+":wake")!;
       assert.equal(wake.role,"user");assert.ok(wake.text.startsWith("Chaldea wake (decision "+row.id+")"));
       assert.ok(wake.text.endsWith("chaldea decision status "+row.id));
-      await invoke("chaldea_decision_answer",{id:row.id,answer:"Defer"});assert.equal(await wakeCount(row.id),1);
+      await invoke("chaldea_decision_answer_cli",{id:row.id,answer:"Defer"});assert.equal(await wakeCount(row.id),1);
       const current=await fetch(url,{headers:auth});assert.ok((await current.text()).includes("answered"));
     });
     await t.test("deadline applies safe default; answer/deadline race has one outcome",async()=>{
       const q=await invoke("chaldea_decision_ask",ask(200));
       await until("default wake",async()=>await wakeCount(q.id)===1);
-      assert.deepEqual(JSON.parse((await invoke("chaldea_decision_status",{id:q.id})).outcome!),{reason:"deadline",answer:"Defer",defaulted:true});
+      assert.deepEqual(JSON.parse((await invoke("chaldea_decision_status",{id:q.id})).outcome!),{reason:"deadline",defaulted:true,action:"defer"});
       const race=ask(350);const row=await invoke("chaldea_decision_ask",race);
       await sleep(Math.max(0,Date.parse(race.deadline)-Date.now()));
-      await invoke("chaldea_decision_answer",{id:row.id,answer:"Run"});
+      await invoke("chaldea_decision_answer_cli",{id:row.id,answer:"Run"});
       await until("race wake",async()=>await wakeCount(row.id)===1);
       const outcome=(await invoke("chaldea_decision_status",{id:row.id})).outcome!;
       await sleep(100);assert.equal((await invoke("chaldea_decision_status",{id:row.id})).outcome,outcome);assert.equal(await wakeCount(row.id),1);
@@ -182,6 +182,12 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         const result=lines().find(r=>r.id===3).result;
         assert.equal(result.isError,undefined,err);
         const row=JSON.parse(result.content[0].text);
+        for (const [id,args] of [[80,{id:row.id,answer:"Run"}],[81,{id:row.id,answer:"Run",answeringThreadId:parent}]] as const) {
+          child.stdin.write(JSON.stringify({jsonrpc:"2.0",id,method:"tools/call",params:{name:"chaldea_decision_answer",arguments:args}})+"\n");
+          await until("MCP refused answer "+id,async()=>lines().some(r=>r.id===id));
+          assert.equal(lines().find(r=>r.id===id).result.isError,true);
+        }
+        assert.equal((await invoke("chaldea_decision_status",{id:row.id})).state,"parked");
         const rpc=async(id:number,name:string,args:unknown)=>{
           child.stdin.write(JSON.stringify({jsonrpc:"2.0",id,method:"tools/call",params:{name,arguments:args}})+"\n");
           await until("MCP response "+id,async()=>lines().some(r=>r.id===id));
@@ -194,7 +200,7 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         assert.equal((await rpc(7,"chaldea_decision_status",{id:row.id})).id,row.id);
         const answered=await runCli(["decision","answer",row.id,"--answer","Run","--config",configPath],dir.path);
         assert.equal(answered.code,0,answered.stderr);
-        await rpc(8,"chaldea_decision_answer",{id:row.id,answer:"Run"});
+        assert.equal(JSON.parse(JSON.parse(answered.stdout).outcome).source,"cli");
         await until("MCP-created decision wake",async()=>await wakeCount(row.id)===1);
       }finally{
         child.stdin.end();
@@ -208,10 +214,15 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,createdBy:"user",creationSource:"web",
       } as never) as Effect.Effect<unknown,unknown>);
       const row=await invoke("chaldea_decision_ask",{...ask(10000),threadId:target});
-      await invoke("chaldea_decision_answer",{id:row.id,answer:"Run"});
+      await assert.rejects(invoke("chaldea_decision_answer",{id:row.id,answer:"Run"}),/answeringThreadId/);
+      await assert.rejects(invoke("chaldea_decision_answer",{id:row.id,answer:"Run",answeringThreadId:target}),/own decision/);
+      await assert.rejects(invoke("chaldea_decision_answer",{id:row.id,answer:"Run",answeringThreadId:"missing-thread"}),/absent/);
+      const answered=await invoke("chaldea_decision_answer",{id:row.id,answer:"Run",answeringThreadId:parent});
+      assert.equal(JSON.parse(answered.outcome!).source,"mcp:"+parent);
       const targetSnap=()=>withClient({serverUrl:t3.serverUrl,token},c=>c["orchestration.getThreadProjection"]({threadId:target} as never));
       await until("Codex decision wake",async()=>(await targetSnap()).messages.some(m=>m.id==="chaldea-decision:"+row.id+":wake"));
       assert.equal((await targetSnap()).messages.filter(m=>m.id==="chaldea-decision:"+row.id+":wake").length,1);
+      assert.ok((await targetSnap()).messages.find(m=>m.id==="chaldea-decision:"+row.id+":wake")!.text.includes('"source":"mcp:'+parent+'"'));
     });
     await t.test("T3 restarts independently while the watcher keeps its durable work",async()=>{
       const row=await invoke("chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+600)}});

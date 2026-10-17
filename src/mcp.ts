@@ -11,11 +11,11 @@ export const WAIT_TOOLS=[
       schema({kind:{const:"thread"},threadId:str,runId:str},["kind","threadId"])]},deadline:str},["threadId","requestId","condition"])},
   {name:"chaldea_wait_cancel",description:"Cancel an unresolved wait without a wake. Reports in-flight/accepted delivery honestly.",inputSchema:schema({id:str},["id"])},
   {name:"chaldea_wait_status",description:"Read wait state and its immutable outcome.",inputSchema:schema({id:str},["id"])},
-  {name:"chaldea_decision_ask",description:"Park a question for Igor and keep working. The default must only skip/defer dependent work; it can never grant approval, permission or expand autonomy. Asker must explicitly attest this.",
-    inputSchema:schema({...identity,question:str,options:{type:"array",items:str,minItems:2,maxItems:8},default:str,
-      defaultSafe:{const:true},defaultAction:{enum:["skip","defer"]},deadline:str},
-      ["threadId","requestId","question","options","default","defaultSafe","defaultAction","deadline"])},
-  {name:"chaldea_decision_answer",description:"Record Igor's explicit choice; do not manufacture consent. One answer/default wins and wakes the asker.",inputSchema:schema({id:str,answer:str},["id","answer"])},
+  {name:"chaldea_decision_ask",description:"Park a question for Igor and keep working. No answer by the deadline only skips/defers dependent work; it never selects an option or grants approval or permission.",
+    inputSchema:schema({...identity,question:str,options:{type:"array",items:str,minItems:2,maxItems:8},dependentAction:{...str,description:"The dependent action to skip or defer if Igor does not answer"},
+      defaultAction:{enum:["skip","defer"]},deadline:str},
+      ["threadId","requestId","question","options","dependentAction","defaultAction","deadline"])},
+  {name:"chaldea_decision_answer",description:"Answer from another local thread, recorded as an agent answer (mcp:<thread>), never as human consent. Your own asking thread cannot answer. Igor uses the page or CLI.",inputSchema:schema({id:str,answer:str,answeringThreadId:identity.threadId},["id","answer","answeringThreadId"])},
   {name:"chaldea_decision_status",description:"Read a question's answer/default, state and deadline.",inputSchema:schema({id:str},["id"])},
 ];
 export async function runMcp(socket:string):Promise<void>{

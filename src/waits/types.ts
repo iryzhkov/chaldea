@@ -6,10 +6,11 @@ export type Condition = { kind: "time"; at: string } | { kind: "thread"; threadI
 export interface WaitInput { threadId: string; requestId: string; condition: Condition; deadline?: string }
 export interface DecisionInput {
   threadId: string; requestId: string; question: string; options: string[];
-  default: string; defaultSafe: true; defaultAction: "skip" | "defer"; deadline: string;
+  dependentAction: string; defaultAction: "skip" | "defer"; deadline: string;
 }
 export type Input = WaitInput | DecisionInput;
-export type Outcome = { reason: string; answer?: string; defaulted?: boolean; runId?: string };
+export type AnswerSource = "page" | "cli" | `mcp:${string}`;
+export type Outcome = { reason: string; answer?: string; defaulted?: boolean; action?: "skip" | "defer"; source?: AnswerSource; runId?: string };
 export function object(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected an object");
   return value as Record<string, unknown>;
@@ -53,11 +54,12 @@ export function validate(kind: "wait" | "decision", value: unknown, now: number)
     if (!Array.isArray(v.options) || v.options.length < 2 || v.options.length > 8) throw new Error("Provide 2–8 options");
     const options = v.options.map(o => text(o, "option", 256));
     if (new Set(options).size !== options.length) throw new Error("Options must be unique");
-    if (v.defaultSafe !== true || !["skip", "defer"].includes(String(v.defaultAction)) || !options.includes(String(v.default)))
-      throw new Error("Default must be an option, explicitly safe, and only skip or defer");
+    if (!["skip", "defer"].includes(String(v.defaultAction)))
+      throw new Error("Default action must only skip or defer");
+    if ("default" in v || "defaultSafe" in v) throw new Error("Option-valued defaults are unsupported; declare only defaultAction");
     deadline = timestamp(v.deadline);
     input = { threadId: v.threadId as string, requestId: v.requestId as string, question: text(v.question, "question", 1024),
-      options, default: v.default as string, defaultSafe: true, defaultAction: v.defaultAction as "skip" | "defer",
+      options, dependentAction: text(v.dependentAction, "dependentAction", 512), defaultAction: v.defaultAction as "skip" | "defer",
       deadline: new Date(deadline).toISOString() };
   }
   // Time waits may use their target + 24 hours as the default timeout.

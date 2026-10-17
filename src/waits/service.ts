@@ -55,7 +55,8 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
         case "chaldea_wait":result=await engine.register("wait",input);break;
         case "chaldea_decision_ask":result=await engine.register("decision",input);break;
         case "chaldea_wait_cancel":result=engine.cancel(text(input.id,"id"));break;
-        case "chaldea_decision_answer":result=engine.answer(text(input.id,"id"),text(input.answer,"answer",256));break;
+        case "chaldea_decision_answer":result=await engine.answerFromThread(text(input.id,"id"),text(input.answer,"answer",256),text(input.answeringThreadId,"answeringThreadId"));break;
+        case "chaldea_decision_answer_cli":result=engine.answer(text(input.id,"id"),text(input.answer,"answer",256),"cli");break;
         case "chaldea_wait_status":case "chaldea_decision_status":result=engine.store.get(text(input.id,"id"));break;
         default:throw new Error("Unknown method");
       }
@@ -100,7 +101,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
           if(req.headers.origin && req.headers.origin!==new URL(config.answerBaseUrl).origin)throw new Error("Origin refused");
           const form=new URLSearchParams(await body(req));
           if(!equal(form.get("csrf")??"",csrf(match[1]!)))throw new Error("Invalid form token");
-          running.answer(match[1]!,text(form.get("answer"),"answer",256));
+          running.answer(match[1]!,text(form.get("answer"),"answer",256),"page");
           res.writeHead(303,{Location:"/decisions/"+match[1]});res.end();return;
         }
         if(req.method!=="GET"){send(res,405,{error:"Method not allowed"});return;}
@@ -111,7 +112,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
           const q=JSON.parse(item.input);
           html+='<article><h2>'+escape(q.question)+'</h2><p>'+escape(item.state)+' · Deadline '+escape(q.deadline)+'</p>';
           if(item.outcome)html+='<p>'+escape(item.outcome)+'</p>';
-          else if(item.state==="parked")html+='<p>Safe default ('+escape(q.defaultAction)+'): '+escape(q.default)+'</p><form method="post" action="/decisions/'+item.id+'"><input type="hidden" name="csrf" value="'+csrf(item.id)+'">'+q.options.map((o:string)=>'<button name="answer" value="'+escape(o)+'">'+escape(o)+'</button>').join(" ")+'</form>';
+          else if(item.state==="parked")html+='<p>Safe default ('+escape(q.defaultAction)+'): '+escape(q.dependentAction ?? q.question)+'</p><form method="post" action="/decisions/'+item.id+'"><input type="hidden" name="csrf" value="'+csrf(item.id)+'">'+q.options.map((o:string)=>'<button name="answer" value="'+escape(o)+'">'+escape(o)+'</button>').join(" ")+'</form>';
           html+='</article>';
         }
         res.writeHead(200,{"Content-Type":"text/html; charset=utf-8"});

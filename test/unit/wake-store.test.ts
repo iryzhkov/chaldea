@@ -16,7 +16,7 @@ function fixture(){
 }
 const wait=(n=0,now=Date.now())=>({threadId:"parent-"+n,requestId:now+":wait-"+n,condition:{kind:"time",at:iso(now)}});
 const question=(now=Date.now())=>({threadId:"parent",requestId:now+":question",question:"Proceed later?",options:["Defer","Run"],
-  default:"Defer",defaultSafe:true,defaultAction:"defer",deadline:iso(now+1000)});
+  dependentAction:"run the dependent step",defaultAction:"defer",deadline:iso(now+1000)});
 test("transactional resolution, stable retry keys, cancel, payload limits, reopen",()=>{
   const f=fixture();
   try{
@@ -42,9 +42,9 @@ test("transactional resolution, stable retry keys, cancel, payload limits, reope
     f.store.resolve(other.id,{reason:"time"});const d=f.store.deliveries().find(d=>d.item===other.id)!;
     f.store.claim(d.id);assert.equal(f.store.cancel(other.id).delivery,"uncertain_in_flight");
     f.store.sent(d.id);assert.equal(f.store.cancel(other.id).delivery,"already_delivered");
-    assert.throws(()=>f.store.prepare("decision",{...question(),defaultSafe:false}),/Default/);
+    assert.throws(()=>f.store.prepare("decision",{...question(),defaultSafe:false}),/defaults/);
     assert.throws(()=>f.store.prepare("decision",{...question(),defaultAction:"approve"}),/Default/);
-    assert.throws(()=>f.store.prepare("decision",{...question(),default:"other"}),/Default/);
+    assert.throws(()=>f.store.prepare("decision",{...question(),default:"other"}),/defaults/);
     assert.throws(()=>f.store.prepare("decision",{...question(),question:"x".repeat(1025)}),/question/);
     assert.throws(()=>new WakeStore(f.path,"changed-environment"),/another environment/);
   }finally{f.close();}
@@ -62,17 +62,44 @@ test("answer/deadline serializations and concurrent processes latch exactly one 
     }));
     await Promise.all(children);
     const outcome=f.store.get(row.id).outcome;
-    f.store.answer(row.id,"Run",now+5000);
+    f.store.answer(row.id,"Run","cli",now+5000);
     assert.equal(f.store.get(row.id).outcome,outcome);
     assert.equal(f.store.deliveries().length,1);
     const q2={...question(now),requestId:now+":q2",deadline:iso(now-1)};
     const row2=f.store.register(f.store.prepare("decision",q2),"project",null);
-    assert.deepEqual(JSON.parse(f.store.answer(row2.id,"Run",now).outcome!),{reason:"deadline",answer:"Defer",defaulted:true});
+    assert.deepEqual(JSON.parse(f.store.answer(row2.id,"Run","cli",now).outcome!),{reason:"deadline",defaulted:true,action:"defer"});
     const q3={...question(now),requestId:now+":q3"};
     const row3=f.store.register(f.store.prepare("decision",q3),"project",null);
-    assert.deepEqual(JSON.parse(f.store.answer(row3.id,"Run",now).outcome!),{reason:"answered",answer:"Run",defaulted:false});
+    assert.deepEqual(JSON.parse(f.store.answer(row3.id,"Run","cli",now).outcome!),{reason:"answered",answer:"Run",defaulted:false,source:"cli"});
   }finally{f.close();}
 });
+
+test("approval-labelled options cannot turn a deadline into approval; answer provenance is immutable",()=>{
+  const f=fixture();
+  try{
+    const now=Date.now();
+    const q={...question(now),options:["Approve deploy","Hold"],dependentAction:"deploy"};
+    assert.throws(()=>f.store.prepare("decision",{...q,default:"Approve deploy",defaultSafe:true}),/Option-valued defaults/);
+    for(const action of ["skip","defer"] as const){
+      const row=f.store.register(f.store.prepare("decision",{...q,requestId:now+":"+action,defaultAction:action}),"project",null);
+      assert.throws(()=>f.store.answer(row.id,"Approve deploy","mcp:parent",now),/own decision/);
+      assert.equal(f.store.get(row.id).outcome,null);
+      const outcome=JSON.parse(f.store.expire(row.id,now+2000).outcome!);
+      assert.deepEqual(outcome,{reason:"deadline",defaulted:true,action});
+      const wake=JSON.parse(f.store.deliveries().find(d=>d.item===row.id)!.payload);
+      assert.ok(wake.text.includes("no answer by the deadline: "+action+" deploy"));
+      assert.ok(!wake.text.includes("Approve deploy"));
+      f.store.answer(row.id,"Approve deploy","cli",now+3000);
+      assert.deepEqual(JSON.parse(f.store.get(row.id).outcome!),outcome);
+    }
+    const row=f.store.register(f.store.prepare("decision",{...q,requestId:now+":agent"}),"project",null);
+    assert.deepEqual(JSON.parse(f.store.answer(row.id,"Hold","mcp:other",now).outcome!),
+      {reason:"answered",answer:"Hold",defaulted:false,source:"mcp:other"});
+    f.store.answer(row.id,"Approve deploy","page",now);
+    assert.ok(JSON.parse(f.store.deliveries().find(d=>d.item===row.id)!.payload).text.includes('"source":"mcp:other"'));
+  }finally{f.close();}
+});
+
 test("active bounds, cycle rejection, retention fence and protected pending delivery",()=>{
   const f=fixture();
   try{

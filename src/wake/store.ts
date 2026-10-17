@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { DAY, MAX_AGE, validate, type Input, type DecisionInput, type Outcome } from "../waits/types.ts";
+import { DAY, MAX_AGE, validate, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
 
 export interface Item {
   id: string; kind: "wait" | "decision"; parent: string; project: string; request_key: string; request_at: number;
@@ -128,7 +128,11 @@ export class WakeStore {
       if (cursor !== undefined) this.db.prepare("UPDATE items SET cursor=max(cursor,?) WHERE id=?").run(cursor,id);
       if (row.state !== "parked") return this.get(id);
       const commandId = "chaldea-" + row.kind + ":" + id + ":wake";
-      const text = "Chaldea wake (" + row.kind + " " + id + "): " + JSON.stringify(outcome) + "\nchaldea " + row.kind + " status " + id;
+      const input = JSON.parse(row.input) as DecisionInput;
+      const summary = row.kind === "decision" && outcome.reason === "deadline"
+        ? "no answer by the deadline: " + outcome.action + " " + (input.dependentAction ?? input.question)
+        : JSON.stringify(outcome);
+      const text = "Chaldea wake (" + row.kind + " " + id + "): " + summary + "\nchaldea " + row.kind + " status " + id;
       const payload = JSON.stringify({
         type:"message.dispatch",commandId,messageId:commandId,threadId:row.parent,
         createdBy:"agent",creationSource:"server",attachments:[],dispatchMode:{type:"queue_after_active"},
@@ -140,17 +144,25 @@ export class WakeStore {
       this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND channel='phone' AND state='pending'").run(id);
       return this.get(id);
   }
-  answer(id: string, answer: string, now?: number): Item {
+  answer(id: string, answer: string, source: AnswerSource, now?: number): Item {
+    if (source !== "page" && source !== "cli" && !(typeof source === "string" && /^mcp:.+/.test(source)))
+      throw new Error("Answer source required");
     // Read the clock after acquiring the writer lock: contention cannot extend a deadline.
-    return this.transaction(() => this.answerLocked(id,answer,now ?? Date.now()));
+    return this.transaction(() => this.answerLocked(id,answer,source,now ?? Date.now()));
   }
-  private answerLocked(id: string, answer: string, now: number): Item {
+  expire(id: string, now = Date.now()): Item {
+    return this.transaction(() => this.answerLocked(id,undefined,undefined,now));
+  }
+  private answerLocked(id: string, answer: string | undefined, source: AnswerSource | undefined, now: number): Item {
     const row = this.get(id);
     if (row.kind !== "decision") throw new Error("Not a decision");
+    if (source === "mcp:" + row.parent) throw new Error("Asking thread cannot answer its own decision");
     const input = JSON.parse(row.input) as DecisionInput;
-    if (!input.options.includes(answer)) throw new Error("Answer must be one of the options");
+    if (answer !== undefined && !input.options.includes(answer)) throw new Error("Answer must be one of the options");
     if (row.state !== "parked") return row;
-    return this.resolveLocked(row, now >= row.deadline ? {reason:"deadline",answer:input.default,defaulted:true} : {reason:"answered",answer,defaulted:false},now);
+    if (now >= row.deadline) return this.resolveLocked(row,{reason:"deadline",defaulted:true,action:input.defaultAction},now);
+    if (answer === undefined || source === undefined) return row;
+    return this.resolveLocked(row,{reason:"answered",answer,defaulted:false,source},now);
   }
   cursor(id: string, sequence: number): void {
     this.transaction(() => this.db.prepare("UPDATE items SET cursor=max(cursor,?) WHERE id=?").run(sequence,id));

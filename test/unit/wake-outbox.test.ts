@@ -44,7 +44,7 @@ test("deleted parent parks a resolved wake; missing relay cannot delay the defau
   try{
     engine.start();
     const row=await engine.register("decision",{threadId:"parent",requestId:Date.now()+":decision",
-      question:"Should this wait?",options:["Defer","Continue"],default:"Defer",defaultSafe:true,defaultAction:"defer",deadline:iso(Date.now()+150)});
+      question:"Should this wait?",options:["Defer","Continue"],dependentAction:"run the dependent step",defaultAction:"defer",deadline:iso(Date.now()+150)});
     await until(()=>store.get(row.id).outcome!==null);
     await until(()=>store.deliveries().find(d=>d.channel==="wake")?.state==="sent");
     assert.equal(JSON.parse(store.get(row.id).outcome!).defaulted,true);
@@ -106,7 +106,7 @@ test("stalled relay requests never occupy wake delivery capacity",async()=>{
   try{
     engine.start();
     for(let i=0;i<8;i++)await engine.register("decision",{threadId:"parent",requestId:Date.now()+":q"+i,
-      question:"Defer?",options:["Defer","Continue"],default:"Defer",defaultSafe:true,defaultAction:"defer",deadline:iso(Date.now()+5000)});
+      question:"Defer?",options:["Defer","Continue"],dependentAction:"run the dependent step",defaultAction:"defer",deadline:iso(Date.now()+5000)});
     const row=await engine.register("wait",{threadId:"parent",requestId:Date.now()+":independent",condition:{kind:"time",at:iso(Date.now()+50)}});
     await until(()=>store.deliveries().some(d=>d.item===row.id&&d.state==="sent"));
     assert.ok(store.deliveries().filter(d=>d.channel==="phone"&&d.state==="sending").length===2);

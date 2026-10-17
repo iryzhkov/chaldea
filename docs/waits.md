@@ -14,7 +14,7 @@ the same SQLite transaction. Command and message IDs are
 and short text:
 
 ```text
-Chaldea wake (decision <id>): {"reason":"answered","answer":"Run","defaulted":false}
+Chaldea wake (decision <id>): {"reason":"answered","answer":"Run","defaulted":false,"source":"page"}
 chaldea decision status <id>
 ```
 
@@ -62,7 +62,7 @@ chaldea wait status "$wait_id"
 chaldea wait cancel "$wait_id"
 
 chaldea decision ask --thread "$thread_id" --question 'Run the dependent step?' \
-  --option Defer --option Run --default Defer --default-safe \
+  --option Defer --option Run --dependent-action 'run the dependent step' \
   --default-action defer --deadline 2026-10-18T09:00:00-07:00
 chaldea decision answer "$question_id" --answer Run
 chaldea decision status "$question_id"
@@ -74,11 +74,23 @@ question lets it continue unrelated work. The answer page and CLI/MCP share the
 same transaction that arbitrates answer versus deadline. Answers after the
 deadline apply the declared default even if the timer has not run yet.
 
-A default must equal one option, be attested `defaultSafe:true`, and declare
-`defaultAction:"skip"|"defer"`. That is the asker's safety assertion, not semantic
-proof about arbitrary prose. Defaults must only skip/defer the dependent action:
-they never grant consent, permissions, approval, or expand autonomy. Only record
-an answer that Igor actually supplied. A notification tap does not answer.
+The asker declares `dependentAction` and `defaultAction:"skip"|"defer"`; there
+is no option-valued default or safety attestation. At the deadline the immutable
+outcome is only `{reason:"deadline",defaulted:true,action:"skip"|"defer"}`, with
+no answer text. The wake says “no answer by the deadline: skip/defer <dependent
+action>”. Even options named “Approve deploy” cannot become a deadline approval.
+Obsolete `default`/`defaultSafe` inputs are refused. Previously parked questions
+also use this structural deadline outcome; their old option-valued default is
+never selected. Defaults never grant consent, permissions or expanded autonomy.
+
+Igor answers through the authenticated page (source `page`) or CLI (source
+`cli`). MCP/agent IPC answers must name `answeringThreadId`, validated on this
+host's T3, and cannot come from the asking thread. Another thread's answer is
+recorded as `mcp:<thread>`, never as human consent. Answer outcomes and wakes
+carry the source. The CLI uses a separate human IPC method; socket access and CLI
+execution share the local-user trust boundary, rather than proving a human is
+at the keyboard. Do not manufacture consent or pass agent choices off as Igor's.
+A notification tap does not answer.
 
 MCP stdio: register `chaldea mcp --config /absolute/path/waits.json` with each
 provider's MCP configuration. It exposes `chaldea_wait`,
@@ -143,8 +155,9 @@ The answer page uses HTTP Basic login `chaldea` and a private answer token as th
 password (or bearer auth for API clients). It escapes all question/option text,
 requires an HMAC form token, checks supplied Origin, disallows framing and
 cross-origin resources, and carries no credential in a URL. Use a trusted LAN
-HTTPS reverse proxy or mesh before exposure; listen/exposure is an explicit
-deployment decision. Default bind is `127.0.0.1`, not LAN/WAN.
+HTTPS reverse proxy or HTTPS mesh endpoint **before any non-loopback bind**;
+plain HTTP Basic credentials must never cross the LAN. Listen/exposure is an
+explicit deployment decision. Default bind is `127.0.0.1`, not LAN/WAN.
 
 ## Deployment provisioning (not performed by this change)
 
@@ -229,9 +242,9 @@ budget and do not depend on an agent model being available.
 
 Native T3 pending-question tracking and auto-settlement hold/restore are omitted
 from this six-day slice. All providers can use Chaldea's own inbox. A long wait
-can be automatically settled by T3; this suppresses its undelivered wake just
-like human settlement. Deploy with the per-thread auto-settle preference disabled
-for long waits if desired; Chaldea does not change it or restore a human choice.
+can be automatically settled by T3; computed auto-settlement does **not**
+suppress its wake. Only explicit `settledOverride:"settled"`, archive or deletion
+parks delivery. Chaldea does not hold/restore auto-settlement preferences.
 
 GitHub/URL/service/feed sources, cron, scheduled sessions, LAN webhook ingress,
 cross-host waits/broker, fleet deployment, and phone receiver hardening remain
