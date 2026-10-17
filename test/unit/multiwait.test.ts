@@ -8,7 +8,8 @@ import { WAIT_TOOLS } from "../../src/mcp.ts";
 import { scratchDir } from "../helpers/scratch.ts";
 import type { WaitT3, WaitSnapshot } from "../../src/t3/waits.ts";
 
-const now=Date.parse("2026-10-17T12:00:00Z");
+// Capture one test epoch; explicit clock arguments stay deterministic without aging past retention.
+const now=Date.now();
 const iso=(n:number)=>new Date(n).toISOString();
 function fixture(){
   const dir=scratchDir("multiwait"),path=join(dir.path,"db");
@@ -29,7 +30,7 @@ test("eight active waits, retry at capacity, optional server keys and independen
     f.store.cancel(rows[0]!.id,now);add(f.store,"replacement");
     const input={threadId:"generated",condition:{kind:"time",at:iso(now)}};
     const a=f.store.prepare("wait",input,now),b=f.store.prepare("wait",input,now);
-    assert.match(a.input.requestId,/^1792238400000:[a-f0-9-]+$/);
+    assert.match(a.input.requestId,new RegExp("^"+now+":[a-f0-9-]+$"));
     assert.notEqual(a.input.requestId,b.input.requestId);
     const generated=f.store.register(a,"project",null,now);
     assert.equal(f.store.register(f.store.prepare("wait",a.input,now),"project",null,now).id,generated.id);
