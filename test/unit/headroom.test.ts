@@ -70,7 +70,7 @@ test("host reports exclude failed/uninstalled/stale rows and combine real transi
     { ...provider("unknown"), usageLimits: { checkedAt: AT, windows: [] } },
   ];
   try {
-    m.update(excluded); await m.tick(); assert.deepEqual(records, []);
+    m.update(excluded); await m.tick(); assert.equal(records.length, 0);
     m.update([...good, ...excluded]); await m.tick();
     applyCodex(state.providers.find(p => p.alias === "failed")!, response, AT);
     m.emit();
