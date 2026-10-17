@@ -2,10 +2,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { timesyncdHealth, sampleClock } from "../../src/access/maintenance.ts";
 const now = 1792252800;
-function report(offset = 0.002, age = 0): string {
-  const dest = (now - age) * 1e6, origin = dest - 100000;
+function report(offset = 0.002, age = 0, trip = 0.08, at = now): string {
+  const dest = (at - age) * 1e6, origin = dest - (trip + 0.02) * 1e6;
   return "(uuuuittayttttbtt) " + [0,4,4,2,-20,1000,1000,4,1,2,3,4,
-    origin, origin + 40000 + offset * 1e6, dest - 40000 + offset * 1e6, dest, false, 5, 100].join(" ");
+    origin, origin + trip / 2 * 1e6 + offset * 1e6, dest - trip / 2 * 1e6 + offset * 1e6, dest, false, 5, 100].join(" ");
 }
 const health = (r = report(), sync = "b true", poll = "t 64000000") => timesyncdHealth(sync,r,poll,now);
 test("timesyncd reads the typed NTP offset and conservative 30 second accuracy bound", () => {
@@ -14,10 +14,12 @@ test("timesyncd reads the typed NTP offset and conservative 30 second accuracy b
   assert.equal(health(report(-29)).healthy, true);
   assert.equal(health(report(31)).healthy, false);
   assert.equal(health(report(30)).healthy, false);
+  assert.equal(health(report(27,0,8)).healthy, false);
+  assert.equal(health(report(0,0,-0.01)).healthy, false);
 });
 test("timesyncd fails closed for unsynchronised, unknown, stale and ignored measurements", () => {
   for (const sync of ["b false", "", "yes"]) assert.equal(health(report(),sync).healthy,false);
-  for (const r of ["",report().replace(" 0 4 4 2 "," 3 4 4 2 "),report().replace(" 0 4 4 2 "," 0 4 4 16 "),
+  for (const r of ["",report().replace(" 0 4 4 2 "," 3 4 4 2 "),report().replace(" 0 4 4 2 "," 1 4 4 2 "),report().replace(" 0 4 4 2 "," 0 4 4 16 "),
     report().replace(" false "," true "),report().replace(" 4 1 2 3 4 "," 4 0 0 0 0 "),
     report(0,193),report(0,-31),report().replace(" 5 100"," 0 100"),report()+" extra"]) assert.equal(health(r).healthy,false,r);
   for (const poll of ["", "t 0","t NaN"]) assert.equal(health(report(),"b true",poll).healthy,false);
@@ -37,6 +39,24 @@ test("active timesyncd never falls back to chrony on failed or unknown status", 
   }
   assert.equal(sampleClock(()=>{throw new Error("timeout");}).healthy,false);
   assert.equal(sampleClock(()=>"failed").healthy,false);
+});
+test("active timesyncd samples the exact system D-Bus properties", () => {
+  const calls: string[][] = [];
+  const h = sampleClock((program,args) => {
+    calls.push([program,...args]);
+    if (program.endsWith("systemctl")) return "active";
+    if (args.at(-1) === "NTPSynchronized") return "b true";
+    if (args.at(-1) === "NTPMessage") return report(0.002,0,0.08,Math.floor(Date.now()/1000));
+    return "t 64000000";
+  });
+  assert.equal(h.healthy,true);
+  assert.deepEqual(calls.slice(1), [
+    ["/usr/bin/busctl","--system","--no-pager","get-property","org.freedesktop.timedate1",
+      "/org/freedesktop/timedate1","org.freedesktop.timedate1","NTPSynchronized"],
+    ["/usr/bin/busctl","--system","--no-pager","get-property","org.freedesktop.timesync1",
+      "/org/freedesktop/timesync1","org.freedesktop.timesync1.Manager","NTPMessage"],
+    ["/usr/bin/busctl","--system","--no-pager","get-property","org.freedesktop.timesync1",
+      "/org/freedesktop/timesync1","org.freedesktop.timesync1.Manager","PollIntervalUSec"]]);
 });
 test("inactive timesyncd retains chrony's protected socket adapter", () => {
   let args: string[] = [];

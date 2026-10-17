@@ -107,14 +107,16 @@ export function timesyncdHealth(synchronized: string, report: string, poll: stri
       ref.join(".") !== "127.127.1.1" && ref.join(".") !== "76.79.67.76", "local_reference");
     const origin = integer(12) / 1e6, receive = integer(13) / 1e6,
       transmit = integer(14) / 1e6, destination = integer(15) / 1e6;
-    requireAccess(leap >= 0 && leap <= 2 && [3, 4].includes(version) && mode === 4 &&
+    requireAccess(leap === 0 && [3, 4].includes(version) && mode === 4 &&
       stratum >= 1 && stratum <= 15 && delay >= 0 && dispersion >= 0 &&
       Number.isFinite(update) && update > 0 && values[16] === "false" &&
       integer(17) > 0 && integer(18) >= 0 && origin > 0 && receive > 0 &&
       transmit >= receive && destination >= origin && destination <= now + 30 &&
       now - destination <= Math.min(3600, Math.max(120, update * 3)), "unsynchronised");
     const offsetSeconds = ((receive - origin) + (transmit - destination)) / 2;
-    return { healthy: Math.abs(offsetSeconds) + dispersion + delay / 2 <= 30, offsetSeconds, checked_at: now };
+    const roundTrip = (destination - origin) - (transmit - receive);
+    requireAccess(roundTrip >= 0, "bad_delay");
+    return { healthy: Math.abs(offsetSeconds) + dispersion + (delay + roundTrip) / 2 <= 30, offsetSeconds, checked_at: now };
   } catch { return bad; }
 }
 const clockCommand = (program: string, args: string[]): string =>
