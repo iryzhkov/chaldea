@@ -14,17 +14,20 @@ failure writes no bearer and a generic denial to stderr. The lifetime is at most
 run ID, lifetime, key, trust, or state paths.
 
 The root-owned launcher calls sudo noninteractively as chaldea-issuer. sudo must set
-SUDO_UID and deny SETENV. The root-owned issuer-command drops every inherited
+SUDO_UID and deny SETENV. The root-owned issuer wrapper drops every inherited
 environment variable except sudo's caller UID and a fixed PATH before starting the
-pinned Node executable. The command requires effective uid 995. Running the Node
+pinned Node executable. The command requires the effective UID from protected
+config. Running the Node
 command directly as a producer fails before opening state or a key. Do not grant
 producers a shell, Node, env, arbitrary chaldea commands, or direct issuer login.
 
-The root-owned /etc/chaldea/token-helper.json contains this shape. The UID below
-is illustrative, not a deployment grant.
+The root-owned /etc/chaldea/token-helper.json contains this shape. Producer UID
+1000 is illustrative, not a deployment grant.
 
 ```json
 {
+  "issuer": {"uid": 995, "key_file": "/var/lib/chaldea-issuer/keys/agent-a-2026-10.pem",
+             "name": "chaldea:agent-a", "kid": "agent-a-2026-10"},
   "state_file": "/var/lib/chaldea-issuer/access/state.sqlite",
   "bundle_file": "/var/lib/chaldea-access-trust-public/bundle.jws",
   "anchor_file": "/etc/chaldea-access-trust/anchors.json",
@@ -35,6 +38,10 @@ is illustrative, not a deployment grant.
   ]
 }
 ```
+
+All issuer fields are required. The example records the original agent-a defaults;
+other hosts must supply their own UID, absolute key path, issuer name and kid.
+These values come only from the root-owned config, never arguments or environment.
 
 Each request must match exactly one entry on UID and all five flags. Profile and
 project come from that entry; resource is exactly source, with only the requested
@@ -56,10 +63,15 @@ missing state or keys. The updater remains responsible for fetching and authenti
 trust bundles signed by Normandy's deployment-2026-10b anchor. This change does not
 alter the existing trust freshness policy.
 
+The legacy packaging/token-helper/issuer-command is an uninstalled example for
+older manual layouts. The fleet role renders the fixed issuer wrapper described
+below; do not install the legacy example as a sudoers target.
+
 ## Deployment prerequisites, not performed by this change
 
-- Install the pinned runtime and root-owned immutable application at /opt/chaldea,
-  plus bin/chaldea-token-helper at /usr/local/bin. Every ancestor of these files,
+- Install an independently checksum-verified client release and pinned Node under
+  a root-owned directory. Install its bin/chaldea-token-helper at /usr/local/bin
+  and a fixed issuer wrapper at /usr/local/libexec/chaldea-token-helper-issuer. Every ancestor of these files,
   /etc/chaldea and the config must be root-owned and not producer-writable.
 - Retain chaldea-issuer uid 995 with no login. Its existing private key stays at
   /var/lib/chaldea-issuer/keys/agent-a-2026-10.pem, issuer-owned 0600 in a 0700
@@ -71,9 +83,10 @@ alter the existing trust freshness policy.
   read access to the issuer. No new persistent issuer daemon or socket is needed.
 - Add explicit producer UID entries and matching signed issuer ceilings plus Akasha
   source registrations. For each approved UID, sudoers may allow only
-  `/opt/chaldea/app/packaging/token-helper/issuer-command *` as chaldea-issuer,
+  `/usr/local/libexec/chaldea-token-helper-issuer` with each grant's exact five flag pairs as chaldea-issuer,
   NOPASSWD and NOSETENV, with env_reset and a fixed secure_path. Validate with visudo.
-  The wrapper interprets no shell text and the application rejects unknown flags.
+  The wrapper clears the environment and invokes the verified release's bin/chaldea
+  through the root-pinned Node. It interprets no shell text; the app rejects unknown flags.
 - Set `tokenHelper` in publisher services' `events.json`, and FEED_TOKEN_HELPER
   for feed and toolfeedback. The old AKASHA_TOKEN_HELPER environment variable
   remains accepted with a deprecation warning; see [configuration](configuration.md). FEED_TOKEN_SOURCE and FEED_TOKEN_HOST name their configured identity;

@@ -12,6 +12,23 @@ test("token helper accepts exactly five flag pairs and rejects caller-controlled
     flags.map(x => x === "append" ? "admin" : x)]) assert.throws(() => tokenRequest(args));
   assert.throws(() => helperConfig({}));
 });
+const config = {
+  issuer: { uid: 1234, key_file: "/private/host-b.pem", name: "chaldea:agent-b", kid: "host-b-key" },
+  state_file: "/private/state", bundle_file: "/public/bundle", anchor_file: "/public/anchors",
+  clock_health_file: "/public/health",
+  grants: [{ ...tokenRequest(flags), uid: 1000, profile: "quota-service", project: "chaldea" }],
+};
+test("issuer identity is required, validated and copied from protected configuration", async () => {
+  assert.deepEqual(helperConfig(config).issuer, config.issuer);
+  for (const issuer of [undefined, { ...config.issuer, uid: 0 }, { ...config.issuer, uid: 1.5 },
+    { ...config.issuer, uid: 4294967295 }, { ...config.issuer, key_file: "relative" },
+    { ...config.issuer, name: "other:agent-b" }, { ...config.issuer, kid: "" },
+    { ...config.issuer, extra: true }]) assert.throws(() => helperConfig({ ...config, issuer }));
+  let output = "";
+  const io = { out: (s: string) => { output += s; }, err: () => {} };
+  assert.equal(await tokenHelperCli(flags, io, { uid: 995, caller: "1000", config: () => config }), 1);
+  assert.equal(output, "");
+});
 test("producer grants bind UID and all five selectors, including read vs append", async () => {
   assert.ok(process.env.CHALDEA_TRUST_TEST_HOME);
   assert.equal(process.env.HOME, process.env.CHALDEA_TRUST_TEST_HOME);
@@ -34,11 +51,10 @@ test("producer grants bind UID and all five selectors, including read vs append"
     await assert.rejects(verifyToken(token, { audience: "akasha", resource: "quota", action: "read" }, r.trust, r.clock));
   } finally { r.remove(); }
 });
-test("helper denies direct calls before opening config or any signing key and redacts errors", async () => {
+test("helper denies calls without a sudo caller before opening config and redacts errors", async () => {
   let opened = false, out = "", err = "";
   const code = await tokenHelperCli(flags, { out: s => { out += s; }, err: s => { err += s; } },
-    { uid: 1000, caller: "0", config: () => { opened = true; throw new Error("SECRET"); },
-      key: "/must-not-open", issuer: "chaldea:agent-a", kid: "agent-a-2026-10" });
+    { uid: 1000, caller: undefined, config: () => { opened = true; throw new Error("SECRET"); } });
   assert.equal(code, 1); assert.equal(opened, false); assert.equal(out, "");
   assert.equal(err, "chaldea token helper: denied\n");
 });

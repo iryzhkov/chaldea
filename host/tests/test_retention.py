@@ -429,6 +429,7 @@ def test_each_stage_error_preserves_failure_and_runs_all_stages(monkeypatch, fai
 def test_go_clean_failure_is_reported_and_mise_still_runs(tmp_path, monkeypatch):
     cache = tmp_path / "go-cache"
     cache.mkdir()
+    age(cache, 3)
     monkeypatch.setattr(retention.shutil, "which", lambda name: "/fake/go")
     monkeypatch.setattr(retention, "size_of", lambda path: retention.GIB)
     commands, later = [], []
