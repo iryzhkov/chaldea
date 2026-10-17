@@ -1,7 +1,7 @@
 // `chaldea` command-line entry point.
 import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
-import { headroomConfig } from "./quota/codex-balance.ts";
+import { loadHeadroomConfig } from "./quota/codex-balance.ts";
 import { humanStatus, statusSnapshot } from "./quota/headroom.ts";
 import { loadState } from "./quota/state.ts";
 import { switchConfig } from "./quota/routing.ts";
@@ -25,7 +25,7 @@ quota observe: records T3 usage-limit stops and native auto-resumes in the fleet
   --token-file PATH    Bearer token, mode 0600 (default: ~/.config/chaldea/t3-token)
   --state-file PATH    Cursor and posted keys (default: ~/.local/state/chaldea/quota-observer.json)
   --feed-command PATH  Feed CLI to run (default: feed)
-  --quota-config PATH  Explicit Codex credential contexts and low-headroom threshold
+  --quota-config PATH  Codex contexts (default: ~/.config/chaldea/quota.json, optional)
   --enable-provider-switch  Continue quota stops on an equivalent provider (default: off)
   --switch-config PATH  JSON { enabled, equivalences: [[Claude model, Codex model], ...] }
   --restart-config PATH  Planned restart recovery config (enabled by default)\n  --host NAME          Host name for feed records (default: short hostname)
@@ -137,7 +137,7 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
       tokenFile: values["token-file"] ?? join(home, ".config", "chaldea", "t3-token"),
       statePath: values["state-file"] ?? join(home, ".local", "state", "chaldea", "quota-observer.json"),
       feedCommand: values["feed-command"] ?? "feed",
-      reporting: headroomConfig(values["quota-config"] ? JSON.parse(readFileSync(values["quota-config"], "utf8")) : {}),
+      reporting: loadHeadroomConfig(home, values["quota-config"]),
       switching: (() => {
         const config = switchConfig(values["switch-config"] ? JSON.parse(readFileSync(values["switch-config"], "utf8")) : {});
         return { ...config, enabled: values["enable-provider-switch"] === true || config.enabled };

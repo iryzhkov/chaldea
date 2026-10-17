@@ -369,22 +369,31 @@ Normal provider-managed credential renewal during a read is distinct from these 
 This exchange was designed against codex-cli 0.163.0; optional fields are tolerated
 and incompatible responses degrade to unknown/error rather than inventing a balance.
 
-Credential matching is deliberately explicit. Add `--quota-config PATH` to
-`quota observe` with a local JSON file, for example:
+Credential matching is deliberately explicit. At startup, `quota observe` reads
+`~/.config/chaldea/quota.json` relative to its user's HOME. For the packaged
+omarchy-pc service the exact path is `/home/igor/.config/chaldea/quota.json`.
+A missing default file leaves Codex balance unknown. `--quota-config PATH`
+overrides that path; an explicit missing file or malformed config is an error.
+Creating the file takes effect on the next observer start.
+
+Minimal example for an instance named `codex` whose effective runtime home is
+`/home/igor/.codex`:
 
 ```json
 {
   "contexts": [{
-    "providers": ["codex", "codex_personal"],
-    "home": "/home/example",
-    "codexHome": "/home/example/.codex",
-    "command": "/absolute/path/to/installed/codex"
-  }],
-  "lowHeadroomPercent": 10
+    "providers": ["codex"],
+    "home": "/home/igor",
+    "codexHome": "/home/igor/.codex"
+  }]
 }
 ```
 
-The operator binds the provider aliases to that HOME/auth context. The observer
+The optional `command` is an absolute path to the installed Codex executable;
+without it the observer resolves `codex` on its service PATH. The optional
+`lowHeadroomPercent` defaults to 10. The operator binds aliases to the actual
+HOME/auth context; use T3's effective runtime path for `codexHome`, including
+a shadow home when configured. The observer
 also requires a loopback T3 URL, an enabled/installed/authenticated Codex provider,
 a confirmed ChatGPT auth type, and an exact normalized match between codexHome and the published effective runtime
 home (shadowHomePath when present, otherwise homePath). Missing runtime paths,
@@ -412,15 +421,22 @@ Claude prepaid wallet. If a future feature-detected control read succeeds, its s
 and cap must retain currency **minor units**; cap remainder is not prepaid cash.
 Unsupported money metrics are distinguished from an unknown observation.
 
-The existing durable feed queue/poster carries `quota_headroom_snapshot` once per
-15-minute UTC bucket while connected (including startup), plus
-`quota_headroom_changed` for metric availability, wallet availability, permission
-or reset-count changes and `quota_headroom_low` when the set of providers below
-the configured included-window remaining-percent threshold changes. Periodic records
-also age stale observations while idle inference is absent. Records are bounded,
-one provider per payload, with at most 32 windows and 64 provider aliases. Claims,
+The existing durable feed queue/poster carries one combined host
+`quota_headroom_snapshot` per 15-minute UTC bucket while connected, including
+startup. Its body contains all enabled, installed providers with at least one
+fresh metric; unavailable or failed probes are excluded even if cached values
+remain. Unknown-only and stale-only providers produce no feed records. The first
+usable observation after startup establishes the change/low baseline silently.
+Afterwards `quota_headroom_changed` reports metric availability, wallet availability,
+permission or reset-count transitions, and `quota_headroom_low` reports a changed
+nonempty set below the configured included-window remaining-percent threshold.
+Each kind is combined per host per evaluation. Refresh timestamps and catalog
+ordering do not trigger records. An empty eligible catalog produces no records.
+Cached status retains per-metric stale/unknown diagnostics.
+
+Each provider carries at most 32 windows, with at most 64 provider aliases. Claims,
 snapshot slot and pending delivery are saved together before enqueue,
-with at most the newest pending headroom intent per provider/kind (192 total);
+with at most the newest pending headroom intent per host/kind (3 total);
 headroom intents are evicted before a transition can be rejected for capacity, so observer
 restarts replay durable delivery intents through the existing poster path.
 Legacy feed attempts retain their existing at-most-once semantics; scoped Akasha

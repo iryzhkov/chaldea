@@ -196,6 +196,7 @@ export class HeadroomMonitor {
   #providers: ReadonlyArray<SwitchProvider> = [];
   #active = false;
   #changed = false;
+  #baseline = false;
   #flight: Promise<void> | null = null;
   #due = new Map<string, number>();
   #failures = new Map<string, number>();
@@ -232,7 +233,8 @@ export class HeadroomMonitor {
     });
     this.#changed ||= before !== JSON.stringify(this.state.providers);
     this.#active = true;
-    this.emit();
+    // Include the bounded startup balance read in the first snapshot/baseline.
+    if (this.#baseline) this.emit();
     void this.tick();
   }
   inactive(): void { this.#active = false; }
@@ -289,27 +291,39 @@ export class HeadroomMonitor {
   }
   emit(): void {
     if (!this.#active) return;
-    const now = this.now(), snapshot = statusSnapshot(this.state, now);
+    const now = this.now();
+    const eligible = new Set(this.#providers.filter(p => p.enabled && p.installed && p.availability !== "unavailable" &&
+      (p.usageLimits?.unavailable === undefined || object(p.usageLimits.unavailable)?.reason === "unsupported")).map(p => p.instanceId));
+    const providers = this.state.providers.filter(p => eligible.has(p.alias) &&
+      [p.plan, p.included, p.credits, p.manualResets, p.extraUsage, p.ordinaryUsageAllowed, p.spendControlReached]
+        .some(m => metricNow<unknown>(m, now).state === "fresh")).sort((a, b) => a.alias.localeCompare(b.alias));
+    const snapshot = statusSnapshot({ ...this.state, providers }, now);
     // Ages and successful-read timestamps are not changes in availability/inventory.
     const digest = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
-    const signature = digest(this.state.providers.map(p => ({ alias: p.alias,
+    const signature = digest(providers.map(p => ({ alias: p.alias,
       states: [p.included, p.credits, p.manualResets, p.extraUsage, p.ordinaryUsageAllowed, p.spendControlReached].map(m => metricNow<unknown>(m, now).state),
       count: p.manualResets.value?.availableCount ?? null, walletAvailable: p.credits.value?.hasCredits ?? null, ordinary: p.ordinaryUsageAllowed.value, spendControl: p.spendControlReached.value })));
-    const low = this.state.providers.filter(p => {
+    const low = providers.filter(p => {
       const m = metricNow(p.included, now);
       return m.state === "fresh" && m.value?.some(w => w.remainingPercent <= this.options.config.lowHeadroomPercent);
     }).map(p => p.alias).sort().join(",");
     const records: Array<QuotaRecord> = [];
     const add = (kind: "quota_headroom_snapshot" | "quota_headroom_changed" | "quota_headroom_low") => {
       this.state.sequence++;
-      for (const provider of snapshot.providers) records.push({ kind, severity: kind === "quota_headroom_low" ? "warn" : "info",
-        threadId: "headroom", runId: `${now}-${this.state.sequence}-${provider.alias}`, provider: "all",
-        resetAt: null, subagent: false, headroom: { ...snapshot, providers: [provider] } });
+      records.push({ kind, severity: kind === "quota_headroom_low" ? "warn" : "info",
+        threadId: "headroom", runId: `${now}-${this.state.sequence}`, provider: "all",
+        resetAt: null, subagent: false, headroom: snapshot });
     };
     const slot = Math.floor(now / SNAPSHOT_EVERY_MS);
-    if (slot !== this.state.snapshotSlot) { this.state.snapshotSlot = slot; add("quota_headroom_snapshot"); }
-    if (signature !== this.state.signature) { this.state.signature = signature; add("quota_headroom_changed"); }
-    if (low !== this.state.low) { this.state.low = low; if (low) add("quota_headroom_low"); }
+    if (providers.length > 0 && slot !== this.state.snapshotSlot) { this.state.snapshotSlot = slot; add("quota_headroom_snapshot"); }
+    if (this.#baseline && providers.length > 0) {
+      if (signature !== this.state.signature) add("quota_headroom_changed");
+      if (low !== this.state.low && low) add("quota_headroom_low");
+    }
+    // The first usable catalog after startup establishes a silent transition baseline.
+    this.#baseline ||= providers.length > 0;
+    this.state.signature = signature;
+    this.state.low = low;
     if (records.length > 0 || this.#changed) {
       this.options.save(records); // snapshot and delivery intents are persisted before poster enqueue
       this.#changed = false;

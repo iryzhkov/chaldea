@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
-import { headroomConfig, readCodexBalance, BalanceReadError } from "../../src/quota/codex-balance.ts";
+import { headroomConfig, loadHeadroomConfig, readCodexBalance, BalanceReadError } from "../../src/quota/codex-balance.ts";
 import { applyCodex, applyT3, emptyHeadroom, failCodex, HeadroomMonitor, humanStatus, metricNow,
   newProvider, routingLanes, statusSnapshot, STALE_AFTER_MS, COLLECT_EVERY_MS } from "../../src/quota/headroom.ts";
 import { emptyState, loadState, saveState } from "../../src/quota/state.ts";
@@ -30,6 +30,83 @@ const provider = (alias = "codex", runtimeHome = "/scratch/codex"): SwitchProvid
   auth: { status: "authenticated", type: "chatgpt" }, models: [], usageLimits: { checkedAt: AT,
     windows: [{ id: "primary", kind: "weekly", usedPercent: 100, windowDurationMins: 10080, resetsAt: "2026-10-21T23:13:21Z" }],
     resetCredits: { availableCount: 1, nextExpiresAt: "2026-11-01T00:00:00Z" } },
+});
+
+test("host startup with 18 instances reports only two enabled providers once per quarter-hour", async () => {
+  let now = Math.floor(START / STALE_AFTER_MS) * STALE_AFTER_MS;
+  const records: QuotaRecord[] = [];
+  const config = headroomConfig({ contexts: [{ providers: ["p0", "p1"], home: "/scratch/home", codexHome: "/scratch/codex" }] });
+  const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true,
+    now: () => now, random: () => 0.5, read: async () => response, save: batch => records.push(...batch) });
+  const catalog = () => Array.from({ length: 18 }, (_, i) => ({
+    ...provider("p" + i), enabled: i < 2,
+    usageLimits: { ...provider().usageLimits!, checkedAt: new Date(now).toISOString() },
+  }));
+  try {
+    m.update(catalog()); await m.tick();
+    assert.equal(records.length, 1, "startup establishes a silent change/low baseline");
+    assert.equal(records[0]?.kind, "quota_headroom_snapshot");
+    assert.deepEqual(records[0]?.headroom?.providers.map(p => p.alias), ["p0", "p1"]);
+    assert.equal(records[0]?.headroom?.providers[0]?.creditFunded.credits.value?.balance, "61951.0098125000");
+    for (let minute = 1; minute <= 45; minute++) {
+      now += 60_000; m.update(catalog()); await m.tick();
+      assert.equal(records.length, 1 + Math.floor(minute / 15));
+    }
+    assert.ok(records.every(r => r.kind === "quota_headroom_snapshot"));
+  } finally { await m.close(); }
+});
+
+test("host reports exclude failed/uninstalled/stale rows and combine real transitions", async () => {
+  const records: QuotaRecord[] = [], state = emptyHeadroom();
+  const m = new HeadroomMonitor({ state, config: headroomConfig(), local: true,
+    now: () => START, save: batch => records.push(...batch) });
+  const good = ["a", "b"].map(alias => ({ ...provider(alias),
+    usageLimits: { checkedAt: AT, windows: [{ usedPercent: 20 }], resetCredits: { availableCount: 1 } } }));
+  const excluded = [
+    { ...provider("disabled"), enabled: false },
+    { ...provider("uninstalled"), installed: false },
+    { ...provider("failed"), usageLimits: { checkedAt: AT, windows: [], unavailable: { reason: "probeFailed" } } },
+    { ...provider("stale"), usageLimits: { checkedAt: new Date(START - STALE_AFTER_MS).toISOString(), windows: [{ usedPercent: 100 }] } },
+    { ...provider("unknown"), usageLimits: { checkedAt: AT, windows: [] } },
+  ];
+  try {
+    m.update(excluded); await m.tick(); assert.deepEqual(records, []);
+    m.update([...good, ...excluded]); await m.tick();
+    applyCodex(state.providers.find(p => p.alias === "failed")!, response, AT);
+    m.emit();
+    assert.equal(records.length, 1);
+    assert.deepEqual(records[0]?.headroom?.providers.map(p => p.alias), ["a", "b"]);
+    m.update([...good.slice().reverse(), ...excluded]); await m.tick();
+    assert.equal(records.length, 1, "catalog ordering is not a transition");
+    m.update([...good.map(p => ({ ...p, usageLimits: { checkedAt: AT,
+      windows: [{ usedPercent: 100 }], resetCredits: { availableCount: 2 } } })), ...excluded]); await m.tick();
+    assert.deepEqual(records.map(r => r.kind), ["quota_headroom_snapshot", "quota_headroom_changed", "quota_headroom_low"]);
+    assert.ok(records.every(r => r.headroom?.providers.length === 2));
+    m.update([...good.map(p => ({ ...p, usageLimits: { checkedAt: AT,
+      windows: [{ usedPercent: 100 }], resetCredits: { availableCount: 2 } } })), ...excluded]); await m.tick();
+    assert.equal(records.length, 3);
+  } finally { await m.close(); }
+  const restarted: QuotaRecord[] = [];
+  const restart = new HeadroomMonitor({ state, config: headroomConfig(), local: true, now: () => START,
+    save: batch => restarted.push(...batch) });
+  try { restart.update(good); await restart.tick(); assert.deepEqual(restarted, []); }
+  finally { await restart.close(); }
+});
+
+test("quota config defaults to the observer user's .config/chaldea/quota.json", () => {
+  const f = scratchDir("quota-config");
+  try {
+    assert.deepEqual(loadHeadroomConfig(f.path), headroomConfig());
+    const dir = join(f.path, ".config", "chaldea"), path = join(dir, "quota.json");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path, JSON.stringify({ contexts: [{ providers: ["codex"], home: f.path, codexHome: join(f.path, ".codex") }] }));
+    assert.equal(loadHeadroomConfig(f.path).contexts[0]?.codexHome, join(f.path, ".codex"));
+    assert.throws(() => loadHeadroomConfig(f.path, join(f.path, "missing.json")));
+    writeFileSync(path, "{broken");
+    assert.throws(() => loadHeadroomConfig(f.path));
+    const explicit = join(f.path, "explicit.json"); writeFileSync(explicit, "{}");
+    assert.deepEqual(loadHeadroomConfig(f.path, explicit), headroomConfig());
+  } finally { f.remove(); }
 });
 
 test("T3 projection preserves full windows/reset count and drops identity and redemption fields", () => {
@@ -140,11 +217,11 @@ test("headroom records survive restart via the existing durable sink; quarter-ho
   try {
     m.update([provider()]); await m.tick();
     assert.equal(delivered.filter(r => r.kind === "quota_headroom_snapshot").length, 1);
-    assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 1);
-    await m.tick(); assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 1);
+    assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 0);
+    await m.tick(); assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 0);
     m.update([{ ...provider(), usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] } }]);
     m.update([provider()]); await m.tick();
-    assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 2);
+    assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 1);
     now = Math.floor(START / STALE_AFTER_MS + 1) * STALE_AFTER_MS;
     await m.tick(); assert.equal(delivered.filter(r => r.kind === "quota_headroom_snapshot").length, 2);
     const loaded = loadState(path, now); assert.equal(loaded.headroom.snapshotSlot, state.headroom.snapshotSlot);
@@ -173,7 +250,7 @@ test("headroom coalescing and eviction preserve the full transition queue during
     for (let i = 0; i < 300; i++) { sink.record([advisory("alias", i)]); sink.save(); }
     assert.equal(state.pendingDelivery.size, 1); assert.equal(queued.size, 1);
     for (let i = 0; i < 220; i++) { sink.record([advisory("p" + i, i + 300)]); sink.save(); }
-    assert.equal(state.pendingDelivery.size, 192); assert.equal(queued.size, 192);
+    assert.equal(state.pendingDelivery.size, 1); assert.equal(queued.size, 1);
     for (let i = 0; i < 256; i++) {
       sink.record([{ kind: "quota_parked", severity: "warn", threadId: "t" + i, runId: "run" + i,
         provider: "codex", resetAt: AT, subagent: false }]); sink.save();

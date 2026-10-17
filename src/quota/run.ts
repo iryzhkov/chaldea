@@ -216,17 +216,16 @@ export class EventSink {
       if (this.state.pendingDelivery.has(key)) continue;
       const advisory = [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
       if (record.headroom) {
-        const alias = record.headroom.providers[0]?.alias;
         for (const [oldKey, old] of advisory) {
-          if (old.kind === record.kind && old.headroom?.providers[0]?.alias === alias) this.#discardHeadroom(oldKey);
+          if (old.kind === record.kind) this.#discardHeadroom(oldKey);
         }
       }
       // Advisory reporting never consumes capacity needed by a transition. Keep at most
-      // 192 advisory intents (64 aliases × 3 kinds) and evict them first on either the count or byte bound.
+      // 3 advisory intents (one host record per kind) and evict them first on either the count or byte bound.
       const overflow = () => this.state.pendingDelivery.size >= MAX_QUEUED_RECORDS ||
         Buffer.byteLength(JSON.stringify([...this.state.pendingDelivery.values(), record])) > MAX_PENDING_BYTES;
       const headroom = () => [...this.state.pendingDelivery].filter(([, r]) => r.headroom !== undefined);
-      while (overflow() || record.headroom !== undefined && headroom().length >= 192) {
+      while (overflow() || record.headroom !== undefined && headroom().length >= 3) {
         const oldest = headroom()[0];
         if (!oldest) break;
         this.#discardHeadroom(oldest[0]);
