@@ -7,7 +7,7 @@ import { WakeStore } from "../wake/store.ts";
 import { WaitEngine, type EngineOptions } from "./engine.ts";
 import { createWaitT3 } from "../t3/waits.ts";
 import { discoverServerUrl } from "../t3/adapter.ts";
-import { loadConfig, privateFile, notify, type WaitConfig } from "./config.ts";
+import { loadConfig, privateFile, type WaitConfig } from "./config.ts";
 import { boundedLog } from "./log.ts";
 import { object, text } from "./types.ts";
 
@@ -84,10 +84,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       if(!serverUrl)throw new Error("T3 is offline");
       return {serverUrl,token:privateFile(config.tokenFile),signal:AbortSignal.timeout(10_000)};
     },config.environment,id=>engine!.trackedNative(id));
-    engine=new WaitEngine(store,t3,{answerBaseUrl:config.answerBaseUrl,threadUrl:threadId=>{
-      const base=config.threadBaseUrl??config.serverUrl??discoverServerUrl(config.t3BaseDir);
-      return base ? new URL("/"+encodeURIComponent(config.environment)+"/"+encodeURIComponent(threadId),base).toString() : "t3-thread://v1/"+threadId;
-    },...(config.notifyUrl && config.notifyEnvFile ? {notify:(p:string)=>notify(config,p)} : {}),report,...extras});
+    engine=new WaitEngine(store,t3,{report,...extras});
     const running=engine;
     page=createServer(async(req,res)=>{
       res.setHeader("Cache-Control","no-store");
