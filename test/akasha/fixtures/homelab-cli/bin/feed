@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# feed - the fleet activity feed: what the agents and jobs on this network did.
+#
+# This is not the memory store. Entries are events, they carry a host and a
+# timestamp, they age out, and nothing here becomes long-term knowledge unless
+# somebody decides to write it into OpenViking on purpose. Read it to find out
+# what already happened; write to it when something happened.
+
+set -uo pipefail
+
+PROGRAM=${0##*/}
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+LIB_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+source "$LIB_DIR/common.sh"
+# shellcheck source=../lib/spool.sh
+source "$LIB_DIR/spool.sh"
+
+# The vocabulary the instrumentation spool is allowed to record: the commands
+# this tool publishes and the options it parses, and nothing else. A word that
+# is not in one of these lists is never written to a record, because a record
+# is shipped to another host and anything else on the command line is a title,
+# a search text, a link or an entry id. See lib/spool.sh.
+# shellcheck disable=SC2034  # read by lib/spool.sh
+SPOOL_VERBS='recent list post show open url health help'
+# shellcheck disable=SC2034  # read by lib/spool.sh
+SPOOL_FLAGS='since host source severity tag grep limit full json link body-file help h'
+spool_begin feed "$@"
+
+FEED_CONFIG=${FEED_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/feed/config}
+# shellcheck source=/dev/null
+[[ -r $FEED_CONFIG ]] && source "$FEED_CONFIG"
+
+FEED_URL=${FEED_URL:-http://192.168.70.223:1934}
+FEED_URL=${FEED_URL%/}
+FEED_KEY_FILE=${FEED_KEY_FILE:-${XDG_CONFIG_HOME:-$HOME/.config}/feed/key}
+AS_JSON=0
+
+usage() {
+	cat <<'USAGE'
+Usage: feed <command> [options]
+
+  recent [options]      What happened lately (default: the last 7 days).
+  post <title> [opts]   Record that something happened.
+  show <id>             One entry in full.
+  open                  Print the web URL, token included, for a browser.
+  health                Check that the feed service is up.
+
+Options for recent:
+  --since 7d|12h|30m    How far back to look (default: 7d).
+  --host NAME           Only entries from this host.
+  --source NAME         Only entries from this job or agent.
+  --severity info|warn|fail
+  --tag NAME            Only entries carrying this tag.
+  --grep TEXT           Only entries whose title or body contains TEXT.
+  --limit N             At most N entries (default: 50).
+  --full                Include the body of each entry.
+  --json                Raw JSON, for a script or an agent.
+
+Options for post:
+  --severity info|warn|fail   Default: info.
+  --source NAME               The job or agent recording this (default: $USER).
+  --host NAME                 Default: this host's short name.
+  --tag "a b"                 Tags, space or comma separated.
+  --link URL                  Where the detail lives, usually a T3 thread.
+  --body-file PATH            Body from a file, or from stdin when PATH is "-".
+
+Config (~/.config/feed/config):
+  FEED_URL=http://192.168.70.223:1934
+The token is read from ~/.config/feed/key (0600) or $FEED_TOKEN.
+
+Examples:
+  feed recent --since 24h --severity fail
+  feed recent --tag docker --full
+  docker-update-sweep | feed post "weekly docker update" --source docker-update --body-file -
+USAGE
+}
+
+token() {
+	if [[ -n ${FEED_TOKEN:-} ]]; then
+		printf '%s' "$FEED_TOKEN"
+		return 0
+	fi
+	[[ -r $FEED_KEY_FILE ]] ||
+		spool_refuse no-credential "no feed token: set FEED_TOKEN or write one to $FEED_KEY_FILE (0600)"
+	tr -d '\n' <"$FEED_KEY_FILE"
+}
+
+request() {
+	local method=$1 path=$2 body=${3:-}
+	local -a args=(-s --max-time 20 -X "$method"
+		-H "Authorization: Bearer $(token)" "$FEED_URL$path")
+	[[ -n $body ]] && args+=(-H 'Content-Type: application/json' --data-binary "$body")
+	curl "${args[@]}" || spool_refuse unreachable "cannot reach the feed at $FEED_URL"
+}
+
+cmd_recent() {
+	local since=7d host= source= severity= tag= grep_text= limit=50 full=0
+	while (($#)); do
+		case $1 in
+		--since) since=$2; shift 2 ;;
+		--host) host=$2; shift 2 ;;
+		--source) source=$2; shift 2 ;;
+		--severity) severity=$2; shift 2 ;;
+		--tag) tag=$2; shift 2 ;;
+		--grep) grep_text=$2; shift 2 ;;
+		--limit) limit=$2; shift 2 ;;
+		--full) full=1; shift ;;
+		--json) AS_JSON=1; shift ;;
+		*) spool_refuse unknown-option "unknown option for recent: $1" ;;
+		esac
+	done
+
+	local query="since=$since&limit=$limit"
+	local name value
+	for name in host source severity tag; do
+		value=${!name}
+		[[ -n $value ]] && query+="&$name=$(printf '%s' "$value" | jq -sRr @uri)"
+	done
+	[[ -n $grep_text ]] && query+="&grep=$(printf '%s' "$grep_text" | jq -sRr @uri)"
+
+	local entries
+	entries=$(request GET "/api/entries?$query") || exit 1
+
+	if ((AS_JSON)); then
+		printf '%s\n' "$entries"
+		return
+	fi
+	if [[ $(jq 'length' <<<"$entries") == 0 ]]; then
+		printf 'nothing in the feed for that filter\n'
+		return
+	fi
+	if ((full)); then
+		jq -r 'reverse[] | "\(.created_at[0:16] | sub("T"; " "))  [\(.severity)]  \(.host)/\(.source)  \(.title)"
+			+ (if .tags == "" then "" else "\n    tags: " + .tags end)
+			+ (if .link == "" then "" else "\n    link: " + .link end)
+			+ (if .body == "" then "" else "\n" + (.body | split("\n") | map("    " + .) | join("\n")) end)
+			+ "\n"' <<<"$entries"
+	else
+		jq -r 'reverse[] | [(.created_at[0:16] | sub("T"; " ")), .severity, .host,
+			(if .source == "" then "-" else .source end), .title] | @tsv' <<<"$entries" |
+			column -t -s $'\t'
+	fi
+}
+
+cmd_post() {
+	local title= severity=info source=${USER:-agent} host tag= link= body= body_file=
+	host=$(hostname -s 2>/dev/null || hostname)
+	while (($#)); do
+		case $1 in
+		--severity) severity=$2; shift 2 ;;
+		--source) source=$2; shift 2 ;;
+		--host) host=$2; shift 2 ;;
+		--tag) tag=$2; shift 2 ;;
+		--link) link=$2; shift 2 ;;
+		--body-file) body_file=$2; shift 2 ;;
+		--json) AS_JSON=1; shift ;;
+		-*) spool_refuse unknown-option "unknown option for post: $1" ;;
+		*)
+			[[ -z $title ]] || spool_refuse usage "give one title (quote it)"
+			title=$1
+			shift
+			;;
+		esac
+	done
+	[[ -n $title ]] || spool_refuse missing-argument "post needs a title"
+
+	if [[ -n $body_file ]]; then
+		if [[ $body_file == - ]]; then
+			body=$(cat)
+		else
+			[[ -r $body_file ]] || spool_refuse unreadable "cannot read $body_file"
+			body=$(cat "$body_file")
+		fi
+	fi
+
+	local payload
+	payload=$(jq -nc --arg title "$title" --arg severity "$severity" --arg source "$source" \
+		--arg host "$host" --arg tags "$tag" --arg link "$link" --arg body "$body" \
+		'{title: $title, severity: $severity, source: $source, host: $host,
+		  tags: $tags, link: $link, body: $body}')
+
+	local created
+	created=$(request POST /api/entries "$payload") || exit 1
+	if ((AS_JSON)); then
+		printf '%s\n' "$created"
+	else
+		local id error
+		id=$(jq -r '.id // empty' <<<"$created")
+		if [[ -z $id ]]; then
+			error=$(jq -r '.error // "unknown error"' <<<"$created")
+			spool_refuse refused "the feed refused the entry: $error"
+		fi
+		printf 'posted #%s\n' "$id"
+	fi
+}
+
+cmd_show() {
+	local id=${1:?usage: feed show <id>}
+	local entry
+	entry=$(request GET "/api/entries/$id") || exit 1
+	# The service answers an entry that does not exist with a 200 response and
+	# an "error" member, so this command exits 0 whether the entry was found or
+	# not and the exit code cannot tell the two apart. The class is therefore
+	# recorded here, at the site that can see the difference. Nothing the
+	# response says reaches the record: the member's presence is the whole
+	# signal, and the class is a literal in this script.
+	if [[ $(jq -r 'if type == "object" and has("error") then "yes" else "no" end' <<<"$entry" 2>/dev/null) == yes ]]; then
+		spool_class not-found
+	fi
+	jq . <<<"$entry"
+}
+
+cmd_open() {
+	printf '%s/?token=%s\n' "$FEED_URL" "$(token)"
+}
+
+cmd_health() {
+	local response
+	response=$(curl -s --max-time 10 "$FEED_URL/healthz") ||
+		spool_refuse unreachable "the feed at $FEED_URL is not answering"
+	printf '%s %s\n' "$FEED_URL" "$response"
+}
+
+need curl jq column
+
+command=${1:-}
+(($#)) && shift || true
+
+case $command in
+recent | list) cmd_recent "$@" ;;
+post) cmd_post "$@" ;;
+show) cmd_show "$@" ;;
+open | url) cmd_open "$@" ;;
+health) cmd_health "$@" ;;
+'' | -h | --help | help) usage ;;
+*) spool_refuse unknown-command "unknown command: $command (try --help)" ;;
+esac
