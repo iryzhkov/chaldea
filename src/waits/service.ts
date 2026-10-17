@@ -83,7 +83,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       const serverUrl=config.serverUrl??discoverServerUrl(config.t3BaseDir);
       if(!serverUrl)throw new Error("T3 is offline");
       return {serverUrl,token:privateFile(config.tokenFile),signal:AbortSignal.timeout(10_000)};
-    },config.environment);
+    },config.environment,id=>engine!.trackedNative(id));
     engine=new WaitEngine(store,t3,{answerBaseUrl:config.answerBaseUrl,threadUrl:threadId=>{
       const base=config.threadBaseUrl??config.serverUrl??discoverServerUrl(config.t3BaseDir);
       return base ? new URL("/"+encodeURIComponent(config.environment)+"/"+encodeURIComponent(threadId),base).toString() : "t3-thread://v1/"+threadId;
@@ -149,7 +149,8 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
 }
 export function callService(socket:string,method:string,input:unknown):Promise<unknown>{
   return new Promise((resolve,reject)=>{
-    const req=request({socketPath:socket,path:"/rpc",method:"POST",headers:{"Content-Type":"application/json"},timeout:15_000},res=>{
+    // Do not reuse a keep-alive Unix connection across watcher replacement.
+    const req=request({socketPath:socket,path:"/rpc",method:"POST",agent:false,headers:{"Content-Type":"application/json"},timeout:15_000},res=>{
       let data="";res.setEncoding("utf8");res.on("data",s=>{data+=s;if(Buffer.byteLength(data)>16384)req.destroy(new Error("IPC response exceeds cap"));});
       res.on("end",()=>{try{const value=JSON.parse(data);res.statusCode===200?resolve(value):reject(new Error(value.error??"Service refused"));}catch(e){reject(e);}});
     });

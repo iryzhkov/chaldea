@@ -20,7 +20,8 @@ if(mode==="receipt"){
     store.resolve(row.id,{reason:"time"});
   }
   store.sent=fault;
-}else store.maintain=fault;
+}else if(mode==="tracking")store.nativeTracking=fault;
+else store.maintain=fault;
 const engine=new WaitEngine(store,t3,{answerBaseUrl:"http://127.0.0.1:7385",report(event){
   if(event!=="watcher_needs_attention")return;
   // Must refuse another registration during the moment before the scheduled exit.
@@ -28,4 +29,5 @@ const engine=new WaitEngine(store,t3,{answerBaseUrl:"http://127.0.0.1:7385",repo
   if(mode==="logger"){writeSync(1,"report_attempt\n");throw new Error("Fake log ENOSPC");}
   writeSync(1,event+"\n");
 }});
+if(mode==="tracking")for(let n=0;n<2;n++)try{engine.trackedNative("parent");}catch{}
 engine.start();engine.poke();

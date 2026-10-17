@@ -1,6 +1,6 @@
 import { WakeStore, CheckpointBlockedError, type Item, type Registration, type Delivery } from "../wake/store.ts";
 import type { WaitT3, WaitSnapshot } from "../t3/waits.ts";
-import { NativeDecisions } from "../decisions/native.ts";
+import { NativeDecisions, questionSchema } from "../decisions/native.ts";
 import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
 import type { WaitInput, DecisionInput, NativeDecisionInput, AnswerSource } from "./types.ts";
@@ -61,6 +61,14 @@ export class WaitEngine {
   constructor(store: WakeStore, t3: WaitT3, options: EngineOptions) { this.store=store; this.t3=t3; this.options=options;
     this.native=new NativeDecisions(store,item=>this.nativePhone(item),options.boundary); }
   start(): void { this.poke(); }
+  trackedNative(parent:string):ReturnType<WakeStore["nativeTracking"]>{
+    if(this.fatal)throw new Error("Watcher needs attention");
+    try{return this.store.nativeTracking(parent);}
+    catch(error){
+      if(error instanceof CheckpointBlockedError)this.backoffStorage();else this.failStorage();
+      throw error;
+    }
+  }
   async register(kind: "wait" | "decision", value: unknown): Promise<Item> {
     if (this.fatal) throw new Error("Watcher needs attention");
     const reg = this.store.prepare(kind,value);
@@ -87,15 +95,18 @@ export class WaitEngine {
     if(track && !("runtimeRequestId" in reg.input))throw new Error("runtimeRequestId required for track");
     if(!track && "runtimeRequestId" in reg.input)throw new Error("Use decision track for an explicit runtime request");
     const existing=this.store.existing(reg);if(existing)return existing;
-    await this.t3.environment();const parent=await this.t3.snapshot(reg.input.threadId);
+    await this.t3.environment();const parent=await this.t3.snapshot(reg.input.threadId,track?(reg.input as NativeDecisionInput).runtimeRequestId:undefined);
     if(!parent||parent.deleted||parent.archived||parent.settled)throw new Error("Caller thread is absent, archived or settled on this T3");
+    let questions:string|null=null,itemId:string|null=null;
     if(track){
       const request=parent.requests?.find(r=>r.id===(reg.input as NativeDecisionInput).runtimeRequestId);
       if(!request)throw new Error("Runtime request does not exist on the caller thread");
       if(request.kind!=="user_input")throw new Error("Only user_input questions can be tracked; permissions and approvals are never answered");
+      questions=questionSchema(request.questions);itemId=request.itemId??null;
+      if(request.status==="pending" && !questions)throw new Error("Native question schema is unavailable or exceeds 4 KiB; prepare before asking");
     }
     const baseline=(parent.requests??[]).filter(r=>r.created>=started-1000).map(r=>r.id);
-    const row=this.store.register(reg,parent.project,null,undefined,Date.now(),baseline);
+    const row=this.store.register(reg,parent.project,null,undefined,Date.now(),baseline,questions,itemId);
     this.snapshots.set(parent.id,parent);
     this.options.boundary?.("registered",row.id);this.poke();return this.store.get(row.id);
   }

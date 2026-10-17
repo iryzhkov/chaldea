@@ -63,6 +63,10 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     notify("item/completed", { threadId: params.threadId, turnId: tid,completedAtMs:Date.now(),
       item: { type: "agentMessage", id: randomUUID(), text: "Done on Codex.", phase: "final_answer",
         ...(params.input?.some(i=>i.text?.includes("chaldea-native-async")) ? {delivery:"async",questions:[{title:"Deploy async fixture?",options:["Approve","Hold"]}]} : {}) } });
+    if(params.input?.some(i=>i.text?.includes("chaldea-native-burst"))){
+      for(let n=0;n<90;n++)notify("item/completed",{threadId:params.threadId,turnId:tid,completedAtMs:Date.now(),
+        item:{type:"agentMessage",id:randomUUID(),text:"Background fixture "+n,phase:"commentary"}});
+    }
     notify("turn/completed", { threadId: params.threadId, turn: turn(tid, "completed") });
     },30);
     return;

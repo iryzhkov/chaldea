@@ -58,7 +58,12 @@ created within ten minutes (or before the deadline, if earlier). Existing
 requests are excluded. One unbound preparation per thread is allowed; an
 unbound policy expires without a message or phone card. After binding, the
 deadline applies to that request alone, including every question in a
-multi-question request. Reconnect takes a fresh authoritative snapshot. An
+multi-question request. Binding atomically saves at most 4 KiB of answer-routing
+schema (question IDs, custom-answer/multi-select flags and required fixed-option
+labels/values) and the verified T3 turn-item ID, without question prose or
+option descriptions. T3 timeline rows
+are bounded; an omitted older turn item never erases this saved policy. Reconnect
+takes a fresh authoritative control-plane snapshot. An
 already-answered request observed after downtime closes its policy; it never
 binds a later, unrelated question. If that first request is already tracked by
 another policy, the preparation closes as `already_tracked` without a wake;
@@ -66,9 +71,18 @@ it does not move to the next question.
 
 For async questions whose ID is already known, use `chaldea_decision_track`
 with `runtimeRequestId`. The service verifies the request belongs to the caller's
-thread and is `user_input`. Permissions and approval requests are never bound
+thread and is `user_input`, and requires a readable schema within the 4 KiB cap
+before committing. Older questions use public `orchestration.getTurnItem`
+point reads rather than a transcript scan. The pinned provider-item node/turn
+ID relationship supplies a lookup candidate; the result must be a
+`user_input_request` with the exact runtime request ID before it can be used.
+Unavailable or oversized schemas are refused with a specific error. Permissions and approval requests are never bound
 or answered. Both APIs require the caller's own explicit thread ID and a saved
 retry key; retries preserve the policy's original binding and deadline.
+
+Completed historical questions are also read by their persisted, verified item
+ID when T3 omits the resolved request from its bounded control snapshot. This
+preserves the human-answer path after paging and watcher restart.
 
 A human answer in T3 records `native_answered`, `source:"t3"`, and the runtime
 request ID, with **no Chaldea wake**. T3 delivers that answer itself. At the
@@ -113,6 +127,9 @@ Pinned T3 evidence (official v0.1.0, same commit as above):
 - [Claude native tool callback](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts#L8191-L8250)
   is live; [Codex async question mapping](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/apps/server/src/orchestration-v2/Adapters/CodexAdapterV2.ts#L5027-L5055)
   is message-capable.
+- [Pinned provider-item IDs](https://github.com/pingdotgg/t3code/blob/81493efb71e8e8244f95d3e9f71d8369654ab151/packages/provider-core/src/server/IdAllocator.ts#L284-L291)
+  differ only in their node/turn-item prefix. Point reads always verify the
+  returned item type, thread, item ID and request ID; they never trust the candidate alone.
 
 Watcher restarts preserve either capability. T3/provider restart can lose a
 **live** callback; pinned T3 marks it unavailable rather than reconstructing the
@@ -212,7 +229,7 @@ or per-wait process. Overdue deadlines resolve once on startup.
 
 Thread waits pin an explicit run, or the latest accepted run at registration;
 there is no “next future run” or generic idle predicate. Self-dependencies and
-local dependency cycles are rejected. Full public thread snapshots plus live
+local dependency cycles are rejected. Public control-plane snapshots plus live
 subscriptions close the subscribe/read race. Cursors are journalled on observed
 events; reconnect requests a fresh authoritative full snapshot rather than
 reconstructing state from old raw events. Missing pinned history never means
@@ -356,7 +373,7 @@ is pruned.
 
 Defaults: 128 active waits (one per thread), 128 pending native/fallback decisions combined, at most 10,000
 terminal tombstones and 42 days; wake/phone payload 4 KiB, normalized registration
-3 KiB, recent-request baseline 4 KiB, native request ID 2 KiB, dependent action
+3 KiB, native answer schema 4 KiB, recent-request baseline 4 KiB, native request ID 2 KiB, dependent action
 512 bytes, question 1 KiB, 2–8 options of 256 bytes. No raw T3 event is persisted.
 Request keys use `<13-digit epoch milliseconds>:<unique key>`; new keys older
 than 42 days or beyond the monotone pruning fence are rejected before insertion.
@@ -404,7 +421,8 @@ watcher SIGKILL at registration/latch/pre-send/post-commit/delivered, and watche
 and T3 restarts. Native tests cover prepare-before-Claude-ask, human answers
 without a wake, multi-question deadline text and turn continuation, permission
 refusal, fixed-only needs-attention, native command ACK loss, every native
-watcher crash boundary, Codex message-capable restart and unavailable live
+watcher crash boundary, a Codex async question beyond 77 timeline rows plus
+watcher restart, Codex message-capable T3 restart and unavailable live
 Claude restart. Pinned adapters never emit `allowCustomAnswer:false`; the
 fixed-only e2e seeds only the disposable T3 projection to exercise that public
 contract state through real reads/commands. Page tests cover null-origin

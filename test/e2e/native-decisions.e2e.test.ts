@@ -92,7 +92,7 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       await rpc(c=>c["orchestration.dispatchCommand"]({type:"runtime-request.respond",commandId:key(),threadId,requestId,
         answers:Object.fromEntries(item.questions.map(q=>[q.id,"Hold"]))} as never));
     };
-    const settled=async(row:Item)=>until("native outcome",async()=>(await invoke("chaldea_decision_status",{id:row.id})).outcome!==null);
+    const settled=async(row:Item,timeout=15_000)=>until("native outcome",async()=>(await invoke("chaldea_decision_status",{id:row.id})).outcome!==null,timeout);
     service=await startWaitService(config);
     await t.test("prepare then Claude AskUserQuestion; human answers in T3 with no Chaldea wake",async()=>{
       const thread=await create();const input=policy(thread,15_000);
@@ -198,6 +198,48 @@ test("native decisions stay in disposable T3; fallback and deadline policy survi
       assert.equal(p.messages.filter(m=>m.id==="async-answer:"+requestId).length,1);assert.equal(await wakeCount(thread,row.id),0);
       await service.stop();service=await startWaitService(config);await sleep(100);
       assert.equal((await projection(thread)).messages.filter(m=>m.id==="async-answer:"+requestId).length,1);
+    });
+    await t.test("native prepare, old-question track and human answers survive paging beyond 77 rows and restart",async()=>{
+      const thread=await create("codex"),row=await prepare(thread,20_000);
+      const ids:string[]=[],items:string[]=[];
+      for(let n=0;n<3;n++){
+        await dispatchMessage(t3,token,thread,"chaldea-native-async",key());
+        await until("async question "+n,async()=>{
+          const p=await projection(thread),r=p.runtimeRequests.find(r=>r.status==="pending"&&r.kind==="user_input"&&!ids.includes(r.id));
+          if(!r)return false;
+          const item=p.turnItems.find(i=>i.type==="user_input_request"&&i.requestId===r.id);
+          if(!item)return false;ids.push(r.id);items.push(item.id);return true;
+        });
+      }
+      await until("schema captured",async()=>!!service!.store.native(row.id).questions);
+      // More than ten subsequent user turns and 90 activity items move every
+      // original question outside pinned T3's bounded projection window.
+      for(let n=0;n<12;n++){
+        const messageKey=key();await dispatchMessage(t3,token,thread,n===11?"chaldea-native-burst":"continue unrelated fixture work",messageKey);
+        await until("background turn "+n,async()=>(await projection(thread)).runs.some(r=>r.userMessageId==="e2e-message-"+messageKey&&r.status==="completed"));
+      }
+      const bounded=await projection(thread);
+      assert.ok(ids.every(id=>bounded.runtimeRequests.some(r=>r.id===id&&r.status==="pending")));
+      assert.ok(!bounded.turnItems.some(i=>i.type==="user_input_request"&&ids.includes(i.requestId)),"questions actually left the history window");
+      const old=await invoke("chaldea_decision_track",{...policy(thread,15_000),runtimeRequestId:ids[1]});
+      const answered=await invoke("chaldea_decision_track",{...policy(thread,30_000),runtimeRequestId:ids[2]});
+      await service!.stop();service=await startWaitService(config);
+      await rpc(c=>c["orchestration.dispatchCommand"]({type:"runtime-request.respond",commandId:key(),threadId:thread,requestId:ids[2],answers:{"0":"Hold"}} as never));
+      await settled(answered);
+      assert.equal(JSON.parse((await invoke("chaldea_decision_status",{id:answered.id})).outcome!).source,"t3");
+      assert.equal(await wakeCount(thread,answered.id),0);
+      for(const [policyRow,index] of [[row,0],[old,1]] as const){
+        await settled(policyRow,30_000);
+        const result=await rpc(c=>c["orchestration.getTurnItem"]({threadId:thread,itemId:items[index]} as never));
+        assert.equal(result.item?.type,"user_input_request");
+        if(result.item?.type!=="user_input_request")throw new Error("Historical question missing");
+        assert.equal(result.item.status,"completed");
+        assert.deepEqual(result.item.questionAnswer?.answers,{"0":"No answer by the deadline: defer deploy the fixture"});
+        assert.equal(JSON.parse((await invoke("chaldea_decision_status",{id:policyRow.id})).outcome!).defaulted,true);
+        assert.equal(await wakeCount(thread,policyRow.id),0);
+      }
+      const p=await projection(thread);
+      for(const id of ids)assert.equal(p.messages.filter(m=>m.id==="async-answer:"+id).length,1);
     });
     await t.test("a lost live Claude request is reported honestly after T3 restart",async()=>{
       const thread=await create(),row=await prepare(thread,10_000);

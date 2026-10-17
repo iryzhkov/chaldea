@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { WakeStore } from "../../src/wake/store.ts";
-import { NativeDecisions,nativeResponse } from "../../src/decisions/native.ts";
+import { NativeDecisions,nativeResponse,questionSchema } from "../../src/decisions/native.ts";
 import type { NativeDecisionInput } from "../../src/waits/types.ts";
 import { WaitEngine } from "../../src/waits/engine.ts";
 import type { NativeRequest,WaitSnapshot,WaitT3 } from "../../src/t3/waits.ts";
@@ -68,6 +69,8 @@ test("safe response never selects approval; free text and fixed skip/defer contr
       const fixed={...q,questions:[{...q.questions[0]!,multiSelect,allowCustomAnswer:false,options:[{label:"Defer",value:"defer",description:"Wait"}]}]};
       assert.deepEqual(JSON.parse(nativeResponse(row,fixed)!).answers,{"Deploy?":multiSelect?["defer"]:"defer"});
     }
+    const fixedMessage={...q,capability:"message" as const,questions:[{...q.questions[0]!,allowCustomAnswer:false,multiSelect:true,options:[{label:"Defer",description:"Wait"}]}]};
+    assert.deepEqual(JSON.parse(nativeResponse(row,fixedMessage)!).answers,{"Deploy?":"Defer"});
     assert.equal(nativeResponse(row,{...q,kind:"command_execution"}),null);
     assert.equal(nativeResponse(row,{...q,questions:[]}),null);
   }finally{f.close();}
@@ -92,7 +95,7 @@ test("unsafe fixed questions and unavailable requests each create exactly one at
   }
 });
 test("native deadlines arbitrate both human/default winners through T3; ambiguous ACK reuses exact bytes",async()=>{
-  for(const mode of ["human_first","default_first","lost_ack","transient_rpc","lost_then_human"]){
+  for(const mode of ["human_first","default_first","lost_ack","transient_rpc","lost_then_human","lost_ack_rpc_error"]){
     const f=fixture();let engine:WaitEngine|undefined;try{
       const q=request();let on:((s:WaitSnapshot|null,c:number)=>void)|undefined;
       const receipts=new Map<string,boolean>(),payloads:string[]=[];
@@ -101,6 +104,7 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
         async dispatch(){throw new Error("Native answers must not wake");},
         async respond(payload){
           payloads.push(payload);const id=JSON.parse(payload).commandId;
+          if(mode==="lost_ack_rpc_error" && payloads.length===2)throw new Error("Transient public receipt lookup error after commit");
           if(receipts.has(id))return receipts.get(id)!;
           if(mode==="transient_rpc" && payloads.length===1)throw new Error("Transient public dispatch error");
           if(mode==="lost_then_human" && payloads.length===1){
@@ -108,7 +112,7 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
           }
           if(mode==="human_first" || mode==="lost_then_human"){q.status="resolved";receipts.set(id,false);on?.(snapshot([q]),2);return false;}
           q.status="resolved";receipts.set(id,true);on?.(snapshot([q]),2);
-          if(mode==="lost_ack")throw new Error("Lost native receipt after commit");
+          if(mode==="lost_ack" || mode==="lost_ack_rpc_error")throw new Error("Lost native receipt after commit");
           return true;
         }};
       engine=new WaitEngine(f.store,port,{answerBaseUrl:"http://127.0.0.1:7385",threadUrl:id=>"https://t3.invalid/env/"+id});
@@ -116,10 +120,10 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
       const row=await engine.registerNative({...input("parent",100),runtimeRequestId:q.id},true);
       await until(()=>f.store.get(row.id).outcome!==null);
       const outcome=JSON.parse(f.store.get(row.id).outcome!);
-      const humanWon=mode==="human_first"||mode==="lost_then_human",retried=["lost_ack","transient_rpc","lost_then_human"].includes(mode);
+      const humanWon=mode==="human_first"||mode==="lost_then_human",retried=["lost_ack","transient_rpc","lost_then_human","lost_ack_rpc_error"].includes(mode);
       assert.equal(outcome.defaulted,!humanWon);assert.equal(outcome.source,humanWon?"t3":"chaldea");
-      assert.equal(receipts.size,1);assert.equal(payloads.length,retried?2:1);
-      if(retried)assert.equal(payloads[0],payloads[1]);
+      assert.equal(receipts.size,1);assert.equal(payloads.length,mode==="lost_ack_rpc_error"?3:retried?2:1);
+      for(const payload of payloads)assert.equal(payload,payloads[0]);
       assert.equal(f.store.deliveries().filter(d=>d.channel==="wake").length,0);
       const phone=f.store.deliveries().find(d=>d.channel==="phone")!;
       assert.equal(JSON.parse(phone.payload).url,"https://t3.invalid/env/parent");
@@ -127,6 +131,39 @@ test("native deadlines arbitrate both human/default winners through T3; ambiguou
       assert.equal(f.store.deliveries().find(d=>d.channel==="native")!.state,humanWon?"suppressed":"sent");
     }finally{await engine?.stop();f.close();}
   }
+});
+test("minimal native answer schema survives restart and a missing history item; fresh schema changes fail closed",()=>{
+  const dir=scratchDir("native-schema"),path=join(dir.path,"db");let store=new WakeStore(path,"env");
+  try{
+    const reg=store.prepare("native",input()),row=store.register(reg,"project",null);
+    const q={...request("persisted",row.created+1),questions:[{id:"q",header:"private header",question:"private question prose",
+      options:[{label:"Approve",description:"private option description"}]}]};
+    let lifecycle=new NativeDecisions(store,()=>"{}");lifecycle.reconcile(row,snapshot([q]),row.created+2);
+    const saved=store.native(row.id).questions!;assert.ok(saved);
+    assert.ok(!saved.includes("private"));assert.deepEqual(JSON.parse(saved),[{id:"q",allowCustomAnswer:true,multiSelect:false,options:[]}]);
+    store.close();store=new WakeStore(path,"env");lifecycle=new NativeDecisions(store,()=>"{}");
+    const omitted={...q,questions:[]};lifecycle.reconcile(store.get(row.id),snapshot([omitted]),row.deadline+1);
+    const delivery=store.deliveries().find(d=>d.channel==="native")!;
+    assert.ok(delivery);assert.deepEqual(JSON.parse(delivery.payload).answers,{q:"No answer by the deadline: defer deploy"});
+    assert.equal(lifecycle.beforeSend(store.get(row.id),delivery,snapshot([omitted])),true);
+    assert.equal(store.deliveries().filter(d=>d.channel==="wake").length,0);
+    const changed={...q,questions:[{id:"other",options:[]}]};
+    assert.equal(lifecycle.beforeSend(store.get(row.id),delivery,snapshot([changed])),false);
+    assert.equal(store.get(row.id).state,"needs_attention");assert.equal(store.deliveries().filter(d=>d.channel==="wake").length,1);
+    const large=Array.from({length:8},(_,i)=>({id:String(i)+"x".repeat(1024),options:[]}));
+    assert.equal(questionSchema(large),null);
+  }finally{store.close();dir.remove();}
+});
+test("older native tables acquire schema and item columns without losing committed policy",()=>{
+  const dir=scratchDir("native-migration"),path=join(dir.path,"db");let store=new WakeStore(path,"env");
+  try{
+    const row=store.register(store.prepare("native",{...input(),runtimeRequestId:"r"}),"project",null);store.close();
+    const old=new DatabaseSync(path);
+    try{old.exec("ALTER TABLE native_decisions DROP COLUMN questions; ALTER TABLE native_decisions DROP COLUMN turn_item");}finally{old.close();}
+    store=new WakeStore(path,"env");const policy=store.native(row.id);
+    assert.equal(policy.request_id,"r");assert.equal(policy.questions,null);assert.equal(policy.turn_item,null);
+    assert.equal(store.get(row.id).state,"parked");
+  }finally{store.close();dir.remove();}
 });
 test("native registration validates explicit runtime identity and refuses permissions, mismatched retry and active capacity",async()=>{
   const f=fixture();let engine:WaitEngine|undefined;try{
@@ -139,7 +176,9 @@ test("native registration validates explicit runtime identity and refuses permis
     await assert.rejects(engine.registerNative({...input(),runtimeRequestId:"missing"},true),/does not exist/);
     q.kind="command_execution";
     await assert.rejects(engine.registerNative({...input(),runtimeRequestId:q.id},true),/permissions and approvals/);
-    q.kind="user_input";const value={...input(),runtimeRequestId:q.id},row=await engine.registerNative(value,true);
+    q.kind="user_input";const original=q.questions;q.questions=[];
+    await assert.rejects(engine.registerNative({...input(),runtimeRequestId:q.id},true),/schema is unavailable/);q.questions=original;
+    const value={...input(),runtimeRequestId:q.id},row=await engine.registerNative(value,true);
     assert.equal((await engine.registerNative(value,true)).id,row.id);
     await assert.rejects(engine.registerNative({...value,defaultAction:"skip"},true),/changed payload/);
     assert.throws(()=>f.register({...input("other"),runtimeRequestId:q.id}),/already tracked/);
