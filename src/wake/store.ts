@@ -178,7 +178,7 @@ export class WakeStore {
     const input = JSON.parse(row.input) as DecisionInput;
     if (answer !== undefined && !input.options.includes(answer)) throw new Error("Answer must be one of the options");
     if (row.state !== "parked") return row;
-    if (now >= row.deadline) return this.resolveLocked(row,{reason:"deadline",defaulted:true,action:input.defaultAction},now);
+    if (now >= row.deadline) return this.resolveLocked(row,{reason:"deadline",defaulted:true,action:input.defaultAction === "skip" ? "skip" : "defer"},now);
     if (answer === undefined || source === undefined) return row;
     return this.resolveLocked(row,{reason:"answered",answer,defaulted:false,source},now);
   }

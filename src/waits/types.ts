@@ -54,7 +54,7 @@ export function validate(kind: "wait" | "decision", value: unknown, now: number)
     if (!Array.isArray(v.options) || v.options.length < 2 || v.options.length > 8) throw new Error("Provide 2–8 options");
     const options = v.options.map(o => text(o, "option", 256));
     if (new Set(options).size !== options.length) throw new Error("Options must be unique");
-    if (!["skip", "defer"].includes(String(v.defaultAction)))
+    if (v.defaultAction !== "skip" && v.defaultAction !== "defer")
       throw new Error("Default action must only skip or defer");
     if ("default" in v || "defaultSafe" in v) throw new Error("Option-valued defaults are unsupported; declare only defaultAction");
     deadline = timestamp(v.deadline);

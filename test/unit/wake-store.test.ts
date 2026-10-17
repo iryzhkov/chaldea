@@ -43,7 +43,8 @@ test("transactional resolution, stable retry keys, cancel, payload limits, reope
     f.store.claim(d.id);assert.equal(f.store.cancel(other.id).delivery,"uncertain_in_flight");
     f.store.sent(d.id);assert.equal(f.store.cancel(other.id).delivery,"already_delivered");
     assert.throws(()=>f.store.prepare("decision",{...question(),defaultSafe:false}),/defaults/);
-    assert.throws(()=>f.store.prepare("decision",{...question(),defaultAction:"approve"}),/Default/);
+    for(const action of ["approve",["defer"],["skip"],{},null])
+      assert.throws(()=>f.store.prepare("decision",{...question(),defaultAction:action}),/Default/);
     assert.throws(()=>f.store.prepare("decision",{...question(),default:"other"}),/defaults/);
     assert.throws(()=>f.store.prepare("decision",{...question(),question:"x".repeat(1025)}),/question/);
     assert.throws(()=>new WakeStore(f.path,"changed-environment"),/already owned/);
