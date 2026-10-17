@@ -95,7 +95,7 @@ test('unprivileged SSH forced command + real bubblewrap', { timeout: 120000 }, a
         chaldea_job_host_port: port, chaldea_job_host_user: userInfo().username,
         chaldea_job_host_listen: ['127.0.0.1'], chaldea_job_host_pid_file: join(scratch, 'sshd.pid'),
         chaldea_job_host_host_key: hostKey, chaldea_job_host_authorized_keys: join(scratch, 'authorized_keys'),
-        chaldea_job_host_log_level: 'VERBOSE',
+        chaldea_job_host_log_level: 'VERBOSE', chaldea_job_host_slots: 3,
         chaldea_job_host_command: '/usr/bin/python3 -I ' + server + ' --config ' + config,
         chaldea_job_host_sources: [{ ip: '127.0.0.1', public_key: pub }]
       })], { stdio: 'pipe' });
@@ -415,6 +415,34 @@ print('dns-config-ok')
       }
       await configure();
     });
+    await t.test('four channels reuse one master; excess mux sessions fall back quietly', async () => {
+      const held: ChildProcess[] = [];
+      const finished: Promise<Awaited<ReturnType<typeof collected>>>[] = [];
+      const authentications = () => (daemonLog.match(/Accepted publickey/g) ?? []).length;
+      const before = authentications();
+      try {
+        // Three running-slot channels plus one queued-admission channel.
+        // Hold at the hello rather than launching jobs, isolating SSH capacity.
+        for (let i = 0; i < 4; i++) {
+          const child = ssh(['chaldea-job-test', 'chaldea-exec-v0']);
+          held.push(child); finished.push(collected(child));
+          const hello = await frames(child.stdout!)[Symbol.asyncIterator]().next();
+          assert.equal(hello.value?.type, 'H');
+        }
+        assert.equal(authentications(), before, 'normal channels must reuse the existing connection');
+        // Saturate MaxSessions deliberately: OpenSSH must use its own safe
+        // pre-session fallback; the job still runs once and stderr stays useful.
+        const overflow = await collected(run(['--', 'printf', 'fallback-once']));
+        assert.equal(overflow.code, 0, overflow.err);
+        assert.equal(overflow.out, 'fallback-once');
+        assert.doesNotMatch(overflow.err, /mux_client_request_session|ControlSocket .* already exists/);
+        assert.match(overflow.err, /chaldea job /);
+      } finally {
+        for (const child of held) child.stdin!.end();
+        await Promise.all(finished);
+      }
+    });
+
     await t.test('two server slots run concurrently, third refuses, artifacts and cleanup stay isolated', { timeout: 15000 }, async () => {
       await configure({ slots: 2 });
       const children: ChildProcess[] = [];

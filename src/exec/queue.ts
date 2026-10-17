@@ -1,5 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { frame, frames, send, json, VERSION, QUEUE_VERSION, COMMANDS } from './protocol.ts';
+import { sshStderr } from './ssh-stderr.ts';
 
 export type Transport = {
   ssh: ChildProcessWithoutNullStreams;
@@ -17,7 +18,7 @@ export function connect(config: string, host: string, command = COMMANDS.exec): 
   });
   void exit.catch(() => {});
   ssh.stdin.on('error', () => {});
-  ssh.stderr.pipe(process.stderr, { end: false });
+  ssh.stderr.pipe(sshStderr()).pipe(process.stderr, { end: false });
   return { ssh, incoming: frames(ssh.stdout), exit };
 }
 function stop(t: Transport) {
