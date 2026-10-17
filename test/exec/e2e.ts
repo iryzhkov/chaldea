@@ -302,6 +302,22 @@ print('network-isolation-ok')
       }
     });
 
+    await t.test('sandbox DNS has usable resolvers even when the host uses a loopback stub', async context => {
+      const hostHasStub = execFileSync('/usr/bin/python3', ['-I', '-c',
+        "import ipaddress,pathlib; print(any(ipaddress.ip_address(line.split()[1]).is_loopback for line in pathlib.Path('/etc/resolv.conf').read_text().splitlines() if line.split()[:1] == ['nameserver']))"
+      ], { encoding: 'utf8' }).trim() === 'True';
+      if (!hostHasStub) { context.skip('host /etc/resolv.conf has no loopback nameserver; loopback-stub regression requires one'); return; }
+      const code = `import ipaddress,pathlib
+addresses = [ipaddress.ip_address(line.split()[1]) for line in pathlib.Path('/etc/resolv.conf').read_text().splitlines() if line.split()[:1] == ['nameserver']]
+assert addresses, 'sandbox must have a nameserver'
+assert all(not address.is_loopback and not address.is_unspecified for address in addresses), addresses
+print('dns-config-ok')
+`;
+      const result = await collected(run(['--', 'python3', '-c', code]));
+      assert.equal(result.code, 0, result.err); assert.match(result.out, /dns-config-ok/);
+      assert.doesNotMatch(result.err, /Couldn't get any nameserver address/);
+    });
+
     await t.test('outbound DNS and HTTPS work when the host has internet', async context => {
       const code = "import socket,urllib.request; socket.getaddrinfo('example.com',443); assert urllib.request.urlopen('https://example.com',timeout=5).status == 200; print('https-ok')";
       try { execFileSync('python3', ['-I', '-c', code], { timeout: 7000, stdio: 'pipe' }); }
