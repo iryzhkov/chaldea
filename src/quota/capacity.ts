@@ -4,7 +4,7 @@ import type { Metric, ProviderHeadroom, Window } from "./headroom.ts";
 export type CapacityClass = "unlimited" | "use-it" | "paced" | "tight" | "stopped" | "unknown";
 export interface BurnSample { observedAt: string; windows: ReadonlyArray<Window> }
 export interface CapacityConfig {
-  heavyMultiplier: number; recentWindowMs: number; maxAgeMs: number;
+  heavyMultiplier: number; recentWindowMs: number; maxAgeMs: number; minimumResetLeadHours: number;
   paceMargin: number; minimumRemaining: number; reserveFraction: number; expiryHorizonMs: number;
   providers: Record<string, {
     creditsPerFullWeek?: number;
@@ -13,7 +13,7 @@ export interface CapacityConfig {
   }>;
 }
 export const DEFAULT_CAPACITY: CapacityConfig = {
-  heavyMultiplier: 2, recentWindowMs: 24 * 3600000, maxAgeMs: 15 * 60000,
+  heavyMultiplier: 2, recentWindowMs: 24 * 3600000, maxAgeMs: 15 * 60000, minimumResetLeadHours: 72,
   paceMargin: .1, minimumRemaining: .1, reserveFraction: .05, expiryHorizonMs: 86400000, providers: {},
 };
 export interface Capacity {
@@ -39,6 +39,26 @@ function burnRate(p: ProviderHeadroom, current: Window, now: number, recentMs: n
   }
   return at - oldestAt >= 5 * 60000 ? (oldestRemaining - current.remainingPercent) / 100 / ((at - oldestAt) / 3600000) : null;
 }
+/** Value each reserve at its projected redemption time. Subsequent exhaustion follows
+ * one full quota allowance, but every reserve is valued only through native reset.
+ * Closed-form arithmetic keeps even oversized inventories bounded.
+ */
+function timedReserves(count: number, expiresAt: string | null, hours: number,
+  rate: number | null, remaining: number, minLead: number, now: number) {
+  if (rate === null || !Number.isFinite(rate) || rate <= 0)
+    return { useful: 0, weeks: 0, reason: "projected exhaustion unknown or absent; no timed reserve value" };
+  const first = remaining / rate, step = 1 / rate;
+  const expiry = expiresAt === null ? Infinity : (Date.parse(expiresAt) - now) / 3600000;
+  const byLead = Math.max(0, Math.floor((hours - minLead - first + 1e-9) / step) + 1);
+  const byExpiry = Math.max(0, Math.ceil((expiry - first) / step));
+  const useful = Math.min(count, byLead, byExpiry);
+  const lead = hours - first;
+  const full = Math.min(useful, Math.max(0, Math.floor((lead - 168) / step) + 1));
+  const tail = useful - full;
+  const valueHours = full * 168 + tail * (lead - full * step) - step * tail * (tail - 1) / 2;
+  return { useful, weeks: Math.max(0, valueHours / 168),
+    reason: `projected first exhaustion in ${first.toFixed(1)}h; ${useful}/${count} reserves usable before expiry with at least ${minLead}h lead to native reset` };
+}
 export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: number, config: CapacityConfig = DEFAULT_CAPACITY): Capacity {
   const c: Capacity = { class: "unknown", reasons: [], remainingFraction: null, reserveWeeks: 0,
     observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null, observedAt: p.included.observedAt };
@@ -56,7 +76,8 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   c.remainingFraction = remaining;
   c.burnTargetPerHour = Math.max(0, remaining - config.reserveFraction) / hours;
   c.observedBurnPerHour = burnRate(p, w, now, config.recentWindowMs);
-  c.projectedHeavyUse = c.observedBurnPerHour === null ? null : c.observedBurnPerHour * config.heavyMultiplier * hours;
+  const heavyRate = c.observedBurnPerHour === null ? null : c.observedBurnPerHour * config.heavyMultiplier;
+  c.projectedHeavyUse = heavyRate === null ? null : heavyRate * hours;
   const reserves = config.providers[p.alias] ?? {};
   let expiring = false;
   const near = (at: string | null | undefined) => unexpired(at, now) && Date.parse(at!) - now <= config.expiryHorizonMs;
@@ -65,9 +86,10 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
     // availableCount is the currently redeemable inventory. A known expired earliest
     // deadline invalidates it until refreshed; an omitted expiry uses only the fresh count.
     if (resets?.availableCount && (resets.nextExpiresAt === null || unexpired(resets.nextExpiresAt, now))) {
-      c.reserveWeeks += resets.availableCount;
-      expiring ||= near(resets.nextExpiresAt);
-      c.reasons.push(`${resets.availableCount} Codex resets: each restarts full quota with a new one-week deadline`);
+      const timing = timedReserves(resets.availableCount, resets.nextExpiresAt, hours, heavyRate, remaining, config.minimumResetLeadHours, now);
+      c.reserveWeeks += timing.weeks;
+      expiring ||= timing.useful > 0 && near(resets.nextExpiresAt);
+      c.reasons.push(`${resets.availableCount} Codex resets: ${timing.reason}; timed value ${timing.weeks.toFixed(3)} weeks`);
     } else if (resets?.availableCount) c.reasons.push("reset expiry unknown/expired; reserve value unknown");
     const credits = fresh(p.credits, now, config.maxAgeMs);
     const balance = Number(credits?.balance);
@@ -84,10 +106,10 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   } else if (p.driver === "claudeAgent") {
     const refill = reserves.claudeRefills;
     if (refill && refill.count > 0 && unexpired(refill.expiresAt, now)) {
-      const value = Math.min(1, hours / durationHours);
-      c.reserveWeeks += refill.count * value;
-      expiring ||= near(refill.expiresAt);
-      c.reasons.push(`${refill.count} Claude refills retain native reset; each capped at ${Math.round(value * 100)}% of a week`);
+      const timing = timedReserves(refill.count, refill.expiresAt, hours, heavyRate, remaining, 0, now);
+      c.reserveWeeks += timing.weeks;
+      expiring ||= timing.useful > 0 && near(refill.expiresAt);
+      c.reasons.push(`${refill.count} Claude refills retain native reset: ${timing.reason}; timed value ${timing.weeks.toFixed(3)} weeks`);
     }
   }
   const low = windows.some(v => v.remainingPercent / 100 < config.minimumRemaining);

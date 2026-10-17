@@ -17,7 +17,7 @@ function provider(driver: string, remaining: number, burn = .002, timeLeft = .4)
 }
 test("capacity scenario table: light/heavy weeks, reserves, expiring credits, stale and stop", () => {
   const light = provider("claudeAgent", 80);
-  const heavy = provider("codex", 20, .01);
+  const heavy = provider("codex", 20, .0015, 6 / 7);
   heavy.manualResets = metric({ availableCount: 2, nextExpiresAt: null });
   const expiring = provider("codex", 30, .01);
   expiring.credits = metric({ balance: "100", hasCredits: true, unlimited: false });
@@ -32,12 +32,12 @@ test("capacity scenario table: light/heavy weeks, reserves, expiring credits, st
     assert.equal(c.class, expected, name); assert.ok(c.reasons.length, name);
   }
   const c = classifyCapacity(heavy, false, now, config);
-  assert.equal(c.reserveWeeks, 2);
-  assert.ok(Math.abs(c.projectedHeavyUse! - 1.344) < 1e-10);
-  assert.ok(Math.abs(c.burnTargetPerHour! - .15 / 67.2) < 1e-10);
+  assert.ok(Math.abs(c.reserveWeeks - (144 - .2 / .003) / 168) < 1e-10);
+  assert.ok(Math.abs(c.projectedHeavyUse! - .432) < 1e-10);
+  assert.ok(Math.abs(c.burnTargetPerHour! - .15 / 144) < 1e-10);
 });
 test("Claude 40% without reserves vs Codex 20% with 2 resets routes Codex", () => {
-  const claude = provider("claudeAgent", 40, .01), codex = provider("codex", 20, .01);
+  const claude = provider("claudeAgent", 40, .0015, 6 / 7), codex = provider("codex", 20, .0015, 6 / 7);
   codex.manualResets = metric({ availableCount: 2, nextExpiresAt: iso(now + 10 * 86400000) });
   const state = emptyState(); state.headroom.providers.push(claude, codex);
   const capacity = classifyCapacities(state, now);
@@ -49,7 +49,7 @@ test("Claude 40% without reserves vs Codex 20% with 2 resets routes Codex", () =
 test("Claude refill keeps native deadline and is capped by remaining window time; expired excluded", () => {
   const p = provider("claudeAgent", 20, .01);
   const config = { ...DEFAULT_CAPACITY, providers: { claudeAgent: { claudeRefills: { count: 2, expiresAt: iso(now + 10 * 86400000) } } } };
-  assert.equal(classifyCapacity(p, false, now, config).reserveWeeks, .8);
+  assert.ok(Math.abs(classifyCapacity(p, false, now, config).reserveWeeks - (57.2 + 7.2) / 168) < 1e-10);
   assert.equal(classifyCapacity(p, false, now, config).class, "paced");
   config.providers.claudeAgent.claudeRefills.expiresAt = iso(now - 1);
   assert.equal(classifyCapacity(p, false, now, config).reserveWeeks, 0);

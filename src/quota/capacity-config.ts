@@ -10,6 +10,7 @@ export function loadCapacityConfig(home: string, path = join(home, ".config/chal
   const c = { ...DEFAULT_CAPACITY, ...r };
   for (const key of ["heavyMultiplier", "recentWindowMs", "maxAgeMs", "expiryHorizonMs"] as const)
     if (!Number.isFinite(c[key]) || c[key] <= 0) throw new Error("Invalid capacity threshold");
+  if (!Number.isFinite(c.minimumResetLeadHours) || c.minimumResetLeadHours < 0) throw new Error("Invalid reset lead");
   for (const key of ["paceMargin", "minimumRemaining", "reserveFraction"] as const)
     if (!Number.isFinite(c[key]) || c[key] < 0 || c[key] >= 1) throw new Error("Invalid capacity fraction");
   if (!c.providers || typeof c.providers !== "object" || Array.isArray(c.providers) || Object.keys(c.providers).length > 64) throw new Error("Invalid capacity providers");

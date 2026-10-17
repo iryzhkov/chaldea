@@ -55,11 +55,19 @@ per hour times the configured multiplier times hours until native reset.
 Burn target is `max(0, remaining - 0.05) / hours to reset`. Missing burn cannot
 establish unlimited capacity.
 
-Each fresh available Codex reset adds one full week. Redemption would restart
-quota with a new one-week deadline. An explicitly expired earliest reset expiry
-invalidates the cached inventory; when T3 omits expiry, only its fresh available
-count is used. A Claude refill instead retains its native deadline, so each
-counts at most the fraction of a week left. Claude refill count defaults to zero.
+A Codex reset would restart full quota with a new one-week deadline, but its
+advisory value is only the time from projected exhaustion to the original native
+reset, capped at one week. It has no value when that lead is below the configured
+minimum of 72 hours. A reset that expires at or before projected redemption adds
+nothing. If a still-useful reset expires soon, the class is use-it.
+
+Each subsequent reserve is considered at the next projected exhaustion of a
+full quota allowance. Only the fresh available count is used when T3 omits an
+expiry; a known expired earliest expiry invalidates that inventory. A Claude
+refill retains the native deadline and is also valued only from projected
+redemption to that deadline, without the Codex minimum lead. Claude refill count
+defaults to zero. Missing or zero burn means no projected exhaustion, so reset
+and refill inventories add no timed value.
 
 Aggregate Codex credits count when fresh and unexpired. Credit units and quota
 percentages are different quantities. Configure `creditsPerFullWeek` to convert
@@ -99,6 +107,7 @@ Chaldea observer state, local T3, read-only T3 token and
 ```json
 {
   "heavyMultiplier": 2,
+  "minimumResetLeadHours": 72,
   "recentWindowMs": 86400000,
   "maxAgeMs": 900000,
   "paceMargin": 0.10,
@@ -182,7 +191,8 @@ Existing observer feed cadence is unchanged.
 runs only the pure policy against injected catalog, quota, analytics and clock.
 It performs no collection or credential access. Unit tests include the
 18-instance catalog, forbidden models/efforts, review separation, stale data,
-capacity scenarios, collector safety and rate bounds. E2E checks the CLI and
+capacity scenarios including native resets in 1 hour, 3 days and 6 days,
+reserve expiry before useful redemption, collector safety and rate bounds. E2E checks the CLI and
 existing MCP server against disposable pinned T3 with fake providers.
 
 This repository ships no Chaldea SKILL.md. Follow-ups belong in fleet-config:
