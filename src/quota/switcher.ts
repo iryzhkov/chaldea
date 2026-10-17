@@ -1,6 +1,6 @@
 // Durable provider-switch intents; observation is independent of this optional path.
 import { createHash } from "node:crypto";
-import { AuthenticationError, type ModelChoice, type ShellEvent, type ShellThread, type SwitchPort } from "../t3/adapter.ts";
+import { AuthenticationError, TransientConnectionError, type ModelChoice, type ShellEvent, type ShellThread, type SwitchPort } from "../t3/adapter.ts";
 import type { Logger } from "../log.ts";
 import { claim, stopTime, type QuotaRecord } from "./observer.ts";
 import { equivalentTarget, type SwitchConfig } from "./routing.ts";
@@ -10,6 +10,8 @@ export { MAX_ACTIVE_SWITCHES, MAX_COMPLETED_SWITCHES } from "./state.ts";
 export const HOLD_GRACE_MS = 2 * 60_000;
 export const RESETLESS_BOUND_MS = 2 * 60_000;
 const RELEASE_RETRY_MS = 5_000;
+export const SWITCH_RETRY_MIN_MS = 1_000;
+export const SWITCH_RETRY_MAX_MS = 60_000;
 export interface SwitchIntent {
   readonly threadId: string;
   readonly runId: string;
@@ -24,6 +26,8 @@ export interface SwitchIntent {
   readonly snooze?: boolean;
   readonly subagent: boolean;
   releaseAttempt?: number;
+  /** A timed-out dispatch may commit after cleanup; reconcile its eventual receipt. */
+  dispatchUncertain?: boolean;
   phase: "holding" | "dispatching" | "releasing" | "switched" | "cancelled";
 }
 export function switchIds(threadId: string, runId: string) {
@@ -51,7 +55,9 @@ function ownsHold(thread: ShellThread, intent: Pick<SwitchIntent, "threadId" | "
 function optedOut(thread: ShellThread): boolean {
   const recovery = thread.limitRecovery;
   return recovery?.runId === thread.latestRunId && recovery.resetAt === thread.usageLimitResetAt &&
-    !recovery.autoResume && !ownsHold(thread, { threadId: thread.id, runId: recovery.runId, resetAt: recovery.resetAt });
+    !recovery.autoResume &&
+    !(recovery.snooze === true && recovery.requestId === `limit-arm:${thread.id}:${recovery.runId}:${Date.parse(recovery.resetAt)}`) &&
+    !ownsHold(thread, { threadId: thread.id, runId: recovery.runId, resetAt: recovery.resetAt });
 }
 
 export class ProviderSwitcher {
@@ -69,6 +75,10 @@ export class ProviderSwitcher {
   #closed = false;
   #capLogged = false;
   #failureLogged = false;
+  #enableAt = Infinity;
+  #enableDelay = SWITCH_RETRY_MIN_MS;
+  #cleanupDone = false;
+  readonly #cancelled = new Map<SwitchIntent, ShellThread>();
   #work: Promise<void> | null = null;
   #requested = false;
   #timer: NodeJS.Timeout | null = null;
@@ -85,7 +95,10 @@ export class ProviderSwitcher {
   }
   reconnect(port: SwitchPort, credentialChanged: boolean): void {
     this.#port = port; this.#synced = false; this.#stops.clear(); this.#catalog = undefined;
-    if (credentialChanged) { this.#disabled = false; this.#failureLogged = false; }
+    if (credentialChanged) {
+      this.#disabled = false; this.#failureLogged = false;
+      this.#enableAt = Infinity; this.#enableDelay = SWITCH_RETRY_MIN_MS;
+    }
   }
   #persist(): void {
     if (!this.#save()) throw new Error("switch intent is not durable");
@@ -105,6 +118,14 @@ export class ProviderSwitcher {
   handle(event: ShellEvent): Promise<void> {
     if (this.#closed) return Promise.resolve();
     if (event.kind === "snapshot" || event.kind === "thread") {
+      const threads = event.kind === "snapshot" ? event.threads : [event.thread];
+      const changed = new Map(threads.map((thread) => [thread.id, thread]));
+      for (const intent of this.#state.switches.values()) {
+        const thread = changed.get(intent.threadId);
+        if (intent.phase === "cancelled" && thread && (this.#cancelled.size < 1_000 || this.#cancelled.has(intent))) {
+          this.#cancelled.set(intent, thread);
+        }
+      }
       for (const thread of event.kind === "snapshot" ? event.threads : [event.thread]) {
         if (switchable(thread)) {
           if (this.#stops.size < 1_000 || this.#stops.has(thread.id)) {
@@ -132,13 +153,32 @@ export class ProviderSwitcher {
   }
   async #drain(): Promise<void> {
     while (this.#requested && !this.#closed) {
-      this.#requested = false; this.#catalog = undefined; this.#retryAt = Infinity;
+      this.#requested = false; this.#catalog = undefined; this.#retryAt = Infinity; this.#cleanupDone = false;
       try {
         // Deadlines/cleanup always precede new admissions, even in observe-only mode.
         for (const intent of this.#state.switches.values()) {
           if (!activeIntent(intent)) continue;
           try { await this.#advance(intent); }
-          catch (error) { await this.#degrade(error, intent); }
+          catch (error) { await this.#degrade(error, intent); break; }
+        }
+        for (const [intent, thread] of this.#cancelled) {
+          this.#cancelled.delete(intent);
+          try {
+            if (await this.#port.delivered(intent.threadId, switchIds(intent.threadId, intent.runId).dispatch)) {
+              this.#switched(intent);
+            } else if (intent.dispatchUncertain && thread.latestRunId !== intent.runId) {
+              delete intent.dispatchUncertain; this.#persist();
+              this.#onReconciled?.(thread);
+            }
+          } catch (error) {
+            if (!this.#cancelled.has(intent)) this.#cancelled.set(intent, thread);
+            throw error;
+          }
+        }
+        if (this.#disabled && this.#now() >= this.#enableAt) {
+          await this.#getCatalog();
+          this.#disabled = false; this.#enableAt = Infinity; this.#enableDelay = SWITCH_RETRY_MIN_MS;
+          this.#logger.info("provider switching re-enabled after transient failure");
         }
         if (!this.#disabled && this.#config.enabled) {
           for (const stop of this.#stops.values()) {
@@ -168,6 +208,8 @@ export class ProviderSwitcher {
   }
   async #degrade(error: unknown, failed?: SwitchIntent): Promise<void> {
     this.#disabled = true;
+    this.#enableAt = error instanceof TransientConnectionError ? this.#now() + this.#enableDelay : Infinity;
+    if (Number.isFinite(this.#enableAt)) this.#enableDelay = Math.min(this.#enableDelay * 2, SWITCH_RETRY_MAX_MS);
     const reason = error instanceof AuthenticationError ? "scope_missing" : "switch_error";
     if (!this.#failureLogged) {
       this.#failureLogged = true;
@@ -175,13 +217,22 @@ export class ProviderSwitcher {
         ? "provider switching disabled: token needs orchestration:operate; observing continues"
         : "provider switching failed; releasing holds and observing only");
     }
+    if (this.#cleanupDone) return;
+    this.#cleanupDone = true;
     for (const intent of this.#state.switches.values()) {
       if (!activeIntent(intent)) continue;
       this.#warning(intent, reason);
       // Do not send any new continuations after a switch-path error.
+      const dispatching = intent.phase === "dispatching";
+      const releasing = intent.phase === "releasing";
       intent.phase = "releasing";
-      try { this.#persist(); await this.#release(intent); }
-      catch { this.#retryAt = this.#now() + RELEASE_RETRY_MS; }
+      try {
+        this.#persist();
+        // A dispatch failure must pass through advance's receipt check first.
+        // The failing intent was already attempted in this drain.
+        if (dispatching || intent === failed && releasing) this.#retryAt = this.#now() + RELEASE_RETRY_MS;
+        else await this.#advance(intent);
+      } catch { this.#retryAt = this.#now() + RELEASE_RETRY_MS; }
     }
     if (failed && activeIntent(failed)) this.#retryAt = this.#now() + RELEASE_RETRY_MS;
     // A warning still gets its usual durable claim before the feed attempt.
@@ -228,7 +279,7 @@ export class ProviderSwitcher {
       ? current : undefined;
   }
   #switched(intent: SwitchIntent): void {
-    intent.phase = "switched";
+    intent.phase = "switched"; delete intent.dispatchUncertain;
     if (claim(this.#state, "provider_switched", intent.threadId, intent.runId, intent.stopAt, this.#now())) {
       this.#record({ kind: "provider_switched", severity: "info", threadId: intent.threadId,
         runId: intent.runId, provider: intent.from.instanceId, resetAt: intent.resetAt,
@@ -266,6 +317,8 @@ export class ProviderSwitcher {
       if (!current || intent.resetAt !== null && !ownsHold(current, intent)) {
         intent.phase = "releasing"; this.#persist();
       } else {
+        // Persist uncertainty before the send, including a crash before its response.
+        intent.dispatchUncertain = true; this.#persist();
         let accepted: boolean;
         try {
           accepted = await this.#port.continue({ threadId: intent.threadId, runId: intent.runId,
@@ -278,6 +331,7 @@ export class ProviderSwitcher {
           throw error;
         }
         if (accepted) { this.#switched(intent); return; }
+        delete intent.dispatchUncertain;
         intent.phase = "releasing"; this.#persist();
       }
     }
@@ -285,28 +339,38 @@ export class ProviderSwitcher {
   }
   async #release(intent: SwitchIntent): Promise<void> {
     const current = await this.#port.thread(intent.threadId);
-    if (intent.resetAt !== null && current && ownsHold(current, intent)) {
+    if (intent.resetAt !== null && current && ownsHold(current, intent) && current.latestRunId === intent.runId) {
       const ids = switchIds(intent.threadId, intent.runId);
       const expired = this.#now() >= holdDeadline(intent);
       if (!expired && (current.archived || current.settled || current.pendingRequest)) return;
+      // Metadata updates have no ownership guard in pinned T3. Re-read immediately
+      // before every write, including a clear after a rejected restore.
+      const freshHold = async () => {
+        const fresh = await this.#port.thread(intent.threadId);
+        return fresh && fresh.latestRunId === intent.runId && ownsHold(fresh, intent) ? fresh : undefined;
+      };
+      const clear = async () => {
+        if (!await freshHold()) return true;
+        return this.#port.clearRecovery(intent.threadId, `${ids.release}:clear:${intent.releaseAttempt ?? 0}`);
+      };
       let released = false;
-      // After the deadline, null bypasses T3's stale-failure/archival guards.
-      // Clearing only our own hold returns the thread to native global policy.
       if (expired && (intent.restoreAutoResume === null || current.archived || current.settled || current.pendingRequest ||
-          current.latestRunId !== intent.runId || current.usageLimitResetAt !== intent.resetAt)) {
-        released = await this.#port.clearRecovery(intent.threadId, `${ids.release}:clear:${intent.releaseAttempt ?? 0}`);
+          current.usageLimitResetAt !== intent.resetAt)) {
+        released = await clear();
       } else if (!current.archived && !current.settled && !current.pendingRequest) {
         const restore = intent.restoreAutoResume ?? (await this.#getCatalog()).autoResume;
-        released = await this.#port.recovery({ threadId: intent.threadId, runId: intent.runId,
-          resetAt: intent.resetAt, commandId: `${ids.release}:${intent.releaseAttempt ?? 0}`,
-          autoResume: restore,
-          // Omitting an expired true snooze preserves it without tripping T3's
-          // "cannot snooze in the past" guard.
-          ...((intent.snooze ?? current.limitRecovery?.snooze) && Date.parse(intent.resetAt) <= this.#now()
-            ? {} : { snooze: intent.snooze ?? current.limitRecovery?.snooze ?? false }) });
-        if (!released && expired) {
-          released = await this.#port.clearRecovery(intent.threadId, `${ids.release}:clear:${intent.releaseAttempt ?? 0}`);
-        }
+        const fresh = await freshHold();
+        if (!fresh) released = true;
+        else if (!fresh.archived && !fresh.settled && !fresh.pendingRequest) {
+          released = await this.#port.recovery({ threadId: intent.threadId, runId: intent.runId,
+            resetAt: intent.resetAt, commandId: `${ids.release}:${intent.releaseAttempt ?? 0}`,
+            autoResume: restore,
+            // Omitting an expired true snooze preserves it without tripping T3's
+            // "cannot snooze in the past" guard.
+            ...((intent.snooze ?? fresh.limitRecovery?.snooze) && Date.parse(intent.resetAt) <= this.#now()
+              ? {} : { snooze: intent.snooze ?? fresh.limitRecovery?.snooze ?? false }) });
+          if (!released && expired) released = await clear();
+        } else if (expired) released = await clear();
       }
       if (!released) {
         intent.releaseAttempt = (intent.releaseAttempt ?? 0) + 1;
@@ -321,7 +385,8 @@ export class ProviderSwitcher {
     this.#timer = null;
     if (this.#closed || !this.#synced) return;
     const now = this.#now();
-    let next = this.#retryAt;
+    let next = Math.min(this.#retryAt, this.#enableAt);
+    if (this.#cancelled.size > 0) next = Math.min(next, now + RELEASE_RETRY_MS);
     for (const intent of this.#state.switches.values()) {
       if (!activeIntent(intent)) continue;
       const deadline = holdDeadline(intent), reset = Date.parse(intent.resetAt ?? "");
@@ -336,6 +401,7 @@ export class ProviderSwitcher {
   }
   /** Final containment boundary for an unexpected worker/callback failure. */
   async fail(error: unknown): Promise<void> {
+    if (this.#work === null) this.#cleanupDone = false;
     try { await this.#degrade(error); } finally { this.#schedule(); }
   }
   async close(): Promise<void> {

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
-import { AuthenticationError, ProtocolIncompatibleError, type ModelChoice, type ShellThread, type SwitchPort, type SwitchProvider } from "../../src/t3/adapter.ts";
+import { AuthenticationError, ProtocolIncompatibleError, TransientConnectionError, type ModelChoice, type ShellThread, type SwitchPort, type SwitchProvider } from "../../src/t3/adapter.ts";
 import { DEFAULT_EQUIVALENCES, equivalentTarget, hasQuota, MAX_USAGE_AGE_MS, switchConfig } from "../../src/quota/routing.ts";
-import { ProviderSwitcher, switchIds, holdDeadline, HOLD_GRACE_MS, RESETLESS_BOUND_MS, type SwitchIntent, MAX_ACTIVE_SWITCHES } from "../../src/quota/switcher.ts";
+import { ProviderSwitcher, switchIds, holdDeadline, HOLD_GRACE_MS, RESETLESS_BOUND_MS, SWITCH_RETRY_MIN_MS, SWITCH_RETRY_MAX_MS, type SwitchIntent, MAX_ACTIVE_SWITCHES } from "../../src/quota/switcher.ts";
 import { emptyState, prune, KEY_TTL_MS, DAY_MS, type ObserverState } from "../../src/quota/state.ts";
 import { observe, type QuotaRecord } from "../../src/quota/observer.ts";
 import { limited } from "../helpers/threads.ts";
@@ -52,10 +52,10 @@ function harness(state: ObserverState = emptyState()) {
       return acceptDispatch;
     },
   };
-  const make = (enabled = true) => {
-    const s = new ProviderSwitcher({ state, port, config: { ...config, enabled }, now,
+  const make = (enabled = true, onReconciled?: (thread: ShellThread) => void) => {
+    const s = new ProviderSwitcher({ state, port, config: { ...config, enabled }, now, ...(onReconciled ? { onReconciled } : {}),
       save: () => durable, record: (r) => records.push(r),
-      logger: { info() {}, warn(message) { logs.push(message); }, error(message) { logs.push(message); } } });
+      logger: { info(message) { logs.push(message); }, warn(message) { logs.push(message); }, error(message) { logs.push(message); } } });
     children.push(s); return s;
   };
   const event = () => ({ kind: "thread" as const, sequence: 1, thread: current! });
@@ -81,6 +81,159 @@ function harness(state: ObserverState = emptyState()) {
     set autoResume(v: boolean) { autoResume = v; },
     set onRecovery(v: () => void) { onRecovery = v; }, set onContinue(v: () => void) { onContinue = v; } };
 }
+
+
+test("release re-reads ownership and latest run immediately before expired clear or restore", async () => {
+  for (const operation of ["clear", "restore"] as const) {
+    for (const change of ["human", "native", "run"] as const) {
+      const h = harness(), intent = h.seed("releasing");
+      if (operation === "clear") {
+        h.advance(60_000 + HOLD_GRACE_MS + 1);
+        h.current = { ...h.current!, archived: true };
+      }
+      const original = h.current!;
+      let reads = 0;
+      h.port.thread = async () => {
+        if (++reads === 2) h.current = change === "run"
+          ? { ...original, latestRunId: "newer-run" }
+          : { ...original, limitRecovery: { ...original.limitRecovery!,
+            requestId: change === "human" ? "human-choice" : "limit-arm:newer", autoResume: true } };
+        return h.current;
+      };
+      await h.start(h.make());
+      assert.equal(reads, 2, operation + change);
+      assert.equal(h.calls.length, 0, operation + change);
+      assert.equal(intent.phase, "cancelled");
+    }
+  }
+  const h = harness(); h.seed("releasing");
+  h.current = { ...h.current!, latestRunId: "already-moved", status: "completed" };
+  await h.start(h.make()); assert.equal(h.calls.length, 0);
+});
+test("fallback clear re-checks ownership after a rejected expired restore", async () => {
+  const h = harness(); h.seed("releasing"); h.advance(60_000 + HOLD_GRACE_MS + 1);
+  h.port.recovery = async (input) => {
+    h.calls.push({ kind: "recovery", input });
+    h.current = { ...h.current!, limitRecovery: { ...h.current!.limitRecovery!, requestId: "human", autoResume: false } };
+    return false;
+  };
+  await h.start(h.make());
+  assert.deepEqual(h.calls.map((call) => call.kind), ["recovery"]);
+  assert.equal(h.current!.limitRecovery!.requestId, "human");
+});
+test("NEW-C: a timeout with a late committed dispatch reconciles releasing and cancelled intents", async () => {
+  for (const cancelBeforeCommit of [false, true]) {
+    const h = harness(), original = h.current!;
+    observe(h.state, { kind: "snapshot", sequence: 1, threads: [original] }, h.now());
+    let commit: NodeJS.Timeout;
+    const committed = new Promise<void>((resolve) => {
+      h.onContinue = () => {
+        commit = setTimeout(() => {
+          h.delivered = true;
+          h.current = { ...h.current!, latestRunId: "continued", status: "running", activeRunId: "continued" };
+          resolve();
+        }, 20);
+        throw new Error("TimeoutException");
+      };
+    });
+    let s = h.make(); await h.start(s);
+    const intent = [...h.state.switches.values()][0]!;
+    assert.equal(intent.phase, "releasing", "degrade must not directly release a dispatching intent");
+    if (cancelBeforeCommit) {
+      await s.handle(h.event());
+      assert.equal(intent.phase, "cancelled");
+      assert.equal(h.current!.limitRecovery!.autoResume, true);
+      await s.close(); s = h.make(); await h.start(s);
+    }
+    await committed; clearTimeout(commit!);
+    assert.deepEqual(observe(h.state, h.event(), h.now()), [], "feed runs before switch reconciliation");
+    await s.handle(h.event()); await s.handle(h.event());
+    assert.equal(intent.phase, "switched");
+    assert.equal(h.calls.filter((call) => call.kind === "continue").length, 1);
+    assert.equal(h.records.filter((record) => record.kind === "provider_switched").length, 1);
+    assert.equal(h.records.filter((record) => record.kind === "quota_resumed").length, 0);
+    assert.deepEqual(observe(h.state, h.event(), h.now()), []);
+    await s.close(); await h.start(h.make());
+    assert.equal(h.records.filter((record) => record.kind === "provider_switched").length, 1);
+  }
+});
+test("an uncommitted timed-out dispatch still reports a later native resume", async () => {
+  const h = harness(), original = h.current!;
+  observe(h.state, { kind: "snapshot", sequence: 1, threads: [original] }, h.now());
+  h.onContinue = () => { throw new Error("TimeoutException"); };
+  const s = h.make(true, (thread) => h.records.push(...observe(h.state, { kind: "thread", sequence: 2, thread }, h.now())));
+  await h.start(s); await s.handle(h.event());
+  assert.equal([...h.state.switches.values()][0]!.phase, "cancelled");
+  h.current = { ...h.current!, status: "completed", latestRunId: "native-resume" };
+  assert.deepEqual(observe(h.state, h.event(), h.now()), []);
+  await s.handle(h.event());
+  assert.equal(h.records.filter((record) => record.kind === "quota_resumed").length, 1);
+  assert.equal(h.records.filter((record) => record.kind === "provider_switched").length, 0);
+});
+test("native snooze-only limit-arm is not a human switching opt-out", async () => {
+  for (const accepted of [true, false]) {
+    const h = harness(); h.autoResume = false; h.acceptDispatch = accepted;
+    h.current = { ...h.current!, limitRecovery: { runId: "run-a", resetAt: h.current!.usageLimitResetAt!,
+      autoResume: false, snooze: true,
+      requestId: `limit-arm:${h.current!.id}:run-a:${Date.parse(h.current!.usageLimitResetAt!)}` } };
+    await h.start(h.make());
+    assert.equal(h.calls.filter((call) => call.kind === "continue").length, 1);
+    if (!accepted) {
+      assert.equal(h.current!.limitRecovery!.autoResume, false);
+      assert.equal(h.current!.limitRecovery!.snooze, true);
+    }
+  }
+});
+test("lost operate scope attempts cleanup once per active intent per drain", async () => {
+  const h = harness(), sample = h.seed("releasing");
+  for (let i = 0; i < 3; i++) {
+    const threadId = "held-" + i;
+    h.state.switches.set(switchIds(threadId, sample.runId).key, { ...sample, threadId });
+  }
+  h.port.thread = async (id) => ({ ...h.current!, id, limitRecovery: {
+    ...h.current!.limitRecovery!, requestId: switchIds(id, sample.runId).hold } });
+  const attempts = new Map<string, number>();
+  h.port.recovery = async (input) => {
+    attempts.set(input.threadId, (attempts.get(input.threadId) ?? 0) + 1);
+    throw new AuthenticationError("operate lost");
+  };
+  const s = h.make(); await h.start(s);
+  assert.equal(attempts.size, 4); assert.deepEqual([...attempts.values()], [1, 1, 1, 1]);
+  await s.handle(h.event()); assert.deepEqual([...attempts.values()], [2, 2, 2, 2]);
+  assert.equal(h.logs.length, 1);
+});
+test("transient disable retries with capped backoff, one warning and one re-enabled log", async () => {
+  const h = harness();
+  h.current = { ...h.current!, usageLimitResetAt: new Date(h.now() + 3_600_000).toISOString() };
+  let probes = 0;
+  h.port.catalog = async () => {
+    if (++probes <= 8) throw new TransientConnectionError("getConfig timeout");
+    const target = provider();
+    return { providers: [{ ...target, usageLimits: { ...target.usageLimits!, checkedAt: new Date(h.now()).toISOString() } }], autoResume: true };
+  };
+  const s = h.make(); await h.start(s);
+  assert.equal(probes, 1);
+  for (let failure = 0; failure < 8; failure++) {
+    const delay = Math.min(SWITCH_RETRY_MIN_MS * 2 ** failure, SWITCH_RETRY_MAX_MS);
+    h.advance(delay - 1); await s.handle(h.event()); assert.equal(probes, failure + 1);
+    h.advance(1); await s.handle(h.event()); assert.equal(probes, failure + 2);
+  }
+  assert.equal(h.calls.filter((call) => call.kind === "continue").length, 1);
+  assert.equal(h.records.filter((record) => record.kind === "provider_switch_failed").length, 1);
+  assert.equal(h.logs.filter((line) => line.includes("failed;")).length, 1);
+  assert.equal(h.logs.filter((line) => line.includes("re-enabled")).length, 1);
+});
+test("transient catalog recovery is scheduled even without new shell events", async () => {
+  const h = harness(), catalog = h.port.catalog; let first = true;
+  h.port.catalog = async () => {
+    if (first) { first = false; throw new TransientConnectionError("getConfig timeout"); }
+    return catalog();
+  };
+  await h.start(h.make());
+  await new Promise((resolve) => setTimeout(resolve, SWITCH_RETRY_MIN_MS + 150));
+  assert.equal(h.calls.filter((call) => call.kind === "continue").length, 1);
+  assert.equal(h.logs.filter((line) => line.includes("re-enabled")).length, 1);
+});
 
 test("defaults route all three pairs both ways and preserve supported effort", () => {
   assert.equal(switchConfig().enabled, false);

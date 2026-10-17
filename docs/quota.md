@@ -5,8 +5,8 @@ at the reported reset time. `chaldea quota observe` records stops and resumes
 in the fleet feed. Optional B3 provider switching can continue the same thread
 immediately on an available equivalent model using T3's context handoff.
 Switching defaults to off; native recovery and its five-second sweep remain
-the fallback. Chaldea adds one timer only while a switch hold needs cleanup;
-continuation at reset remains native.
+the fallback. Chaldea uses one timer for pending hold cleanup and transient
+switch-path retry backoff; continuation at reset remains native.
 
 Decisions behind this design (Igor, 2026-10-16):
 
@@ -59,9 +59,12 @@ failed usage-limit stop must still be blocking: its reset is in the future.
 A resetless stop must be less than two minutes old and first seen live, or
 completed after this observer process started. Old abandoned stops are never
 admitted on startup or reconnect. A human's per-thread `autoResume:false`
-choice wins over switching; Chaldea recognizes only its deterministic hold ID
-as its own cancellation. There must be no active run, pending runtime request,
-archival, deletion or explicit settlement. Switching
+choice wins over switching. Chaldea distinguishes its deterministic hold ID
+and T3's exact `limit-arm:<thread>:<run>:<resetMs>` snooze-only arm from a human
+cancellation. A native arm with `autoResume:false, snooze:true` does not opt out
+of switching, and its false auto-resume choice is preserved on release. There
+must be no active run, pending runtime request, archival, deletion or explicit
+settlement. Switching
 waits for shell catch-up before acting. When enabled (or when saved intents
 exist), reconnect begins with a current snapshot so stops remain discoverable
 across observer and server restarts. No periodic Chaldea scan is introduced.
@@ -87,7 +90,11 @@ a reset correction cannot mint a second continuation for the same run.
    source/target preflight. If already delivered, claim the switch without
    resending. If the run, provider/model, settlement, pending requests, reset,
    target health or fresh quota moved, release instead. An ambiguous send
-   checks delivery before falling back to release.
+   checks delivery before falling back to release. A timeout may commit later:
+   cleanup re-enters the receipt check, and subsequent thread events or snapshots
+   reconcile even a cancelled intent into one `provider_switched`. While that
+   outcome is uncertain, `quota_resumed` is deferred; a newer run without the
+   dispatch receipt is reconciled as an ordinary resume.
 4. A guard rejection starts release. Restore the prior native auto-resume
    choice while the observed `requestId` still belongs to Chaldea. If the
    recorded prior value was Chaldea's own hold, it is unknown and release
@@ -118,17 +125,27 @@ resetless stop. One next-deadline timer handles idle threads; release retries
 exist only while cleanup is pending. At the reset itself, an undelivered
 continuation is no longer eligible and is released instead of resent.
 After the deadline, an owned hold that T3 refuses to update because the
-thread is archived, settled, superseded or awaiting input is cleared with
+thread is archived, settled or awaiting input is cleared with
 `thread.metadata.update limitRecovery:null`. This returns it to native global
-policy and frees its intent slot. A human recovery request observed in place
-of Chaldea's hold is left alone. As with dispatch, pinned T3 has no atomic
-ownership compare-and-swap for a human edit racing that final read.
+policy and frees its intent slot. Immediately before every restore or clear,
+including a fallback clear after a rejected restore, Chaldea re-reads the thread
+projection and requires both its own hold request ID and the unchanged latest
+run. A newer run or human/native recovery request is left alone and frees the
+intent slot. A read-then-write race remains: pinned T3 has no guarded metadata
+update, so a change after that final projection read can still be overwritten.
+Remove this limitation when upgrading to a T3 version with a metadata update
+that atomically checks the expected recovery request ID and latest run.
 
 Switch work is coalesced in a bounded background worker. Quota records are
 processed before it and never wait for optional switch RPCs. Any switch-path
 exception, including protocol drift or insufficient scope, disables new
 switches, tries to release existing owned holds, and claims one loud
-`provider_switch_failed` warning per source run. Observation continues.
+`provider_switch_failed` warning per source run. Cleanup is attempted at most
+once per active intent per drain. Observation continues. Transient connection
+failures retry the live catalog after exponential backoff from one second to
+at most one minute, then re-enable switching and log once. The failure warning
+is not repeated. Authorization and protocol failures stay disabled until
+credentials change or the observer restarts.
 A genuinely revoked operate scope or an unreachable server cannot be bypassed:
 failed cleanup stays durable and retries; restoring access or restarting the
 observer reconciles it before new work. No client-only deadline can run while

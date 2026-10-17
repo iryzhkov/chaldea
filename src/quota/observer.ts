@@ -64,7 +64,7 @@ export function claim(state: ObserverState, kind: RecordKind, threadId: string, 
   // A switched stop has no reset lateness. Its switch claim survives reconnects.
   if (kind === "quota_resumed" && [...state.switches.values()].some((intent) =>
     intent.threadId === threadId && intent.runId === runId &&
-    (intent.phase === "switched" || intent.phase === "dispatching" || intent.phase === "releasing"))) return false;
+    (intent.phase === "switched" || intent.phase === "dispatching" || intent.phase === "releasing" || intent.dispatchUncertain === true))) return false;
   const key = recordKey(kind, threadId, runId);
   if (state.posted.has(key)) return false;
   state.posted.set(key, stopAt);
@@ -147,7 +147,7 @@ export function observeThread(
     // A newer run exists, so the parked run was continued: natively, or by hand.
     const unresolvedDispatch = [...state.switches.values()].some((intent) =>
       intent.threadId === thread.id && intent.runId === parked.runId &&
-      (intent.phase === "dispatching" || intent.phase === "releasing"));
+      (intent.phase === "dispatching" || intent.phase === "releasing" || intent.dispatchUncertain === true));
     if (!unresolvedDispatch) state.parked.delete(thread.id);
     const recovery = thread.limitRecovery;
     const armed = recovery !== null && recovery.runId === parked.runId && recovery.autoResume;
