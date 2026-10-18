@@ -12,8 +12,9 @@ import { startDisposableT3, t3Version } from "../helpers/disposable-t3.ts";
 import { ShellWatcher, waitFor } from "../helpers/e2e.ts";
 import { withClient } from "../../src/t3/adapter.ts";
 import { MessageStore } from "../../src/message-store.ts";
+import { readTrustedFile, ConfigurationError } from "../../src/config/files.ts";
 import { receiverBinding, payload, type ReceiverConfig } from "../../src/message-receiver.ts";
-import { identity, request, message, senderBinding, sshRequest, type SenderConfig, type Route } from "../../src/message.ts";
+import { identity, request, message, senderBinding, sshRequest, sshArgs, type SenderConfig, type Route } from "../../src/message.ts";
 
 async function port():Promise<number>{
   const s=createServer();await new Promise<void>(r=>s.listen(0,"127.0.0.1",r));
@@ -62,7 +63,7 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     writeFileSync(authorized,'restrict,from="127.0.0.1",command="'+forced+'" '+publicKey+"\n",{mode:0o644});
     const sshd=join(root,"sshd.conf");
     const policy="Port "+sshPort+"\nListenAddress 127.0.0.1\nHostKey "+join(root,"host")+"\nPidFile "+join(root,"sshd.pid")+"\n"+
-      "UsePAM no\nPermitRootLogin no\nStrictModes yes\nPermitUserEnvironment no\nLogLevel ERROR\nAllowUsers "+user+"\n"+
+      "UsePAM no\nPermitRootLogin no\nStrictModes yes\nPermitUserEnvironment no\nLogLevel DEBUG1\nAllowUsers "+user+"\n"+
       "AcceptEnv NODE_OPTIONS BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH SSH_AUTH_SOCK\n"+
       "Subsystem sftp internal-sftp\nMatch User "+user+"\n"+
       "  AuthenticationMethods publickey\n  PubkeyAuthentication yes\n  PasswordAuthentication no\n  KbdInteractiveAuthentication no\n"+
@@ -94,11 +95,11 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     const sender:SenderConfig={callerId:"fixture",sourceHost:"source",database:join(root,"sender/state.db"),hosts:{target:route}};
     const ss=new MessageStore(sender.database,senderBinding(sender),true);ss.close();
     daemon=spawn("/usr/sbin/sshd",["-D","-e","-f",sshd],{stdio:["ignore","ignore","pipe"]});
-    daemon.stderr!.on("data",b=>log=(log+b).slice(-4096));
+    daemon.stderr!.on("data",b=>log=(log+b).slice(-32768));
     const deadline=Date.now()+5000;
     for(;;){
       const connected=await new Promise<boolean>(r=>{const s=createConnection(sshPort,"127.0.0.1");s.once("connect",()=>{s.destroy();r(true);});s.once("error",()=>r(false));});
-      if(connected)break;assert.ok(Date.now()<deadline,log);await new Promise(r=>setTimeout(r,30));
+      if(connected)break;assert.ok(Date.now()<deadline,"fixture sshd did not listen");await new Promise(r=>setTimeout(r,30));
     }
     const common=["-F","/dev/null","-p",String(sshPort),"-i",clientKey,"-o","BatchMode=yes","-o","IdentitiesOnly=yes",
       "-o","IdentityAgent=none","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile="+known,"-o","GlobalKnownHostsFile=/dev/null",
@@ -106,6 +107,26 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     const ssh=(command:string[]= ["chaldea-message-v1"],extra:string[]=[],body="",env:NodeJS.ProcessEnv={})=>
       collected(spawn("/usr/bin/ssh",[...common,...extra,user+"@127.0.0.1",...command],{
         env:{PATH:"/usr/bin:/bin",...env},stdio:["pipe","pipe","pipe"]}),body);
+    // [DEBUG-m1ssh] Status-only transport diagnosis. Never emit raw stderr or wire data.
+    for(const [label,file,secret] of [["key",clientKey,true],["known_hosts",known,false]] as const){
+      try{readTrustedFile(file,{secret,maxBytes:secret?16384:65536});}
+      catch(e){assert.fail(JSON.stringify({probe:"custody",file:label,reason:e instanceof ConfigurationError?e.reason:"read"}));}
+    }
+    const probe=request({v:1,op:"status",host:"target",environment,threadId,requestId:Date.now()+":transport-probe"});
+    const transport=await collected(spawn("/usr/bin/ssh",["-vv",...sshArgs(route)],{
+      env:{PATH:"/usr/bin:/bin"},stdio:["pipe","pipe","pipe"]}),JSON.stringify(probe),35_000);
+    const flags=(text:string)=>Object.fromEntries(Object.entries({
+      authenticated:/Authenticated to /,keyAccepted:/Server accepts key:/,permissionDenied:/Permission denied/i,
+      accountLocked:/account is locked/i,badOwnership:/bad ownership or modes/i,notFound:/No such file or directory/i,
+      loader:/error while loading shared libraries/i,envRefused:/env request failed/i,
+      commandStarted:/Sending command: chaldea-message-v1/,connectionClosed:/Connection closed/i,
+    }).map(([key,re])=>[key,re.test(text)]));
+    let probeState="invalid";
+    try{const value=JSON.parse(transport.out);if(["accepted","rejected","uncertain","conflict"].includes(value.state))probeState=value.state;}catch{}
+    t.diagnostic(JSON.stringify({probe:"ssh-status",exit:transport.code,stdoutBytes:Buffer.byteLength(transport.out),state:probeState,
+      client:flags(transport.err),server:flags(log),envChecked:readFileSync(config+".env-checked","utf8").includes("clean")}));
+    assert.equal(transport.code,0,"status-only SSH transport must succeed before any send");
+    assert.equal(probeState,"uncertain","absent receipt has one uncertain status response");
     const r=request({v:1,op:"send",host:"target",environment,threadId,requestId:Date.now()+":ssh-success",text:"$(touch "+join(state,"injected")+"); literal shell data"});
     const before=await withClient(opts(),c=>c["orchestration.getThreadProjection"]({threadId} as never));
     let firstReply:Awaited<ReturnType<typeof sshRequest>>|undefined;
