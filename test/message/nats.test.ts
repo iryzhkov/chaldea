@@ -9,7 +9,7 @@ import { once } from "node:events";
 import { randomUUID } from "node:crypto";
 import { connect,nkeys,nkeyAuthenticator,type NatsConnection } from "@nats-io/transport-node";
 import { jetstreamManager,AckPolicy,StorageType,RetentionPolicy,DiscardPolicy } from "@nats-io/jetstream";
-import { message,senderConfig,senderBinding,request,identity,requestHash,messageTargets,type SenderConfig } from "../../src/message.ts";
+import { message,senderConfig,senderConfigPath,senderBinding,request,identity,requestHash,messageTargets,type SenderConfig } from "../../src/message.ts";
 import { receiverConfig,receiverBinding,runReceiver,deliver,receive,type ReceiverConfig } from "../../src/message-receiver.ts";
 import { connection,publish,pull,acknowledge,next,decodeReceipt,brokerConfig,type Mapping } from "../../src/message-broker.ts";
 import { MessageStore,WINDOW } from "../../src/message-store.ts";
@@ -56,9 +56,9 @@ accounts {MESSAGES {jetstream:enabled, users:[
  let a=await start();
  const manager=await jetstreamManager(a);
  for(const [name,subjects,age]of [["MESSAGE_COMMANDS",Object.values(routes).map(r=>r.commandSubject),24*3600e9],
-  ["MESSAGE_RECEIPTS",Object.values(routes).map(r=>r.receiptSubject),42*24*3600e9]] as const){
+  ["MESSAGE_RECEIPTS",Object.values(routes).map(r=>r.receiptSubject),120e9]] as const){
   await manager.streams.add({name,subjects:[...subjects],storage:StorageType.File,retention:RetentionPolicy.Workqueue,discard:DiscardPolicy.New,
-   max_age:age,max_bytes:1048576,max_msgs:256,max_msg_size:8192,num_replicas:1,max_consumers:8,duplicate_window:60e9});
+   max_age:age,max_bytes:1048576,max_msgs:256,max_msgs_per_subject:32,discard_new_per_subject:true,max_msg_size:8192,num_replicas:1,max_consumers:8,duplicate_window:60e9});
   for(const r of Object.values(routes))await manager.consumers.add(name,{durable_name:name==="MESSAGE_COMMANDS"?r.commandConsumer:r.receiptConsumer,
    filter_subject:name==="MESSAGE_COMMANDS"?r.commandSubject:r.receiptSubject,ack_policy:AckPolicy.Explicit,ack_wait:250e6,
    max_deliver:5,max_ack_pending:32,max_batch:1,max_waiting:32,max_expires:1e9});
@@ -67,6 +67,7 @@ accounts {MESSAGES {jetstream:enabled, users:[
  const token=t3.issueToken(["orchestration:read","orchestration:operate"]);writeFileSync(join(root,"t3-token"),token,{mode:0o600});
  let watcher:ShellWatcher|undefined=new ShellWatcher(t3.serverUrl,token);
  const threadId=await waitFor("bootstrap thread",()=>watcher!.firstThreadId(),30000);
+ function stmtSafe(db:MessageStore,n:number){db.db.prepare("INSERT INTO attempts VALUES(?,?,?,?,NULL,?)").run(randomUUID(),"held-"+n,"held",Date.now()+WINDOW,"fixture");}
  const opts=()=>({serverUrl:t3.serverUrl,token});
  const env=String((await withClient(opts(),c=>c["server.getConfig"]({}))).environment.environmentId);
  const projection=()=>withClient(opts(),c=>c["orchestration.getThreadProjection"]({threadId} as never));
@@ -102,12 +103,22 @@ accounts {MESSAGES {jetstream:enabled, users:[
  try{
   await t.test("private root config, exact mappings, identity pin and configured targets",async()=>{
    await reset("config");assert.deepEqual(messageTargets(s),[{host:"target",threads:[threadId]}]);
+   const oldXdg=process.env.XDG_CONFIG_HOME;process.env.XDG_CONFIG_HOME=join(root,"xdg");
+   try{assert.equal(senderConfigPath(),join(root,"xdg/chaldea/message.json"));}finally{if(oldXdg===undefined)delete process.env.XDG_CONFIG_HOME;else process.env.XDG_CONFIG_HOME=oldXdg;}
+   const limits=(await(await jetstreamManager(a)).streams.info("MESSAGE_RECEIPTS")).config;
+   assert.equal(limits.max_age,120e9);assert.equal(limits.max_msgs_per_subject,32);assert.equal(limits.discard_new_per_subject,true);
    chmodSync(sourceFile,0o644);assert.throws(()=>senderConfig(sourceFile));chmodSync(sourceFile,0o640);assert.deepEqual(JSON.parse(JSON.stringify(senderConfig(sourceFile))),s);
    for(const broker of [{...s.broker,account:"CHALDEA"},{...s.broker,url:"nats://192.0.2.1:4222/"},
     {...s.broker,url:"wss://user:password@example.invalid/"},{...s.broker,inboxPrefix:"_INBOX_message.>"}])assert.throws(()=>brokerConfig(broker));
    await assert.rejects(connection({...s.broker,publicKey:keys.b.getPublicKey()}),/message_broker_unavailable/);
+   await assert.rejects(connection({...s.broker,url:url.replace("nats:","tls:")}),/message_broker_unavailable/);
    const bad={...c,callers:{...c.callers,b:{...c.callers.b!,commandSubject:c.callers.a!.commandSubject}}};
    writeFileSync(receiverFile,JSON.stringify(bad));assert.throws(()=>receiverConfig(receiverFile));writeFileSync(receiverFile,JSON.stringify(c));
+  });
+  await t.test("pull timeout includes bounded network delay beyond the old half-second margin",async()=>{
+   await reset("pull-margin");const nc=await receiverConnection(),original=nc.publish.bind(nc);
+   nc.publish=((subject:string,...args:unknown[])=>{if(subject===next("MESSAGE_COMMANDS",routes.a.commandConsumer))setTimeout(()=>{(original as (...args:unknown[])=>void)(subject,...args);},2000);else(original as (...args:unknown[])=>void)(subject,...args);}) as typeof nc.publish;
+   const start=Date.now();assert.equal(await pull(nc,c.broker,routes.a,AbortSignal.timeout(5000)),undefined);assert.ok(Date.now()-start>=2800);nc.publish=original;
   });
   await t.test("production service, one T3 effect, identical retry/status, queued active work/provider",async()=>{
    await reset("once");void startService();const i=input("once"),r=wire(i),before=await projection();
@@ -135,6 +146,52 @@ accounts {MESSAGES {jetstream:enabled, users:[
     const [x,y]=await Promise.all([one,two]);assert.equal(x.state,"accepted");assert.equal(y.state,"accepted");
     assert.equal(x.commandId,ids(r).commandId);assert.equal(y.commandId,ids(q).commandId);assert.equal(await count(r),1);assert.equal(await count(q),1);
    }finally{db.close();}
+  });
+  await t.test("CLI processes sharing a sender journal serialize intent and correlated receipts",async()=>{
+   await reset("processes");void startService();const i=input("process-one"),j=input("process-two");
+   const held=new MessageStore(s.database,senderBinding(s));
+   const launch=(v:ReturnType<typeof input>)=>{
+    const child=spawn(process.execPath,["src/cli.ts","message","send","--config",sourceFile,"--host","target","--thread",threadId,"--request-id",v.requestId,"--text",v.text],{stdio:["ignore","pipe","pipe"]});
+    let output="",error="";child.stdout!.on("data",b=>{output+=b;assert.ok(output.length<4096);});child.stderr!.on("data",b=>{error+=b;assert.ok(error.length<4096);});
+    return new Promise<ReturnType<typeof decodeReceipt>>((resolve,reject)=>child.once("close",code=>{
+     try{assert.equal(code,0,error);resolve(decodeReceipt(Buffer.from(output.trim())));}catch(e){reject(e);}
+    }));
+   };
+   const one=launch(i),two=launch(j);await delay(1000);held.close();
+   const [x,y]=await Promise.all([one,two]);assert.equal(x.state,"accepted");assert.equal(y.state,"accepted");
+   assert.equal(x.commandId,ids(wire(i)).commandId);assert.equal(y.commandId,ids(wire(j)).commandId);assert.equal(await count(wire(i)),1);assert.equal(await count(wire(j)),1);
+  });
+  await t.test("identity-poison receipt is terminated without failing the matching live exchange",async()=>{
+   await reset("receipt-poison");const i=input("receipt-poison"),r=wire(i),pending=message("send",i,s),nc=await receiverConnection();
+   const m=await pull(nc,c.broker,routes.a,AbortSignal.timeout(5000));assert.ok(m);const nonce=m.headers!.get("Chaldea-Attempt");
+   await publish(nc,c.broker,routes.a,Buffer.from(JSON.stringify({state:"accepted",commandId:"wrong",messageId:"wrong"})),nonce,true);await delay(100);
+   const db=new MessageStore(c.database,receiverBinding(c));
+   try{const result=await receive(r,{caller:"a",sourceHost:"source-a",subject:m.subject},c,db,()=>receiverConfig(receiverFile));
+    await publish(nc,c.broker,routes.a,Buffer.from(JSON.stringify(result)),nonce,true);acknowledge(nc,c.broker,routes.a,m);
+   }finally{db.close();}
+   assert.equal((await pending).state,"accepted");assert.equal(await count(r),1);
+  });
+  await t.test("caller capacity/status pressure and receipt publication failure leave the other caller running",async()=>{
+   await reset("capacity");const db=new MessageStore(c.database,receiverBinding(c)),stmt=db.db.prepare("INSERT INTO attempts VALUES(?,?,?,?,NULL,?)");
+   db.db.exec("BEGIN");for(let n=0;n<1000;n++)stmt.run(randomUUID(),"held-"+n,"held",Date.now()+WINDOW,"a");db.db.exec("COMMIT");
+   assert.throws(()=>db.reserve(randomUUID(),"full","full",Date.now()+WINDOW,Date.now(),true,"a"),/message_caller_attempt_capacity/);db.close();
+   const b:SenderConfig={...s,callerId:"b",sourceHost:"source-b",database:join(root,"capacity-b.db"),broker:connectionConfig("b"),hosts:{target:{...s.hosts.target!,...routes.b}}};
+   new MessageStore(b.database,senderBinding(b),true).close();void startService();const i=input("full-a"),r=wire(i);
+   assert.equal((await message("send",i,s)).state,"uncertain");assert.equal(await count(r),0);
+   const j=input("capacity-b");assert.equal((await message("send",j,b)).state,"accepted");assert.equal(await count(wire(j),"b"),1);
+   const states=[];for(let n=0;n<12;n++)states.push((await message("status",{host:"target",threadId,requestId:j.requestId},b)).state);
+   assert.ok(states.every(state=>state==="accepted"||state==="uncertain"));await stopService();
+   const check=new MessageStore(c.database,receiverBinding(c));assert.equal(check.db.prepare("SELECT count(*) AS n FROM attempts").get()!.n,1001);check.close();
+   // Shared global-cap refusal is also before dispatch; no second reservation/worker failure.
+   const full=new MessageStore(c.database,receiverBinding(c));full.db.exec("BEGIN");for(let n=1001;n<10000;n++)stmtSafe(full,n);full.db.exec("COMMIT");assert.throws(()=>full.reserve(randomUUID(),"full","full",Date.now()+WINDOW,Date.now(),true,"b"),/message_attempt_capacity/);full.close();
+   void startService();const k=input("global-full");assert.equal((await message("send",k,b)).state,"uncertain");assert.equal(await count(wire(k),"b"),0);await stopService();
+   await reset("publication-isolation");const nc=await receiverConnection();
+   for(let n=0;n<32;n++)await publish(nc,c.broker,routes.a,Buffer.from(JSON.stringify({state:"uncertain",commandId:"stale",messageId:"stale"})),randomUUID(),true);
+   await assert.rejects(publish(nc,c.broker,routes.a,Buffer.from("{}"),randomUUID(),true));
+   const source=await sourceConnection(),aInput=input("blocked-receipt"),aRequest=wire(aInput);await publish(source,s.broker,routes.a,Buffer.from(JSON.stringify(aRequest)),randomUUID());
+   void startService();const deadline=Date.now()+5000;while(await count(aRequest)!==1){assert.ok(Date.now()<deadline);await delay(30);}
+   const other={...b,database:join(root,"isolation-b.db")};new MessageStore(other.database,senderBinding(other),true).close();
+   const q=input("isolated-b");assert.equal((await message("send",q,other)).state,"accepted");assert.equal(await count(wire(q),"b"),1);
   });
   await t.test("T3 commit/receipt-state failure parks interrupted attempt; explicit original-ID retry survives T3 restart",async()=>{
    await reset("crash");const i=input("crash"),r=wire(i),pending=message("send",i,s),nc=await receiverConnection();
@@ -165,7 +222,7 @@ accounts {MESSAGES {jetstream:enabled, users:[
   });
   await t.test("malformed poison does not starve valid work; expiry, wrong thread and live ACL revoke fail closed",async()=>{
    await reset("poison");const nc=await sourceConnection();
-   for(let n=0;n<256;n++)await publish(nc,c.broker,routes.a,Buffer.from("{"),randomUUID());
+   for(let n=0;n<32;n++)await publish(nc,c.broker,routes.a,Buffer.from("{"),randomUUID());
    await assert.rejects(publish(nc,c.broker,routes.a,Buffer.from("{"),randomUUID()));
    void startService();
    const deadline=Date.now()+10000;

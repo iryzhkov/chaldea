@@ -13,6 +13,8 @@ Defaults work without XDG variables; setting them intentionally relocates the co
 | Akasha gateway | `$XDG_CONFIG_HOME/chaldea/akasha.json` | Yes |
 | Collector and in-process event publishers | `$XDG_CONFIG_HOME/chaldea/events.json` | No |
 | T3 restart/recovery support | `$XDG_CONFIG_HOME/chaldea/restart.json` | No |
+| Messaging sender, CLI and MCP discovery | `$XDG_CONFIG_HOME/chaldea/message.json` | For messaging |
+| Messaging receiver (explicit system boundary) | `/etc/chaldea/message-receiver.json` | For receiver |
 
 An absent optional file selects the old defaults. An explicitly selected missing file,
 invalid JSON, or an unsafe file fails closed. Unknown config keys are rejected except
@@ -22,7 +24,13 @@ including duplicate-key rejection. Config readers never include file contents in
 The sudo token helper is a system security boundary, with a fixed root-owned
 `/etc/chaldea/token-helper.json`. It deliberately ignores user XDG settings and
 retains its provisioned key names. Host programs in `host/` retain their system
-configuration contracts. Neither is a user daemon.
+configuration contracts. Neither is a user daemon. The messaging receiver also
+uses a fixed root-controlled /etc boundary despite running as a profile user:
+its caller/subject/thread grants must not be editable by that user. Both messaging
+configs are root-owned, private 0600/0640, bounded to 64 KiB; 0640 requires a
+read-only profile group. See [messaging](message.md) for literal state paths that
+match its disabled source user unit. CLI help/describe and MCP discovery parse
+only the sender config; they open no credential/DB or broker connection.
 
 ## Paths and files
 

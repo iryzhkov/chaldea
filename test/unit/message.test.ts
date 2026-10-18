@@ -19,6 +19,15 @@ function fixture(){
   const s=new MessageStore(c.database,receiverBinding(c),true);
   return {dir,c,x,r,s,close(){s.close();rmSync(dir,{recursive:true,force:true});}};
 }
+test("transport admission rate is durable, includes status, and isolates caller buckets",()=>{
+  const f=fixture();try{
+    for(let n=0;n<8;n++)f.s.admit("pc",now);
+    assert.throws(()=>f.s.admit("pc",now),/message_rate/);
+    f.s.admit("other",now);f.s.admit("pc",now+1000);
+    assert.throws(()=>f.s.admit("pc",now+1000),/message_rate/);
+    assert.equal(f.s.db.prepare("SELECT count(*) AS n FROM transport_buckets").get()!.n,2);
+  }finally{f.close();}
+});
 test("strict bounded wire schema and UTF-8",()=>{
   const good={v:1,op:"send",host:"target",environment:"fixture",threadId:"thread",requestId:now+":key",text:"$(touch marker); ' \" \n"};
   assert.equal(decodeRequest(Buffer.from(JSON.stringify(good))).text,good.text);

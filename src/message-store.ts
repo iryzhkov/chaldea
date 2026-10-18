@@ -13,6 +13,20 @@ export interface Row {
   state: "dispatching" | State; result: string | null;
 }
 const check = (ok: unknown, reason: string): void => { if (!ok) throw new Error(reason); };
+// Short bounded retries serialize CLI/MCP journal transactions across processes.
+export async function senderJournal<T>(database:string,binding:string,fn:(s:MessageStore)=>T,until=Date.now()+2000):Promise<T>{
+  for(;;){
+    let s:MessageStore|undefined,last:unknown;
+    try{s=new MessageStore(database,binding);return fn(s);}
+    catch(e){
+      const busy=e instanceof Error&&(e.message==="message_busy"||(e as Error&{errcode?:number}).errcode===5);
+      if(!busy)throw e;last=e;
+    }finally{s?.close();}
+    if(Date.now()>=until)throw last;
+    await new Promise(resolve=>setTimeout(resolve,10));
+  }
+}
+
 export class MessageStore {
   readonly db: DatabaseSync;
   private lock: number | undefined;
@@ -29,7 +43,9 @@ export class MessageStore {
           CREATE TABLE receipts(id TEXT PRIMARY KEY,caller TEXT NOT NULL,hash TEXT NOT NULL,
             stamp INTEGER NOT NULL,payload TEXT,state TEXT NOT NULL,result TEXT);
           CREATE TABLE buckets(caller TEXT PRIMARY KEY,tokens REAL NOT NULL,observed INTEGER NOT NULL);
-          CREATE TABLE attempts(id TEXT PRIMARY KEY,command_id TEXT NOT NULL,binding TEXT NOT NULL,expires INTEGER NOT NULL,result TEXT);`);
+          CREATE TABLE attempts(id TEXT PRIMARY KEY,command_id TEXT NOT NULL,binding TEXT NOT NULL,expires INTEGER NOT NULL,result TEXT,caller TEXT NOT NULL);
+          CREATE INDEX attempts_caller ON attempts(caller);
+          CREATE TABLE transport_buckets(caller TEXT PRIMARY KEY,tokens REAL NOT NULL,observed INTEGER NOT NULL);`);
         meta(this.db).put("binding",binding); meta(this.db).put("observed","0");
       });
       check(meta(this.db).get("binding")===binding,"message_state_binding");
@@ -55,7 +71,7 @@ export class MessageStore {
       check(Number.isSafeInteger(observed),"message_clock_state");
       if(now<observed-300_000) return false;
       meta(this.db).put("observed",String(Math.max(now,observed)));
-      if(callers){check(callers.length<=8,"message_callers");this.db.prepare("DELETE FROM buckets WHERE caller NOT IN ("+callers.map(()=>"?").join(",")+")").run(...callers);}
+      if(callers){check(callers.length<=8,"message_callers");for(const table of ["buckets","transport_buckets"])this.db.prepare("DELETE FROM "+table+" WHERE caller NOT IN ("+callers.map(()=>"?").join(",")+")").run(...callers);}
       this.db.prepare("UPDATE receipts SET payload=NULL WHERE stamp<? AND state IN ('uncertain','dispatching')").run(now-WINDOW);
       this.db.prepare("DELETE FROM receipts WHERE stamp<?").run(now-RETENTION);
       return true;
@@ -74,13 +90,14 @@ export class MessageStore {
   attempt(id:string):{command_id:string;binding:string;expires:number;result:string|null}|undefined {
     return this.db.prepare("SELECT * FROM attempts WHERE id=?").get(id) as never;
   }
-  reserve(id:string,command:string,binding:string,expires:number,now:number,receiver=false):void {
+  reserve(id:string,command:string,binding:string,expires:number,now:number,receiver=false,caller=""):void {
     tx(this.db,()=>{
       this.db.prepare("DELETE FROM attempts WHERE expires<?").run(now);
       check(!this.attempt(id),"message_attempt_conflict");
       check(Number(this.db.prepare("SELECT count(*) AS n FROM attempts").get()!.n)<(receiver?10000:128),"message_attempt_capacity");
+      if(receiver)check(caller.length>0&&Number(this.db.prepare("SELECT count(*) AS n FROM attempts WHERE caller=?").get(caller)!.n)<1000,"message_caller_attempt_capacity");
       check(Buffer.byteLength(binding)<=2048,"message_attempt_binding");
-      this.db.prepare("INSERT INTO attempts VALUES(?,?,?,?,NULL)").run(id,command,binding,expires);
+      this.db.prepare("INSERT INTO attempts VALUES(?,?,?,?,NULL,?)").run(id,command,binding,expires,caller);
     });
   }
   answer(id:string,result:Receipt):void {
@@ -88,11 +105,15 @@ export class MessageStore {
     this.db.prepare("UPDATE attempts SET result=? WHERE id=? AND result IS NULL").run(JSON.stringify(result),id);
   }
   forget(id:string):void {this.db.prepare("DELETE FROM attempts WHERE id=?").run(id);}
-  consume(caller:string,now:number):void {
-    const bucket=this.db.prepare("SELECT * FROM buckets WHERE caller=?").get(caller) as {tokens:number;observed:number}|undefined;
-    const tokens=Math.min(2,(bucket?.tokens??2)+Math.max(0,now-(bucket?.observed??now))/6000);
+  admit(caller:string,now:number):void {tx(this.db,()=>{
+    check(this.db.prepare("SELECT 1 FROM transport_buckets WHERE caller=?").get(caller)||Number(this.db.prepare("SELECT count(*) AS n FROM transport_buckets").get()!.n)<8,"message_callers");
+    this.consume(caller,now,"transport_buckets",8,1000);
+  });}
+  consume(caller:string,now:number,table:"buckets"|"transport_buckets"="buckets",burst=2,interval=6000):void {
+    const bucket=this.db.prepare("SELECT * FROM "+table+" WHERE caller=?").get(caller) as {tokens:number;observed:number}|undefined;
+    const tokens=Math.min(burst,(bucket?.tokens??burst)+Math.max(0,now-(bucket?.observed??now))/interval);
     check(tokens>=1,"message_rate");
-    this.db.prepare("INSERT INTO buckets VALUES(?,?,?) ON CONFLICT(caller) DO UPDATE SET tokens=excluded.tokens,observed=excluded.observed")
+    this.db.prepare("INSERT INTO "+table+" VALUES(?,?,?) ON CONFLICT(caller) DO UPDATE SET tokens=excluded.tokens,observed=excluded.observed")
       .run(caller,tokens-1,Math.max(now,bucket?.observed??now));
   }
   retry(id:string,caller:string,now:number,rate=false):void {

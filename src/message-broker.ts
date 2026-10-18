@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { connect, wsconnect, nkeys, nkeyAuthenticator, headers, createInbox, type NatsConnection, type Msg } from "@nats-io/transport-node";
 import { jetstream } from "@nats-io/jetstream";
 import { readTrustedFile } from "./config/files.ts";
-import { MessageStore, type Receipt } from "./message-store.ts";
+import { senderJournal, type Receipt } from "./message-store.ts";
 import { object, name, path, field, requireMessage, identity, senderBinding, type SenderConfig, type Route, type Request } from "./message.ts";
 
 export interface BrokerConfig {url:string;account:string;seedFile:string;publicKey:string;inboxPrefix:string;commandStream:string;receiptStream:string}
@@ -45,7 +45,7 @@ export async function connection(b:BrokerConfig):Promise<NatsConnection> {
     seed=Buffer.from(readTrustedFile(b.seedFile,{secret:true,maxBytes:1024}).toString("utf8").trim());
     const key=nkeys.fromSeed(Uint8Array.from(seed));
     try{requireMessage(key.getPublicKey()===b.publicKey,"message_broker_identity");}finally{key.clear();}
-    const options={servers:b.url,authenticator:nkeyAuthenticator(seed),inboxPrefix:b.inboxPrefix,reconnect:false,timeout:2000};
+    const options={servers:b.url,authenticator:nkeyAuthenticator(seed),inboxPrefix:b.inboxPrefix,reconnect:false,timeout:2000,...(b.url.startsWith("tls:")?{tls:{}}:{})};
     return await(b.url.startsWith("wss:")?wsconnect(options):connect(options));
   }catch{throw new Error("message_broker_unavailable");}
   finally{seed?.fill(0);}
@@ -58,7 +58,7 @@ export async function publish(nc:NatsConnection,b:BrokerConfig,h:Mapping,data:Ui
 }
 export async function pull(nc:NatsConnection,b:BrokerConfig,h:Mapping,signal:AbortSignal,receipt=false):Promise<Msg|undefined> {
   if(signal.aborted)return;
-  const inbox=createInbox(b.inboxPrefix),sub=nc.subscribe(inbox,{max:1,timeout:1500});
+  const inbox=createInbox(b.inboxPrefix),sub=nc.subscribe(inbox,{max:1,timeout:5000});
   const stop=()=>sub.unsubscribe();signal.addEventListener("abort",stop,{once:true});
   try{
     nc.publish(next(receipt?b.receiptStream:b.commandStream,receipt?h.receiptConsumer:h.commandConsumer),
@@ -69,6 +69,10 @@ export async function pull(nc:NatsConnection,b:BrokerConfig,h:Mapping,signal:Abo
       }
       return m;
     }
+  }catch(e){
+    // nats-core subscription timers stop the iterator with TimeoutError.
+    if(!(e instanceof Error&&(e.name==="TimeoutError"||e.message==="TIMEOUT")))throw e;
+    return;
   }finally{signal.removeEventListener("abort",stop);sub.unsubscribe();}
 }
 export function acknowledge(nc:NatsConnection,b:BrokerConfig,h:Mapping,m:Msg,receipt=false,poison=false):void {
@@ -87,16 +91,14 @@ export function decodeReceipt(bytes:Uint8Array):Receipt {
 export async function exchange(c:SenderConfig,h:Route,r:Request):Promise<Receipt> {
   const id=randomUUID(),ids=identity(c.callerId,c.sourceHost,r),binding=mappingBinding(c.broker,h);
   const deadline=Date.now()+35000,signal=AbortSignal.timeout(35000);
-  const store=<T>(fn:(s:MessageStore)=>T):T=>{
-    const s=new MessageStore(c.database,senderBinding(c));try{return fn(s);}finally{s.close();}
-  };
-  store(s=>s.reserve(id,ids.commandId,binding,deadline+5000,Date.now()));
+  const store=<T>(fn:Parameters<typeof senderJournal<T>>[2])=>senderJournal(c.database,senderBinding(c),fn,Math.min(deadline,Date.now()+2000));
+  await store(s=>s.reserve(id,ids.commandId,binding,deadline+5000,Date.now()));
   let nc:NatsConnection|undefined;
   try{
     nc=await connection(c.broker);
     await publish(nc,c.broker,h,Buffer.from(JSON.stringify(r)),id);
     while(!signal.aborted){
-      const saved=store(s=>s.attempt(id)?.result);
+      const saved=await store(s=>s.attempt(id)?.result);
       if(saved)return decodeReceipt(Buffer.from(saved));
       const m=await pull(nc,c.broker,h,signal,true);if(!m)continue;
       let replyId:string,result:Receipt;
@@ -104,17 +106,17 @@ export async function exchange(c:SenderConfig,h:Route,r:Request):Promise<Receipt
         requireMessage(m.subject===h.receiptSubject,"message_receipt_subject");
         replyId=attempt(m.headers?.get("Chaldea-Attempt"));result=decodeReceipt(m.data);
       }catch{acknowledge(nc,c.broker,h,m,true,true);continue;}
-      store(s=>{
+      const valid=await store(s=>{
           const pending=s.attempt(replyId);
-          if(!pending||pending.expires<Date.now())return;
-          requireMessage(pending.binding===binding&&pending.command_id===result.commandId&&result.messageId===result.commandId,"message_receipt_identity");
-          s.answer(replyId,result); // A concurrent request may be the intended reader.
+          if(!pending||pending.expires<Date.now())return true;
+          if(pending.binding!==binding||pending.command_id!==result.commandId||result.messageId!==result.commandId)return false;
+          s.answer(replyId,result);return true; // A concurrent request may be the intended reader.
       });
-      acknowledge(nc,c.broker,h,m,true);await nc.flush();
+      acknowledge(nc,c.broker,h,m,true,!valid);await nc.flush();
     }
     throw new Error("message_receipt_timeout");
   }finally{
     await nc?.close();
-    try{store(s=>s.forget(id));}catch{} // Expiry bounds cleanup even if the journal is busy.
+    try{await store(s=>s.forget(id));}catch{} // Expiry bounds cleanup even if the journal is busy.
   }
 }

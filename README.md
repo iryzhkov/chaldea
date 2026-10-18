@@ -1,7 +1,9 @@
 # Chaldea
 
-`chaldea --describe` prints compact JSON discovery metadata without loading
-configuration, credentials or service code. Each command has a one-line summary
+`chaldea --describe` prints compact JSON discovery metadata. Messaging discovery
+is a deliberate exception to static discovery: it parses the bounded private
+sender config and loads messaging client modules to expose only configured
+routes. It opens no journal or credential and makes no network connection. Each command has a one-line summary
 and `read`/`write` access; local pruning and trust high-water updates count as
 writes. `chaldea --help` lists every command; group help supplies full syntax.
 

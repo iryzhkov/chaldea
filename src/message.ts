@@ -1,13 +1,13 @@
 // Existing-thread messaging. Public identities and durable local intent are transport independent.
 import { createHash } from "node:crypto";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute } from "node:path";
+import { configPath } from "./config/paths.ts";
 import { parseArgs } from "node:util";
 import { TextDecoder } from "node:util";
 import * as Schema from "effect/Schema";
 import { ThreadId } from "../vendor/t3-contracts/src/index.ts";
 import { readJson, onlyKeys } from "./config/files.ts";
-import { MessageStore, WINDOW, type Receipt } from "./message-store.ts";
+import { senderJournal, WINDOW, type Receipt } from "./message-store.ts";
 
 import { exchange, brokerConfig, mapping, distinctMappings, MAPPING_KEYS, type BrokerConfig, type Mapping } from "./message-broker.ts";
 
@@ -61,7 +61,7 @@ export const requestHash=(r:Request)=>hash([r.host,r.environment,r.threadId,r.re
 export const inWindow=(r:Request,now:number)=>Number(r.requestId.slice(0,13))>=now-WINDOW && Number(r.requestId.slice(0,13))<=now+300_000;
 export interface Route extends Mapping {destinationHost:string;environment:string;threads:string[]}
 export interface SenderConfig {callerId:string;sourceHost:string;database:string;broker:BrokerConfig;hosts:Record<string,Route>}
-export const senderConfigPath=()=>join(homedir(),".config/chaldea/message.json");
+export const senderConfigPath=()=>configPath("message");
 export function senderConfig(file=senderConfigPath()):SenderConfig {
   const c=object(readJson(file,false,undefined,{owners:[0],private:true,maxBytes:65536}),["callerId","sourceHost","database","broker","hosts"]);
   const hosts=object(c.hosts),routes:Record<string,Route>=Object.create(null);
@@ -87,8 +87,7 @@ export async function message(op:"send"|"status"|"recover",input:unknown,c=sende
     ...(op==="send"?{text:i.text}:{})});
   const ids=identity(c.callerId,c.sourceHost,r);
   // Hold the nonblocking lock only for journal transactions, never across a network wait.
-  let s=new MessageStore(c.database,senderBinding(c));
-  try {
+  const refused=await senderJournal(c.database,senderBinding(c),s=>{
     const clock=s.maintain(now),row=s.get(ids.commandId);
     if(op==="recover"){
       requireMessage(row,"message_recovery_unavailable");
@@ -99,21 +98,21 @@ export async function message(op:"send"|"status"|"recover",input:unknown,c=sende
       requireMessage(identity(c.callerId,c.sourceHost,r).commandId===ids.commandId,"message_identity");
     }
     if(r.op==="send"){
-      if(row && row.hash!==requestHash(r))return {...ids,state:"conflict",error:"message_conflict"};
+      if(row && row.hash!==requestHash(r))return {...ids,state:"conflict" as const,error:"message_conflict"};
       requireMessage((row?.state==="accepted"||row?.state==="rejected")||(clock&&inWindow(r,now)),"message_expired_or_clock");
       if(!row)s.begin({id:ids.commandId,caller:c.callerId,hash:requestHash(r),stamp:Number(r.requestId.slice(0,13)),payload:JSON.stringify(r)},false,now);
       else if(row.state!=="accepted"&&row.state!=="rejected")s.retry(ids.commandId,c.callerId,now);
     }
-  }finally{s.close();}
+  });
+  if(refused)return refused;
   let result:Receipt;
   try{result=await exchange(c,h,r);}
   catch{result={...ids,state:"uncertain",error:"message_transport"};}
   try{
-    s=new MessageStore(c.database,senderBinding(c));
-    try{
+    await senderJournal(c.database,senderBinding(c),s=>{
       const row=s.get(ids.commandId);
       if(row && row.state!=="accepted"&&row.state!=="rejected")s.finish(ids.commandId,result);
-    }finally{s.close();}
+    });
   }catch{return {...ids,state:"uncertain",error:"message_state_write"};}
   return result;
 }

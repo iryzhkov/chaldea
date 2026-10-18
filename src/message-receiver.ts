@@ -127,19 +127,23 @@ export async function deliver(nc:Awaited<ReturnType<typeof connection>>,c:Receiv
     requireMessage(receiverBinding(current)===receiverBinding(c)&&current.database===c.database&&
       mappingBinding(current.broker,authorize(current,x))===mappingBinding(c.broker,a),"message_configuration_changed");
     if(prior){
-      requireMessage(prior.binding===binding&&prior.command_id===ids.commandId,"message_attempt_conflict");
       result=prior.result?JSON.parse(prior.result):{...ids,state:"uncertain",error:"message_uncertain"};
     }else{
-      s.reserve(id,ids.commandId,binding,now+WINDOW+300000,now,true);
+      s.admit(caller,now); // Includes status; separate from the accepted T3 send bucket.
+      // Status cannot dispatch and needs no attempt tombstone.
+      if(r.op==="send")s.reserve(id,ids.commandId,binding,now+WINDOW+300000,now,true,caller);
       result=await receive(r,x,current,s,fresh);
     }
   }catch{result={...ids,state:"uncertain",error:"message_refused"};}
-  // No ACK on state/publication failure. A crash recovers to uncertainty, with original IDs.
   if(s.attempt(id))s.answer(id,result);
   else{
-    s.reserve(id,ids.commandId,binding,now+WINDOW+300000,now,true);
-    s.answer(id,result);
+    // No attempt means no dispatch barrier was crossed. Refusal/status can be
+    // terminated even if its receipt stream is full: original intent stays uncertain.
+    try{await publish(nc,c.broker,a,Buffer.from(JSON.stringify(result)),id,true);}
+    finally{acknowledge(nc,c.broker,a,m,false,true);await nc.flush();}
+    return true;
   }
+  // No ACK on state/publication failure after a possible dispatch.
   await publish(nc,c.broker,a,Buffer.from(JSON.stringify(result)),id,true);
   acknowledge(nc,c.broker,a,m);await nc.flush();return true;
 }
@@ -164,11 +168,13 @@ export async function runReceiver(file="/etc/chaldea/message-receiver.json",exte
         const c=fresh();nc=await connection(c.broker);
         const active=nc;
         workers=Object.keys(c.callers).map(async caller=>{
-          while(!currentSignal.aborted){
+          let callerFailures=0;
+          while(!currentSignal.aborted&&!active.isClosed()){
             const current=fresh();
             requireMessage(JSON.stringify(current.broker)===JSON.stringify(c.broker)&&
               mappingBinding(c.broker,c.callers[caller]!)===mappingBinding(current.broker,current.callers[caller]!),"message_configuration_changed");
-            if(await deliver(active,current,caller,s,fresh,currentSignal))failures=0;
+            try{if(await deliver(active,current,caller,s,fresh,currentSignal)){failures=0;callerFailures=0;}}
+            catch{if(!currentSignal.aborted){report("message_caller_retry");await sleep(backoff(callerFailures),currentSignal);callerFailures=Math.min(callerFailures+1,7);}}
           }
         });
         if(!workers.length){await sleep(30000,currentSignal);continue;}

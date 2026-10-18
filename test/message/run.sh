@@ -25,5 +25,5 @@ if [ "${MESSAGE_FULL:-0}" = 1 ]; then
   npm run exec:check
   npm run exec:test
   node --test test/exec/fallback.e2e.ts test/exec/queue.e2e.ts
-  npm run host:build
+  npm run host:build -- nats-source-check "$job_scratch/host-artifacts"
 fi

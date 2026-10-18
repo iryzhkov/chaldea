@@ -29,16 +29,17 @@ other access and group writes are refused. Ancestor directories, code and runtim
 must be root-controlled. Seed, target-local bearer, DB and lock are process-owner
 0600; state directories are 0700. Never use operator/job credentials.
 
-Sender default: ~/.config/chaldea/message.json.
+Sender default: $XDG_CONFIG_HOME/chaldea/message.json, falling back to
+~/.config/chaldea/message.json through the central paths() convention.
 
     {
       "callerId": "pc-laptop-v1",
       "sourceHost": "omarchy-pc",
-      "database": "/var/lib/chaldea-message-sender/messages.db",
+      "database": "/home/example/.local/state/chaldea/message-sender/messages.db",
       "broker": {
         "url": "tls://broker.example:4222/",
         "account": "MESSAGES",
-        "seedFile": "/var/lib/chaldea-message-sender/source.seed",
+        "seedFile": "/home/example/.local/state/chaldea/message-sender/source.seed",
         "publicKey": "EXACT-SOURCE-USER-NKEY",
         "inboxPrefix": "_INBOX_message.pc",
         "commandStream": "MESSAGE_COMMANDS",
@@ -63,13 +64,13 @@ Receiver default: /etc/chaldea/message-receiver.json.
       "host": "laptop",
       "environment": "EXACT-T3-ENVIRONMENT",
       "loopbackT3Url": "http://127.0.0.1:PORT",
-      "tokenFile": "/var/lib/chaldea-message/t3-token",
-      "database": "/var/lib/chaldea-message/messages.db",
-      "logFile": "/var/lib/chaldea-message/events.jsonl",
+      "tokenFile": "/home/example/.local/state/chaldea/message-receiver/t3-token",
+      "database": "/home/example/.local/state/chaldea/message-receiver/messages.db",
+      "logFile": "/home/example/.local/state/chaldea/message-receiver/events.jsonl",
       "broker": {
         "url": "tls://broker.example:4222/",
         "account": "MESSAGES",
-        "seedFile": "/var/lib/chaldea-message/receiver.seed",
+        "seedFile": "/home/example/.local/state/chaldea/message-receiver/receiver.seed",
         "publicKey": "EXACT-RECEIVER-USER-NKEY",
         "inboxPrefix": "_INBOX_message.laptop",
         "commandStream": "MESSAGE_COMMANDS",
@@ -88,9 +89,16 @@ Receiver default: /etc/chaldea/message-receiver.json.
       }
     }
 
+The supplied unit is a user unit for the dedicated profile user. Replace
+/home/example with that user\'s absolute home; explicit JSON paths do not expand
+shell variables. Its state/log/token/seed paths must be under the unit\'s writable
+~/.local/state/chaldea/message-receiver directory. Alternative root-process
+installations need their own separately qualified service policy.
+
 Replace the NKEY placeholders with enrolled U-prefixed public user keys. The seed
 must match its configured public key before a connection is attempted. TLS or WSS
-is required except for literal loopback disposable NATS. Account names CHALDEA
+is required except for literal loopback disposable NATS. The TLS connection option
+is set explicitly; a tls URL pointed at a plaintext broker is refused. Account names CHALDEA
 and SYS are refused. The account label is a root-controlled enrollment binding;
 it is not proof of server-side account membership.
 
@@ -131,8 +139,12 @@ Source host IP authentication has been replaced by this broker identity/grant
 binding, which must be independently checked during enrollment.
 
 The qualification uses NATS Server 2.15.1 and NATS client 3.4.0. Each stream has
-1 MiB/256 message limits, 8192-byte maximum message size, at most eight consumers,
-and command age 24 hours / receipt age 42 days. Use explicit ACK consumers,
+1 MiB/256 message limits, at most 32 messages per subject with
+discard_new_per_subject=true, 8192-byte maximum message size and at most eight
+consumers. Command age is 24 hours; transport receipts expire after 120 seconds
+(application receipts remain in SQLite for 42 days). Per-subject limits keep one
+quiet caller from filling either shared stream; short receipt age bounds stale
+or max-delivered receipt occupancy. Use explicit ACK consumers,
 max_deliver 5, max_ack_pending 32, max_waiting 32, max_batch 1 and max_expires 1s.
 The fixture uses ack_wait 250ms to exercise redelivery. Production ack_wait
 must exceed bounded receiver work (for example 30s) to avoid excess redelivery.
@@ -152,16 +164,21 @@ correlates receipts without changing application IDs. Concurrent sends can consu
 each other's receipts; a bounded SQLite attempt table durably transfers the
 matching result after checking mapping, nonce, command ID and message ID.
 Transport failure preserves local intent and returns uncertainty with original IDs.
-A send waits at most 35 seconds; there is no automatic republish loop.
+The network exchange has a 35-second deadline, plus short bounded journal
+contention waits. CLI/MCP processes sharing a sender store retry only lock/busy
+transactions for at most two seconds at a time; they never republish automatically.
 
 The receiver holds its existing nonblocking store lock, persists the attempt and
 exact immutable T3 payload before dispatch, and stores the application outcome.
-It ACKs a command only after storing an attempt result and receiving a PubAck
-for the receipt. Redelivery of that attempt returns its durable result; an attempt
-interrupted before its result was stored returns uncertainty without automatic
-redispatch. Explicit recover/send uses a fresh transport attempt with the same
+A dispatch-capable command is ACKed only after storing an attempt result and
+receiving a PubAck for the receipt. Read-only status needs no attempt row.
+Refusals before the durable dispatch barrier publish uncertainty if possible,
+then TERM even if publication fails: no T3 effect was possible for that attempt,
+and the source journal remains uncertain. Redelivery of a stored dispatch attempt
+returns its durable result; an attempt interrupted before its result was stored
+returns uncertainty without automatic redispatch. Explicit recover/send uses a fresh transport attempt with the same
 application IDs and original bytes. Receipt publication or state write failure
-leaves the command unacked. Exhausting broker max_deliver is not acceptance:
+after the dispatch barrier leaves the command unacked. Exhausting broker max_deliver is not acceptance:
 the source journal remains uncertain and requires explicit recovery.
 
 The existing receiver semantics remain: metadata-only preflight, durable terminal
@@ -175,14 +192,20 @@ status and terminal replay remain readable.
 Each store retains at most 10,000 receipts, 128 unresolved payloads and 16 per
 caller, with burst two / ten sends per minute. A 4096-page SQLite cap with 4 KiB
 pages and DELETE journal bounds DB plus rollback journal to about 33 MiB. Transport
-attempts are capped at 128 per source / 10,000 per receiver and expire; terminal
+attempts are capped at 128 per source / 10,000 per receiver / 1,000 per caller
+and expire. A separate eight-caller durable request bucket (burst eight,
+60/minute, including status) bounds admission before attempt reservation.
+The original T3 send bucket remains burst two / ten per minute; terminal
 payloads purge immediately, uncertain payloads after 24 hours and receipts after
 42 days on operations/receiver maintenance. There is no unbounded local spool.
 
 Run one supervised receiver with chaldea message serve. The source-only unit
 packaging/systemd/chaldea-message.service is disabled until separately installed
 and enrolled. The loop uses bounded reconnect backoff up to 30s, cancellation,
-one-second pulls, bounded T3 calls and minute maintenance. Malformed poison is
+one-second pulls with a five-second subscription timeout, bounded T3 calls and
+minute maintenance. The larger timeout covers broker round-trip margin;
+subscription timeout retries are empty pulls. Caller delivery failures back off
+independently; connection loss reconnects the supervised loop. Malformed poison is
 terminated without T3 dispatch. Fixed event categories use the existing bounded
 10 MiB / 14-day log helper; bodies, seeds, bearers and raw exceptions are not logged.
 Broker failure has no dependency in local waits, exec or same-host T3 operations.
