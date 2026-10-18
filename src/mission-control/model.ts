@@ -14,7 +14,9 @@ const count = (n: unknown): n is number => typeof n === "number" && Number.isSaf
 type Thread = { row: ShellThread; observed: number; connected: boolean; detailObserved: number | null; steps: string[] };
 export class MissionModel {
   private threads = new Map<string, Thread>();
-  private turns = new Map<string, { output: number; at: number; live: boolean }>();
+  private turns = new Map<string, { output: number; at: number; live: boolean; fence: number }>();
+  private evictedThrough: number | null = null;
+  private accountingPartial = false;
   private samples: { at: number; output: number }[] = [];
   private listeners = new Set<() => void>();
   private sequence: number | undefined;
@@ -76,19 +78,33 @@ export class MissionModel {
       if (label !== t.steps[0]) t.steps = [label, ...t.steps].slice(0, 6);
     }
     if (event.kind === "usage" && count(event.output)) {
+      if (!Number.isFinite(event.at) || event.startedAt != null && event.startedAt > now) return;
       const key = id + ":" + event.turnId;
       const prev = this.turns.get(key);
       if (prev && event.at <= prev.at) return;
       // Only a live report with a demonstrated post-start turn may count from zero.
-      const postStart = event.startedAt != null && event.startedAt >= this.startedAt && event.startedAt <= now;
-      const delta = prev ? event.output >= prev.output ? event.output - prev.output : event.output : !event.baseline && postStart ? event.output : 0;
+      const postStart = event.startedAt != null && event.startedAt >= this.startedAt && event.startedAt <= now && event.startedAt <= event.at;
+      // A start beyond every forgotten counter proves this first report was not counted before.
+      const knownNew = postStart && (this.evictedThrough === null || event.startedAt! > this.evictedThrough);
+      const delta = prev ? event.output >= prev.output ? event.output - prev.output : event.output : !event.baseline && knownNew ? event.output : 0;
+      const fence = Math.max(prev?.fence ?? 0, now, event.at, Number.isFinite(event.startedAt) ? event.startedAt! : 0);
       if (!prev && this.turns.size >= MAX_TURNS) {
         const baselineKey = [...this.turns].find(([, value]) => !value.live)?.[0];
-        if (event.baseline && baselineKey === undefined) return;
-        this.turns.delete(baselineKey ?? this.turns.keys().next().value!);
+        if (event.baseline && baselineKey === undefined) {
+          // An unretained snapshot sample is also forgotten knowledge.
+          this.evictedThrough = Math.max(this.evictedThrough ?? 0, fence);
+          this.accountingPartial = true;
+          this.changed();
+          return;
+        }
+        const victim = baselineKey ?? this.turns.keys().next().value!;
+        this.evictedThrough = Math.max(this.evictedThrough ?? 0, now, this.turns.get(victim)!.fence);
+        this.accountingPartial = true;
+        this.turns.delete(victim);
       }
-      this.turns.delete(key); this.turns.set(key, { output: event.output, at: event.at, live: prev?.live === true || !event.baseline });
-      if (!event.baseline && (prev !== undefined || postStart)) { this.samples.push({ at: now, output: delta }); this.output += delta; this.usageObserved = now; }
+      this.turns.delete(key); this.turns.set(key, { output: event.output, at: event.at, live: prev?.live === true || !event.baseline,
+        fence });
+      if (!event.baseline && (prev !== undefined || knownNew)) { this.samples.push({ at: now, output: delta }); this.output += delta; this.usageObserved = now; }
       this.samples = this.samples.filter(s => now - s.at <= 60_000).slice(-MAX_SAMPLES);
     }
     this.changed();
@@ -126,7 +142,9 @@ export class MissionModel {
     return { version: 1, demo: this.demo, now, source: { state: freshness(this.connected, this.observed, 30_000, 300_000), observedAt: this.observed },
       agents, shown: agents.length, total: this.coverageExact ? this.total : null, truncated: !this.coverageExact || this.total > agents.length,
       tokens: { rate: this.usageObserved === null || !usageConnected ? null : this.samples.filter(s => now - s.at <= 60_000).reduce((s,v) => s + v.output, 0) / 60,
-        output: this.usageObserved === null ? null : this.output, observedAt: this.usageObserved, scope: "Observed deltas since this process started; 48-thread cap. Daily reconciliation unavailable." },
+        output: this.usageObserved === null ? null : this.output, observedAt: this.usageObserved,
+        coverage: this.accountingPartial ? "partial" : "observed",
+        scope: this.accountingPartial ? "Partial accounting: known lower bound after bounded counter eviction. Uncertain returning counters establish new baselines. Daily reconciliation unavailable." : "Observed deltas since this process started; 48-thread cap. Daily reconciliation unavailable." },
       quota: { state: this.quotaError ? "error" : this.quota === null ? "unknown" : "cached", accounts },
       unavailable: ["Fleet","Events","Ops","Lab","host health","exec slots","cost","daily totals"] };
   }

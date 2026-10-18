@@ -72,6 +72,64 @@ test("historical baseline floods cannot evict a live turn baseline",()=>{
   m.detail(id,{kind:"usage",turnId:"live",output:200,at:1000,baseline:false});
   assert.equal(m.snapshot().tokens.output,100);
 });
+
+test("live counter eviction never reports Sol's 762 as complete output when full truth is 662",()=>{
+  let now=1_000_000;const m=new MissionModel(false,()=>now);
+  m.shell({kind:"snapshot",sequence:1,threads:[row("long-thread"),row("short-thread")]});m.shell({kind:"synchronized"});
+  m.detail("long-thread",{kind:"synchronized"});m.detail("short-thread",{kind:"synchronized"});
+  const start=++now;
+  m.detail("long-thread",{kind:"usage",turnId:"long",output:100,at:now,startedAt:start,baseline:false});
+  for(let i=0;i<512;i++){now++;m.detail("short-thread",{kind:"usage",turnId:"short-"+i,output:1,at:now,startedAt:now,baseline:false});}
+  now++;m.detail("long-thread",{kind:"usage",turnId:"long",output:150,at:now,startedAt:start,baseline:false});
+  const tokens=m.snapshot().tokens;
+  assert.ok(tokens.output! <= 662,"full truth662, duplicate100 produced "+tokens.output);
+  assert.equal(tokens.output,612);assert.equal(Reflect.get(tokens,"coverage"),"partial");
+  assert.equal(tokens.rate,612/60);assert.match(tokens.scope,/lower bound/i);
+  assert.equal(Reflect.get(m,"turns").size,512); // Explicit retained-state bound, no diagnostic payload added.
+  m.detailDisconnected("long-thread");m.detail("long-thread",{kind:"synchronized"});
+  now++;m.detail("long-thread",{kind:"usage",turnId:"long",output:155,at:now,startedAt:start,baseline:false});
+  assert.equal(m.snapshot().tokens.output,617);
+  m.detail("long-thread",{kind:"usage",turnId:"long",output:999,at:now-1,startedAt:start,baseline:false});
+  assert.equal(m.snapshot().tokens.output,617);
+  now++;m.detail("long-thread",{kind:"usage",turnId:"long",output:5,at:now,startedAt:start,baseline:false});
+  assert.equal(m.snapshot().tokens.output,622);
+  now++;m.detail("long-thread",{kind:"usage",turnId:"demonstrably-new",output:40,at:now,startedAt:now,baseline:false});
+  assert.equal(m.snapshot().tokens.output,662);
+  m.shell({kind:"snapshot",sequence:2,threads:[row("long-thread"),row("short-thread")]});m.shell({kind:"synchronized"});
+  assert.equal(Reflect.get(m.snapshot().tokens,"coverage"),"partial");
+});
+
+test("a snapshot baseline dropped at the cap cannot later masquerade as a new first report",()=>{
+  let now=1_000_000;const m=initialized(()=>now),id="private-thread-id";
+  for(let i=0;i<512;i++){now++;m.detail(id,{kind:"usage",turnId:"live-"+i,output:1,at:now,startedAt:now,baseline:false});}
+  now++;const start=now;
+  m.detail(id,{kind:"usage",turnId:"unretained-snapshot",output:100,at:now,startedAt:start,baseline:true});
+  now++;m.detail(id,{kind:"usage",turnId:"unretained-snapshot",output:120,at:now,startedAt:start,baseline:false});
+  assert.equal(m.snapshot().tokens.output,512);
+  assert.equal(Reflect.get(m.snapshot().tokens,"coverage"),"partial");
+  assert.equal(Reflect.get(m,"turns").size,512);
+});
+
+test("eviction fence rebaselines late old or uncertain starts without manufacturing a first zero",()=>{
+  let now=1_000_000;const m=initialized(()=>now),id="private-thread-id";
+  // Snapshot-only history exhausts bounded knowledge without measuring any live output.
+  for(let i=0;i<513;i++){now++;m.detail(id,{kind:"usage",turnId:"baseline-"+i,output:100,at:now+100,startedAt:now,baseline:true});}
+  now++;m.detail(id,{kind:"usage",turnId:"baseline-0",output:200,at:now+1000,startedAt:1_000_001,baseline:false});
+  assert.equal(m.snapshot().tokens.output,null);assert.equal(m.snapshot().tokens.rate,null);
+  m.detailDisconnected(id);m.detail(id,{kind:"synchronized"});
+  now++;m.detail(id,{kind:"usage",turnId:"unknown-late",output:500,at:now+1000,baseline:false});
+  assert.equal(m.snapshot().tokens.output,null);
+  now++;m.detail(id,{kind:"usage",turnId:"old-late",output:500,at:now+1000,startedAt:0,baseline:false});
+  assert.equal(m.snapshot().tokens.output,null);
+  // A future official start is not evidence of a new turn.
+  now++;const future=now+500;
+  m.detail(id,{kind:"usage",turnId:"future",output:500,at:now+1000,startedAt:future,baseline:false});
+  now++;m.detail(id,{kind:"usage",turnId:"future",output:1000,at:now+1000,startedAt:future,baseline:false});
+  assert.equal(m.snapshot().tokens.output,null);
+  assert.equal(Reflect.get(m,"turns").size,512);
+  assert.equal(Reflect.get(m.snapshot().tokens,"coverage"),"partial");
+});
+
 test("full snapshot coverage is exact; ambiguous incremental overflow stays honestly unknown without duplicate inflation",()=>{
   const m=new MissionModel();
   m.shell({kind:"snapshot",sequence:1,threads:Array.from({length:49},(_,i)=>row("t"+i))});
