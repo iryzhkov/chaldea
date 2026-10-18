@@ -12,7 +12,7 @@ export function validateCache(raw:unknown):StatusCache {
   const v=object(raw);exact(v,["schema","gap","snapshots"]);
   if(v.schema!=="mission-control.cache.v1"||typeof v.gap!=="boolean"||!Array.isArray(v.snapshots)||v.snapshots.length>4)throw new Error("invalid_status_cache");
   const snapshots=v.snapshots.map(validateHostSnapshot);
-  if(new Set(snapshots.map(s=>s.host)).size!==snapshots.length||Buffer.byteLength(JSON.stringify(v))>CACHE_BYTES)throw new Error("invalid_status_cache");
+  if(snapshots.reduce((n,s)=>n+s.agents.length,0)>48||new Set(snapshots.map(s=>s.host)).size!==snapshots.length||Buffer.byteLength(JSON.stringify(v))>CACHE_BYTES)throw new Error("invalid_status_cache");
   return {schema:"mission-control.cache.v1",gap:v.gap,snapshots};
 }
 export function loadCache(path:string,now=Date.now()):StatusCache {
@@ -37,6 +37,7 @@ export function mergeStatus(cache:StatusCache,raw:HostSnapshot,now=Date.now()):b
     } else cache.gap=true;
     cache.snapshots[i]=s;
   }else {if(cache.snapshots.length===4)throw new Error("source_limit");cache.snapshots.push(s);}
+  while(cache.snapshots.reduce((n,v)=>n+v.agents.length,0)>48){const largest=cache.snapshots.toSorted((a,b)=>b.agents.length-a.agents.length||a.host.localeCompare(b.host))[0]!;largest.agents.pop();largest.truncated=true;}
   return true;
 }
 export class CacheModel {

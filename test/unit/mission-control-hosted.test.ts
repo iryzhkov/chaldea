@@ -18,6 +18,16 @@ function scratch(){const root=process.env.CHALDEA_TEST_SCRATCH!;assert.ok(root&&
 const row=(id="private-thread"):ShellThread=>({id,title:"PRIVATE arbitrary task /home/igor/key",status:"running",providerInstanceId:"SECRET account alias",modelSelection:{instanceId:"SECRET",model:"gpt-6.1-sol"},latestRunId:"private-run",activeRunId:"private-run",latestRunStartedAt:new Date(now0-1000).toISOString(),latestRunCompletedAt:null,lastErrorClass:null,usageLimitResetAt:null,limitRecovery:null,relationshipToParent:null,archived:false,deleted:false});
 function live(clock=()=>now0,rows=[row()]){const m=new MissionModel(false,clock);m.shell({kind:"snapshot",sequence:1,threads:rows});m.shell({kind:"synchronized"});for(const r of rows)m.detail(r.id,{kind:"synchronized"});return m;}
 const sample=(sequence=1,now=now0)=>captureSnapshot(live(()=>now),"agent-a",epoch,sequence)!;
+
+test("four-source cache admits at most48 global rows and labels omitted rows honestly",()=>{
+  const c=emptyCache();for(const host of ["agent-a","agent-b","omarchy-pc","laptop"]){
+    const s=sample();s.host=host;s.agents=Array.from({length:40},(_,i)=>({...s.agents[0]!,id:i.toString(16).padStart(16,"0")}));s.total=40;s.truncated=false;
+    mergeStatus(c,validateHostSnapshot(s),now0);
+  }
+  assert.equal(c.snapshots.length,4);assert.equal(c.snapshots.reduce((n,s)=>n+s.agents.length,0),48);
+  assert.equal(c.snapshots.reduce((n,s)=>n+s.total!,0),160);assert.ok(c.snapshots.every(s=>s.truncated));
+  const d=scratch();try{const file=join(d.path,"cache");writeCache(file,c);assert.ok(readFileSync(file).length<=512*1024);const m=new CacheModel(file,()=>now0);assert.equal(m.snapshot().total,160);assert.equal(m.snapshot().agents.length,48);assert.equal(m.snapshot().truncated,true);}finally{d.close();}
+});
 test("capture samples quiet live state, preserves activity age and private metadata never escapes",()=>{
   let now=now0;const m=live(()=>now);m.detail("private-thread",{kind:"activity",tool:"read"});
   let s=captureSnapshot(m,"agent-a",epoch,1)!;

@@ -20,7 +20,7 @@ export interface Pending { event_id: string; envelope: string; bytes: number; at
 export interface Query { sql: string; params: SQLInputValue[] }
 export function scopeSql(scope: Scope, prefix = ""): Query {
   if (scope.missionControlSources !== undefined) {
-    ensure(scope.source==="mission-control-reader"&&scope.profile==="mission-control-reader"&&scope.project==="chaldea"&&scope.host==="omarchy-normandy"&&!scope.global&&!scope.quotaFleet&&!scope.routeScores&&Array.isArray(scope.missionControlSources)&&scope.missionControlSources.length>0&&scope.missionControlSources.length<=4&&scope.missionControlSources.every(s=>/^(agent-a|agent-b|omarchy-pc|laptop)--mission-control$/.test(s)), "invalid_mission_control_scope", 403);
+    ensure(scope.source==="mission-control-reader"&&scope.profile==="mission-control-reader"&&scope.project==="chaldea"&&scope.host==="omarchy-normandy"&&scope.issuer==="chaldea:omarchy-normandy"&&!scope.global&&!scope.quotaFleet&&!scope.routeScores&&Array.isArray(scope.missionControlSources)&&scope.missionControlSources.length>0&&scope.missionControlSources.length<=4&&new Set(scope.missionControlSources).size===scope.missionControlSources.length&&scope.missionControlSources.every(s=>/^(agent-a|agent-b|omarchy-pc|laptop)--mission-control$/.test(s)), "invalid_mission_control_scope", 403);
     return {sql: "json_extract("+prefix+"envelope,'$.source_id') IN ("+scope.missionControlSources.map(()=>"?").join(",")+") AND "+prefix+"kind=? AND "+prefix+"profile=? AND "+prefix+"project=? AND json_extract("+prefix+"envelope,'$.data.snapshot.schema')=?",
       params:[...scope.missionControlSources,"agent_status","mission-control-publisher","chaldea","mission-control.host.v1"]};
   }
@@ -164,7 +164,10 @@ export class EventStore {
         ensure(observed <= now*1000 && now*1000-observed <= 120_000, "stale_host_snapshot", 409);
         const priorAdmission=Number(this.get("mission-control-admitted:"+event.source_id)??"-30000");
         ensure(now*1000-priorAdmission>=30_000, "host_snapshot_rate", 429);
+        const sample=event.data.snapshot as {epoch:string;sequence:number;observedAt:number},oldSample=this.get("mission-control-sample:"+event.source_id);
+        if(oldSample){const old=JSON.parse(oldSample) as typeof sample;ensure(sample.epoch===old.epoch?sample.sequence>old.sequence&&sample.observedAt>=old.observedAt:sample.observedAt>old.observedAt,"host_snapshot_order",409);}
         this.statusCapacity(event,estimate);
+        this.put("mission-control-sample:"+event.source_id,JSON.stringify({epoch:sample.epoch,sequence:sample.sequence,observedAt:sample.observedAt}));
         this.put("mission-control-admitted:"+event.source_id,String(now*1000));
       }
       const id = needsFeed ? legacyId ?? Number(this.get("feed_next")) : null;
@@ -200,6 +203,9 @@ export class EventStore {
       let r = this.receipt(e.event_id);
       if (r) ensure(r.envelope_hash === envelopeHash, "broker_payload_conflict", 409);
       else {
+        // Broker retention exceeds compact receipt retention. Old status replay
+        // advances only the cursor; it must not reconstruct payload or receipt.
+        if (e.kind==="agent_status"&&e.data.snapshot!==undefined&&Math.floor(Date.parse(e.received_at)/1000)+DAY<=now){this.completeSequence(streamSeq);return;}
         // Restore replay can reconstruct a missing receipt from trusted, immutable provenance.
         const p = e.provenance;
         const feedId = p.type === "legacy-feed" ? p.legacy_id : p.feed_id;

@@ -66,7 +66,7 @@ test("scoped HTTP denies append, raw endpoints, foreign scope, expired tokens, r
   try{
     assert.equal((await h.post(payload())).status,201);
     for(const query of ["source=foreign","host=agent-b","kind=tool_call","project=foreign"]){const result=await(await h.get("/api/v1/events?from="+new Date((N-3600)*1000).toISOString()+"&to="+new Date(N*1000).toISOString()+"&"+query)).json()as any;assert.equal(result.events.length,0);}
-    for(const path of ["/api/entries","/","/api/v1/health","/api/v1/receipts?kind=agent_status&key=status-1"])assert.equal((await h.get(path)).status,403);
+    for(const path of ["/api/entries","/","/api/v1/health","/api/v1/receipts?kind=agent_status&key=status-1"])assert.equal((await h.get(path)).status,path.startsWith("/api/v1/receipts")?401:403);
     const append=await h.readerToken({grants:[{resource:"mission-control-reader",actions:["append"]}]});assert.equal((await h.post(payload(),"reader-append",append)).status,403);
     for(const change of [{host:"agent-b"},{sub:"fake"},{project:"foreign"},{source:"quota"},{exp:N-1,iat:N-301,nbf:N-301}]){
       assert.equal((await h.get(undefined,await h.readerToken(change))).status,401);
@@ -93,7 +93,7 @@ test("status admission rate, one-hour payload TTL and24h receipts cannot resurre
     h.x.store.prune(N+3601);assert.equal(h.x.store.scalar("SELECT count(*) FROM events"),0);assert.equal(h.x.store.receipt(original.event_id)!.state,"tombstone");
     h.x.store.prune(N+86401);assert.equal(h.x.store.receipt(original.event_id),undefined);
     h.x.store.project(original,h.x.store.cursor("nats")+1,N+7*86400);assert.equal(h.x.store.scalar("SELECT count(*) FROM events"),0);
-    assert.equal(h.x.store.receipt(original.event_id)!.state,"tombstone");
+    assert.equal(h.x.store.receipt(original.event_id),undefined);
     const forged={...original,source_id:"agent-b--mission-control"};assert.throws(()=>validateEnvelope(forged));
     const raw=sample();(raw as any).prompt="secret";assert.throws(()=>normalize({...payload(),data:{snapshot:raw}},identity,false));
   }finally{await h.close();}

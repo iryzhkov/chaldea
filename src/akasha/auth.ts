@@ -41,6 +41,8 @@ export class Authorization {
     }
     const publishers = registry.filter(e => e.profile === "mission-control-publisher");
     ensure(publishers.length <= 4, "mission_control_source_limit");
+    for (const p of publishers) ensure(p.mode==="service"&&p.project==="chaldea"&&["agent-a","agent-b","omarchy-pc","laptop"].includes(p.host)&&p.source===p.host+".mission-control"&&p.source_id===p.host+"--mission-control"&&p.kinds.length===1&&p.kinds[0]==="agent_status"&&!p.global_read&&!p.quota_fleet_read&&!p.route_scores_read, "invalid_mission_control_publisher");
+    for (const p of registry) if(p.profile==="mission-control-reader") ensure(p.mission_control_read_sources!==undefined,"mission_control_selector_required");
     for (const entry of registry) if (entry.mission_control_read_sources !== undefined) {
       const sources=entry.mission_control_read_sources;
       ensure(entry.mode==="service"&&entry.profile==="mission-control-reader"&&entry.project==="chaldea"&&entry.source==="mission-control-reader"&&entry.host==="omarchy-normandy"&&entry.kinds.length===1&&entry.kinds[0]==="agent_status"&&!entry.global_read&&!entry.quota_fleet_read&&!entry.route_scores_read, "invalid_mission_control_reader");
@@ -58,6 +60,7 @@ export class Authorization {
     const r = this.registry.find(r => r.issuer === c.iss && r.source === c.source && r.host === c.host &&
       r.profile === c.sub && r.project === c.project);
     ensure(r, "unregistered_source", 403);
+    ensure(r.profile !== "mission-control-publisher" || action === "append", "append_only", 403);
     ensure(action !== "append" || r.mission_control_read_sources === undefined, "read_only", 403);
     ensure(c.grants.every(g => g.resource === c.source), "source_grant_mismatch", 403);
     ensure(action !== "read" || r.mode !== "report", "append_only", 403);
