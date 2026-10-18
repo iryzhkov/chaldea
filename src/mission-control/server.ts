@@ -5,7 +5,9 @@ const assets = new Map(["core.css","dir-flight.css","palettes.js","core.js","cli
   body: readFileSync(new URL("./static/"+name, import.meta.url)), type: name.endsWith(".css") ? "text/css" : "text/javascript",
 }]));
 const html = `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Mission control</title><link rel="stylesheet" href="/core.css"><link rel="stylesheet" href="/dir-flight.css"><body data-default-dir="flight" data-default-palette="mocr-1969"><div id="board"><div id="top"><span class="brand"><span class="code">MOCR</span> · PC canary</span><span id="urgent"></span><nav id="tabs"></nav><select id="pick"></select><span id="navstate"></span><span id="clock"></span><span id="globalfresh"></span></div><div id="view"></div></div><script src="/palettes.js"></script><script type="module" src="/client.js"></script></body></html>`;
-export function missionServer(model: MissionModel, maxClients = 8) {
+export function missionServer(model: Pick<MissionModel,"snapshot"|"subscribe">, maxClients = 8, options: {siteOrigin?:string} = {}) {
+  const configured=options.siteOrigin===undefined?null:new URL(options.siteOrigin);
+  if(configured&&(configured.protocol!=="https:"||configured.origin!==options.siteOrigin))throw new Error("invalid_site_origin");
   if (!Number.isInteger(maxClients) || maxClients < 1 || maxClients > 8) throw new Error("invalid_client_limit");
   const clients = new Set<ServerResponse>();
   const publish = () => {
@@ -21,10 +23,14 @@ export function missionServer(model: MissionModel, maxClients = 8) {
     res.setHeader("Cache-Control","no-store");
     res.setHeader("Cross-Origin-Resource-Policy","same-origin");
     const address = server.address();
-    const expectedHost = typeof address === "object" && address ? "127.0.0.1:" + address.port : "";
-    if (req.headers.host !== expectedHost || req.headers.origin && req.headers.origin !== "http://" + expectedHost ||
+    const expectedHost = configured?.host ?? (typeof address === "object" && address ? "127.0.0.1:" + address.port : "");
+    const expectedOrigin=configured?.origin??"http://"+expectedHost;
+    const hosts=req.rawHeaders.filter((_v,i)=>i%2===0&&req.rawHeaders[i]!.toLowerCase()==="host").length;
+    if (hosts!==1 || req.headers.upgrade || req.headers["cf-ray"] || req.headers.host !== expectedHost || req.headers.origin && req.headers.origin !== expectedOrigin ||
         req.headers["sec-fetch-site"] && !["same-origin","none"].includes(String(req.headers["sec-fetch-site"]))) { res.writeHead(403).end(); return; }
     if (req.method !== "GET") { res.setHeader("Allow","GET"); res.writeHead(405).end(); return; }
+    if (req.url === "/healthz") { res.setHeader("Content-Type","application/json"); res.end('{"ok":true}'); return; }
+    if (req.url === "/readyz") {const fresh=model.snapshot().source.state==="live";res.writeHead(fresh?200:503,{"Content-Type":"application/json"}).end(JSON.stringify({ready:fresh}));return;}
     if (req.url === "/api/snapshot") { res.setHeader("Content-Type","application/json"); res.end(JSON.stringify(model.snapshot())); return; }
     if (req.url === "/api/events") {
       if (clients.size >= maxClients) { res.writeHead(503).end(); return; }
@@ -34,7 +40,7 @@ export function missionServer(model: MissionModel, maxClients = 8) {
       res.once("close",release); res.once("error",release);
       res.write("retry: 2000\n\n"); publish(); return;
     }
-    if (req.url === "/" || req.url?.startsWith("/?")) { res.setHeader("Content-Type","text/html"); res.end(html); return; }
+    if (req.url === "/" || req.url?.startsWith("/?")) { res.setHeader("Content-Type","text/html"); res.end(configured?html.replace("PC canary","Enrolled sources"):html); return; }
     const asset = assets.get(req.url ?? "");
     if (!asset) { res.writeHead(404).end(); return; }
     res.setHeader("Content-Type",asset.type); res.end(asset.body);

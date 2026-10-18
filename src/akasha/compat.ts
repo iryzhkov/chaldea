@@ -88,12 +88,14 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
   }
   const start = q.get("from") ? since(q.get("from")!, now)! : new Date((now - 7 * 86400) * 1000).toISOString();
   const end = q.get("to") ? since(q.get("to")!, now)! : new Date(now * 1000).toISOString();
+  if (scope.missionControlSources) ensure(Date.parse(end)-Date.parse(start)<=3600_000, "mission_control_window", 403);
   ensure(Date.parse(start) <= Date.parse(end) && Date.parse(end) - Date.parse(start) <= 180 * 86400_000, "invalid_time_range");
   const base = scopeSql(scope), parts = [base.sql, "occurred_at>=?", "occurred_at<=?"], params = [...base.params, start, end];
   for (const key of ["source", "host", "kind", "session", "tool", "client", "project"]) {
     const value = q.get(key);
     if (value) { ensure(value.length <= 512, "invalid_filter"); parts.push(key + "=?"); params.push(value); }
   }
+  if (scope.missionControlSources) { parts.push("expiry>?"); params.push(now); }
   // Select a bounded page of IDs once: repeating LIMIT 1 can sort the entire
   // time window for every row. No envelope or live SQLite reader crosses a yield.
   const ids = count ? store.db.prepare("SELECT seq FROM events WHERE " + parts.join(" AND ") + " AND seq>? ORDER BY seq LIMIT ?")

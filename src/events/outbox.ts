@@ -78,5 +78,15 @@ export class Outbox {
     });
   }
   forget(file: string): void { this.db.prepare("DELETE FROM cursors WHERE file=?").run(file); }
+  /** Optional fixed-size latest/pending status slot in the existing 16MiB DB. */
+  statusState(): {latest:Publication|null;pending:Publication|null;until:number;admitted:number;seen:{epoch:string;sequence:number;observedAt:number}|null} {
+    this.db.exec("CREATE TABLE IF NOT EXISTS mission_control_status(slot INTEGER PRIMARY KEY CHECK(slot=1), value TEXT NOT NULL)");
+    const r=this.db.prepare("SELECT value FROM mission_control_status WHERE slot=1").get();
+    return r?JSON.parse(String(r.value)):{latest:null,pending:null,until:0,admitted:-30000,seen:null};
+  }
+  saveStatus(state:ReturnType<Outbox["statusState"]>):void {
+    const bytes=JSON.stringify(state);if(Buffer.byteLength(bytes)>32*1024)throw new Error("status_capacity");
+    this.db.prepare("INSERT INTO mission_control_status VALUES(1,?) ON CONFLICT(slot) DO UPDATE SET value=excluded.value").run(bytes);
+  }
   close(): void { this.db.close(); }
 }

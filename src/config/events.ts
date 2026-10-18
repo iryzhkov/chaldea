@@ -6,10 +6,11 @@ import { legacyEnv } from "./compat.ts";
 /** Shared by the collector and in-process quota/restart publishers. */
 export function eventsConfig() {
   const c = readJson(configPath("events"), true), p = paths();
-  onlyKeys(c, ["url", "tokenHelper", "stateFile", "spool", "timerSpool"]);
+  onlyKeys(c, ["url", "tokenHelper", "stateFile", "spool", "timerSpool", "missionControlSnapshotFile"]);
   const optional = (key: string, env: string) => legacyEnv(env, key) ??
     (c[key] === undefined ? undefined : configString(c[key], key, ""));
   return {
+    missionControlSnapshotFile: optional("missionControlSnapshotFile", "AKASHA_MISSION_CONTROL_SNAPSHOT_FILE"),
     url: optional("url", "AKASHA_URL"), tokenHelper: optional("tokenHelper", "AKASHA_TOKEN_HELPER"),
     stateFile: optional("stateFile", "AKASHA_STATE_FILE") ?? join(p.state, "events/collector.db"),
     spool: optional("spool", "AKASHA_SPOOL") ?? join(p.data, "toolfeedback"),

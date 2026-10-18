@@ -10,9 +10,28 @@ import { MissionModel } from "./model.ts";
 import { missionServer } from "./server.ts";
 import { runSource } from "./source.ts";
 import { fixtureModel } from "./fixture.ts";
+import {CacheModel,webConfig} from "./cache.ts";
+import {runCapture,captureConfig} from "./capture.ts";
+import {runReader,readerConfig} from "./reader.ts";
+async function configuredMission(command:string,path:string):Promise<number> {
+  const controller=new AbortController(),stop=()=>controller.abort();
+  process.once("SIGINT",stop);process.once("SIGTERM",stop);
+  try{
+    if(command==="capture"){await runCapture(captureConfig(path),controller.signal);return 0;}
+    if(command==="reader"){await runReader(readerConfig(path),controller.signal);return 0;}
+    if(command!=="serve")throw new Error("unknown_mission_control_mode");
+    const c=webConfig(path),model=new CacheModel(c.cacheFile),server=missionServer(model,8,{siteOrigin:c.siteOrigin});
+    await server.listen(c.port);
+    const timer=setInterval(()=>model.reload(),5000);
+    try{await new Promise<void>(resolve=>controller.signal.addEventListener("abort",()=>resolve(),{once:true}));}
+    finally{clearInterval(timer);await server.close();}
+    return 0;
+  }finally{process.removeListener("SIGINT",stop);process.removeListener("SIGTERM",stop);}
+}
 export async function missionCli(args: string[]): Promise<number> {
-  const { values, positionals } = parseArgs({args,options:{ help:{type:"boolean"}, fixture:{type:"boolean"}, port:{type:"string"} },allowPositionals:true,strict:true});
-  if(values.help) { process.stdout.write("chaldea mission-control serve [--fixture] [--port 7392]\nRead-only PC canary on 127.0.0.1; no fleet deployment.\n"); return 0; }
+  const { values, positionals } = parseArgs({args,options:{ help:{type:"boolean"}, config:{type:"string"}, fixture:{type:"boolean"}, port:{type:"string"} },allowPositionals:true,strict:true});
+  if(values.help) { process.stdout.write("chaldea mission-control serve [--fixture] [--port 7392]\nchaldea mission-control capture|reader|serve --config FILE\n"); return 0; }
+  if(values.config!==undefined){if(positionals.length!==1||values.fixture||values.port!==undefined)throw new Error("config_mode_arguments");return configuredMission(positionals[0]!,values.config);}
   if(positionals.length!==1 || positionals[0]!=="serve") throw new Error("Expected mission-control serve");
   const port=values.port===undefined?7392:Number(values.port);
   if(!Number.isInteger(port)||port<1024||port>65535) throw new Error("Invalid loopback port");

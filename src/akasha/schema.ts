@@ -1,3 +1,4 @@
+import { validateHostSnapshot, statusIdentity } from "../mission-control/contract.ts";
 import { validateScores } from "../route/scores.ts";
 import { createHash } from "node:crypto";
 import { validateSnapshot } from "../quota/capacity-snapshot.ts";
@@ -98,13 +99,16 @@ const DATA: Record<Kind, readonly string[]> = {
   task_finished: ["task_id", "thread_id", "model", "status"],
   review_verdict: ["task_id", "thread_id", "model", "verdict", "revision"],
   review_note: ["task_id", "thread_id", "model", "revision"],
-  agent_status: ["thread_id", "model", "status"],
+  agent_status: ["thread_id", "model", "status", "snapshot"],
 };
 function validateData(kind: Kind, data: Record<string, unknown>): void {
   fields(data, DATA[kind]);
   ensure(Buffer.byteLength(canonical(data)) <= 48 * KiB, "data_too_large", 413);
   for (const [key, value] of Object.entries(data)) {
-    if (key === "scores") {
+    if (key === "snapshot") {
+      ensure(kind === "agent_status" && Object.keys(data).length === 1, "invalid_host_snapshot");
+      try { validateHostSnapshot(value); } catch { throw new HttpError(400, "invalid_host_snapshot"); }
+    } else if (key === "scores") {
       try { validateScores(value); } catch { throw new HttpError(400, "invalid_route_scores"); }
     } else if (key === "capacity") {
       try { validateSnapshot(value); } catch { throw new HttpError(400, "invalid_capacity_snapshot"); }
@@ -153,7 +157,13 @@ export function normalize(payload: Record<string, unknown>, identity: Identity, 
   if (data.capacity !== undefined) ensure(record(data.capacity).host === identity.host, "snapshot_host_mismatch", 403);
   // Tool telemetry is allowlisted data only; general prose could smuggle raw output.
   if (kind === "tool_call") ensure(!payload.body && !payload.title && !link && tags.length === 0, "tool_prose_forbidden");
-  const occurred = payload.occurred_at === undefined ? null : timestamp(payload.occurred_at);
+  const snapshot = kind === "agent_status" && data.snapshot !== undefined ? validateHostSnapshot(data.snapshot) : null;
+  if (snapshot) {
+    ensure(statusIdentity(identity, snapshot), "snapshot_identity_mismatch", 403);
+    ensure(title === "Mission control status" && !payload.body && !link && tags.length === 0 && severity === "info", "snapshot_prose_forbidden");
+  }
+  const occurred = payload.occurred_at === undefined ? snapshot ? new Date(snapshot.observedAt).toISOString() : null : timestamp(payload.occurred_at);
+  if (snapshot) ensure(occurred === new Date(snapshot.observedAt).toISOString(), "snapshot_time_mismatch");
   if (kind === "tool_call") ensure(occurred === null || occurred === data.ts, "tool_time_mismatch");
   return { kind: kind as Kind, occurred_at: kind === "tool_call" ? data.ts as string : occurred,
     title, body: text(payload.body ?? "", legacy ? MAX_LEGACY : MAX_EVENT), severity: severity as string,
@@ -175,7 +185,7 @@ export function validateEnvelope(value: unknown): Envelope {
     timestamp(e.occurred_at);
     fields(p, ["type", "request_hash", "feed_id"]);
     ensure(typeof p.request_hash === "string" && /^[a-f0-9]{64}$/.test(p.request_hash), "invalid_request_hash");
-    ensure(e.kind === "tool_call" ? p.feed_id === null : (Number.isSafeInteger(p.feed_id) &&
+    ensure(e.kind === "tool_call" || e.kind === "agent_status" && record(e.data).snapshot !== undefined ? p.feed_id === null : (Number.isSafeInteger(p.feed_id) &&
       (p.feed_id as number) >= NEW_FEED_ID && (p.feed_id as number) < Number.MAX_SAFE_INTEGER), "invalid_feed_id");
     const input = { ...e }; for (const k of ["issuer", "profile", "source_id", "event_id", "received_at", "provenance"]) delete input[k];
     if (e.kind === "feed_post") { text(input.body, MAX_LEGACY); input.body = ""; }
