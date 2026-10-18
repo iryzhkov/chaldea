@@ -54,8 +54,19 @@ export async function publishScores(config: ScoreTransport, cacheFile: string, n
 }
 export async function collectScores(config: ScoreTransport, cacheFile: string, now: number,
   fetcher: typeof fetch = fetch, tokenReader = helperToken) {
+  if (!config.enabled) {
+    // Disabling transport keeps last-good data usable without reserving a refresh.
+    let value: ScoreSnapshot | null = null, fetchedAt: string | null = null;
+    try {
+      const prior = readJson(cacheFile) as { attemptedAt: number; fetchedAt: unknown; value: unknown };
+      if (Number.isFinite(prior.attemptedAt) && prior.attemptedAt >= 0) {
+        fetchedAt = typeof prior.fetchedAt === "string" && Number.isFinite(Date.parse(prior.fetchedAt)) ? prior.fetchedAt : null;
+        if (prior.value !== null) value = validateScores(prior.value);
+      }
+    } catch { /* No valid last-good snapshot. Disabled transport never collects. */ }
+    return { value, fetchedAt, reason: "snapshot transport disabled" };
+  }
   return cached(cacheFile, 15 * 60000, now, validateScores, async () => {
-    if (!config.enabled) throw new Error();
     const token = await tokenReader(config.tokenHelper, { key: "", source: "route", host: config.host,
       payload: { kind: "route_score_snapshot" } }, "read");
     const url = new URL("/api/v1/events", config.url);

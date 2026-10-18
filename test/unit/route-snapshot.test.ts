@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
-import { chmodSync, linkSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { collectScores, fetchScores, publishScores, readAAKey } from "../../src/route/snapshot.ts";
 import { scoreSnapshot, validateScores, MODEL_MAP } from "../../src/route/scores.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
-import { scores, now, iso } from "../fixtures/route/targets.ts";
+import { catalog, scores, now, iso } from "../fixtures/route/targets.ts";
+import { recommend } from "../../src/route/policy.ts";
 import { readJson } from "../../src/route/cache.ts";
 
 const config = { enabled: true, url: "https://akasha.fixture", tokenHelper: "/fixture/helper", host: "homelab" };
@@ -89,6 +90,36 @@ test("daily fetch follows UTC dates despite randomized timer jitter", async () =
   } finally { scratch.remove(); }
 });
 
+test("disabled score transport reads last good without helpers, requests, reservations or writes", async () => {
+  const scratch = routeScratch();
+  try {
+    const path = join(scratch.path, "scores.json"), disabled = { ...config, enabled: false };
+    let requests = 0, helpers = 0;
+    const fetcher: typeof fetch = async () => { requests++; throw new Error("disabled transport fetched"); };
+    const token = async () => { helpers++; throw new Error("disabled transport read credentials"); };
+    const missing = await collectScores(disabled, path, now, fetcher, token);
+    assert.deepEqual(missing, { value: null, fetchedAt: null, reason: "snapshot transport disabled" });
+    assert.equal(existsSync(path), false); assert.equal(existsSync(path + ".lock"), false);
+    const old = { ...scores, fetchedAt: iso(now - 10 * 86400000) };
+    const disk = JSON.stringify({ attemptedAt: now - 900001, fetchedAt: iso(now - 86400000), value: old,
+      failureReason: "collection_failed", retryAt: now + 86400000 });
+    writeFileSync(path, disk, { mode: 0o600 });
+    writeFileSync(path + ".lock", "");
+    const before = statSync(path), lockBefore = statSync(path + ".lock");
+    assert.deepEqual(await collectScores(disabled, path, now, fetcher, token),
+      { value: old, fetchedAt: iso(now - 86400000), reason: "snapshot transport disabled" });
+    const pick = recommend({ role: "builder" }, { catalog, quota: {}, analytics: null, scores: old, now });
+    assert.equal(pick.dataAges.artificialAnalysis, 10 * 86400);
+    assert.match(pick.reasons.join(" "), /AA snapshot stale; use last good/);
+    assert.equal(readFileSync(path, "utf8"), disk); assert.equal(statSync(path).mtimeMs, before.mtimeMs);
+    assert.equal(statSync(path + ".lock").mtimeMs, lockBefore.mtimeMs);
+    for (const value of [null, { ...old, fetchedAt: "invalid" }]) {
+      writeFileSync(path, JSON.stringify({ attemptedAt: now, fetchedAt: iso(now), value }), { mode: 0o600 });
+      assert.equal((await collectScores(disabled, path, now, fetcher, token)).value, null);
+    }
+    assert.equal(helpers, 0); assert.equal(requests, 0);
+  } finally { scratch.remove(); }
+});
 test("authenticated readers accept only verified homelab route scores and preserve last good on failure", async () => {
   const scratch = routeScratch();
   try {
