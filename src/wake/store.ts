@@ -6,7 +6,7 @@ import { ownDatabase } from "./owner.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { MAX_AGE, validate, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
+import { MAX_AGE, validate, waitDescription, type WaitInput, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
 
 export interface Item {
   id: string; kind: "wait" | "decision" | "native"; parent: string; project: string; request_key: string; request_at: number;
@@ -21,6 +21,14 @@ export interface Delivery {
 export interface NativePolicy { item: string; request_id: string | null; bind_until: number; baseline: string; questions: string|null; turn_item:string|null; created?:number }
 export interface Registration { id: string; kind: Item["kind"]; input: Input; deadline: number; requestAt: number; hash: string }
 const DB_LIMIT = 64 * 1024 * 1024;
+function waitSummary(row: Item, outcome: Outcome): string {
+  const context = waitDescription(JSON.parse(row.input) as WaitInput, row.target_run);
+  const result = outcome.reason === "time" ? "target time reached"
+    : outcome.reason === "timeout" ? "wait deadline reached"
+    : outcome.reason === "target_deleted" ? "target thread deleted"
+    : "target run " + outcome.reason.replaceAll("_", " ");
+  return "Context: " + JSON.stringify(context) + "; " + result + "; " + JSON.stringify(outcome);
+}
 export class CheckpointBlockedError extends Error {
   constructor() { super("WAL checkpoint blocked; work retained for retry"); this.name="CheckpointBlockedError"; }
 }
@@ -178,7 +186,7 @@ export class WakeStore {
         ? "no answer by the deadline: " + outcome.action + " " + (input.dependentAction ?? input.question)
         : row.kind === "native"
           ? "native question needs attention (" + outcome.detail + "); no safe automatic answer confirmed. " + outcome.action + " " + input.dependentAction + ". Answer in T3."
-          : JSON.stringify(outcome);
+          : row.kind === "wait" ? waitSummary(row,outcome) : JSON.stringify(outcome);
       const text = "Chaldea wake (" + label + " " + id + "): " + summary + "\nchaldea " + label + " status " + id;
       const payload = JSON.stringify({
         type:"message.dispatch",commandId,messageId:commandId,threadId:row.parent,
@@ -323,7 +331,7 @@ export class WakeStore {
           const command=JSON.parse(payload);
           command.text="Chaldea wake (waits):\n"+members.map(d => {
             const wait=this.get(d.item);
-            return wait.id+": "+wait.outcome;
+            return wait.id+": "+waitSummary(wait,JSON.parse(wait.outcome!));
           }).join("\n")+"\nchaldea wait status <id>";
           payload=JSON.stringify(command);
         }

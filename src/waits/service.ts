@@ -9,7 +9,7 @@ import { createWaitT3 } from "../t3/waits.ts";
 import { discoverServerUrl } from "../t3/adapter.ts";
 import { loadConfig, privateFile, type WaitConfig } from "./config.ts";
 import { boundedLog } from "./log.ts";
-import { object, text } from "./types.ts";
+import { object, text, waitDescription, type WaitInput } from "./types.ts";
 
 export async function body(req: IncomingMessage, limit=8192): Promise<string> {
   const parts:Buffer[]=[];let n=0;
@@ -64,7 +64,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       }
       if (result && typeof result === "object" && "kind" in result && "id" in result) {
         const item=result as import("../wake/store.ts").Item;
-        result={...item,...(item.kind === "wait" ? {waitId:item.id} : {questionId:item.id}),
+        result={...item,...(item.kind === "wait" ? {waitId:item.id,description:waitDescription(JSON.parse(item.input) as WaitInput,item.target_run)} : {questionId:item.id}),
           ...(item.kind === "native" ? {native:{runtimeRequestId:engine.store.native(item.id).request_id,preparationExpiresAt:engine.store.native(item.id).bind_until}} : {}),
           delivery:engine.store.deliveries().filter(d=>d.item===item.id).map(d=>({channel:d.channel,state:d.state,disposition:d.disposition,attempts:d.attempts,nextAt:d.next_at}))};
       }

@@ -140,6 +140,35 @@ turn continued. Message-capable async questions survive T3 restart and receive
 one native continuation. This is a pinned T3 limitation, not a second delivery
 path for live questions.
 
+## Wait descriptions
+
+Time and thread waits accept optional `description` through `chaldea_wait`, or
+`--description TEXT` through `chaldea wait time` and `chaldea wait thread`.
+Use it to record why the model is waiting, such as "Recheck review availability
+after quota reset". It is context only and never an executable instruction,
+permission or authorization.
+
+Descriptions must be nonblank, single-line plain text, at most 512 UTF-8 bytes.
+Control and format characters, including terminal escapes and bidi controls, are
+refused by the shared service validation. Registration and status return a
+top-level `description`; caller descriptions also remain in stored `input` and
+participate in the request's idempotency hash. Reusing a key with a changed or
+removed description is refused.
+
+Without a description, status and new wakes show the target time or target thread
+and pinned run. Old pending inputs need no migration. Single and combined wakes
+quote each context and include a readable outcome, the exact outcome JSON and wait
+ID, for example:
+
+```text
+Chaldea wake (wait <id>): Context: "Recheck review availability after quota reset"; target time reached; {"reason":"time"}
+chaldea wait status <id>
+```
+
+Stored delivery payloads are not rewritten. Already-attempted wakes and frozen
+batches retain their original text and IDs across retries and upgrades, so they
+may still show the older opaque format.
+
 ## Calls and identity
 
 For waits, `requestId` is optional: the server generates `<epoch milliseconds>:<random>` when omitted; pass a saved explicit key and identical arguments for idempotent retries after ambiguity.
@@ -157,7 +186,8 @@ and are not retried to inactive parents. Items are never rebound.
 ```sh
 # Save a retry key before invoking; reuse both key and arguments after ambiguity.
 request_id="$(date +%s%3N):$(uuidgen)"
-chaldea wait time --after 30s --thread "$thread_id" --request-id "$request_id"
+chaldea wait time --after 30s --thread "$thread_id" --request-id "$request_id" \
+  --description "Recheck review availability after quota reset"
 chaldea wait thread --target "$other_thread" --run "$run_id" --thread "$thread_id"
 chaldea wait status "$wait_id"
 chaldea wait cancel "$wait_id"

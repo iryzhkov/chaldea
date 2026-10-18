@@ -67,11 +67,16 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
 
     await t.test("time and already-true waits commit exactly one wake",async()=>{
       for(const offset of [200,-1000]){
-        const started=Date.now();const input={...waitTime(),condition:{kind:"time",at:iso(started+offset)}};
+        const started=Date.now();const input={...waitTime(),description:"Recheck review after reset",condition:{kind:"time",at:iso(started+offset)}};
         const row=await invoke("chaldea_wait",input);
+        assert.equal((row as Item & {description:string}).description,input.description);
         assert.equal((await invoke("chaldea_wait",input)).id,row.id);
+        await assert.rejects(invoke("chaldea_wait",{...input,description:"changed"}),/changed payload/);
         await until("one time wake",async()=>await wakeCount(row.id)===1);
         await sleep(150);assert.equal(await wakeCount(row.id),1);
+        const message=(await snapshot()).messages.find(m=>m.id==="chaldea-wait:"+row.id+":wake")!;
+        assert.ok(message.text.includes('Context: "Recheck review after reset"; target time reached'));
+        assert.equal((await invoke("chaldea_wait_status",{id:row.id}) as Item & {description:string}).description,input.description);
       }
     });
     await t.test("performance: wake delivery (2 s product target, generous CI guard)",async()=>{
@@ -100,6 +105,8 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       assert.equal(message.role,"user");
       assert.ok(message.text.startsWith("Chaldea wake (wait "+row.id+")"));
       assert.ok(message.text.includes('"reason":"time"'));
+      assert.ok(message.text.includes("Wait until "));
+      assert.ok(message.text.includes("target time reached"));
       assert.ok(message.text.endsWith("chaldea wait status "+row.id));
       assert.ok(Buffer.byteLength(message.text)<1024);
       assert.equal(p.messages.filter(m=>m.text.startsWith("Chaldea wake")).length,before+1);
@@ -110,12 +117,12 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
     });
     await t.test("CLI duration retry, status and cancellation round trip",async()=>{
       const requestId=key();
-      const args=["wait","time","--after","10s","--thread",parent,"--request-id",requestId,"--config",configPath];
+      const args=["wait","time","--after","10s","--description","Check build logs","--thread",parent,"--request-id",requestId,"--config",configPath];
       const first=await runCli(args,dir.path);assert.equal(first.code,0,first.stderr);
-      const row=JSON.parse(first.stdout);const second=await runCli(args,dir.path);
+      const row=JSON.parse(first.stdout);assert.equal(row.description,"Check build logs");assert.equal(JSON.parse(row.input).description,row.description);const second=await runCli(args,dir.path);
       assert.equal(second.code,0,second.stderr);assert.equal(JSON.parse(second.stdout).id,row.id);
       const status=await runCli(["wait","status",row.id,"--config",configPath],dir.path);
-      assert.equal(status.code,0,status.stderr);assert.equal(JSON.parse(status.stdout).id,row.id);
+      assert.equal(status.code,0,status.stderr);assert.equal(JSON.parse(status.stdout).id,row.id);assert.equal(JSON.parse(status.stdout).description,row.description);
       const cancel=await runCli(["wait","cancel",row.id,"--config",configPath],dir.path);
       assert.equal(cancel.code,0,cancel.stderr);assert.equal(JSON.parse(cancel.stdout).delivery,"suppressed");
       assert.equal(await wakeCount(row.id),0);
@@ -134,10 +141,14 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       await dispatchMessage(t3,token,target,"complete this test chaldea-waits-delay:800","target-run");
       const targetSnap=()=>withClient({serverUrl:t3.serverUrl,token},c=>c["orchestration.getThreadProjection"]({threadId:target} as never));
       await until("target accepted run",async()=>(await targetSnap()).runs.length>0);
-      const row=await invoke("chaldea_wait",{threadId:parent,requestId:key(),condition:{kind:"thread",threadId:target}});
+      const result=await runCli(["wait","thread","--target",target,"--thread",parent,"--description","Collect target result","--config",configPath],dir.path);
+      assert.equal(result.code,0,result.stderr);const row=JSON.parse(result.stdout);
+      assert.equal(row.description,"Collect target result");
       assert.equal(row.state,"parked");
       await until("thread wake",async()=>await wakeCount(row.id)===1);
       assert.equal(JSON.parse((await invoke("chaldea_wait_status",{id:row.id})).outcome!).reason,"completed");
+      const message=(await snapshot()).messages.find(m=>m.id==="chaldea-wait:"+row.id+":wake")!;
+      assert.ok(message.text.includes('Context: "Collect target result"; target run completed'));
       await sleep(100);assert.equal(await wakeCount(row.id),1);
     });
     await t.test("answer page and CLI wake once",async()=>{
@@ -208,8 +219,11 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
           const result=lines().find(r=>r.id===id).result;assert.equal(result.isError,undefined);
           return JSON.parse(result.content[0].text);
         };
-        const w=await rpc(4,"chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+10000)}});
-        assert.equal((await rpc(5,"chaldea_wait_status",{id:w.id})).id,w.id);
+        const w=await rpc(4,"chaldea_wait",{...waitTime(),description:"Resume contract check",condition:{kind:"time",at:iso(Date.now()+10000)}});
+        assert.equal(w.description,"Resume contract check");
+        assert.equal(JSON.parse(w.input).description,w.description);
+        const status=await rpc(5,"chaldea_wait_status",{id:w.id});
+        assert.equal(status.id,w.id);assert.equal(status.description,w.description);
         assert.equal((await rpc(6,"chaldea_wait_cancel",{id:w.id})).delivery,"suppressed");
         assert.equal((await rpc(7,"chaldea_decision_status",{id:row.id})).id,row.id);
         const answered=await runCli(["decision","answer",row.id,"--answer","Run","--config",configPath],dir.path);
