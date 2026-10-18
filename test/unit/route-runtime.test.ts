@@ -75,7 +75,12 @@ test("config defaults safe, validates fractions/keys/collector/target", () => {
   const d = routeScratch();
   try {
     assert.equal(loadRouteConfig(d.path).claudeUsage.enabled, false);
+    assert.equal(loadRouteConfig(d.path).analyticsMaxAgeMs, 21 * 86400000);
+    const valid = join(d.path, "valid.json");
+    writeFileSync(valid, JSON.stringify({ analyticsMaxAgeMs: 7 * 86400000 }));
+    assert.equal(loadRouteConfig(d.path, valid).analyticsMaxAgeMs, 7 * 86400000);
     for (const invalid of [{ minimumRemaining: -1 }, { paceMargin: 15 }, { minimumTurns: 0 },
+      { analyticsMaxAgeMs: 0 }, { analyticsMaxAgeMs: -1 }, { analyticsMaxAgeMs: "21" },
       { claudeUsage: { enabled: "yes" } }, { claudeWeeklyTarget: { remainingPercent: 62 } }, { misspelled: true }]) {
       const path = join(d.path, "config.json"); writeFileSync(path, JSON.stringify(invalid));
       assert.throws(() => loadRouteConfig(d.path, path), /Invalid/);

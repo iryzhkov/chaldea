@@ -65,6 +65,8 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
     observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null, observedAt: p.included.observedAt };
   const finish = (kind: CapacityClass, reason: string) => { c.class = kind; c.reasons.push(reason); return c; };
   if (activeStop) return finish("stopped", "active usage stop; reserves do not authorize redemption");
+  if (fresh(p.ordinaryUsageAllowed, now, config.maxAgeMs) === false)
+    return finish("tight", "provider reports ordinary usage not allowed; credits do not override");
   const reserves = config.providers[p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias] ?? {};
   const creditExpiry = p.creditExpiresAt ?? reserves.creditExpiresAt;
   const credits = fresh(p.credits, now, config.maxAgeMs);

@@ -6,6 +6,7 @@ import { classifyCapacity, classifyCapacities, DEFAULT_CAPACITY } from "../../sr
 import { emptyState } from "../../src/quota/state.ts";
 import { recommend } from "../../src/route/policy.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
+import { liveCodex } from "../fixtures/route/live-policy.ts";
 const metric = <T>(value: T): Metric<T> => ({ value, observedAt: iso(now), state: "fresh", error: null, source: "fixture" });
 function provider(driver: string, remaining: number, burn = .002, timeLeft = .4) {
   const p = newProvider(driver, driver);
@@ -65,6 +66,38 @@ test("Codex credits need no conversion or reserve; stale credits and expired res
   assert.equal(classifyCapacity(p, false, now, config).class, "paced");
   const missing = newProvider("codex", "codex"); missing.credits = metric({ balance: "999999", hasCredits: true, unlimited: true });
   assert.equal(classifyCapacity(missing, false, now, config).class, "unlimited");
+});
+test("live Codex wallet establishes capacity without native windows, conversion or burn", () => {
+  const p = liveCodex();
+  assert.equal(classifyCapacity(p, false, now).class, "unlimited");
+  p.included = provider("codex", 0).included;
+  assert.equal(classifyCapacity(p, false, now).class, "unlimited");
+  p.creditExpiresAt = iso(now + 3600000);
+  assert.equal(classifyCapacity(p, false, now).class, "use-it");
+  assert.equal(classifyCapacity(p, true, now).class, "stopped");
+  p.ordinaryUsageAllowed = metric(false);
+  assert.equal(classifyCapacity(p, false, now).class, "tight");
+  p.ordinaryUsageAllowed = metric(true);
+  assert.equal(classifyCapacity(p, false, now).class, "use-it");
+  const capacity = { codex: classifyCapacity(p, false, now) };
+  assert.equal(recommend({ role: "builder" }, { catalog, now, quota: {}, analytics: null, capacity }).providerInstanceId, "codex");
+});
+test("missing, invalid, stale and expired credit evidence never implies unlimited", () => {
+  for (const balance of [null, "0", "invalid", "-1"]) {
+    const p = newProvider("codex", "codex");
+    p.credits = metric({ balance, hasCredits: true, unlimited: false });
+    assert.equal(classifyCapacity(p, false, now).class, "unknown", String(balance));
+  }
+  for (const state of ["unknown", "stale", "error"] as const) {
+    const p = liveCodex(); p.credits = { ...p.credits, state };
+    assert.equal(classifyCapacity(p, false, now).class, "unknown", state);
+  }
+  const p = liveCodex();
+  p.creditExpiresAt = iso(now);
+  assert.equal(classifyCapacity(p, false, now).class, "unknown");
+  delete p.creditExpiresAt;
+  p.credits = { ...p.credits, observedAt: iso(now - DEFAULT_CAPACITY.maxAgeMs) };
+  assert.equal(classifyCapacity(p, false, now).class, "unknown");
 });
 test("recent burn resets on refill, respects configurable heavy multiplier, no writes in policy", () => {
   const p = provider("codex", 20, .01), before = JSON.stringify(p);
