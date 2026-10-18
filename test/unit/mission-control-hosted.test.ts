@@ -10,6 +10,7 @@ import { readerConfig,refreshStatus } from "../../src/mission-control/reader.ts"
 import { captureConfig } from "../../src/mission-control/capture.ts";
 import { Outbox } from "../../src/events/outbox.ts";
 import { collect } from "../../src/events/collector.ts";
+import { publish,type PublisherOptions } from "../../src/events/publisher.ts";
 import { missionServer } from "../../src/mission-control/server.ts";
 import { eventsConfig } from "../../src/config/events.ts";
 import type { ShellThread } from "../../src/t3/adapter.ts";
@@ -108,6 +109,17 @@ test("collector coalesces latest state behind one frozen retry, expires gaps, ke
       assert.equal(reopened.db.prepare("PRAGMA max_page_count").get()!.max_page_count,4096);
     }finally{reopened.close();}
   }finally{try{outbox.close();}catch{}d.close();}
+});
+
+test("ordinary tombstone acknowledgement remains compatible while status records an expired gap",async()=>{
+  const d=scratch(),outbox=new Outbox(join(d.path,"tombstone.db"));let attempts=0;
+  try{
+    const publisher:PublisherOptions={url:"https://fixture.invalid",token:async()=>"fixture",fetch:async()=>{attempts++;return new Response(JSON.stringify({event_id:"f".repeat(64),state:"tombstone"}),{status:410});}};
+    assert.equal(await publish({key:"ordinary",source:"agent-a.toolfeedback",host:"agent-a",payload:{v:1,kind:"tool_call"}},publisher),true);
+    const file=join(d.path,"snapshot.json");writeFileSync(file,JSON.stringify(sample()),{mode:0o600});
+    await collect({outbox,host:"agent-a",spool:d.path,missionControlSnapshotFile:file,publisher,now:()=>now0});
+    assert.equal(attempts,2);assert.equal(outbox.counters().status_expired_gap,1);assert.equal(outbox.counters().status_delivered,undefined);assert.equal(outbox.statusState().pending,null);
+  }finally{outbox.close();d.close();}
 });
 test("unconfigured collector leaves optional status table absent and env seam is explicit",async()=>{
   const d=scratch(),o=new Outbox(join(d.path,"collector.db"));
