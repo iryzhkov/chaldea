@@ -538,7 +538,7 @@ export type MissionDetailEvent =
   | { kind: "synchronized" }
   | { kind: "cursor"; sequence: number }
   | { kind: "activity"; tool: string | null }
-  | { kind: "usage"; turnId: string; output: number | null; at: number; baseline: boolean };
+  | { kind: "usage"; turnId: string; output: number | null; at: number; baseline: boolean; startedAt?: number | null };
 export async function connectMissionThread(options: ConnectOptions, threadId: string,
   afterSequence: number | undefined, onEvent: (event: MissionDetailEvent) => void): Promise<void> {
   await withClient(options, client => client["orchestration.subscribeThread"]({
@@ -547,8 +547,10 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   } as never).pipe(Stream.runForEach(item => Effect.sync(() => {
     if (item.kind === "synchronized") { onEvent({ kind: "synchronized" }); return; }
     if (item.kind === "snapshot") {
-      for (const turn of item.projection.providerTurns.slice(-512)) {
+      const turns = item.projection.providerTurns.toSorted((a, b) => b.ordinal - a.ordinal);
+      for (const turn of turns.filter((turn, i) => i === 0 || turn.status === "running").slice(0, 8)) {
         onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
+          startedAt: turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : null,
           at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : 0, baseline: true });
       }
       const recent = [...item.projection.turnItems, ...item.projection.visibleTurnItems.map(row => row.item)]
@@ -562,6 +564,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       if (e.type === "provider-turn.updated") {
         const turn = e.payload;
         onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
+          startedAt: turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : null,
           at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : DateTime.toEpochMillis(e.occurredAt), baseline: false });
       } else if (e.type === "turn-item.updated" && e.payload.status === "running") {
         onEvent({ kind: "activity", tool: "toolName" in e.payload && typeof e.payload.toolName === "string" ? e.payload.toolName : null });

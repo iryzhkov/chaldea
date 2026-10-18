@@ -43,6 +43,64 @@ test("usage baseline, duplicates, zero, reset and missing counters remain distin
   now+=61000;assert.equal(m.snapshot().tokens.rate,0);
   m.detailDisconnected(id);assert.equal(m.snapshot().tokens.rate,null);assert.equal(m.snapshot().tokens.output,65);
 });
+
+test("new post-start single-report turns count output; old/unknown starts baseline and reconnect does not recount",()=>{
+  let now=1_000_000;const m=initialized(()=>now),id="private-thread-id";
+  const usage=(turnId:string,output:number,stamp:number,startedAt?:number|null,baseline=false)=>{
+    const event={kind:"usage" as const,turnId,output,at:stamp,...(startedAt === undefined ? {} : {startedAt}),baseline};m.detail(id,event);
+  };
+  const preexisting=initialized(()=>now);
+  preexisting.detail(id,{kind:"usage",turnId:"unknown-first",output:500,at:now,baseline:false});
+  assert.equal(preexisting.snapshot().tokens.output,null);assert.equal(preexisting.snapshot().tokens.rate,null);
+  now+=1000;usage("new",500,now,now-500);
+  assert.equal(m.snapshot().tokens.output,500);assert.equal(m.snapshot().tokens.rate,500/60);
+  usage("new",500,now,now-500);usage("new",800,now-1,now-500);assert.equal(m.snapshot().tokens.output,500);
+  usage("old",1000,now,0);usage("unknown",1000,now);usage("unknown-null",1000,now,null);
+  assert.equal(m.snapshot().tokens.output,500);
+  m.detailDisconnected(id);m.detail(id,{kind:"synchronized"});
+  usage("new",500,now+1,now-500,true);usage("new",550,now+2,now-500);
+  assert.equal(m.snapshot().tokens.output,550);
+  usage("new",5,now+3,now-500);assert.equal(m.snapshot().tokens.output,555);
+  usage("snapshot-only",5000,now+4,now-500,true);assert.equal(m.snapshot().tokens.output,555);
+  assert.equal(JSON.stringify(m.snapshot()).includes("snapshot-only"),false);
+});
+test("historical baseline floods cannot evict a live turn baseline",()=>{
+  let now=1_000_000;const m=initialized(()=>now),id="private-thread-id";
+  m.detail(id,{kind:"usage",turnId:"live",output:100,at:1,baseline:true});
+  m.detail(id,{kind:"usage",turnId:"live",output:150,at:2,baseline:false});
+  for(let i=0;i<600;i++)m.detail(id,{kind:"usage",turnId:"history"+i,output:500,at:3+i,baseline:true});
+  m.detail(id,{kind:"usage",turnId:"live",output:200,at:1000,baseline:false});
+  assert.equal(m.snapshot().tokens.output,100);
+});
+test("full snapshot coverage is exact; ambiguous incremental overflow stays honestly unknown without duplicate inflation",()=>{
+  const m=new MissionModel();
+  m.shell({kind:"snapshot",sequence:1,threads:Array.from({length:49},(_,i)=>row("t"+i))});
+  assert.equal(m.snapshot().total,49);assert.equal(m.snapshot().truncated,true);
+  m.shell({kind:"snapshot",sequence:2,threads:Array.from({length:48},(_,i)=>row("t"+i))});
+  m.shell({kind:"thread",sequence:3,thread:row("overflow")});
+  assert.equal(m.ids().length,48);assert.equal(m.snapshot().total,null);assert.equal(m.snapshot().truncated,true);
+  m.shell({kind:"thread",sequence:4,thread:row("overflow")});
+  m.shell({kind:"removed",sequence:5,threadId:m.ids()[0]!});
+  m.shell({kind:"thread",sequence:6,thread:row("overflow")});
+  assert.equal(m.snapshot().total,null);assert.equal(m.snapshot().truncated,true);
+  m.shell({kind:"snapshot",sequence:7,threads:[row("only")]});
+  assert.equal(m.snapshot().total,1);assert.equal(m.snapshot().truncated,false);
+});
+test("reconnect churn forgets departed cursors independently of cleared child subscriptions",async()=>{
+  const model=new MissionModel(),controller=new AbortController();let round=0;const stale:number[]=[];
+  const source:ReadSource={
+    async shell(_options,sub){
+      const id=round<60?"thread-"+round:"thread-0";round++;
+      await sub.onEvent({kind:"snapshot",sequence:round,threads:[row(id)]});await sub.onEvent({kind:"synchronized"});
+      await delay(1);if(round===61)controller.abort();
+    },
+    async detail(options,_id,cursor,emit){if(cursor!==undefined)stale.push(cursor);emit({kind:"cursor",sequence:8});emit({kind:"synchronized"});
+      await new Promise<void>(resolve=>options.signal!.addEventListener("abort",()=>resolve(),{once:true}));},
+  };
+  await runSource(model,()=>({serverUrl:"http://127.0.0.1:1111",token:"fixture"}),controller.signal,source,1);
+  assert.equal(round,61);assert.deepEqual(stale,[]);
+});
+
 test("snapshot and removals bound thread retention and reject replayed shell events",()=>{
   const m=new MissionModel();m.shell({kind:"snapshot",sequence:4,threads:Array.from({length:100},(_,i)=>row("t"+i))});
   assert.equal(m.ids().length,MAX_AGENTS);assert.equal(m.snapshot().total,100);assert.equal(m.snapshot().truncated,true);
@@ -85,13 +143,13 @@ test("detail adapter uses only official read subscription and omits unknown raw 
     if(req._tag!=="Request")return;
     requests.push(req.tag);assert.equal(req.payload.threadId,"fixture-thread");assert.equal(req.payload.afterSequence,7);
     assert.equal(req.payload.requestCompletionMarker,true);assert.equal(req.payload.acceptBoundedSnapshot,true);
-    socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"event",sequence:8,event:{type:"future.safe",payload:{input:"RAW_SECRET"}}},{kind:"synchronized"}]}));
+    socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"event",sequence:8,event:{type:"future.safe",payload:{input:"RAW_SECRET"}}},{"kind":"event","sequence":9,"event":{"id":"usage-event","threadId":"fixture-thread","occurredAt":"2026-10-18T18:00:00.000Z","type":"provider-turn.updated","payload":{"id":"fixture-turn","providerThreadId":"provider-thread","nodeId":"node","runAttemptId":null,"nativeTurnRef":null,"ordinal":1,"status":"running","startedAt":"2026-10-18T18:00:00.000Z","completedAt":null,"tokenUsage":{"usedTokens":500,"outputTokens":500,"updatedAt":"2026-10-18T18:00:00.000Z"}}}},{kind:"synchronized"}]}));
   }));
   await new Promise<void>(resolve=>http.listen(0,"127.0.0.1",resolve));
   try{
     const port=(http.address() as {port:number}).port;
     const done=connectMissionThread({serverUrl:"http://127.0.0.1:"+port,token:"DISPOSABLE_FIXTURE",signal:controller.signal},"fixture-thread",7,event=>{seen.push(event);if(event.kind==="synchronized")controller.abort();});
-    await assert.rejects(done);assert.deepEqual(seen,[{kind:"cursor",sequence:8},{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
+    await assert.rejects(done);assert.deepEqual(seen,[{kind:"cursor",sequence:8},{kind:"usage",turnId:"fixture-turn",output:500,startedAt:Date.parse("2026-10-18T18:00:00.000Z"),at:Date.parse("2026-10-18T18:00:00.000Z"),baseline:false},{kind:"cursor",sequence:9},{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
   }finally{wss.close();http.close();}
 });
 

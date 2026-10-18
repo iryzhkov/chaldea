@@ -1,4 +1,18 @@
+// Age the retained source snapshot even when the browser transport is quiet or lost.
+export function projectClientSnapshot(snapshot, now, connected) {
+  if (!snapshot) return null;
+  const lost = !connected || !Number.isFinite(snapshot.now) || now - snapshot.now > 30_000;
+  return { ...snapshot,
+    source: { ...snapshot.source, observedAt: snapshot.source.state === "live" ? snapshot.now : snapshot.source.observedAt,
+      state: lost && snapshot.source.state === "live" ? "disconnected" : snapshot.source.state },
+    agents: snapshot.agents.map(a => ({ ...a,
+      detailObservedAt: a.activityFreshness === "live" ? snapshot.now : a.detailObservedAt,
+      activityFreshness: lost && a.activityFreshness === "live" ? "disconnected" : a.activityFreshness,
+    })),
+  };
+}
 // Browser receives only the allowlisted MissionModel snapshot. No credentials or T3 access.
+if (typeof window !== "undefined") {
 window.DATA = { now:new Date(), tz:"UTC", tzOffsetMin:0, demo:false, threads:[], agentPool:[], wallTargets:{}, hosts:[], decisions:[], incidents:[], shipped:[], events:[], prs:[], accounts:[], sources:[], tokens:{providers:[],hourly:[]} };
 document.getElementById("board").style.visibility = "hidden";
 const script = document.createElement("script"); script.src = "/core.js"; document.body.append(script);
@@ -6,7 +20,7 @@ script.onload = () => {
   const { R, UI } = window.MC, { panel, heroStat, gauge, st, budget } = UI;
   const esc = v => String(v ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const missing = text => '<div class="muted">' + esc(text) + '</div>';
-  let snapshot = null, mode = new URLSearchParams(location.search).get("mode") || "overview";
+  let snapshot = null, receivedSnapshot = null, transportConnected = false, mode = new URLSearchParams(location.search).get("mode") || "overview";
   const age = at => at == null ? null : Math.max(0,Math.floor((Date.now()-at)/1000));
   const sourcePanel = (area,title,body,kind="t3shell") => panel(area,title,body,kind,age(snapshot?.source.observedAt),snapshot?.source.state === "live" ? "live" : snapshot?.source.state === "nosource" ? "nosource" : age(snapshot?.source.observedAt)>300 ? "lost" : "stale");
   const unavailable = (area,title) => panel(area,title,missing("Unavailable in the PC canary · no source"),"host",null,"nosource");
@@ -21,18 +35,19 @@ script.onload = () => {
     const quotaObserved=s?.quota.accounts.map(a=>a.observedAt).filter(Number.isFinite) || [];
     const kpi = '<div class="stats hero-row">' + [["—","needs Igor"],["—","open incidents"],[s?agents.filter(a=>a.state==="working").length:"—","working"],[s?agents.filter(a=>a.state==="waiting-igor").length:"—","waiting"],["—","exec slots"],["—","queued jobs"],[s?.tokens.rate == null ? "—" : s.tokens.rate.toFixed(1),"output rate","tok/s · 60 s avg"],["—","shipped today"]].map(x=>heroStat(...x)).join("") + '</div>';
     const rows=budget(agents,4,a=>'<div class="item"><div class="l1"><span class="t two t1">' + esc(a.title) + '</span></div><div class="l2">' + st(a.state,a.state) + ' · ' + esc(a.model) + ' · omarchy-pc</div><div class="t1 muted">' + esc(a.steps[0] || "Activity unavailable") + '</div></div>',"threads");
-    return sourcePanel("kpi","PC canary · " + (live?"connected":"last known"),kpi) + unavailable("inbox","Decision inbox") + sourcePanel("threads","Threads · showing " + agents.length + " of " + (s?.total ?? "unknown"),rows || missing("No observed threads")) + unavailable("hosts","Hosts · exec slots") + panel("quota","Quota",s?.quota.accounts.length ? budget(s.quota.accounts,2,a=>'<div class="item">' + esc(a.label) + ' · ' + esc(a.state) + ' · ' + (a.used==null?"usage unknown":a.used+"% used") + '</div>',"accounts") : missing("No cached quota"),"quota",quotaObserved.length ? age(Math.max(...quotaObserved)) : null) + unavailable("events","Latest events");
+    return sourcePanel("kpi","PC canary · " + (live?"connected":"last known"),kpi) + unavailable("inbox","Decision inbox") + sourcePanel("threads","Threads · showing " + agents.length + " of " + (s?.total ?? "unknown") + (s?.truncated ? " · coverage incomplete" : ""),rows || missing("No observed threads")) + unavailable("hosts","Hosts · exec slots") + panel("quota","Quota",s?.quota.accounts.length ? budget(s.quota.accounts,2,a=>'<div class="item">' + esc(a.label) + ' · ' + esc(a.state) + ' · ' + (a.used==null?"usage unknown":a.used+"% used") + '</div>',"accounts") : missing("No cached quota"),"quota",quotaObserved.length ? age(Math.max(...quotaObserved)) : null) + unavailable("events","Latest events");
   };
   R.tokens = () => sourcePanel("thero","Output rate · 60 s average",'<div class="stats">' + heroStat(snapshot?.tokens.rate == null ? "—" : snapshot.tokens.rate.toFixed(1),"output rate","tok/s · 60 s avg") + heroStat(snapshot?.tokens.output ?? "—","observed output","since process start") + '</div>',"t3thread") + panel("models","Observation scope",missing(snapshot?.tokens.scope || "No usage data") + missing("Updated " + (age(snapshot?.tokens.observedAt) ?? "unknown") + "s ago · daily totals and model history unavailable"),"t3thread",age(snapshot?.tokens.observedAt),snapshot?.source.state === "live" ? undefined : "stale") + unavailable("hourly","Today by hour");
   R.quota=()=>quotas();
   for(const m of ["fleet","events","ops","lab"]) R[m]=()=>unavailable("summary",m + " unavailable");
   const originalAgents = R.agents;
-  R.agents = () => originalAgents().replace(/hosts awake[^<]*/g,"PC source only · fleet presence not observed");
+  R.agents = () => originalAgents().replace(/hosts awake[^<]*/g,"PC source only · fleet presence not observed" + (snapshot?.truncated ? " · coverage incomplete" : ""));
   document.addEventListener("mc:mode",e=>{mode=e.detail;});
   function render() {
+    snapshot = projectClientSnapshot(receivedSnapshot, Date.now(), transportConnected);
     if(snapshot) {
       DATA.demo=snapshot.demo;
-      DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:a.activityFreshness==="live"?0:age(a.detailObservedAt), age:null, run:age(a.startedAt), effort:"unknown", steps:a.steps.map(tool=>({tool})) }));
+      DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:age(a.detailObservedAt), age:null, run:age(a.startedAt), effort:"unknown", steps:a.steps.map(tool=>({tool})) }));
       DATA.agentPool=DATA.threads; DATA.sources=[];
     }
     window.MC.show(window.MC.MODES.includes(mode)?mode:"overview");
@@ -43,8 +58,9 @@ script.onload = () => {
   }
   render();
   const events=new EventSource("/api/events");
-  events.addEventListener("snapshot",e=>{ snapshot=JSON.parse(e.data); render(); });
-  events.onerror=()=>{ if(snapshot) snapshot.source.state="disconnected"; render(); };
+  events.addEventListener("snapshot",e=>{ receivedSnapshot=JSON.parse(e.data); transportConnected=true; render(); });
+  events.onerror=()=>{ transportConnected=false; render(); };
   setInterval(render,5000);
   addEventListener("pagehide",()=>events.close(),{once:true});
 };
+}

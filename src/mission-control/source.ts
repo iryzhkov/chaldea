@@ -24,6 +24,7 @@ export async function runSource(model: MissionModel, resolve: () => Omit<Connect
   };
   const reconcile = (options: ConnectOptions) => {
     const ids = new Set(model.ids());
+    for (const id of cursors.keys()) if (!ids.has(id)) cursors.delete(id);
     for (const [id, child] of children) if (!ids.has(id)) { child.controller.abort(); children.delete(id); cursors.delete(id); }
     for (const id of ids) if (!children.has(id)) {
       const controller = new AbortController(), current = generation;

@@ -14,7 +14,7 @@ const count = (n: unknown): n is number => typeof n === "number" && Number.isSaf
 type Thread = { row: ShellThread; observed: number; connected: boolean; detailObserved: number | null; steps: string[] };
 export class MissionModel {
   private threads = new Map<string, Thread>();
-  private turns = new Map<string, { output: number; at: number }>();
+  private turns = new Map<string, { output: number; at: number; live: boolean }>();
   private samples: { at: number; output: number }[] = [];
   private listeners = new Set<() => void>();
   private sequence: number | undefined;
@@ -23,11 +23,13 @@ export class MissionModel {
   private quota: HeadroomState | null = null;
   private quotaError = false;
   private total = 0;
+  private coverageExact = true;
+  private startedAt: number;
   private output = 0;
   private usageObserved: number | null = null;
   readonly demo: boolean;
   private now: () => number;
-  constructor(demo = false, now = Date.now) { this.demo = demo; this.now = now; }
+  constructor(demo = false, now = Date.now) { this.demo = demo; this.now = now; this.startedAt = now(); }
   subscribe(fn: () => void): () => void { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   changed(): void { for (const fn of this.listeners) fn(); }
   cursor(): number | undefined { return this.sequence; }
@@ -39,16 +41,28 @@ export class MissionModel {
     this.sequence = event.sequence;
     if (event.kind === "snapshot") {
       const rows = event.threads.filter(t => !t.archived && !t.deleted && !t.settled);
-      this.total = rows.length;
+      this.total = rows.length; this.coverageExact = true;
       const selected = rows.toSorted((a,b) => (a.latestRunStartedAt ?? "").localeCompare(b.latestRunStartedAt ?? "") || a.id.localeCompare(b.id)).slice(0, MAX_AGENTS);
       const previous = this.threads; this.threads = new Map();
       for (const row of selected) this.threads.set(row.id, { connected: false, detailObserved: null, steps: [], ...previous.get(row.id), row, observed: now });
     } else if (event.kind === "thread") {
       const row = event.thread;
-      if (row.archived || row.deleted || row.settled) { if (this.threads.delete(row.id)) this.total = Math.max(0, this.total - 1); }
+      if (row.archived || row.deleted || row.settled) {
+        if (this.threads.delete(row.id)) this.total = Math.max(0, this.total - 1);
+        else if (this.total > this.threads.size) this.coverageExact = false;
+      }
       else if (this.threads.has(row.id)) { this.threads.get(row.id)!.row = row; this.threads.get(row.id)!.observed = now; }
-      else if (this.threads.size < MAX_AGENTS) { this.threads.set(row.id, { row, observed: now, connected: false, detailObserved: null, steps: [] }); this.total++; }
-    } else if (event.kind === "removed") { if (this.threads.delete(event.threadId)) this.total = Math.max(0, this.total - 1); }
+      else {
+        if (this.total > this.threads.size || this.threads.size >= MAX_AGENTS) this.coverageExact = false;
+        if (this.threads.size < MAX_AGENTS) {
+          this.threads.set(row.id, { row, observed: now, connected: false, detailObserved: null, steps: [] });
+          if (this.coverageExact) this.total++;
+        }
+      }
+    } else if (event.kind === "removed") {
+      if (this.threads.delete(event.threadId)) this.total = Math.max(0, this.total - 1);
+      else if (this.total > this.threads.size) this.coverageExact = false;
+    }
     this.observed = now; this.changed();
   }
   disconnected(): void { if (this.connected) this.observed = this.now(); this.connected = false; for (const t of this.threads.values()) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
@@ -65,11 +79,16 @@ export class MissionModel {
       const key = id + ":" + event.turnId;
       const prev = this.turns.get(key);
       if (prev && event.at <= prev.at) return;
-      // First samples establish a baseline; snapshots never fabricate historical throughput.
-      const delta = prev ? event.output >= prev.output ? event.output - prev.output : event.output : 0;
-      this.turns.delete(key); this.turns.set(key, { output: event.output, at: event.at });
-      while (this.turns.size > MAX_TURNS) this.turns.delete(this.turns.keys().next().value!);
-      if (!event.baseline) { this.samples.push({ at: now, output: delta }); this.output += delta; this.usageObserved = now; }
+      // Only a live report with a demonstrated post-start turn may count from zero.
+      const postStart = event.startedAt != null && event.startedAt >= this.startedAt && event.startedAt <= now;
+      const delta = prev ? event.output >= prev.output ? event.output - prev.output : event.output : !event.baseline && postStart ? event.output : 0;
+      if (!prev && this.turns.size >= MAX_TURNS) {
+        const baselineKey = [...this.turns].find(([, value]) => !value.live)?.[0];
+        if (event.baseline && baselineKey === undefined) return;
+        this.turns.delete(baselineKey ?? this.turns.keys().next().value!);
+      }
+      this.turns.delete(key); this.turns.set(key, { output: event.output, at: event.at, live: prev?.live === true || !event.baseline });
+      if (!event.baseline && (prev !== undefined || postStart)) { this.samples.push({ at: now, output: delta }); this.output += delta; this.usageObserved = now; }
       this.samples = this.samples.filter(s => now - s.at <= 60_000).slice(-MAX_SAMPLES);
     }
     this.changed();
@@ -105,7 +124,7 @@ export class MissionModel {
     }));
     const usageConnected = agents.length > 0 && [...this.threads.values()].every(t => t.connected);
     return { version: 1, demo: this.demo, now, source: { state: freshness(this.connected, this.observed, 30_000, 300_000), observedAt: this.observed },
-      agents, shown: agents.length, total: this.total, truncated: this.total > agents.length,
+      agents, shown: agents.length, total: this.coverageExact ? this.total : null, truncated: !this.coverageExact || this.total > agents.length,
       tokens: { rate: this.usageObserved === null || !usageConnected ? null : this.samples.filter(s => now - s.at <= 60_000).reduce((s,v) => s + v.output, 0) / 60,
         output: this.usageObserved === null ? null : this.output, observedAt: this.usageObserved, scope: "Observed deltas since this process started; 48-thread cap. Daily reconciliation unavailable." },
       quota: { state: this.quotaError ? "error" : this.quota === null ? "unknown" : "cached", accounts },
