@@ -51,7 +51,7 @@ export class RouteState {
       for (const [model, allocation] of Object.entries(history.allocations)) {
         if (inProbation(model, input.role, history, config, data.now)) {
           allocation.calls++;
-          if (model === result.model) allocation.trials++;
+          if (model === result.model || Object.values(result.byProvider).some(p => p.eligible && p.model === model)) allocation.trials++;
         }
       }
       if (!inProbation(result.model, input.role, history, config, data.now)) history.picks[key] = {

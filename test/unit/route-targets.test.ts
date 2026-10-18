@@ -35,6 +35,71 @@ test("AA floor, unmapped models, unavailable efforts and disabled providers rema
   assert.match(recommend({ role: "bulk-read" }, f).reasons.join(" "), /unmapped or missing AA/);
   assert.equal(recommend({ role: "builder" }, fixture()).model, "gpt-6.1-sol");
 });
+test("byProvider returns each driver's best eligible pick, including rejected providers and instances", () => {
+  for (const role of ["builder", "critical-review", "bulk-read", "general"] as const) {
+    const r = recommend({ role }, fixture());
+    assert.equal(r.byProvider.claudeAgent?.eligible, true);
+    assert.equal(r.byProvider.codex?.eligible, true);
+    assert.equal(r.byProvider.claudeAgent?.model, role === "bulk-read" ? newcomer : role === "critical-review" ? "claude-fable-5-1" : "claude-opus-5-5");
+    assert.equal(r.byProvider.codex?.model, role === "bulk-read" ? "gpt-6-luna" : role === "critical-review" ? "gpt-6-astra" : "gpt-6.1-sol");
+    assert.ok(Object.values(r.byProvider).every(p => p.reasons.length));
+    if (r.byProvider.codex?.eligible) {
+      assert.equal(r.byProvider.codex.providerInstanceId, "codex");
+      assert.deepEqual(r.byProvider.codex.options, { reasoningEffort: role === "builder" ? "high" : "medium" });
+    }
+    assert.deepEqual(Object.keys(r.byProvider).sort(), [...new Set(fixture().catalog.map(p => p.driverKind))].sort());
+  }
+  const base = fixture();
+  const stopped = recommend({ role: "builder" }, { ...base,
+    quota: { codex: { observedAt: iso(now), windows: [], activeStop: true } } });
+  assert.equal(stopped.byProvider.codex?.eligible, false);
+  assert.equal(stopped.byProvider.codex?.model, null);
+  assert.match(stopped.byProvider.codex!.reasons.join("; "), /active usage stop/);
+  const banned = recommend({ role: "builder" }, { ...base, config: { bans: ["gpt-*"] } });
+  assert.equal(banned.byProvider.codex?.eligible, false);
+  assert.match(banned.byProvider.codex!.reasons.join("; "), /banned/);
+  const below = recommend({ role: "builder" }, { ...base, config: { floors: { builder: 51, "critical-review": 49, "bulk-read": 30, general: 48 } } });
+  assert.equal(below.byProvider.codex?.eligible, false);
+  assert.match(below.byProvider.codex!.reasons.join("; "), /floor/);
+  const review = recommend({ role: "critical-review", authorProvider: "codex" }, base);
+  assert.equal(review.byProvider.codex?.eligible, false);
+  assert.match(review.byProvider.codex!.reasons.join("; "), /other provider/);
+  const pin = recommend({ role: "builder" }, { ...base, config: { pins: { builder: { model: "gpt-6.1-sol", providerInstanceId: "codex" } } } });
+  assert.equal(pin.byProvider.claudeAgent?.eligible, false);
+  assert.match(pin.byProvider.claudeAgent!.reasons.join("; "), /fleet pin/);
+});
+test("byProvider respects probation shares even when another provider wins overall", () => {
+  const f = fixture();
+  f.history.seen[newcomer] = now;
+  f.history.allocations[newcomer] = { calls: 10, trials: 1 };
+  const held = recommend({ role: "bulk-read" }, f);
+  assert.equal(held.byProvider.claudeAgent?.model, "claude-haiku-5-5");
+  assert.match(held.byProvider.claudeAgent!.reasons.join("; "), /probation recommendation share/);
+  f.history.allocations[newcomer] = { calls: 10, trials: 0 };
+  assert.equal(recommend({ role: "bulk-read" }, f).byProvider.claudeAgent?.model, newcomer);
+});
+test("persistent provider picks consume trial shares while Codex wins overall", () => {
+  const scratch = routeScratch();
+  try {
+    const f = fixture(), codex = newProvider("codex", "codex");
+    codex.credits = { state: "fresh", observedAt: iso(now), source: "fixture", error: null,
+      value: { balance: "1", hasCredits: true, unlimited: false } };
+    const data = { ...f, capacity: { codex: classifyCapacity(codex, false, now) },
+      quota: { claudeAgent: { observedAt: iso(now), activeStop: false, windows: [
+        { kind: "weekly", remainingPercent: 40, windowDurationMins: 10080, resetsAt: iso(now + .4 * 7 * 86400000) },
+      ] } } };
+    let trials = 0;
+    for (let i = 0; i < 30; i++) {
+      const state = new RouteState(join(scratch.path, "provider-shares.sqlite"));
+      try {
+        const r = state.recommend({ role: "bulk-read" }, data, "fixture", false);
+        assert.equal(r.providerInstanceId, "codex");
+        if (r.byProvider.claudeAgent?.model === newcomer) trials++;
+      } finally { state.close(); }
+    }
+    assert.equal(trials, 3);
+  } finally { scratch.remove(); }
+});
 test("stale AA uses last good scores; absent and future snapshots use safe pairs", () => {
   const f = fixture(); f.scores = { ...f.scores, fetchedAt: iso(now - 4 * 86400000) };
   const stale = recommend({ role: "bulk-read" }, f);

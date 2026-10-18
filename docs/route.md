@@ -33,6 +33,12 @@ the requested effort option are held. With no eligible candidate it returns an e
 whose required other provider is unavailable.
 
 Results include `alternatives`, human-readable `reasons` and `dataAges`.
+`byProvider` is keyed by catalog driver, such as `claudeAgent` or `codex`, and
+returns each provider's best eligible `{providerInstanceId, model, options, eligible, reasons}`
+under the same quota, review, pin and probation gates. A provider with no eligible
+model remains present with `eligible: false`, null model/options and its rejection
+reasons. Provider picks also consume probation recommendation shares. The overall
+winner and alternatives remain available; no eligible model overall still returns an error.
 Ages are seconds, or null for unknown/future timestamps. Fresh Codex credits classify as unlimited even with no native window; credits
 near expiry classify as use-it. Identified results also include accountKey.
 See [fleet quota accounts](quota-fleet.md) for account binding and shared snapshots.

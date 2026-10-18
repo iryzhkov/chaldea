@@ -41,17 +41,31 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     : overrideFallback ? "AA has no role anchors at requested effort; use fixed role pairs with Sonnet removed"
     : "AA unavailable; no last good snapshot; use fixed role pairs with Sonnet removed");
   if (scores?.unmapped.length) reasons.push("AA models unmapped, held: " + scores.unmapped.join(", "));
+  const policyReasons = [...reasons];
+  const providerReasons = new Map<Provider, string[]>();
   const candidates: Array<Target & { driver: Provider; pace: number | null }> = [];
   for (const p of [...data.catalog].sort((a, b) => a.providerInstanceId.localeCompare(b.providerInstanceId))) {
-    if (input.role === "critical-review" && p.driverKind === input.authorProvider) continue;
-    if (pin?.providerInstanceId && pin.providerInstanceId !== p.providerInstanceId) continue;
+    const scoped = providerReasons.get(p.driverKind) ?? [];
+    providerReasons.set(p.driverKind, scoped);
+    const reject = (reason: string) => { scoped.push(reason); reasons.push(reason); };
+    if (input.role === "critical-review" && p.driverKind === input.authorProvider) {
+      reject(p.providerInstanceId + ": review requires the other provider from " + input.authorProvider); continue;
+    }
+    if (pin?.providerInstanceId && pin.providerInstanceId !== p.providerInstanceId) {
+      reject(p.providerInstanceId + ": fleet pin requires instance " + pin.providerInstanceId); continue;
+    }
+    const start = reasons.length;
+    if (!p.models.length) reasons.push(p.providerInstanceId + ": no catalog models");
+
     for (const m of p.models) {
     const model = m.id;
     if (pin ? model !== pin.model : banned(model, config.bans)) {
-      if (!pin && banned(model, config.bans)) reasons.push(model + ": banned");
+      reasons.push(model + (pin ? ": fleet pin requires " + pin.model : ": banned"));
       continue;
     }
-    if (!pin && !scores && model !== (p.driverKind === "claudeAgent" ? pair[0] : p.driverKind === "codex" ? pair[1] : undefined)) continue;
+    if (!pin && !scores && model !== (p.driverKind === "claudeAgent" ? pair[0] : p.driverKind === "codex" ? pair[1] : undefined)) {
+      reasons.push(model + ": outside fixed role pair while AA unavailable"); continue;
+    }
     const incumbent = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride)]?.model ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
     if (!pin && scores && !targetEligible(model, effort, input.role, scores, data.analytics, config, data.now, incumbent, reasons)) continue;
     const option = m.options?.find(o => ["reasoningEffort", "effort", "variant"].includes(o.id) &&
@@ -83,6 +97,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     if (!advice.pacing) reasons.push(`${p.providerInstanceId}: quota pacing unknown${p.driverKind === "codex" ? ", not assumed unlimited" : ""}${age !== null && age * 1000 >= config.quotaMaxAgeMs ? " (stale cache)" : ""}`);
     candidates.push({ ...(p.accountKey ? { accountKey: p.accountKey } : {}), providerInstanceId: p.providerInstanceId, model, options: { [option]: effort }, driver: p.driverKind, pace });
     }
+    scoped.push(...reasons.slice(start));
   }
   const a = data.analytics;
   const analyticsAge = ageSeconds(a?.fetchedAt, data.now);
@@ -99,7 +114,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
       const hasEligiblePeer = candidates.some(other => other.driver !== c.driver);
       const drop = hasEligiblePeer && s && peer && s.turns >= config.minimumTurns && peer.turns >= config.minimumTurns &&
         s.failedRate + s.interruptedRate - peer.failedRate - peer.interruptedRate > config.failureMargin;
-      if (drop) reasons.push(`${c.model}: Slopalytics failure+interrupt rate exceeds peer by more than ${Math.round(config.failureMargin * 100)} points, avoid`);
+      if (drop) {
+        const reason = `${c.model}: Slopalytics failure+interrupt rate exceeds peer by more than ${Math.round(config.failureMargin * 100)} points, avoid`;
+        reasons.push(reason); providerReasons.get(c.driver)!.push(reason);
+      }
       return !drop;
     });
     reasons.push("Slopalytics compares only the role pair; minimum sample applies to both models");
@@ -145,17 +163,27 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   if (!eligible[0]) throw new Error("No eligible routing candidate: " + reasons.join("; "));
   if (input.role === "critical-review" && input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
   const topPick = target(eligible[0]);
-  if (scores && !pin && inProbation(topPick.model, input.role, history, config, data.now) && !trialAvailable(history, config, topPick.model)) {
-    const settled = eligible.filter(c => !inProbation(c.model, input.role, history, config, data.now));
-    if (!settled[0]) throw new Error("No settled candidate while probation share is exhausted");
-    eligible = settled;
-    reasons.push(topPick.model + ": probation recommendation share limited to " + config.probationShare);
-  }
+  // Every exposed provider pick is a recommendation and obeys its trial share.
+  eligible = eligible.filter(c => {
+    const held = scores && !pin && inProbation(c.model, input.role, history, config, data.now) && !trialAvailable(history, config, c.model);
+    if (held) {
+      const reason = c.model + ": probation recommendation share limited to " + config.probationShare;
+      reasons.push(reason); providerReasons.get(c.driver)!.push(reason);
+    }
+    return !held;
+  });
+  if (!eligible[0]) throw new Error("No settled candidate while probation share is exhausted");
+  const byProvider: RouteResult["byProvider"] = Object.fromEntries([...providerReasons].map(([driver, details]) => {
+    const best = eligible.find(c => c.driver === driver);
+    return [driver, best ? { ...target(best), eligible: true, reasons: [...new Set([...policyReasons, ...details]),
+      "Best eligible " + input.role + " pick for " + driver + ": " + best.model + " after quota and role objective"] }
+      : { eligible: false, model: null, options: null, reasons: [...new Set([...policyReasons, ...details]), "No eligible " + input.role + " model for " + driver] }];
+  }));
   if (scores && !pin) {
     const s = scoreFor(scores, topPick.model, effort)!;
     reasons.push("Role top pick " + topPick.model + ": AA intelligence " + s.intelligence + ", coding " + s.coding +
       ", 3:1 input/output price $" + ((3 * s.inputPrice + s.outputPrice) / 4) + "/M; " + input.role + " objective after quota policy");
   }
-  return { ...target(eligible[0]!), topPick, alternatives: eligible.slice(1).map(target), reasons,
+  return { ...target(eligible[0]!), topPick, byProvider, alternatives: eligible.slice(1).map(target), reasons,
     dataAges: { quota: ages, slopalytics: analyticsAge, slopalyticsWindow: windowAge, artificialAnalysis: scoreAge } };
 }

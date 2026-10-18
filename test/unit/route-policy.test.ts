@@ -30,6 +30,8 @@ test("18-instance catalog uses safe fallback pairs/options including Haiku", () 
     assert.equal(r.alternatives[0]?.model, PAIRS[role][1]);
     assert.deepEqual(r.alternatives[0]?.options, { reasoningEffort: role === "builder" ? "high" : "medium" });
     assert.notEqual(r.model, "claude-sonnet-5-5");
+    assert.equal(r.byProvider.claudeAgent?.model, PAIRS[role][0]);
+    assert.equal(r.byProvider.codex?.model, PAIRS[role][1]);
   }
 });
 test("Claude under-paced by >=10 points wins; otherwise Codex", () => {

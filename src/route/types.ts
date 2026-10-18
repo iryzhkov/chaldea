@@ -29,7 +29,10 @@ export interface Analytics {
   models: Record<string, ModelStats>;
 }
 export interface Target { accountKey?: string; providerInstanceId: string; model: string; options: Record<string, Effort> }
+export type ProviderPick = (Target & { eligible: true; reasons: string[] }) |
+  { eligible: false; model: null; options: null; reasons: string[] };
 export interface RouteResult extends Target {
+  byProvider: Record<Provider, ProviderPick>;
   alternatives: Target[];
   reasons: string[];
   dataAges: { quota: Record<string, number | null>; slopalytics: number | null; slopalyticsWindow: number | null; artificialAnalysis?: number | null };
