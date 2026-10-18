@@ -1,5 +1,10 @@
 // Sanitized, independently timestamped quota observations. No provider/account payload is persisted wholesale.
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
+import { collectClaudeUsage, claudeCacheFile } from "../route/claude-usage.ts";
+import { capacitySnapshot, publishSnapshot } from "./fleet.ts";
+import { loadCapacityConfig } from "./capacity-config.ts";
+import { accountKey, capacityKey } from "./account.ts";
 import { retainBurnSample } from "./capacity.ts";
 import type { BurnSample } from "./capacity.ts";
 import { resolve } from "node:path";
@@ -32,6 +37,8 @@ export interface ExtraUsage { readonly usedMinor: number | null; readonly capMin
 export interface ProviderHeadroom {
   readonly alias: string;
   readonly driver: string;
+  accountKey?: string;
+  creditExpiresAt?: string;
   burnHistory?: ReadonlyArray<BurnSample>;
   binding?: "asserted" | "verified";
   plan: Metric<string>;
@@ -89,6 +96,8 @@ export function validateHeadroom(value: unknown): HeadroomState {
   }
   for (const p of s.providers) {
     if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
+        p.accountKey !== undefined && !/^[a-f0-9]{64}$/.test(p.accountKey) ||
+        p.creditExpiresAt !== undefined && !iso(p.creditExpiresAt) ||
         p.burnHistory !== undefined && (!Array.isArray(p.burnHistory) || p.burnHistory.length > 288 ||
           !p.burnHistory.every((s: any) => object(s) && iso(s.observedAt) && Array.isArray(s.windows) && s.windows.length <= 32 &&
             s.windows.every((w: any) => object(w) && safeId(w.id) && percent(w.remainingPercent) && percent(w.usedPercent) &&
@@ -136,6 +145,8 @@ const PLANS = new Set(["free", "go", "plus", "pro", "team", "business", "enterpr
 export function applyCodex(row: ProviderHeadroom, raw: unknown, at: string): void {
   const result = object(raw);
   if (!result) throw new BalanceReadError("protocol");
+  const key = accountKey(result.accountId);
+  if (key) row.accountKey = key; else delete row.accountKey;
   const map = object(result.rateLimitsByLimitId);
   const buckets = map ? Object.values(map).map(object).filter(b => b !== null) : [object(result.rateLimits)].filter(b => b !== null);
   // Prefer the map and Codex bucket; never add wallets from duplicate buckets.
@@ -175,7 +186,7 @@ export function routingLanes(row: ProviderHeadroom, nowMs: number) {
 }
 export function statusSnapshot(state: HeadroomState, nowMs: number) {
   return { version: 1, generatedAt: new Date(nowMs).toISOString(), providers: state.providers.map(row => ({
-    alias: row.alias, driver: row.driver, plan: metricNow(row.plan, nowMs),
+    alias: row.alias, driver: row.driver, ...(row.accountKey ? { accountKey: row.accountKey } : {}), plan: metricNow(row.plan, nowMs),
     ...routingLanes(row, nowMs),
   })) };
 }
@@ -224,6 +235,8 @@ export type BalanceReader = (context: CodexContext, signal: AbortSignal) => Prom
 export interface HeadroomMonitorOptions {
   state: HeadroomState; config: HeadroomConfig; local: boolean;
   save: (records: ReadonlyArray<QuotaRecord>) => void;
+  activeStops?: () => ReadonlySet<string>;
+  claudeRead?: typeof collectClaudeUsage;
   read?: BalanceReader; now?: () => number; random?: () => number;
   diagnostic?: (detail: { provider: string; reason: BalanceReason; binding?: "asserted" }) => void;
 }
@@ -262,6 +275,7 @@ export class HeadroomMonitor {
       if (!priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p)) {
         const clean = newProvider(p.instanceId, p.driver);
         delete next.burnHistory;
+        delete next.accountKey;
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;
@@ -269,6 +283,10 @@ export class HeadroomMonitor {
       applyT3(next, p);
       return next;
     });
+    for (const ctx of this.options.config.claudeContexts ?? []) {
+      if (!this.state.providers.some(p => p.alias === ctx.providerInstanceId) && this.state.providers.length < 64)
+        this.state.providers.push(previous.get(ctx.providerInstanceId) ?? newProvider(ctx.providerInstanceId, "claudeAgent"));
+    }
     this.#diagnose();
     this.#changed ||= before !== JSON.stringify(this.state.providers);
     this.#active = true;
@@ -342,6 +360,28 @@ export class HeadroomMonitor {
   }
   async #collect(): Promise<void> {
     this.#diagnose();
+    for (const ctx of this.options.config.claudeContexts ?? []) {
+      if (!ctx.enabled || this.#abort.signal.aborted || !this.options.local) continue;
+      const row = this.state.providers.find(p => p.alias === ctx.providerInstanceId);
+      if (!row || row.driver !== "claudeAgent") continue;
+      const usage = await (this.options.claudeRead ?? collectClaudeUsage)({ enabled: true, credentialFile: ctx.credentialFile,
+        cacheFile: claudeCacheFile(homedir(), ctx.credentialFile),
+        now: this.now() });
+      if (!usage.value) continue;
+      if (ctx.accountKey && usage.value.accountKey !== ctx.accountKey) {
+        delete row.accountKey;
+        row.included = { ...row.included, state: "error", error: "context_mismatch" };
+        this.#changed = true;
+        continue;
+      }
+      const u = usage.value;
+      if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt) || row.included.source === "t3") {
+        retainBurnSample(row, u.observedAt);
+        row.included = observed(u.windows.map(w => ({ ...w, id: w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt);
+        if (u.accountKey) row.accountKey = u.accountKey; else delete row.accountKey;
+        this.#changed = true;
+      }
+    }
     // Policies may differ across aliases sharing one executable/HOME tuple.
     const contexts = new Map(this.options.config.contexts.map(ctx => [contextKey(ctx), ctx]));
     if (this.options.local) for (const [key, ctx] of contexts) {
@@ -364,8 +404,9 @@ export class HeadroomMonitor {
           const row = this.#currentRow(p, binding);
           if (!row) continue;
           const accountId = object(raw)?.accountId;
-          if (p.quotaAccountKey && (typeof accountId !== "string" ||
-              createHash("sha256").update(accountId).digest("hex") !== p.quotaAccountKey)) {
+          if ((binding.accountKey ?? p.quotaAccountKey) && accountKey(accountId) !== (binding.accountKey ?? p.quotaAccountKey)) {
+            delete row.accountKey;
+            row.included = { ...row.included, state: "error", error: "context_mismatch" };
             failCodex(row, "context_mismatch"); this.#report(p.instanceId, "context_mismatch");
           } else { applyCodex(row, raw, at); this.#report(p.instanceId, "read_completed"); }
         }
@@ -387,6 +428,18 @@ export class HeadroomMonitor {
       this.#due.set(key, this.now() + COLLECT_EVERY_MS * 2 ** failures * jitter);
     }
     this.emit();
+    const fleet = this.options.config.fleet;
+    if (fleet?.enabled) {
+      try {
+        const capacity = loadCapacityConfig(homedir());
+        for (const row of this.state.providers) {
+          const expiry = capacity.providers[row.accountKey ? capacityKey(row.driver, row.accountKey) : row.alias]?.creditExpiresAt;
+          if (expiry) row.creditExpiresAt = expiry; else delete row.creditExpiresAt;
+        }
+        const snapshot = capacitySnapshot(fleet.host, this.state.providers, this.options.activeStops?.() ?? new Set(), this.now());
+        await publishSnapshot(fleet, snapshot, this.now());
+      } catch { /* Optional publication never interrupts the observer. */ }
+    }
   }
   emit(): void {
     if (!this.#active) return;
@@ -414,7 +467,10 @@ export class HeadroomMonitor {
         resetAt: null, subagent: false, headroom: snapshot });
     };
     const slot = Math.floor(now / SNAPSHOT_EVERY_MS);
-    if (providers.length > 0 && slot !== this.state.snapshotSlot) { this.state.snapshotSlot = slot; add("quota_headroom_snapshot"); }
+    if (providers.length > 0 && slot !== this.state.snapshotSlot) {
+      this.state.snapshotSlot = slot;
+      if (!this.options.config.fleet?.enabled) add("quota_headroom_snapshot");
+    }
     if (this.#baseline && providers.length > 0) {
       if (signature !== this.state.signature) add("quota_headroom_changed");
       if (low !== this.state.low && low) add("quota_headroom_low");

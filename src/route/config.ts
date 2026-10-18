@@ -6,7 +6,7 @@ import type { PolicyConfig, QuotaWindow } from "./types.ts";
 import { readJson } from "./cache.ts";
 
 export interface RouteConfig extends PolicyConfig {
-  stateFile: string; cacheDir: string; t3BaseDir: string; tokenFile: string; capacityConfigFile: string;
+  stateFile: string; cacheDir: string; t3BaseDir: string; tokenFile: string; capacityConfigFile: string; quotaConfigFile: string | undefined;
   claudeUsage: { enabled: boolean; providerInstanceId: string; credentialFile: string };
   claudeWeeklyTarget: { observedAt: string; window: QuotaWindow } | null;
 }
@@ -14,6 +14,7 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
   const defaults: RouteConfig = {
     ...DEFAULT_POLICY,
     capacityConfigFile: join(home, ".config/chaldea/capacity.json"),
+    quotaConfigFile: undefined,
     stateFile: join(home, ".local/state/chaldea/quota-observer.json"),
     cacheDir: join(home, ".cache/chaldea/route"),
     t3BaseDir: join(home, ".t3"), tokenFile: join(home, ".config/chaldea/t3-token"),
@@ -36,7 +37,7 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
       c[key] = r[key];
     }
   }
-  for (const key of ["stateFile", "cacheDir", "t3BaseDir", "tokenFile", "capacityConfigFile"] as const) {
+  for (const key of ["stateFile", "cacheDir", "t3BaseDir", "tokenFile", "capacityConfigFile", "quotaConfigFile"] as const) {
     if (r[key] !== undefined) {
       if (typeof r[key] !== "string" || !r[key].startsWith("/")) throw new Error("Route paths must be absolute");
       c[key] = r[key];

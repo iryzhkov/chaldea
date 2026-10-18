@@ -280,6 +280,7 @@ export async function runObserver(options: ObserverOptions): Promise<number> {
       const local = ["127.0.0.1", "[::1]", "localhost"].includes(new URL(serverUrl).hostname);
       monitor ??= new HeadroomMonitor({
         state: state.headroom, config: options.reporting ?? headroomConfig(), local,
+        activeStops: () => new Set([...state.parked.values()].filter(s => s.resetAt === null || Date.parse(s.resetAt) > Date.now()).map(s => s.provider)),
         diagnostic: detail => logger.info("Codex balance collector", detail),
         save: records => { sink.record(records); sink.save(); },
       });

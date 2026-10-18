@@ -1,4 +1,5 @@
 // Capacity is advice over cached observations. This module performs no IO or redemption.
+import { capacityKey } from "./account.ts";
 import type { ObserverState } from "./state.ts";
 import type { Metric, ProviderHeadroom, Window } from "./headroom.ts";
 export type CapacityClass = "unlimited" | "use-it" | "paced" | "tight" | "stopped" | "unknown";
@@ -64,6 +65,18 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
     observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null, observedAt: p.included.observedAt };
   const finish = (kind: CapacityClass, reason: string) => { c.class = kind; c.reasons.push(reason); return c; };
   if (activeStop) return finish("stopped", "active usage stop; reserves do not authorize redemption");
+  const reserves = config.providers[p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias] ?? {};
+  const creditExpiry = p.creditExpiresAt ?? reserves.creditExpiresAt;
+  const credits = fresh(p.credits, now, config.maxAgeMs);
+  const balance = Number(credits?.balance);
+  if (p.driver === "codex" && credits?.hasCredits &&
+      (credits.unlimited || credits.balance !== null && Number.isFinite(balance) && balance > 0) &&
+      (creditExpiry === undefined || unexpired(creditExpiry, now))) {
+    c.observedAt = p.credits.observedAt;
+    c.burnTargetPerHour = null;
+    return finish(creditExpiry && Date.parse(creditExpiry) - now <= config.expiryHorizonMs ? "use-it" : "unlimited",
+      "fresh Codex credits available; no credit reserve floor" + (creditExpiry ? "; expiry " + creditExpiry : ""));
+  }
   const maxAge = p.included.source === "operator-weekly-target" ? 7 * 86400000 : config.maxAgeMs;
   const windows = fresh(p.included, now, maxAge)?.filter(w => unexpired(w.resetsAt, now)) ?? [];
   if (!windows.length) return finish("unknown", "missing, stale or expired native window; never assumed unlimited");
@@ -78,7 +91,6 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   c.observedBurnPerHour = burnRate(p, w, now, config.recentWindowMs);
   const heavyRate = c.observedBurnPerHour === null ? null : c.observedBurnPerHour * config.heavyMultiplier;
   c.projectedHeavyUse = heavyRate === null || heavyRate <= 0 ? null : heavyRate * hours;
-  const reserves = config.providers[p.alias] ?? {};
   let expiring = false;
   const near = (at: string | null | undefined) => unexpired(at, now) && Date.parse(at!) - now <= config.expiryHorizonMs;
   if (p.driver === "codex") {
@@ -91,18 +103,6 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
       expiring ||= timing.useful > 0 && near(resets.nextExpiresAt);
       c.reasons.push(`${resets.availableCount} Codex resets: ${timing.reason}; timed value ${timing.weeks.toFixed(3)} weeks`);
     } else if (resets?.availableCount) c.reasons.push("reset expiry unknown/expired; reserve value unknown");
-    const credits = fresh(p.credits, now, config.maxAgeMs);
-    const balance = Number(credits?.balance);
-    const usable = credits && credits.balance !== null && Number.isFinite(balance) && balance > 0 &&
-      (reserves.creditExpiresAt === undefined || unexpired(reserves.creditExpiresAt, now));
-    if (usable) {
-      expiring ||= near(reserves.creditExpiresAt);
-      if (reserves.creditsPerFullWeek !== undefined && reserves.creditsPerFullWeek > 0) {
-        c.reserveWeeks += balance / reserves.creditsPerFullWeek;
-        c.reasons.push(`${balance} aggregate credits at operator conversion ${reserves.creditsPerFullWeek} credits/full week`);
-      } else c.reasons.push("positive credits balance; credits/full-week conversion unknown");
-    }
-    // A provider-declared unlimited wallet is still not an unlimited quota window.
   } else if (p.driver === "claudeAgent") {
     const refill = reserves.claudeRefills;
     if (refill && refill.count > 0 && unexpired(refill.expiresAt, now)) {
@@ -125,8 +125,15 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
 export function classifyCapacities(state: Pick<ObserverState, "headroom" | "parked">, now: number, config: CapacityConfig = DEFAULT_CAPACITY): Record<string, Capacity> {
   const stopped = new Set([...state.parked.values()].filter(s => s.resetAt === null ||
     !Number.isFinite(Date.parse(s.resetAt)) || Date.parse(s.resetAt) > now).map(s => s.provider));
-  const result = Object.fromEntries(state.headroom.providers.map(p => [p.alias, classifyCapacity(p, stopped.has(p.alias), now, config)]));
-  for (const alias of stopped) if (!result[alias]) result[alias] = { class: "stopped",
+  const id = (p: ProviderHeadroom) => p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias;
+  const stoppedAccounts = new Set(state.headroom.providers.filter(p => stopped.has(p.alias)).map(id));
+  const result: Record<string, Capacity> = {};
+  for (const p of state.headroom.providers) {
+    const key = id(p), next = classifyCapacity(p, stoppedAccounts.has(key), now, config), prior = result[key];
+    if (!prior || Date.parse(next.observedAt ?? "") > Date.parse(prior.observedAt ?? "") ||
+        prior.observedAt === null) result[key] = next;
+  }
+  for (const alias of stopped) if (!state.headroom.providers.some(p => p.alias === alias)) result[alias] = { class: "stopped",
     reasons: ["active usage stop; no cached native window"], observedAt: null, remainingFraction: null, reserveWeeks: 0,
     observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null };
   return result;

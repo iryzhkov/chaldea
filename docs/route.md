@@ -29,13 +29,14 @@ effort. With no eligible candidate it returns an error, including for a review
 whose required other provider is unavailable.
 
 Results include `alternatives`, human-readable `reasons` and `dataAges`.
-Ages are seconds, or null for unknown/future timestamps. Codex with no native
-window is unknown, even if its wallet reports an unlimited balance.
+Ages are seconds, or null for unknown/future timestamps. Fresh Codex credits classify as unlimited even with no native window; credits
+near expiry classify as use-it. Identified results also include accountKey.
+See [fleet quota accounts](quota-fleet.md) for account binding and shared snapshots.
 
 ## Capacity and preference
 
 `chaldea quota status --json` includes a `capacity` object keyed by provider
-instance ID. Human status prints the class, reasons and burn target. Both use
+and account hash when identified, or by instance ID for legacy local records. Human status prints the class, reasons and burn target. Both use
 the pure classifier in `src/quota/capacity.ts`. Routing consumes the same
 classifier, supplementing observer windows with opt-in Claude usage or the
 operator weekly estimate.
@@ -73,12 +74,10 @@ redemption to that deadline, without the Codex minimum lead. Claude refill count
 defaults to zero. Missing or zero burn means no projected exhaustion, so reset
 and refill inventories add no timed value.
 
-Aggregate Codex credits count when fresh and unexpired. Credit units and quota
-percentages are different quantities. Configure `creditsPerFullWeek` to convert
-the observed balance to full-week equivalents; without it the classifier
-reports the missing conversion. No conversion or unlimited capacity is inferred
-from a positive balance alone. Reserve amounts are estimates, and existing
-shorter native windows still gate low quota unless usable reserves exist.
+Fresh, positive, unexpired Codex credits count as unlimited with no reserve
+floor or required creditsPerFullWeek conversion. Credits nearing expiry count
+as use-it. Zero, stale and expired balances do not add capacity. Short native
+windows do not exclude a Codex account with usable credits; an active stop does.
 
 Chaldea never spends credits, purchases capacity, redeems resets, refreshes
 credentials, or calls any purchase, reset-redemption or refresh method.
@@ -106,7 +105,7 @@ from the observer's `quota.json`. Use `--config PATH` for CLI or
 }
 ```
 
-Optional absolute paths are `stateFile`, `cacheDir`, `t3BaseDir`, `tokenFile`,
+Optional absolute paths are `stateFile`, `cacheDir`, `t3BaseDir`, `tokenFile`, `quotaConfigFile`,
 `capacityConfigFile` and `claudeUsage.credentialFile`. Defaults use the normal
 Chaldea observer state, local T3, the shared observer token at
 `~/.config/chaldea/t3-token`, and `~/.cache/chaldea/route/`. That token may include
@@ -172,7 +171,9 @@ The reader accepts only a regular, bounded file, refuses symlinks and expired
 tokens, and never refreshes or writes credentials. Requests use the OAuth bearer
 and `anthropic-beta: oauth-2025-04-20`, a fixed HTTPS origin, no redirects, a
 five-second timeout and a 64 KiB response cap. Failure text is sanitized.
-Only 5-hour and 7-day utilization/deadlines are cached, with mode 0600.
+Only 5-hour and 7-day utilization/deadlines and a hashed account identity are
+cached, with mode 0600. A GET of the OAuth profile endpoint supplies identity
+when the usage response omits it.
 A persistent reservation plus cross-process lock limits attempts, including
 failures, to once per five minutes. Collector off means no credential read.
 An old lock can be cleared after its cadence; lock contention skips collection.
@@ -209,8 +210,10 @@ existing MCP server against disposable pinned T3 with fake providers.
 
 This repository ships no Chaldea SKILL.md. Follow-ups belong in fleet-config:
 
-- Render route.json and capacity.json, including any measured credit conversion.
-- Enable the opt-in Claude collector only on omarchy-pc after account binding is verified.
+- Render route.json, quota.json contexts per host/account, and capacity.json.
+- Enable approved Claude collectors on any host with the matching login.
+- Register quota sources and R7 helper grants on Akasha before enabling shared publishing.
+  See [fleet activation requirements](quota-fleet.md#activation-follow-ups).
 - Add "call chaldea_route before delegate_task, then delegate natively" to the
   distributed CLAUDE.md and Chaldea skill.
 - Distribute a validated client release and verify hosts manually. This PR does

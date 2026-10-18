@@ -4,6 +4,7 @@ export type Effort = "low" | "medium" | "high" | "xhigh";
 export interface RouteInput { role: Role; authorProvider?: Provider; effortOverride?: Effort }
 export interface CatalogProvider {
   providerInstanceId: string;
+  accountKey?: string;
   driverKind: string;
   canRunChildTask: boolean;
   models: ReadonlyArray<{ id: string; options?: ReadonlyArray<{
@@ -26,7 +27,7 @@ export interface Analytics {
   endExclusive: string;
   models: Record<string, ModelStats>;
 }
-export interface Target { providerInstanceId: string; model: string; options: Record<string, Effort> }
+export interface Target { accountKey?: string; providerInstanceId: string; model: string; options: Record<string, Effort> }
 export interface RouteResult extends Target {
   alternatives: Target[];
   reasons: string[];

@@ -129,7 +129,7 @@ export interface SwitchProvider {
   readonly runtimeHome?: string;
   /** Any instance environment override needs a future explicit context adapter. */
   readonly quotaContextBlocked?: boolean;
-  /** Private comparison only: never included in status, state or feed payloads. */
+  /** Nonsecret account hash, public in capacity and routing per the 2026-10-18 decision. */
   readonly quotaAccountKey?: string;
   readonly headroom?: ReturnType<typeof import("../quota/headroom.ts").routingLanes>;
   readonly usageLimits?: {

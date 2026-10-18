@@ -1,6 +1,8 @@
 // Read-only Codex app-server client. Never starts a model thread or accepts arbitrary RPCs.
 import { spawn } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
+import { homedir } from "node:os";
+import { claudeContexts, fleetConfig, type ClaudeContext, type FleetConfig } from "./fleet.ts";
 import { quotaConfig } from "../config/quota.ts";
 
 export interface CodexContext {
@@ -9,22 +11,25 @@ export interface CodexContext {
   readonly codexHome: string;
   readonly command: string;
   readonly assertRuntimeHome?: boolean;
+  readonly accountKey?: string;
 }
 export interface HeadroomConfig {
   readonly contexts: ReadonlyArray<CodexContext>;
   readonly lowHeadroomPercent: number;
+  readonly claudeContexts?: ReadonlyArray<ClaudeContext>;
+  readonly fleet?: FleetConfig;
 }
-export function headroomConfig(raw: unknown = {}): HeadroomConfig {
+export function headroomConfig(raw: unknown = {}, home = homedir()): HeadroomConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid quota reporting config");
   const c = raw as Record<string, unknown>;
-  if (Object.keys(c).some(k => !["contexts", "lowHeadroomPercent"].includes(k))) throw new Error("unknown quota reporting option");
+  if (Object.keys(c).some(k => !["contexts", "claudeContexts", "fleet", "lowHeadroomPercent"].includes(k))) throw new Error("unknown quota reporting option");
   const contexts = c.contexts ?? [];
   if (!Array.isArray(contexts) || contexts.length > 16) throw new Error("quota contexts must contain at most 16 entries");
   const seen = new Set<string>();
   const parsed = contexts.map((entry): CodexContext => {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("invalid quota credential context");
     const v = entry as Record<string, unknown>;
-    if (Object.keys(v).some(k => !["providers", "home", "codexHome", "command", "assertRuntimeHome"].includes(k))) throw new Error("unknown credential context option");
+    if (Object.keys(v).some(k => !["providers", "home", "codexHome", "command", "assertRuntimeHome", "accountKey"].includes(k))) throw new Error("unknown credential context option");
     if (!Array.isArray(v.providers) || v.providers.length === 0 || v.providers.length > 64 ||
         !v.providers.every(p => typeof p === "string" && /^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(p) && !seen.has(p))) {
       throw new Error("credential context needs unique provider aliases");
@@ -39,7 +44,8 @@ export function headroomConfig(raw: unknown = {}): HeadroomConfig {
     if (v.assertRuntimeHome !== undefined && typeof v.assertRuntimeHome !== "boolean") {
       throw new Error("assertRuntimeHome must be a boolean");
     }
-    return { assertRuntimeHome: v.assertRuntimeHome === true, providers: v.providers, home: resolve(v.home as string), codexHome: resolve(v.codexHome as string),
+    if (v.accountKey !== undefined && (typeof v.accountKey !== "string" || !/^[a-f0-9]{64}$/.test(v.accountKey))) throw new Error("invalid account key");
+    return { ...(v.accountKey ? { accountKey: v.accountKey as string } : {}), assertRuntimeHome: v.assertRuntimeHome === true, providers: v.providers, home: resolve(v.home as string), codexHome: resolve(v.codexHome as string),
       command: v.command as string | undefined ?? "codex" };
   });
   const low = c.lowHeadroomPercent ?? 10;
@@ -47,15 +53,18 @@ export function headroomConfig(raw: unknown = {}): HeadroomConfig {
   // The same effective context has one collector even when listed in several entries.
   const grouped = new Map<string, CodexContext>();
   for (const ctx of parsed) {
-    const key = JSON.stringify([contextKey(ctx), ctx.assertRuntimeHome]), previous = grouped.get(key);
+    const key = JSON.stringify([contextKey(ctx), ctx.assertRuntimeHome, ctx.accountKey]), previous = grouped.get(key);
     grouped.set(key, { ...ctx, providers: [...(previous?.providers ?? []), ...ctx.providers] });
   }
-  return { contexts: [...grouped.values()], lowHeadroomPercent: low };
+  const claude = claudeContexts(c.claudeContexts);
+  if (claude.some(ctx => seen.has(ctx.providerInstanceId))) throw new Error("duplicate provider alias");
+  return { contexts: [...grouped.values()], lowHeadroomPercent: low, claudeContexts: claude,
+    fleet: fleetConfig(c.fleet, home) };
 }
 /** Missing default config leaves balance unknown; explicit paths and malformed files fail closed. */
 export function loadHeadroomConfig(home: string, path?: string): HeadroomConfig {
   const c = quotaConfig(home, path);
-  return headroomConfig({ contexts: c.contexts, lowHeadroomPercent: c.lowHeadroomPercent });
+  return headroomConfig({ contexts: c.contexts, claudeContexts: c.claudeContexts, fleet: c.fleet, lowHeadroomPercent: c.lowHeadroomPercent }, home);
 }
 export const contextKey = (c: CodexContext): string => JSON.stringify([c.home, c.codexHome, c.command]);
 
@@ -102,6 +111,7 @@ export function readCodexBalance(context: CodexContext, signal: AbortSignal, tim
     child.once("error", () => { failure = new BalanceReadError("spawn_failed"); finish(); });
     child.once("close", finish);
     let initialized = false;
+    let account: unknown;
     child.stdout.on("data", (chunk: Buffer) => {
       if (stopping) return;
       bytes += chunk.length;
@@ -113,17 +123,28 @@ export function readCodexBalance(context: CodexContext, signal: AbortSignal, tim
         let message: any;
         try { message = JSON.parse(line); } catch { stop(new BalanceReadError("protocol")); break; }
         if (!message || typeof message !== "object") { stop(new BalanceReadError("protocol")); break; }
-        if (message.id !== 1 && message.id !== 2) continue; // unsolicited notifications are not full observations
+        if (message.id !== 1 && message.id !== 2 && message.id !== 3) continue; // unsolicited notifications are not full observations
+        if (message.error && message.id === 3 && initialized) {
+          account = undefined;
+          send({ id: 2, method: "account/rateLimits/read",
+            params: { excludeResetCreditDetails: true, supportsLunaReserve: false } });
+          continue;
+        }
         if (message.error) {
           stop(new BalanceReadError(message.error.code === 429 ? "rate_limited" : "protocol")); break;
         }
         if (message.id === 1 && !initialized && Object.hasOwn(message, "result")) {
           initialized = true;
           send({ method: "initialized" });
+          send({ id: 3, method: "account/read", params: { refreshToken: false } });
+        } else if (message.id === 3 && initialized && Object.hasOwn(message, "result")) {
+          account = message.result?.account;
           send({ id: 2, method: "account/rateLimits/read",
             params: { excludeResetCreditDetails: true, supportsLunaReserve: false } });
         } else if (message.id === 2 && initialized && Object.hasOwn(message, "result")) {
-          result = message.result; received = true; stop();
+          const a = account as Record<string, unknown> | null;
+          result = { ...message.result, accountId: message.result?.accountId ?? a?.accountId ?? a?.id };
+          received = true; stop();
         }
       }
     });

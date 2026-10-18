@@ -19,6 +19,9 @@ input.on("line", line => {
     send({ id: m.id, result: {} });
   } else if (m.method === "initialized") {
     // notification, no reply
+  } else if (m.method === "account/read") {
+    if (scenario.mode === "account-error") send({ id: m.id, error: { code: -32601, message: "unsupported" } });
+    else send({ id: m.id, result: { account: scenario.account ?? { type: "chatgpt", email: "PRIVATE_EMAIL", planType: "pro" } } });
   } else if (m.method === "account/rateLimits/read") {
     if (scenario.mode === "hang") return;
     if (scenario.mode === "overflow") { process.stdout.write("x".repeat(1024 * 1024 + 1)); return; }
