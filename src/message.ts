@@ -13,9 +13,9 @@ import { MessageStore, WINDOW, type Receipt } from "./message-store.ts";
 
 export const PROTOCOL="chaldea-message-v1";
 export function requireMessage(ok:unknown,code:string):asserts ok { if(!ok)throw new Error(code); }
-export function object(v:unknown,keys:string[]):Record<string,unknown> {
+export function object(v:unknown,keys?:string[]):Record<string,unknown> {
   requireMessage(v && typeof v==="object" && !Array.isArray(v),"message_schema");
-  onlyKeys(v as Record<string,unknown>,keys); return v as Record<string,unknown>;
+  if(keys)onlyKeys(v as Record<string,unknown>,keys); return v as Record<string,unknown>;
 }
 export function field(v:unknown,max=512):string {
   requireMessage(typeof v==="string" && v.length>0 && Buffer.byteLength(v)<=max && !v.includes("\0") && v.isWellFormed(),"message_string");return v;
@@ -64,7 +64,7 @@ export interface SenderConfig {callerId:string;sourceHost:string;database:string
 export const senderConfigPath=()=>join(homedir(),".config/chaldea/message.json");
 export function senderConfig(file=senderConfigPath()):SenderConfig {
   const c=object(readJson(file,false,undefined,{owners:[0],maxBytes:65536}),["callerId","sourceHost","database","hosts"]);
-  const hosts=object(c.hosts,Object.keys(object(c.hosts,Object.keys(c.hosts as object??{}))));
+  const hosts=object(c.hosts);
   requireMessage(Object.keys(hosts).length<=8,"message_routes");
   const routes:Record<string,Route>=Object.create(null);
   for(const [alias,value] of Object.entries(hosts)){

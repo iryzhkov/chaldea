@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createServer, createConnection, type AddressInfo } from "node:net";
@@ -113,6 +113,14 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     assert.equal(p.messages.filter(m=>m.id===identity("fixture","source",r).messageId).length,1);
     assert.deepEqual(p.thread.modelSelection,before.thread.modelSelection);assert.equal(existsSync(join(state,"injected")),false);
     t.diagnostic("actual SSH send, lost-response identical replay and unchanged model passed");
+    const conflict=await ssh(["chaldea-message-v1"],[],JSON.stringify({...r,text:"changed"}));
+    assert.equal(conflict.code,0,conflict.err);assert.equal(JSON.parse(conflict.out).state,"conflict");
+    for(const invalid of [{...statusFor(r),host:"other"},{...statusFor(r),environment:"other"},{...statusFor(r),threadId:"unlisted"},
+      {...r,caller:"other"},{...r,extra:true}])assert.notEqual((await ssh(["chaldea-message-v1"],[],JSON.stringify(invalid))).code,0);
+    const older={...r,requestId:(Date.now()-60_000)+":older",text:"out of order distinct request"};
+    const outOfOrder=await ssh(["chaldea-message-v1"],[],JSON.stringify(older));
+    assert.equal(outOfOrder.code,0,outOfOrder.err);assert.equal(JSON.parse(outOfOrder.out).state,"accepted");
+    function statusFor(r:ReturnType<typeof request>){const {text,...s}=r;return {...s,op:"status"};}
     const marker=join(state,"environment-injected"),shell=join(root,"hostile.sh"),source=join(root,"hostile.c"),library=join(root,"hostile.so");
     writeFileSync(shell,"touch "+marker+"\n");
     writeFileSync(source,'#include <stdio.h>\n__attribute__((constructor)) static void injected(void){FILE *f=fopen('+JSON.stringify(marker)+',"w");if(f)fclose(f);}\n');
@@ -160,7 +168,11 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     assert.notEqual((await ssh(["chaldea-message-v1"],["-b","127.0.0.2"],JSON.stringify(status))).code,0);
     writeFileSync(config,JSON.stringify({...c,callers:{}}),{mode:0o644});
     assert.notEqual((await ssh(["chaldea-message-v1"],[],JSON.stringify(status))).code,0,"revoked ACL checked on replay");
-    t.diagnostic("shell/original command/subsystem/PTY/TCP/StreamLocal/tunnel/source/env/ACL gates passed; agent/X11 effective policy asserted");
+    writeFileSync(config,JSON.stringify(c),{mode:0o644});
+    unlinkSync(c.database);
+    const lostState=await ssh(["chaldea-message-v1"],[],JSON.stringify({...r,text:"changed after DB loss"}));
+    assert.notEqual(lostState.code,0);assert.equal(existsSync(c.database),false,"missing receipt DB never recreates itself");
+    t.diagnostic("shell/original command/subsystem/PTY/TCP/StreamLocal/tunnel/agent/X11/source/env/ACL/lost-DB gates passed");
   }finally{
     for(const client of cleanupClients)client.kill("SIGKILL");
     if(daemon?.pid){daemon.kill("SIGTERM");await new Promise<void>(r=>daemon!.once("close",()=>r()));}

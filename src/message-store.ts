@@ -22,7 +22,8 @@ export class MessageStore {
     try {
       if(initialize)this.db.exec("PRAGMA page_size=4096");
       check(Number(this.db.prepare("PRAGMA page_size").get()!.page_size)===4096,"message_page_size");
-      this.db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=0; PRAGMA max_page_count=4096;");
+      this.db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=0;");
+      check(Number(this.db.prepare("PRAGMA max_page_count=4096").get()!.max_page_count)<=4096,"message_state_capacity");
       if (initialize) tx(this.db, () => {
         this.db.exec(`CREATE TABLE meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE receipts(id TEXT PRIMARY KEY,caller TEXT NOT NULL,hash TEXT NOT NULL,
@@ -83,7 +84,7 @@ export class MessageStore {
   }
   finish(id:string,receipt:Receipt):void {
     tx(this.db,()=>{
-      this.db.prepare("UPDATE receipts SET state=?,result=?,payload=CASE WHEN ? IN ('accepted','rejected') THEN NULL ELSE payload END WHERE id=?")
+      this.db.prepare("UPDATE receipts SET state=?,result=?,payload=CASE WHEN ? IN ('accepted','rejected','conflict') THEN NULL ELSE payload END WHERE id=?")
         .run(receipt.state,JSON.stringify(receipt),receipt.state,id);
     });
   }

@@ -16,7 +16,7 @@ export function receiverConfig(file:string):ReceiverConfig {
   const url=new URL(field(c.loopbackT3Url));
   requireMessage(url.protocol==="http:" && ["127.0.0.1","[::1]"].includes(url.hostname) &&
     !url.username && !url.password && url.pathname==="/" && !url.search && !url.hash,"message_t3_url");
-  const callers=object(c.callers,Object.keys(c.callers as object??{}));
+  const callers=object(c.callers);
   requireMessage(Object.keys(callers).length<=8,"message_callers");
   const entries:Record<string,Caller>=Object.create(null);
   for(const [id,value] of Object.entries(callers)){
