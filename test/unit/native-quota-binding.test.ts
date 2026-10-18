@@ -124,7 +124,9 @@ test("configured Claude binding rejects a different native account before HTTP o
       accountKey: other, credentialFile: "/unused" }] }),
     claudeRead: async () => { throw new Error("binding mismatch must not read credentials"); } });
   try {
-    m.update([provider()]); await m.tick();
+    m.update([provider()]);
+    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), now).accounts.length, 0);
+    await m.tick();
     assert.equal(m.state.providers[0]?.included.error, "context_mismatch");
     assert.equal(m.state.providers[0]?.accountKey, undefined);
     assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), now).accounts.length, 0);
@@ -145,5 +147,44 @@ test("a native refresh during a pending HTTP read keeps the current account auth
     assert.equal(m.state.providers[0]?.accountKey, other);
     assert.equal(m.state.providers[0]?.included.source, "t3");
     assert.equal(m.state.providers[0]?.included.error, null);
+  } finally { await m.close(); }
+});
+
+for (const configured of [false, true]) test(`unbound native updates never inherit HTTP identity, configured=${configured}`, async () => {
+  let clock = now;
+  const http = { accountKey: other, observedAt: iso(now - 1000), windows: [
+    { kind: "weekly" as const, remainingPercent: 80, windowDurationMins: 10080, resetsAt: iso(now + 4 * 86400000) }] };
+  let reply: Awaited<ReturnType<typeof collectClaudeUsage>> = { value: http, fetchedAt: http.observedAt, reason: null };
+  const m = new HeadroomMonitor({ state: emptyHeadroom(), local: true, now: () => clock, save() {},
+    config: headroomConfig({ claudeContexts: [{ enabled: true, providerInstanceId: alias,
+      credentialFile: "/unused", ...(configured ? { accountKey: other } : {}) }] }),
+    claudeRead: async () => reply });
+  const row = () => m.state.providers[0]!;
+  const native = () => ({ ...provider(null), usageLimits: { ...provider().usageLimits!, checkedAt: iso(clock) } });
+  try {
+    m.update([{ ...provider(null), usageLimits: { checkedAt: iso(clock), windows: [], unavailable: { reason: "unsupported" } } }]);
+    await m.tick();
+    assert.equal(row().accountKey, other); assert.equal(row().included.source, "claude-usage");
+    reply = { value: null, fetchedAt: null, reason: "rate_limited; no successful cache" };
+    clock++;
+    m.update([native()]);
+    assert.equal(row().accountKey, undefined, "unbound native data must lose the prior HTTP key before async collection");
+    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), clock).accounts.length, 0);
+    await m.tick();
+    assert.equal(row().included.source, "t3"); assert.equal(row().included.observedAt, iso(clock));
+    assert.equal(row().included.error, null); assert.equal(row().manualResets.value, null);
+    reply = { value: { observedAt: iso(clock), windows: http.windows }, fetchedAt: iso(clock), reason: null };
+    await m.tick();
+    assert.notEqual(row().included.error, "context_mismatch", "missing HTTP identity is unknown, not a conflicting account");
+    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), clock).accounts.length, 0);
+    reply = { value: http, fetchedAt: http.observedAt, reason: null };
+    for (let repeat = 0; repeat < 2; repeat++) {
+      clock++; m.update([native()]);
+      assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), clock).accounts.length, 0);
+      await m.tick();
+      assert.equal(row().accountKey, other); assert.equal(row().included.source, "claude-usage");
+      assert.equal(row().included.value?.[0]?.usedPercent, 20);
+      assert.equal(row().included.observedAt, http.observedAt); assert.equal(row().manualResets.value, null);
+    }
   } finally { await m.close(); }
 });

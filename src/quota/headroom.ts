@@ -279,13 +279,23 @@ export class HeadroomMonitor {
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;
-        if (p.driver === "claudeAgent" && (p.quotaAccountKey || next.included.source === "t3" || next.manualResets.source === "t3-internal-claude-reset-read")) {
+        if (p.driver === "claudeAgent") {
           // Native windows/reset inventory belong to this instance's account only.
           next.included = clean.included; next.manualResets = clean.manualResets;
         }
       }
+      const expected = this.options.config.claudeContexts?.find(ctx => ctx.providerInstanceId === p.instanceId)?.accountKey;
+      if (p.driver === "claudeAgent" && expected && p.quotaAccountKey && expected !== p.quotaAccountKey) {
+        delete next.accountKey; next.included = unknown("t3", "error", "context_mismatch");
+        next.manualResets = newProvider(p.instanceId, p.driver).manualResets;
+        return next;
+      }
       if (p.driver === "claudeAgent" && p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
       applyT3(next, p);
+      if (p.driver === "claudeAgent" && !p.quotaAccountKey) {
+        if (next.included.source === "t3") delete next.accountKey;
+        next.manualResets = newProvider(p.instanceId, p.driver).manualResets;
+      }
       return next;
     });
     for (const ctx of this.options.config.claudeContexts ?? []) {
@@ -381,6 +391,7 @@ export class HeadroomMonitor {
         cacheFile: claudeCacheFile(homedir(), claudeSourceId(ctx)),
         now: this.now() });
       if (rejectNativeMismatch() || freshNative()) continue; // Native auth may have changed during HTTP.
+      if (usage.value && !usage.value.accountKey && (ctx.accountKey || nativeKey())) continue;
       const error = usage.reason;
       if ((!row.included.value || row.included.source !== "t3") && row.included.error !== error) {
         row.included = { ...row.included, source: "claude-usage", error,
@@ -395,7 +406,7 @@ export class HeadroomMonitor {
         continue;
       }
       const u = usage.value;
-      if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt)) {
+      if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt) || row.included.source === "t3" && !nativeKey()) {
         retainBurnSample(row, u.observedAt);
         row.included = { ...observed(u.windows.map(w => ({ ...w, id: w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt), error };
         if (u.accountKey) row.accountKey = u.accountKey; else delete row.accountKey;
