@@ -1,5 +1,6 @@
 import { join } from "node:path";
-import { hostname } from "node:os";
+import { hostname, homedir } from "node:os";
+import { tokenSource, type ClaudeTokenSource } from "../route/claude-usage.ts";
 import { capacityKey } from "./account.ts";
 import { newProvider, STALE_AFTER_MS } from "./headroom.ts";
 import type { ProviderHeadroom } from "./headroom.ts";
@@ -13,7 +14,7 @@ import type { PublisherOptions } from "../events/publisher.ts";
 
 export const FLEET_BUCKET_MS = 15 * 60000;
 export interface FleetConfig { enabled: boolean; url: string; tokenHelper: string; host: string; cacheFile: string }
-export interface ClaudeContext { providerInstanceId: string; credentialFile: string; enabled: boolean; accountKey?: string }
+export interface ClaudeContext extends ClaudeTokenSource { providerInstanceId: string; enabled: boolean; accountKey?: string }
 const key = (v: unknown): v is string => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
 const obj = (v: unknown): Record<string, any> => {
   if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("invalid_capacity_snapshot");
@@ -41,12 +42,12 @@ export function claudeContexts(raw: unknown): ClaudeContext[] {
   const seen = new Set<string>();
   return raw.map(value => {
     const v = obj(value);
-    fields(v, ["providerInstanceId", "credentialFile", "enabled", "accountKey"]);
+    fields(v, ["providerInstanceId", "credentialFile", "envFile", "envVar", "enabled", "accountKey"]);
     if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(v.providerInstanceId) || seen.has(v.providerInstanceId) ||
-        typeof v.credentialFile !== "string" || !v.credentialFile.startsWith("/") ||
+        v.credentialFile === undefined && v.envFile === undefined && v.envVar === undefined ||
         typeof v.enabled !== "boolean" || v.accountKey !== undefined && !key(v.accountKey)) throw new Error("invalid_claude_context");
     seen.add(v.providerInstanceId);
-    return v as unknown as ClaudeContext;
+    return { ...v, ...tokenSource(v, homedir()) } as ClaudeContext;
   });
 }
 export function capacitySnapshot(host: string, providers: readonly ProviderHeadroom[], stops: ReadonlySet<string>, now: number): CapacitySnapshot {

@@ -5,13 +5,14 @@ import type { ScoreTransport } from "./snapshot.ts";
 import { join } from "node:path";
 import { DEFAULT_POLICY } from "./types.ts";
 import type { PolicyConfig, QuotaWindow } from "./types.ts";
+import { tokenSource, type ClaudeTokenSource } from "./claude-usage.ts";
 import { readJson } from "./cache.ts";
 
 export interface RouteConfig extends PolicyConfig {
   scores: ScoreTransport;
   announceHost: string; routeStateFile: string;
   stateFile: string; cacheDir: string; t3BaseDir: string; tokenFile: string; capacityConfigFile: string; quotaConfigFile: string | undefined;
-  claudeUsage: { enabled: boolean; providerInstanceId: string; credentialFile: string };
+  claudeUsage: ClaudeTokenSource & { enabled: boolean; providerInstanceId: string };
   claudeWeeklyTarget: { observedAt: string; window: QuotaWindow } | null;
 }
 export function loadRouteConfig(home: string, path = join(home, ".config/chaldea/route.json")): RouteConfig {
@@ -86,11 +87,12 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
   }
   if (r.claudeUsage !== undefined) {
     const v = r.claudeUsage as Record<string, unknown>;
-    if (!v || typeof v !== "object" || Array.isArray(v) || Object.keys(v).some(k => !["enabled", "providerInstanceId", "credentialFile"].includes(k)) ||
+    if (!v || typeof v !== "object" || Array.isArray(v) || Object.keys(v).some(k => !["enabled", "providerInstanceId", "credentialFile", "envFile", "envVar"].includes(k)) ||
       v.enabled !== undefined && typeof v.enabled !== "boolean" ||
       v.providerInstanceId !== undefined && (typeof v.providerInstanceId !== "string" || !v.providerInstanceId.length) ||
       v.credentialFile !== undefined && (typeof v.credentialFile !== "string" || !v.credentialFile.startsWith("/"))) throw new Error("Invalid Claude collector configuration");
-    c.claudeUsage = { ...c.claudeUsage, ...v } as RouteConfig["claudeUsage"];
+    c.claudeUsage = { enabled: c.claudeUsage.enabled, providerInstanceId: c.claudeUsage.providerInstanceId, ...v,
+      ...tokenSource(v as ClaudeTokenSource, home) } as RouteConfig["claudeUsage"];
   }
   if (r.claudeWeeklyTarget !== undefined && r.claudeWeeklyTarget !== null) {
     const v = r.claudeWeeklyTarget as Record<string, unknown>;

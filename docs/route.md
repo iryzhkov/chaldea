@@ -181,8 +181,32 @@ Its real age appears in the output. Without it, Claude pacing stays unknown.
 
 T3 0.1.0 marks Claude windows unsupported. Opt in with
 `claudeUsage.enabled: true` on the host whose local Claude credential belongs
-to the configured instance. The collector reads
-`~/.claude/.credentials.json` read-only and sends one GET to
+to the configured instance. Select exactly one token source: `credentialFile`
+defaults to `~/.claude/.credentials.json`; or set `envFile` plus optional
+`envVar`, defaulting to `~/.config/claude/oauth.env` and
+`CLAUDE_CODE_OAUTH_TOKEN`. Paths in configuration must be absolute. For example:
+
+```json
+{
+  "claudeUsage": {
+    "enabled": true,
+    "providerInstanceId": "claudeAgent",
+    "envFile": "/home/igor/.config/claude/oauth.env",
+    "envVar": "CLAUDE_CODE_OAUTH_TOKEN"
+  }
+}
+```
+
+The same source fields are accepted on quota.json `claudeContexts`. JSON and
+env-file sources are mutually exclusive; there is no implicit fallback to another
+login. The env reader requires an owner-owned regular 0600 file, bounded at 64 KiB,
+with exactly one assignment to the selected variable. Bare, single-quoted and
+double-quoted values and optional `export` are accepted. It extracts that value
+only, ignores other variables, performs no shell expansion and never populates
+the process environment. Tokens containing expansion syntax or unmatched quotes
+are rejected. Cache keys include the source path and selected variable.
+
+The collector reads the selected source read-only and sends one GET to
 `https://api.anthropic.com/api/oauth/usage`, the endpoint used by Claude usage
 monitoring. This is an undocumented OAuth endpoint; authentication or schema
 changes degrade to cached data or the operator target.
@@ -195,7 +219,18 @@ Only 5-hour and 7-day utilization/deadlines and a hashed account identity are
 cached, with mode 0600. A GET of the OAuth profile endpoint supplies identity
 when the usage response omits it.
 A persistent reservation plus cross-process lock limits attempts, including
-failures, to once per five minutes. Collector off means no credential read.
+failures, to once per five minutes. HTTP 429 records `rate_limited` and honors
+`Retry-After` seconds or HTTP date, with the five-minute minimum cadence still
+applying. Without a valid header, consecutive 429s back off for 5, 10, 20, 40
+then 60 minutes, capped at an hour; success resets the backoff. JSON expiry at
+zero or in the past records `credential_expired` without an HTTP request.
+A 401 records `unauthorized`. Other credential failures record
+`credential_unavailable`; other collection failures use `collection_failed`.
+The mode-0600 cache records `attemptedAt`, `failureReason`, `failureCount` and
+`retryAt`, keeping the last good value and original `fetchedAt`. Route reasons
+show the failure and cached age; quota status retains the sanitized diagnostic
+on the included metric for the board. No raw response/error or credential field
+is persisted. Collector off means no credential read.
 An old lock can be cleared after its cadence; lock contention skips collection.
 
 ## Slopalytics
@@ -461,7 +496,9 @@ existing MCP server against disposable pinned T3 with fake providers.
 This repository ships no Chaldea SKILL.md. Follow-ups belong in fleet-config:
 
 - Render route.json, quota.json contexts per host/account, and capacity.json.
-- Enable approved Claude collectors on any host with the matching login.
+- Render `envFile: /home/igor/.config/claude/oauth.env` for omarchy-pc in both
+  route `claudeUsage` and quota `claudeContexts`, after this client is available;
+  keep laptop on its current JSON credential source. Enable only matching logins.
 - Register quota sources and R7 helper grants on Akasha before enabling shared publishing.
   See [fleet activation requirements](quota-fleet.md#activation-follow-ups).
 - Add "call chaldea_route before delegate_task, then delegate natively" to the

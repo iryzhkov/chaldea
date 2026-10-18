@@ -114,10 +114,21 @@ test("Claude on any host GETs usage and profile, hashes org ID, never writes or 
     assert.equal(readFileSync(credentialFile, "utf8"), credential); assert.equal(statSync(credentialFile).mtimeMs, before);
     assert.doesNotMatch(readFileSync(cacheFile, "utf8"), /fixture-secret|fixture-refresh|fixture-org|private@/);
     const state = emptyHeadroom();
+    let next: Awaited<ReturnType<typeof collectClaudeUsage>> = result;
     const monitor = new HeadroomMonitor({ state, local: true, now: () => now, save() {},
       config: headroomConfig({ claudeContexts: [{ enabled: true, credentialFile, providerInstanceId: "claude2" }] }),
-      claudeRead: async () => result });
-    try { monitor.update([]); await monitor.tick(); assert.equal(state.providers[0]?.accountKey, accountKey("fixture-org")); }
+      claudeRead: async () => next });
+    try {
+      monitor.update([]); await monitor.tick(); assert.equal(state.providers[0]?.accountKey, accountKey("fixture-org"));
+      next = { ...result, reason: "rate_limited; retained last successful cache, age 300s" };
+      await monitor.tick();
+      assert.match(state.providers[0]!.included.error!, /rate_limited/);
+      assert.equal(state.providers[0]!.included.observedAt, result.value!.observedAt);
+      next = { value: null, fetchedAt: null, reason: "credential_expired; no successful cache" };
+      await monitor.tick();
+      assert.match(state.providers[0]!.included.error!, /credential_expired/);
+      assert.equal(state.providers[0]!.included.observedAt, result.value!.observedAt);
+    }
     finally { await monitor.close(); }
   } finally { d.remove(); }
 });

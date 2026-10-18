@@ -41,7 +41,7 @@ test("operator weekly fallback lasts until reset, collector failures degrade wit
     assert.match(r.reasons.join(" "), /operator-set weekly target/);
     assert.match(r.reasons.join(" "), /under-paced/);
     assert.equal(r.dataAges.quota.claudeAgent, 86400);
-    assert.match(r.reasons.join(" "), /collection failed/);
+    assert.match(r.reasons.join(" "), /credential_unavailable/);
   } finally { d.remove(); }
 });
 test("enabled collector skips credential access when its catalog binding is absent", async () => {

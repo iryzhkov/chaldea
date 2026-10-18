@@ -11,7 +11,7 @@ import { discoverServerUrl, switchPort } from "../t3/adapter.ts";
 import type { SwitchProvider } from "../t3/adapter.ts";
 import { readToken } from "../quota/run.ts";
 import { loadRouteConfig } from "./config.ts";
-import { collectClaudeUsage, claudeCacheFile } from "./claude-usage.ts";
+import { collectClaudeUsage, claudeCacheFile, claudeSourceId } from "./claude-usage.ts";
 import { collectAnalytics } from "./analytics.ts";
 import { collectScores } from "./snapshot.ts";
 import { RouteState } from "./state.ts";
@@ -65,7 +65,7 @@ export async function route(value: unknown, options: {
   }
   const id = config.claudeUsage.providerInstanceId;
   const claudeBound = catalog.some(p => p.providerInstanceId === id && p.driverKind === "claudeAgent" && p.canRunChildTask);
-  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: claudeCacheFile(options.home ?? homedir(), config.claudeUsage.credentialFile), now,
+  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: claudeCacheFile(options.home ?? homedir(), claudeSourceId(config.claudeUsage)), now,
     ...(options.fetcher ? { fetcher: options.fetcher } : {}) });
   if (usage.reason) reasons.push(!config.claudeUsage.enabled || claudeBound ? usage.reason : "Claude collector binding absent or unavailable; skipped");
   if (claudeBound) {
