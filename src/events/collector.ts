@@ -4,13 +4,16 @@ import { parseArgs } from "node:util";
 import { closeSync, openSync, readSync, fstatSync, lstatSync, unlinkSync, opendirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { hostname } from "node:os";
+import { readTrustedFile } from "../config/files.ts";
+import { strictJson } from "../access/token.ts";
+import { validateHostSnapshot,SNAPSHOT_BYTES } from "../mission-control/contract.ts";
 import { eventsConfig } from "../config/events.ts";
 import { createLogger } from "../config/log.ts";
 import { ConfigurationError } from "../config/files.ts";
 import { EXIT } from "../config/exit.ts";
 import { pathToFileURL } from "node:url";
 import { Outbox, type Cursor } from "./outbox.ts";
-import { publish, type Publication, type PublisherOptions } from "./publisher.ts";
+import { publish,publishStatus, type Publication, type PublisherOptions } from "./publisher.ts";
 const LINE_BYTES = 64 * 1024;
 const DAY = 86400_000;
 const sha = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
@@ -23,6 +26,7 @@ export interface CollectorOptions {
   now?: () => number; maxEvents?: number; maxAgeDays?: number;
   /** Only configured labels are retained. Raw filesystem paths are never uploaded. */
   roots?: Record<string, string>;
+  missionControlSnapshotFile?: string;
 }
 function safeString(value: unknown, max = 256): string {
   if (typeof value !== "string" || !value || value.length > max || /[\x00-\x1f]/.test(value)) throw new Error("invalid_field");
@@ -117,9 +121,43 @@ export function timerPublication(raw: Record<string, unknown>, host: string): Pu
       }),
       data: { job_id: job, invocation_id: invocation, status } } };
 }
+function statusCount(outbox:Outbox,name:string):void {
+  try{outbox.count(name);}catch{/* Optional counters cannot consume ordinary delivery capacity. */}
+}
+function statusStorageDeferred(outbox:Outbox):void {
+  statusCount(outbox,"status_storage_deferred");
+  try{createLogger().warn("mission control status persistence unavailable; ordinary delivery continues");}catch{}
+}
+/** One latest sample and one immutable uncertain attempt, never a second collector. */
+export async function collectStatus(options:CollectorOptions,deliver:(e:Publication)=>Promise<"visible"|"expired"|"deferred">,now:number):Promise<void> {
+  const outbox=options.outbox;let state:ReturnType<Outbox["statusState"]>;
+  try{state=outbox.statusState();}catch{statusStorageDeferred(outbox);return;}
+  try{
+    const snapshot=validateHostSnapshot(strictJson(readTrustedFile(options.missionControlSnapshotFile!,{maxBytes:SNAPSHOT_BYTES,secret:true})));
+    if(snapshot.host!==options.host||snapshot.observedAt>now||now-snapshot.observedAt>120_000)throw new Error("stale_status");
+    const seen=state.seen;
+    if(!seen||(snapshot.epoch===seen.epoch?snapshot.sequence>seen.sequence&&snapshot.observedAt>=seen.observedAt:snapshot.observedAt>seen.observedAt)){
+      state.latest={key:"mission-control:"+snapshot.epoch+":"+snapshot.sequence,source:options.host+".mission-control",host:options.host,
+        payload:{v:1,kind:"agent_status",source:options.host+".mission-control",host:options.host,project:"chaldea",occurred_at:new Date(snapshot.observedAt).toISOString(),title:"Mission control status",data:{snapshot}}};
+      state.seen={epoch:snapshot.epoch,sequence:snapshot.sequence,observedAt:snapshot.observedAt};
+    }
+  }catch{statusCount(outbox,"status_rejected");}
+  if(state.pending&&now>=state.until){state.pending=null;statusCount(outbox,"status_expired_gap");}
+  if(state.latest&&now-(state.latest.payload.data as {snapshot:{observedAt:number}}).snapshot.observedAt>120_000){state.latest=null;statusCount(outbox,"status_expired_gap");}
+  if(!state.pending&&state.latest&&now-state.admitted>=30_000){state.pending=state.latest;state.latest=null;state.until=now+120_000;state.admitted=now;}
+  // A failed admission never permits a new send. SQLite retains the previous frozen slot.
+  try{outbox.saveStatus(state);}catch{statusStorageDeferred(outbox);return;}
+  if(state.pending){
+    const outcome=await deliver(state.pending);
+    if(outcome!=="deferred")state.pending=null;
+    try{outbox.saveStatus(state);}catch{statusStorageDeferred(outbox);return;}
+    statusCount(outbox,outcome==="visible"?"status_delivered":outcome==="expired"?"status_expired_gap":"status_deferred");
+  }
+}
 export async function collect(options: CollectorOptions): Promise<void> {
   const { outbox } = options, now = (options.now ?? Date.now)();
   const deliver = options.deliver ?? ((e: Publication) => publish(e, options.publisher));
+  if (options.missionControlSnapshotFile) await collectStatus(options,options.deliver?async(e)=>await options.deliver!(e)?"visible":"deferred":(e)=>publishStatus(e,options.publisher),now);
   let budget = options.maxEvents ?? 100;
   async function drain(): Promise<boolean> {
     while (budget > 0) {
@@ -223,8 +261,9 @@ export async function collectorMain(args: string[]): Promise<void> {
   const outbox = new Outbox(config.stateFile);
   try {
     await collect({ outbox, host: hostname().split(".")[0]!, spool: config.spool,
+      ...(config.missionControlSnapshotFile ? {missionControlSnapshotFile:config.missionControlSnapshotFile} : {}),
       timers: config.timerSpool, maxAgeDays, publisher: values.url === undefined ? {} : { url: values.url } });
-    const counters = outbox.counters(), pending = outbox.next() !== null;
+    const counters = outbox.counters(), pending = outbox.next() !== null || !!config.missionControlSnapshotFile && outbox.statusState().pending !== null;
     console.log(JSON.stringify({ counters, pending }));
     // A caller must not mistake retained work for successful delivery.
     if (pending) process.exitCode = EXIT.failure;

@@ -19,6 +19,11 @@ export interface Receipt {
 export interface Pending { event_id: string; envelope: string; bytes: number; attempts: number }
 export interface Query { sql: string; params: SQLInputValue[] }
 export function scopeSql(scope: Scope, prefix = ""): Query {
+  if (scope.missionControlSources !== undefined) {
+    ensure(scope.source==="mission-control-reader"&&scope.profile==="mission-control-reader"&&scope.project==="chaldea"&&scope.host==="omarchy-normandy"&&scope.issuer==="chaldea:omarchy-normandy"&&!scope.global&&!scope.quotaFleet&&!scope.routeScores&&Array.isArray(scope.missionControlSources)&&scope.missionControlSources.length>0&&scope.missionControlSources.length<=4&&new Set(scope.missionControlSources).size===scope.missionControlSources.length&&scope.missionControlSources.every(s=>/^(agent-a|agent-b|omarchy-pc|laptop)--mission-control$/.test(s)), "invalid_mission_control_scope", 403);
+    return {sql: "json_extract("+prefix+"envelope,'$.source_id') IN ("+scope.missionControlSources.map(()=>"?").join(",")+") AND "+prefix+"kind=? AND "+prefix+"profile=? AND "+prefix+"project=? AND json_extract("+prefix+"envelope,'$.data.snapshot.schema')=?",
+      params:[...scope.missionControlSources,"agent_status","mission-control-publisher","chaldea","mission-control.host.v1"]};
+  }
   if (scope.routeScores && scope.source === "route") return {
     sql: prefix + "profile=? AND " + prefix + "project=? AND " + prefix + "source=? AND " + prefix + "host=? AND " + prefix + "kind=?",
     params: [scope.profile, scope.project, "route", "homelab", "route_score_snapshot"],
@@ -140,18 +145,31 @@ export class EventStore {
   receipt(id: string): Receipt | undefined { return this.db.prepare("SELECT * FROM receipts WHERE event_id=?").get(id) as unknown as Receipt | undefined; }
   ownedReceipt(id: string, scope: Scope): Receipt | undefined {
     // Receipts never have an operator listing/global override.
-    const q = scopeSql({ ...scope, global: false, quotaFleet: false, routeScores: false });
+    const { missionControlSources: _selector, ...ownScope } = scope;
+    const q = scopeSql({ ...ownScope, global: false, quotaFleet: false, routeScores: false });
     return this.db.prepare("SELECT * FROM receipts WHERE event_id=? AND " + q.sql).get(id, ...q.params) as unknown as Receipt | undefined;
   }
   admit(event: Envelope, requestHash: string, now: number, legacyId?: number, guard?: () => void): Receipt {
     const prior = this.receipt(event.event_id);
     if (prior) { ensure(prior.request_hash === requestHash, "idempotency_conflict", 409); return prior; }
-    const needsFeed = event.kind !== "tool_call";
+    const status = event.kind === "agent_status" && event.data.snapshot !== undefined;
+    const needsFeed = event.kind !== "tool_call" && !status;
     const estimate = Buffer.byteLength(canonical(event));
-    if ((this.scalar("PRAGMA page_count") - this.scalar("PRAGMA freelist_count")) * 4096 + estimate * 4 + 256 * 1024 >= this.budget.main * 0.85)
+    if (!status && (this.scalar("PRAGMA page_count") - this.scalar("PRAGMA freelist_count")) * 4096 + estimate * 4 + 256 * 1024 >= this.budget.main * 0.85)
       this.prune(now, 10);
     return this.transaction(() => {
       guard?.();
+      if (status) {
+        const observed = (event.data.snapshot as { observedAt:number }).observedAt;
+        ensure(Math.floor(observed/1000) <= now && now*1000-observed <= 120_000, "stale_host_snapshot", 409);
+        const priorAdmission=Number(this.get("mission-control-admitted:"+event.source_id)??"-30000");
+        ensure(now*1000-priorAdmission>=30_000, "host_snapshot_rate", 429);
+        const sample=event.data.snapshot as {epoch:string;sequence:number;observedAt:number},oldSample=this.get("mission-control-sample:"+event.source_id);
+        if(oldSample){const old=JSON.parse(oldSample) as typeof sample;ensure(sample.epoch===old.epoch?sample.sequence>old.sequence&&sample.observedAt>=old.observedAt:sample.observedAt>old.observedAt,"host_snapshot_order",409);}
+        this.statusCapacity(event,estimate);
+        this.put("mission-control-sample:"+event.source_id,JSON.stringify({epoch:sample.epoch,sequence:sample.sequence,observedAt:sample.observedAt}));
+        this.put("mission-control-admitted:"+event.source_id,String(now*1000));
+      }
       const id = needsFeed ? legacyId ?? Number(this.get("feed_next")) : null;
       ensure(id === null || (Number.isSafeInteger(id) && id > 0 && id < Number.MAX_SAFE_INTEGER), "feed_id_exhaustion", 503);
       if (legacyId !== undefined) ensure(legacyId < NEW_FEED_ID, "legacy_id_range", 409);
@@ -161,11 +179,17 @@ export class EventStore {
       ensure(bytes <= (event.kind === "feed_post" ? MAX_ENVELOPE : 64 * 1024), "event_too_large", 413);
       this.capacity(bytes, true);
       this.db.prepare("INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(event.event_id, requestHash, hash(event),
-        "pending", id, event.issuer, event.profile, event.project, event.source, event.host, now + 180 * DAY);
+        "pending", id, event.issuer, event.profile, event.project, event.source, event.host, now + (status ? DAY : 180 * DAY));
       this.outbox.enqueue(event.event_id, { event_id: event.event_id, envelope, bytes, attempts: 0 });
       if (id !== null && legacyId === undefined) this.put("feed_next", String(id + 1));
       guard?.(); return this.receipt(event.event_id)!;
     });
+  }
+  private statusCapacity(e:Envelope,bytes:number):void {
+    const usage=(source?:string)=>this.scalar("SELECT coalesce(sum(length(CAST(envelope AS BLOB))),0) FROM events WHERE kind='agent_status' AND json_extract(envelope,'$.data.snapshot.schema')='mission-control.host.v1'"+(source?" AND json_extract(envelope,'$.source_id')=?":""),...(source?[source]:[]))+
+      this.scalar("SELECT coalesce(sum(bytes),0) FROM outbox JOIN receipts USING(event_id) WHERE profile='mission-control-publisher' AND project='chaldea'"+(source?" AND source=?":""),...(source?[e.source]:[]))+
+      512*this.scalar("SELECT count(*) FROM receipts WHERE profile='mission-control-publisher' AND project='chaldea'"+(source?" AND source=?":""),...(source?[e.source]:[]));
+    ensure(usage(e.source_id)+bytes+512<=64*1024**2&&usage()+bytes+512<=128*1024**2,"host_status_capacity",503);
   }
   pending(now: number, limit = 100): Pending[] {
     return this.db.prepare("SELECT event_id,envelope,bytes,attempts FROM outbox WHERE next_try<=? ORDER BY rowid LIMIT ?").all(now, limit) as unknown as Pending[];
@@ -179,6 +203,9 @@ export class EventStore {
       let r = this.receipt(e.event_id);
       if (r) ensure(r.envelope_hash === envelopeHash, "broker_payload_conflict", 409);
       else {
+        // Broker retention exceeds compact receipt retention. Old status replay
+        // advances only the cursor; it must not reconstruct payload or receipt.
+        if (e.kind==="agent_status"&&e.data.snapshot!==undefined&&Math.floor(Date.parse(e.received_at)/1000)+DAY<=now){this.completeSequence(streamSeq);return;}
         // Restore replay can reconstruct a missing receipt from trusted, immutable provenance.
         const p = e.provenance;
         const feedId = p.type === "legacy-feed" ? p.legacy_id : p.feed_id;
@@ -189,17 +216,19 @@ export class EventStore {
         }
         this.db.prepare("INSERT INTO receipts VALUES(?,?,?,?,?,?,?,?,?,?,?)").run(e.event_id,
           p.request_hash, envelopeHash, "pending", feedId,
-          e.issuer, e.profile, e.project, e.source, e.host, Math.floor(Date.parse(e.received_at) / 1000) + 180 * DAY);
+          e.issuer, e.profile, e.project, e.source, e.host, Math.floor(Date.parse(e.received_at) / 1000) + (e.kind === "agent_status" && e.data.snapshot !== undefined ? DAY : 180 * DAY));
         if (feedId !== null && feedId >= Number(this.get("feed_next"))) this.put("feed_next", String(feedId + 1));
         r = this.receipt(e.event_id)!;
       }
       if (r.state === "pending") {
-        this.capacity(Buffer.byteLength(canonical(e)));
+        const status = e.kind === "agent_status" && e.data.snapshot !== undefined;
         const original = e.kind === "tool_call" || e.provenance.type === "legacy-feed" ? e.occurred_at : e.received_at;
         // Producer timestamps cannot extend retention beyond the original server admission.
         const expiryBase = Math.min(Math.floor(Date.parse(original) / 1000), Math.floor(Date.parse(e.received_at) / 1000));
-        const expiry = expiryBase + (e.kind === "tool_call" ? 90 : 180) * DAY;
+        const expiry = status ? Math.min(expiryBase,Math.floor((e.data.snapshot as {observedAt:number}).observedAt/1000))+3600 : expiryBase + (e.kind === "tool_call" ? 90 : 180) * DAY;
         if (expiry > now) {
+          this.capacity(Buffer.byteLength(canonical(e)));
+          if (status) this.statusCapacity(e,Buffer.byteLength(canonical(e)));
           this.db.prepare("INSERT OR IGNORE INTO events(event_id,envelope,issuer,profile,project,source,host,kind,received_at,occurred_at,expiry,session,tool,client) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .run(e.event_id, canonical(e), e.issuer, e.profile, e.project, e.source, e.host, e.kind,
               e.received_at, e.occurred_at, expiry, String(e.data.session ?? ""), String(e.data.tool ?? ""), String(e.data.client ?? ""));

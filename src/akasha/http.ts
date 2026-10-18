@@ -78,6 +78,7 @@ export function httpServer(ingress: Ingress) {
         try { p = await ingress.auth.authorize(token, action); }
         catch (e) { if (e instanceof HttpError) throw e; throw new HttpError(401, "authorization_denied"); }
         await p.recheck();
+        if (p.scope.missionControlSources) ensure(req.method === "GET" && path === "/api/v1/events", "mission_control_events_only", 403);
         const deadline = setTimeout(() => res.destroy(), Math.max(1, Math.min(10_000, (p.access.validUntil - ingress.now()) * 1000)));
         res.once("close", () => clearTimeout(deadline)); res.once("finish", () => clearTimeout(deadline));
         if (req.method === "POST") {
