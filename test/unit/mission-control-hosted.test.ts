@@ -20,6 +20,63 @@ const row=(id="private-thread"):ShellThread=>({id,title:"PRIVATE arbitrary task 
 function live(clock=()=>now0,rows=[row()]){const m=new MissionModel(false,clock);m.shell({kind:"snapshot",sequence:1,threads:rows});m.shell({kind:"synchronized"});for(const r of rows)m.detail(r.id,{kind:"synchronized"});return m;}
 const sample=(sequence=1,now=now0)=>captureSnapshot(live(()=>now),"agent-a",epoch,sequence)!;
 
+
+test("R1 full4096page status admission cannot starve100 protected ordinary deliveries",async()=>{
+  const d=scratch(),o=new Outbox(join(d.path,"full.db"));
+  try{
+    const cursor={generation:"fixture",dev:"0",ino:"1",offset:1,prefix:"",prefixLength:0,tail:""};
+    for(let i=0;i<280;i++)assert.equal(o.admit({key:"ordinary-"+i,source:"agent-a.toolfeedback",host:"agent-a",payload:{v:1,kind:"tool_call",body:"x".repeat(54000)}},"ordinary",cursor),true);
+    o.db.exec("CREATE TABLE fixture_pressure(value BLOB)");
+    const fill=o.db.prepare("INSERT INTO fixture_pressure VALUES(zeroblob(3500))");
+    while(true){try{fill.run();}catch(error){assert.match(String(error),/full/i);break;}}
+    assert.equal(o.db.prepare("PRAGMA page_count").get()!.page_count,4096);
+    const s=sample();s.agents=Array.from({length:40},(_,i)=>({...s.agents[0]!,id:i.toString(16).padStart(16,"0")}));s.total=40;
+    validateHostSnapshot(s);assert.ok(Buffer.byteLength(JSON.stringify(s))>7000);
+    const file=join(d.path,"snapshot.json");writeFileSync(file,JSON.stringify(s),{mode:0o600});
+    const sent:string[]=[];
+    await collect({outbox:o,host:"agent-a",spool:join(d.path,"absent"),missionControlSnapshotFile:file,now:()=>now0,deliver:async e=>{assert.notEqual(e.payload.kind,"agent_status","unsaved status must never send");sent.push(e.key);return true;}});
+    assert.equal(sent.length,100);assert.equal(o.db.prepare("SELECT count(*) AS n FROM pending").get()!.n,180);
+    assert.equal(o.next()!.event.key,"ordinary-100");assert.equal((o.next()!.event.payload.body as string).length,54000);
+  }finally{o.close();d.close();}
+});
+test("R1 optional counter/save failures retain frozen status while ordinary errors still propagate",async()=>{
+  const d=scratch(),o=new Outbox(join(d.path,"guard.db"));
+  try{
+    const file=join(d.path,"snapshot.json");writeFileSync(file,JSON.stringify(sample()),{mode:0o600});
+    const save=o.saveStatus.bind(o),count=o.count.bind(o);let writes=0;const sent:string[]=[];
+    o.saveStatus=s=>{if(++writes===2)throw new Error("database or disk is full");save(s);};
+    o.count=(name,n)=>{if(name.startsWith("status_"))throw new Error("database or disk is full");count(name,n);};
+    await collect({outbox:o,host:"agent-a",spool:join(d.path,"absent"),missionControlSnapshotFile:file,now:()=>now0,deliver:async e=>{sent.push(JSON.stringify(e));return true;}});
+    assert.ok(o.statusState().pending);o.saveStatus=save;o.count=count;
+    await collect({outbox:o,host:"agent-a",spool:join(d.path,"absent"),missionControlSnapshotFile:file,now:()=>now0+1000,deliver:async e=>{sent.push(JSON.stringify(e));return true;}});
+    assert.equal(sent.length,2);assert.equal(sent[0],sent[1]);assert.equal(o.statusState().pending,null);
+    const cursor={generation:"fixture",dev:"0",ino:"1",offset:1,prefix:"",prefixLength:0,tail:""};
+    o.admit({key:"ordinary",source:"agent-a.toolfeedback",host:"agent-a",payload:{v:1,kind:"tool_call"}},"ordinary",cursor);
+    o.count=()=>{throw new Error("ordinary counter error");};
+    await assert.rejects(collect({outbox:o,host:"agent-a",spool:join(d.path,"absent"),deliver:async()=>true}),/ordinary counter error/);
+    assert.equal(o.next()!.event.key,"ordinary");
+  }finally{o.close();d.close();}
+});
+test("R1 qualified unknown is a valid wire state and remains unknown within its epoch",()=>{
+  const c=emptyCache(),unknown=sample();unknown.tokens={qualified:true,output:null,rate:null,observedAt:null,coverage:"unknown"};
+  mergeStatus(c,validateHostSnapshot(unknown),now0);
+  const observed={...sample(2,now0+1),tokens:{qualified:true,output:100,rate:1,observedAt:now0,coverage:"observed" as const}};
+  mergeStatus(c,validateHostSnapshot(observed),now0+1);assert.deepEqual(c.snapshots[0]!.tokens,unknown.tokens);
+  mergeStatus(c,{...observed,epoch:"b".repeat(32),sequence:1,observedAt:now0+2},now0+2);
+  assert.equal(c.snapshots[0]!.tokens.output,100);assert.equal(c.gap,true);
+});
+test("R1 first successful cache load after missing or invalid startup establishes a baseline",()=>{
+  for(const initial of ["missing","invalid"]){
+    const d=scratch();let now=now0;
+    try{
+      const path=join(d.path,"late.json");if(initial==="invalid")writeFileSync(path,"invalid");
+      const m=new CacheModel(path,()=>now),c=emptyCache();mergeStatus(c,sample(),now);writeCache(path,c);m.reload();
+      assert.equal(m.snapshot().source.state,"cached");now+=1000;m.reload();assert.equal(m.snapshot().source.state,"cached");
+      mergeStatus(c,sample(2,now),now);writeCache(path,c);m.reload();assert.equal(m.snapshot().source.state,"live");
+      const b={...sample(1,now),host:"agent-b"};mergeStatus(c,b,now);writeCache(path,c);m.reload();assert.equal(m.snapshot().agents.find(a=>a.host==="agent-b")!.freshness,"cached");
+    }finally{d.close();}
+  }
+});
 test("four-source cache admits at most48 global rows and labels omitted rows honestly",()=>{
   const c=emptyCache();for(const host of ["agent-a","agent-b","omarchy-pc","laptop"]){
     const s=sample();s.host=host;s.agents=Array.from({length:40},(_,i)=>({...s.agents[0]!,id:i.toString(16).padStart(16,"0")}));s.total=40;s.truncated=false;

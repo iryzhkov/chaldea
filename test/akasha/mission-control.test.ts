@@ -35,6 +35,35 @@ async function hostedRig(){
   const readerFetch:typeof fetch=async(input,init)=>{const url=new URL(String(input));assert.equal(url.origin,"https://akasha.fixture");return fetch(base+url.pathname+url.search,init);};
   return {x,auth,publisher,reader,config,readerFetch,readerToken,readToken,post,get,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));x.close();}};
 }
+
+test("R1 complete authenticated refresh clears transient gaps but preserves current epoch/reset/clipping and token evidence",async()=>{
+  const h=await hostedRig();
+  try{
+    const p=payload();p.data.snapshot.tokens={qualified:true,output:100,rate:1,observedAt:N*1000,coverage:"observed"} as any;
+    assert.equal((await h.post(p)).status,201);
+    const deps={token:async()=>h.readToken,fetch:h.readerFetch,now:()=>h.x.sample.unixSeconds*1000};
+    const good=await refreshStatus(h.config,emptyCache(),deps);
+    const failed=await refreshStatus(h.config,good,{...deps,fetch:async()=>{throw new Error("temporary outage");}});assert.equal(failed.gap,true);
+    const recovered=await refreshStatus(h.config,failed,deps);assert.equal(recovered.gap,false);assert.equal(recovered.snapshots[0]!.observedAt,N*1000);
+    writeCache(h.config.cacheFile,recovered);assert.equal(new CacheModel(h.config.cacheFile,()=>N*1000).snapshot().tokens.coverage,"observed");
+    let reset=true;const resetCache=await refreshStatus(h.config,recovered,{...deps,fetch:async(u,i)=>{if(reset){reset=false;return new Response("",{status:410});}return h.readerFetch(u,i);}});assert.equal(resetCache.gap,true);
+    assert.equal((await refreshStatus(h.config,resetCache,deps)).gap,false);
+    h.x.sample={...h.x.sample,unixSeconds:N+31,monotonicSeconds:131};
+    const changed=payload();changed.data.snapshot=sample(2,(N+31)*1000);changed.data.snapshot.epoch="b".repeat(32);
+    assert.equal((await h.post(changed,"new-epoch")).status,201);
+    const epochGap=await refreshStatus(h.config,recovered,deps);assert.equal(epochGap.gap,true);
+    assert.equal((await refreshStatus(h.config,epochGap,deps)).gap,false);
+    h.x.sample={...h.x.sample,unixSeconds:N+62,monotonicSeconds:162};
+    const clipped=payload();clipped.data.snapshot=sample(3,(N+62)*1000);clipped.data.snapshot.epoch="b".repeat(32);clipped.data.snapshot.total=49;clipped.data.snapshot.truncated=true;
+    assert.equal((await h.post(clipped,"clipped")).status,201);
+    const incomplete=await refreshStatus(h.config,epochGap,deps);assert.equal(incomplete.gap,true);assert.equal(incomplete.snapshots[0]!.truncated,true);
+    for(const coverage of ["unknown","partial"]as const){
+      const prior=structuredClone(recovered);prior.gap=true;prior.snapshots[0]!.tokens=coverage==="unknown"?{qualified:true,output:null,rate:null,observedAt:null,coverage}:{qualified:true,output:100,rate:1,observedAt:N*1000,coverage};
+      const result=await refreshStatus(h.config,prior,{...deps,now:()=>N*1000,fetch:async()=>new Response(JSON.stringify({events:[],next_cursor:null}))});
+      assert.equal(result.gap,false);assert.equal(result.snapshots[0]!.tokens.coverage,coverage);
+    }
+  }finally{await h.close();}
+});
 test("real HTTP ingest/store/scoped reader/cache/web continue without a PC producer and deduplicate retry",async()=>{
   const h=await hostedRig();
   try{
