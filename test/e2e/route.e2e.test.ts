@@ -91,7 +91,14 @@ test("builder review CLI rejects a same-driver pin through the runtime", { skip,
       "--author-provider", "codex", "--config", configPath],
       { encoding: "utf8", env: { ...process.env, HOME: d.path }, timeout: 20000 });
     assert.notEqual(cli.status, 0, "same-provider review must refuse, received: " + cli.stdout);
-    assert.match(cli.stderr, /No eligible/);
+    assert.match(cli.stderr, /No eligible.*review requires the other provider/);
+    for (const args of [[], ["--author-provider", "claudeAgent"]]) {
+      const allowed = spawnSync(process.execPath, ["bin/chaldea", "route", "--role", "builder",
+        "--config", configPath, ...args],
+        { encoding: "utf8", env: { ...process.env, HOME: d.path }, timeout: 20000 });
+      assert.equal(allowed.status, 0, allowed.stderr);
+      assert.equal(JSON.parse(allowed.stdout).providerInstanceId, "codex");
+    }
     assert.equal(t3.fakeClaudeEvents().filter(e => e.event === "turn").length, 0);
   } finally { await t3.stop(); d.remove(); }
 });
