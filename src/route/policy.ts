@@ -57,7 +57,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   const windowAge = ageSeconds(a?.endExclusive, data.now);
   const sourceAge = ageSeconds(a?.sourceFetchedAt, data.now);
   const usable = a !== null && analyticsAge !== null && sourceAge !== null && windowAge !== null &&
-    Math.max(analyticsAge, sourceAge, windowAge) * 1000 < config.analyticsMaxAgeMs;
+    windowAge * 1000 < config.analyticsMaxAgeMs;
   if (!usable) reasons.push("Slopalytics stale or unavailable; use quota policy and role defaults");
   let eligible = candidates;
   if (usable) {

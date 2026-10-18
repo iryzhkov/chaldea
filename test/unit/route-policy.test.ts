@@ -6,6 +6,7 @@ import { newProvider } from "../../src/quota/headroom.ts";
 import { PAIRS, routeInput } from "../../src/route/types.ts";
 import type { Analytics, Quota } from "../../src/route/types.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
+import { liveReportDates } from "../fixtures/route/live-policy.ts";
 const weekly = (remainingPercent: number, timeLeft = 0.4): Quota => ({
   observedAt: iso(now), activeStop: false,
   windows: [{ kind: "weekly", remainingPercent, windowDurationMins: 10080, resetsAt: iso(now + timeLeft * 7 * 86400000) }],
@@ -110,11 +111,24 @@ test("statistics cannot remove the only eligible review or stopped-peer fallback
   assert.equal(recommend({ role: "builder" }, { ...base, analytics: a,
     quota: { codex: { ...weekly(60), activeStop: true } } }).model, "claude-opus-5-5");
 });
-test("freshly downloaded old report and stale cache are ignored with ages/reason", () => {
+test("irregular live report stays usable for 21 days from endExclusive; bound configurable", () => {
+  const a = { ...analytics(stats(75, 15, 10)), ...liveReportDates };
+  const r = recommend({ role: "builder" }, { ...base, analytics: a });
+  assert.equal(r.model, "gpt-6.1-sol");
+  assert.doesNotMatch(r.reasons.join(" "), /stale or unavailable/);
+  assert.equal(r.dataAges.slopalyticsWindow, (now - Date.parse(a.endExclusive)) / 1000);
+  assert.equal(recommend({ role: "builder" }, { ...base, analytics: a,
+    config: { analyticsMaxAgeMs: 7 * 86400000 } }).model, "claude-opus-5-5");
+  const boundary = { ...a, endExclusive: iso(now - 21 * 86400000 + 1000) };
+  assert.equal(recommend({ role: "builder" }, { ...base, analytics: boundary }).model, "gpt-6.1-sol");
+  boundary.endExclusive = iso(now - 21 * 86400000);
+  assert.equal(recommend({ role: "builder" }, { ...base, analytics: boundary }).model, "claude-opus-5-5");
+});
+test("old window stays stale after retrieval; future or missing timestamps fall back", () => {
   for (const a of [
-    { ...analytics(), endExclusive: iso(now - 10 * 86400000) },
-    { ...analytics(), sourceFetchedAt: iso(now - 10 * 86400000) },
-    { ...analytics(), fetchedAt: iso(now - 10 * 86400000) },
+    { ...analytics(), endExclusive: iso(now - 22 * 86400000) },
+    ...["endExclusive", "sourceFetchedAt", "fetchedAt"].flatMap(key =>
+      [iso(now + 1000), ""].map(value => ({ ...analytics(), [key]: value }))),
   ]) {
     const r = recommend({ role: "builder" }, { ...base, analytics: a });
     assert.equal(r.model, "claude-opus-5-5"); assert.match(r.reasons.join(" "), /stale or unavailable/);

@@ -43,7 +43,7 @@ export interface PolicyConfig {
 }
 export const DEFAULT_POLICY: PolicyConfig = {
   paceMargin: 0.10, minimumRemaining: 0.10, failureMargin: 0.10, minimumTurns: 100,
-  quotaMaxAgeMs: 15 * 60_000, analyticsMaxAgeMs: 3 * 86_400_000,
+  quotaMaxAgeMs: 15 * 60_000, analyticsMaxAgeMs: 21 * 86_400_000,
 };
 export const PAIRS = {
   builder: ["claude-opus-5-5", "gpt-6.1-sol"],

@@ -56,8 +56,10 @@ history budget. Burn uses the most recent
 at a reset or refill. The heavy projection is observed fractional quota burn
 per hour times the configured multiplier times hours until native reset.
 Burn target is `max(0, remaining - 0.05) / hours to reset`. Missing or zero burn cannot
-establish unlimited capacity. Claude collector/operator windows do not yet retain
-burn samples in observer state, so their refill timing stays unknown unless
+establish unlimited capacity from native quota or reset/refill inventories. Fresh
+positive Codex credits establish unlimited independently of burn. Claude
+collector/operator windows do not yet retain burn samples in observer state,
+so their refill timing stays unknown unless
 comparable observer samples exist.
 
 A Codex reset would restart full quota with a new one-week deadline, but its
@@ -77,7 +79,9 @@ and refill inventories add no timed value.
 Fresh, positive, unexpired Codex credits count as unlimited with no reserve
 floor or required creditsPerFullWeek conversion. Credits nearing expiry count
 as use-it. Zero, stale and expired balances do not add capacity. Short native
-windows do not exclude a Codex account with usable credits; an active stop does.
+windows do not exclude a Codex account with usable credits. An active usage stop
+remains stopped; a fresh provider report that ordinary usage is not allowed
+remains tight. Missing credit and native-window data remains unknown.
 
 Chaldea never spends credits, purchases capacity, redeems resets, refreshes
 credentials, or calls any purchase, reset-redemption or refresh method.
@@ -100,7 +104,7 @@ from the observer's `quota.json`. Use `--config PATH` for CLI or
   "failureMargin": 0.10,
   "minimumTurns": 100,
   "quotaMaxAgeMs": 900000,
-  "analyticsMaxAgeMs": 259200000,
+  "analyticsMaxAgeMs": 1814400000,
   "claudeUsage": { "enabled": false, "providerInstanceId": "claudeAgent" }
 }
 ```
@@ -127,7 +131,6 @@ process, which reads this token and owns its collection caches. Capacity configu
   "expiryHorizonMs": 86400000,
   "providers": {
     "codex": {
-      "creditsPerFullWeek": 1000,
       "creditExpiresAt": "2026-11-01T00:00:00Z"
     },
     "claudeAgent": {
@@ -137,9 +140,9 @@ process, which reads this token and owns its collection caches. Capacity configu
 }
 ```
 
-The example conversion is illustrative, not a measured rate. Set it from
-operator knowledge of the account. Refill and credit expiry settings are
-operator assertions, never an automatic source of Claude reserves.
+`creditsPerFullWeek` is accepted for existing configurations but is not required
+or used to classify Codex credits. Refill and credit expiry settings are operator
+assertions, never an automatic source of Claude reserves.
 
 When Claude collection is off or unavailable, optionally set
 `claudeWeeklyTarget` in route.json:
@@ -191,9 +194,13 @@ With at least 100 terminal turns for both peers, a failure plus interrupt rate
 more than 10 points above its role peer excludes that candidate. Otherwise
 statistics break a tie by completion rate, then minutes per timed turn.
 Statistics never override the provider constraint or capacity ordering.
-Retrieval age, publisher timestamp and window end must all be less than three
-days old by default. A recently downloaded old report is stale. Missing,
-unreachable or stale data keeps quota policy and role defaults, with a reason.
+The aggregate describes model behaviour that changes slowly and is published
+irregularly. Its window end, `endExclusive`, must be less than 21 days old by
+default, configurable through `analyticsMaxAgeMs` in route.json. Retrieval and
+publisher timestamps must be valid and not in the future; they do not restart
+the window's age. A recently downloaded report with an older window remains
+stale. Missing, unreachable or stale data keeps quota policy and role defaults,
+with a reason.
 
 Routing emits no per-call feed records and never changes observer state.
 Existing observer feed cadence is unchanged.
