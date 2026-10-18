@@ -192,19 +192,43 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-R","0:127.0.0.1:"+sshPort])).code,0,"remote TCP forwarding refused");
     assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-R",join(state,"remote.sock")+":127.0.0.1:"+sshPort])).code,0,"remote StreamLocal forwarding refused");
     assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-w","any:any"])).code,0,"tunnel refused");
-    // Force a real direct-streamlocal channel attempt through a local socket.
+    // A reachable endpoint distinguishes policy refusal from a missing/denied path.
     const localSocket=join(root,"local.sock"),remoteSocket=join(state,"forbidden.sock");
-    const forwarding=spawn("/usr/bin/ssh",[...common,"-v","-N","-L",localSocket+":"+remoteSocket,user+"@127.0.0.1"],
-      {env:{PATH:"/usr/bin:/bin"},stdio:["ignore","ignore","pipe"]});
-    cleanupClients.push(forwarding);let forwardError="";
-    forwarding.stderr!.on("data",b=>forwardError=(forwardError+b).slice(-8192));
-    await waitFor("local StreamLocal listener",()=>existsSync(localSocket),5000);
-    const channel=createConnection(localSocket);channel.on("error",()=>{});
-    const ended=new Promise<void>(r=>channel.once("close",()=>r()));
-    channel.end("forbidden");
-    await Promise.race([ended,new Promise((_,reject)=>setTimeout(()=>reject(new Error("StreamLocal did not refuse")),5000).unref())]);
-    await waitFor("remote StreamLocal denial",()=>/administratively prohibited/i.test(forwardError),5000);
-    forwarding.kill("SIGTERM");await new Promise<void>(r=>forwarding.once("close",()=>r()));
+    let targetConnections=0,targetBytes=0;
+    const destination=createServer(socket=>{targetConnections++;socket.on("data",b=>{targetBytes+=b.length;socket.write(b);});});
+    await new Promise<void>(r=>destination.listen(remoteSocket,r));chownSync(remoteSocket,uid,gid);chmodSync(remoteSocket,0o600);
+    try {
+      const control=await collected(spawn("runuser",["-u",user,"--",node,"-e",
+        'const s=require("node:net").createConnection(process.argv[1]);s.on("connect",()=>s.end("streamlocal-control"));s.pipe(process.stdout);',
+        remoteSocket],{env:{PATH:"/usr/bin:/bin"},stdio:["pipe","pipe","pipe"]}));
+      assert.equal(control.code,0,"fixture UID Unix socket control");
+      assert.ok(control.out==="streamlocal-control","live endpoint must echo the control");
+      assert.equal(targetConnections,1);assert.equal(targetBytes,Buffer.byteLength("streamlocal-control"));
+      const baselineBytes=targetBytes;
+      const forwarding=spawn("/usr/bin/ssh",[...common,"-v","-N","-L",localSocket+":"+remoteSocket,user+"@127.0.0.1"],
+        {env:{PATH:"/usr/bin:/bin"},stdio:["ignore","ignore","pipe"]});
+      cleanupClients.push(forwarding);let forwardError="",received=0,closed=false;
+      const refused=()=>log.split("\n").some(line=>line.includes("refused streamlocal port forward:")&&line.includes(remoteSocket));
+      const openFailed=()=>/open failed: (?:connect failed|administratively prohibited):/i.test(forwardError);
+      forwarding.stderr!.on("data",b=>forwardError=(forwardError+b).slice(-8192));
+      try {
+        await waitFor("local StreamLocal listener",()=>existsSync(localSocket),5000);
+        const channel=createConnection(localSocket);channel.on("error",()=>{});channel.on("data",b=>received+=b.length);
+        channel.once("close",()=>closed=true);
+        try {
+          await new Promise<void>((resolve,reject)=>{channel.once("connect",resolve);channel.once("error",reject);});
+          channel.end("streamlocal-forbidden");
+          await waitFor("StreamLocal channel closure and server policy refusal",()=>closed&&refused()&&openFailed(),5000);
+          assert.equal(received,0);assert.equal(targetConnections,1);assert.equal(targetBytes,baselineBytes);
+        }finally{channel.destroy();}
+      }finally{
+        t.diagnostic(JSON.stringify({probe:"streamlocal-denial",serverPolicyRefused:refused(),clientOpenFailed:openFailed(),closed,
+          receivedBytes:received,extraTargetConnections:targetConnections-1,extraTargetBytes:targetBytes-baselineBytes}));
+        if(forwarding.exitCode===null&&forwarding.signalCode===null){
+          const stopped=new Promise<void>(r=>forwarding.once("close",()=>r()));forwarding.kill("SIGTERM");await stopped;
+        }
+      }
+    }finally{await new Promise<void>(r=>destination.close(()=>r()));}
     // Supply a real local agent socket so the client actually requests agent forwarding.
     const agentPath=join(root,"agent.sock"),agentServer=createServer(socket=>socket.destroy());
     await new Promise<void>(r=>agentServer.listen(agentPath,r));
