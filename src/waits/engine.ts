@@ -1,5 +1,6 @@
 import { backoff } from "../retry.ts";
 import { createLogger } from "../config/log.ts";
+import { EXIT } from "../config/exit.ts";
 import { WakeStore, CheckpointBlockedError, type Item, type Delivery } from "../wake/store.ts";
 import type { WaitT3, WaitSnapshot } from "../t3/waits.ts";
 import { NativeDecisions, questionSchema } from "../decisions/native.ts";
@@ -37,7 +38,7 @@ export class WaitEngine {
     const fallback=() => createLogger().error("Chaldea waits: fatal storage error; restarting");
     try { this.options.report ? this.options.report("watcher_needs_attention") : fallback(); }
     catch { fallback(); }
-    finally { setImmediate(() => process.exit(1)); }
+    finally { setImmediate(() => process.exit(EXIT.failure)); }
   }
   private storageRetry: NodeJS.Timeout | undefined;
   private storageAttempts = 0;

@@ -1,21 +1,14 @@
-import { mkdirSync, openSync, closeSync, readFileSync, fstatSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { mkdirSync, openSync, closeSync, fstatSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
-import { randomUUID } from "node:crypto";
+import { readTrustedFile } from "../config/files.ts";
+import { atomicWrite } from "../fs/atomic.ts";
 
 export function readJson(path: string, limit = 2 * 1024 * 1024): unknown {
-  const fd = openSync(path, "r");
-  try {
-    if (!fstatSync(fd).isFile() || fstatSync(fd).size > limit) throw new Error("JSON file too large");
-    return JSON.parse(readFileSync(fd, "utf8"));
-  } finally { closeSync(fd); }
+  return JSON.parse(readTrustedFile(path, { maxBytes: limit }).toString("utf8"));
 }
 export function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temp = path + "." + randomUUID();
-  try {
-    writeFileSync(temp, JSON.stringify(value), { mode: 0o600, flag: "wx" });
-    renameSync(temp, path);
-  } finally { rmSync(temp, { force: true }); }
+  atomicWrite(path, JSON.stringify(value), 0o600);
 }
 const FAILURE_REASONS = ["credential_expired", "credential_unavailable", "rate_limited", "unauthorized", "collection_failed"] as const;
 type FailureReason = typeof FAILURE_REASONS[number];

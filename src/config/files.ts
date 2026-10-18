@@ -42,9 +42,9 @@ export function privateFile(path: string): string {
     throw new ConfigurationError("Credential file could not be read", path, (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "read");
   }
 }
-export function readJson(path: string, optional = false, decode: (bytes: Buffer) => unknown = bytes => JSON.parse(bytes.toString("utf8"))): Record<string, unknown> {
+export function readJson(path: string, optional = false, decode: (bytes: Buffer) => unknown = bytes => JSON.parse(bytes.toString("utf8")), policy: FilePolicy = {}): Record<string, unknown> {
   let bytes: Buffer;
-  try { bytes = readTrustedFile(path); }
+  try { bytes = readTrustedFile(path, policy); }
   catch (error) {
     if (optional && (error as NodeJS.ErrnoException).code === "ENOENT") return {};
     if (error instanceof ConfigurationError) throw error;

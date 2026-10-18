@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { readJson } from "../config/files.ts";
 import { loadCapacityConfig } from "../quota/capacity-config.ts";
 import { hostname } from "node:os";
 import type { ScoreTransport } from "./snapshot.ts";
@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { DEFAULT_POLICY } from "./types.ts";
 import type { PolicyConfig, QuotaWindow } from "./types.ts";
 import { tokenSource, type ClaudeTokenSource } from "./claude-usage.ts";
-import { readJson } from "./cache.ts";
 
 export interface RouteConfig extends PolicyConfig {
   scores: ScoreTransport;
@@ -28,7 +27,7 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
     claudeUsage: { enabled: false, providerInstanceId: "claudeAgent", credentialFile: join(home, ".claude/.credentials.json") },
     claudeWeeklyTarget: null,
   };
-  const r = (existsSync(path) ? readJson(path, 64 * 1024) : {}) as Record<string, unknown>;
+  const r = readJson(path, true, undefined, { maxBytes: 64 * 1024 });
   if (!r || typeof r !== "object" || Array.isArray(r) ||
     Object.keys(r).some(k => !Object.hasOwn(defaults, k))) throw new Error("Invalid route configuration keys");
   const c = { ...defaults };
