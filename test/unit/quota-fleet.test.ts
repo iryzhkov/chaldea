@@ -178,7 +178,30 @@ test("four local T3 instances select the matching shared account and reject a co
     const conflict = await route({ role: "builder" }, { home: d.path, configPath, now,
       catalog: async () => localCatalog.map(p => p.providerInstanceId === "codex-work" ? { ...p, accountKey: ps[0]!.accountKey! } : p), fetcher });
     assert.notEqual(conflict.providerInstanceId, "codex-work");
-    assert.match(conflict.reasons.join(" "), /does not match the live T3 login/);
+    assert.match(conflict.reasons.join(" "), /does not match the observed provider login/);
+    const mismatched = newProvider("claude-work", "claudeAgent");
+    mismatched.included = { ...mismatched.included, state: "error", error: "context_mismatch" };
+    const observed = emptyState(); observed.headroom.providers.push(mismatched);
+    saveState(stateFile, observed, now);
+    const observerMismatch = await route({ role: "critical-review", authorProvider: "codex" }, {
+      home: d.path, configPath, now, catalog: async () => localCatalog, fetcher });
+    assert.equal(observerMismatch.providerInstanceId, "claudeAgent");
+    assert.ok(observerMismatch.alternatives.every(p => p.providerInstanceId !== "claude-work"));
+    saveState(stateFile, emptyState(), now);
+    const credentialFile = join(d.path, "claude-credential.json");
+    writeJson(credentialFile, { claudeAiOauth: { accessToken: "fixture-token", expiresAt: now + 86400000 } });
+    writeJson(configPath, { stateFile, quotaConfigFile, cacheDir,
+      claudeUsage: { enabled: true, providerInstanceId: "claude-work", credentialFile } });
+    const liveMismatch = await route({ role: "critical-review", authorProvider: "codex" }, {
+      home: d.path, configPath, now, catalog: async () => localCatalog,
+      fetcher: async (url, init) => String(url).includes("api.anthropic.com") ? Response.json({
+        organization_id: "claudeAgent-login-1",
+        five_hour: { utilization: 100, resets_at: iso(now + 3600000) },
+        seven_day: { utilization: 100, resets_at: iso(now + 86400000) },
+      }) : fetcher(url, init) });
+    assert.equal(liveMismatch.providerInstanceId, "claudeAgent");
+    assert.ok(liveMismatch.alternatives.every(p => p.providerInstanceId !== "claude-work"));
+    writeJson(configPath, { stateFile, quotaConfigFile, cacheDir });
     const offline = await route({ role: "builder" }, { home: d.path, configPath, now, catalog: async () => localCatalog,
       fetcher: async () => { throw new Error("offline"); } });
     assert.equal(offline.providerInstanceId, "claude-work");

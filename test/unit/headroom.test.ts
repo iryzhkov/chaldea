@@ -101,7 +101,7 @@ test("quota config defaults to the observer user's .config/chaldea/quota.json", 
   const previousXdg = process.env.XDG_CONFIG_HOME;
   delete process.env.XDG_CONFIG_HOME;
   try {
-    assert.deepEqual(loadHeadroomConfig(f.path), headroomConfig());
+    assert.deepEqual(loadHeadroomConfig(f.path), headroomConfig({}, f.path));
     const dir = join(f.path, ".config", "chaldea"), path = join(dir, "quota.json");
     mkdirSync(dir, { recursive: true });
     writeFileSync(path, JSON.stringify({ contexts: [{ providers: ["codex"], home: f.path, codexHome: join(f.path, ".codex") }] }));
@@ -110,7 +110,7 @@ test("quota config defaults to the observer user's .config/chaldea/quota.json", 
     writeFileSync(path, "{broken");
     assert.throws(() => loadHeadroomConfig(f.path));
     const explicit = join(f.path, "explicit.json"); writeFileSync(explicit, "{}");
-    assert.deepEqual(loadHeadroomConfig(f.path, explicit), headroomConfig());
+    assert.deepEqual(loadHeadroomConfig(f.path, explicit), headroomConfig({}, f.path));
   } finally {
     if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previousXdg;
     f.remove();
@@ -544,6 +544,12 @@ test("stdio fake verifies the complete allowlisted exchange and redaction; failu
     chmodSync(command, 0o600);
     await assert.rejects(readCodexBalance(ctx, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "spawn_failed");
     chmodSync(command, 0o700);
+    scenario("account-error");
+    const withoutAccountRead = await readCodexBalance(ctx, new AbortController().signal) as { accountId: string };
+    assert.equal(withoutAccountRead.accountId, response.accountId);
+    writeFileSync(join(home, "scenario.json"), JSON.stringify({ mode: "success", codexHome,
+      result: response, account: { id: "PRIVATE_DIFFERENT_USER_ID" } }));
+    assert.equal((await readCodexBalance(ctx, new AbortController().signal) as { accountId: string }).accountId, response.accountId);
     scenario("error"); await assert.rejects(readCodexBalance(ctx, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "rate_limited");
     scenario("overflow"); await assert.rejects(readCodexBalance(ctx, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "protocol");
     scenario("hang"); await assert.rejects(readCodexBalance(ctx, new AbortController().signal, 100), e => e instanceof BalanceReadError && e.code === "timeout");

@@ -107,9 +107,12 @@ export async function route(value: unknown, options: {
     const row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
     if (!row) continue;
     const configured = mappings.get(p.providerInstanceId);
-    if (configured && p.accountKey && configured !== p.accountKey) {
+    const observer = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
+    const expected = configured ?? p.accountKey;
+    if (observer?.included.error === "context_mismatch" || row.included.error === "context_mismatch" || row.credits.error === "context_mismatch" ||
+        expected && (p.accountKey && expected !== p.accountKey || row.accountKey && expected !== row.accountKey)) {
       blockedInstances.add(p.providerInstanceId);
-      reasons.push(p.providerInstanceId + ": configured account does not match the live T3 login; excluded");
+      reasons.push(p.providerInstanceId + ": configured account does not match the observed provider login; excluded");
     }
     const key = configured ?? p.accountKey ?? row.accountKey;
     if (key && row.accountKey !== key) {

@@ -7,7 +7,9 @@ never form an account key. A host is observation provenance only.
 
 Codex's read-only app-server exchange is initialize, initialized,
 `account/read {refreshToken:false}`, then `account/rateLimits/read`.
-Identity uses the returned account ID, falling back to rateLimits' accountId.
+Identity prefers rateLimits' accountId, which T3 uses for its workspace binding,
+then falls back to an ID from account/read. If account/read is unsupported,
+the rateLimits read still runs.
 If neither response supplies an ID, observations remain local and are not
 published. Claude uses the organisation/account ID in the usage response or
 a GET of the OAuth profile endpoint when usage omits identity. Both requests
@@ -56,9 +58,11 @@ contexts remain supported. Claude contexts opt in individually.
 
 The illustrative hashes must be replaced with 64 lowercase hexadecimal
 characters. The accountKey assertions are optional for collection and checked
-against provider-returned identity. They let routing bind remote observations
-before the local collector has run. Distinct configured T3 aliases cannot share
-a Codex/Claude binding. Existing runtime-HOME checks and asserted-binding
+against provider-returned identity. Before the first identity observation,
+routing trusts the operator assertion; a mistyped assertion can bind another
+account's capacity. A reported identity mismatch excludes the local instance.
+A T3 alias cannot appear in both a Codex and a Claude binding. Several aliases
+for the same account share one account capacity record. Existing runtime-HOME checks and asserted-binding
 visibility remain in force for Codex.
 
 T3 currently exposes one usable instance per provider in Igor's configuration.
@@ -117,6 +121,9 @@ Route configuration may set quotaConfigFile to an explicit quota.json.
 Otherwise routing loads the usual quota config for that host. Capacity reserve
 settings for identified accounts use provider:accountKey keys in capacity.json;
 legacy unidentified local observations still use instance aliases.
+The observer publishes credit expiry from its host's default capacity.json.
+A route-only capacityConfigFile override affects that route, not the observer's
+publication. Fleet-config must render expiry in the observer's capacity.json.
 
 ## Codex credit policy
 

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { validateSnapshot } from "../quota/fleet.ts";
+import { validateSnapshot } from "../quota/capacity-snapshot.ts";
 import { strictJson } from "../access/token.ts";
 
 export const KiB = 1024;

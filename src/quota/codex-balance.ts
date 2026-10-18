@@ -124,6 +124,12 @@ export function readCodexBalance(context: CodexContext, signal: AbortSignal, tim
         try { message = JSON.parse(line); } catch { stop(new BalanceReadError("protocol")); break; }
         if (!message || typeof message !== "object") { stop(new BalanceReadError("protocol")); break; }
         if (message.id !== 1 && message.id !== 2 && message.id !== 3) continue; // unsolicited notifications are not full observations
+        if (message.error && message.id === 3 && initialized) {
+          account = undefined;
+          send({ id: 2, method: "account/rateLimits/read",
+            params: { excludeResetCreditDetails: true, supportsLunaReserve: false } });
+          continue;
+        }
         if (message.error) {
           stop(new BalanceReadError(message.error.code === 429 ? "rate_limited" : "protocol")); break;
         }
@@ -137,7 +143,7 @@ export function readCodexBalance(context: CodexContext, signal: AbortSignal, tim
             params: { excludeResetCreditDetails: true, supportsLunaReserve: false } });
         } else if (message.id === 2 && initialized && Object.hasOwn(message, "result")) {
           const a = account as Record<string, unknown> | null;
-          result = { ...message.result, accountId: a?.accountId ?? a?.id ?? message.result?.accountId };
+          result = { ...message.result, accountId: message.result?.accountId ?? a?.accountId ?? a?.id };
           received = true; stop();
         }
       }
