@@ -98,6 +98,24 @@ test("status admission rate, one-hour payload TTL and24h receipts cannot resurre
     const raw=sample();(raw as any).prompt="secret";assert.throws(()=>normalize({...payload(),data:{snapshot:raw}},identity,false));
   }finally{await h.close();}
 });
+
+test("real scoped event cursors bind the exact query and reset with410 after retention floor changes",async()=>{
+  const h=await hostedRig();
+  try{
+    assert.equal((await h.post(payload())).status,201);
+    h.x.sample={...h.x.sample,unixSeconds:N+31,monotonicSeconds:131};
+    const second=payload();second.data.snapshot=sample(2,(N+31)*1000);assert.equal((await h.post(second,"second")).status,201);
+    const path="/api/v1/events?from="+new Date((N-3600+31)*1000).toISOString()+"&to="+new Date((N+31)*1000).toISOString()+"&limit=1";
+    const first=await(await h.get(path)).json()as any;assert.equal(first.events.length,1);assert.equal(typeof first.next_cursor,"string");
+    const cursor="&cursor="+encodeURIComponent(first.next_cursor);
+    assert.equal((await h.get(path+cursor)).status,200);
+    assert.equal((await h.get(path+cursor+"&host=agent-a")).status,400);
+    h.x.store.put("floor","999999");assert.equal((await h.get(path+cursor)).status,410);
+    assert.equal((await h.get("/api/v1/events?from="+new Date((N-7200)*1000).toISOString()+"&to="+new Date(N*1000).toISOString())).status,403);
+    const forgedScope={issuer:"chaldea:agent-b",profile:"mission-control-reader",source:"mission-control-reader",host:"omarchy-normandy",project:"chaldea",global:false,missionControlSources:[identity.source_id]};
+    assert.throws(()=>scopeSql(forgedScope));
+  }finally{await h.close();}
+});
 test("status pressure refuses admission without evicting unrelated protected events",async()=>{
   const h=await hostedRig();
   try{

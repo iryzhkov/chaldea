@@ -29,5 +29,5 @@ export async function runCapture(c:CaptureConfig,signal:AbortSignal):Promise<voi
     const url=discoverServerUrl(c.t3BaseDir);if(!url)throw new Error("source_unavailable");
     const u=new URL(url);if(u.protocol!=="http:"||u.hostname!=="127.0.0.1"||u.username||u.password)throw new Error("local_source_required");
     return {serverUrl:url,token:privateFile(c.tokenFile)};
-  },signal);}finally{clearInterval(timer);unsubscribe();}
+  },signal);if(!signal.aborted)throw new Error("capture_source_stopped");}finally{clearInterval(timer);unsubscribe();}
 }

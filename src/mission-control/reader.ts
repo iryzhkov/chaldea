@@ -27,7 +27,7 @@ export async function refreshStatus(c:ReaderConfig,previous:StatusCache,dependen
   try {
     const token=await(dependencies.token?dependencies.token():helperToken(c.tokenHelper,{key:"",source:c.source,host:c.host,payload:{kind:"agent_status"}},"read"));
     const url=new URL("/api/v1/events",c.url);url.searchParams.set("kind","agent_status");url.searchParams.set("project","chaldea");
-    url.searchParams.set("from",new Date(now-3600_000).toISOString());url.searchParams.set("to",new Date(now).toISOString());url.searchParams.set("limit","1000");
+    url.searchParams.set("from",new Date(now-3600_000).toISOString());url.searchParams.set("to",new Date(now).toISOString());url.searchParams.set("limit","128");
     let reset=false;const seen=new Set<string>(),candidate=structuredClone(next);
     for(let page=0;page<4;page++){
       const response=await(dependencies.fetch??fetch)(url,{redirect:"error",headers:{authorization:"Bearer "+token},signal});
@@ -36,7 +36,7 @@ export async function refreshStatus(c:ReaderConfig,previous:StatusCache,dependen
       const raw=await responseJson(response);
       if(!raw||typeof raw!=="object"||Array.isArray(raw))throw new Error("invalid_page");
       const v=raw as Record<string,unknown>;
-      if(Object.keys(v).length!==2||!Array.isArray(v.events)||v.events.length>1000)throw new Error("invalid_page");
+      if(Object.keys(v).length!==2||!Array.isArray(v.events)||v.events.length>128)throw new Error("invalid_page");
       for(const item of v.events){
         const e=validateEnvelope(item),s=validateHostSnapshot(e.data.snapshot);
         if(e.kind!=="agent_status"||e.provenance.type!=="verified"||!c.allowedSourceIds.includes(e.source_id)||!statusIdentity(e,s)||Date.parse(e.received_at)>now||now-s.observedAt>3600_000)throw new Error("unauthorized_status");

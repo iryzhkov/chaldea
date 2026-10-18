@@ -90,7 +90,7 @@ test("unconfigured collector leaves optional status table absent and env seam is
   const d=scratch(),o=new Outbox(join(d.path,"collector.db"));
   try{await collect({outbox:o,spool:d.path,host:"agent-a",deliver:async()=>true});assert.equal(o.db.prepare("SELECT name FROM sqlite_master WHERE name='mission_control_status'").get(),undefined);
     const old=process.env.AKASHA_MISSION_CONTROL_SNAPSHOT_FILE;
-    try{process.env.AKASHA_MISSION_CONTROL_SNAPSHOT_FILE=join(d.path,"capture.json");assert.equal(eventsConfig().missionControlSnapshotFile,join(d.path,"capture.json"));}
+    try{process.env.AKASHA_MISSION_CONTROL_SNAPSHOT_FILE=join(d.path,"capture.json");assert.equal(eventsConfig().missionControlSnapshotFile,join(d.path,"capture.json"));process.env.AKASHA_MISSION_CONTROL_SNAPSHOT_FILE="relative";assert.throws(()=>eventsConfig());}
     finally{if(old===undefined)delete process.env.AKASHA_MISSION_CONTROL_SNAPSHOT_FILE;else process.env.AKASHA_MISSION_CONTROL_SNAPSHOT_FILE=old;}
   }finally{o.close();d.close();}
 });
@@ -112,7 +112,7 @@ test("reader binds pagination to one window, resets410 as a gap and fails closed
   const old=emptyCache();mergeStatus(old,sample(),now0);
   let page=0;const urls:string[]=[];
   const result=await refreshStatus(config,old,{now:()=>now0+1000,token:async()=>"fixture",fetch:async(url,options)=>{
-    assert.equal(options!.redirect,"error");urls.push(String(url));page++;
+    assert.equal(options!.redirect,"error");assert.equal(new URL(String(url)).searchParams.get("limit"),"128");urls.push(String(url));page++;
     return page===1?new Response(JSON.stringify({events:[],next_cursor:"cursor"})):page===2?new Response("",{status:410}):new Response(JSON.stringify({events:[],next_cursor:null}));
   }});
   assert.equal(result.gap,true);assert.equal(result.snapshots[0]!.observedAt,now0);
