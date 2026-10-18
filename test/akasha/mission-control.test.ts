@@ -76,6 +76,19 @@ test("scoped HTTP denies append, raw endpoints, foreign scope, expired tokens, r
     await h.x.install({...h.x.bundle,sequence:3,keys:[]});assert.equal((await h.get()).status,401);
   }finally{await h.close();}
 });
+
+test("status admission compares millisecond sample time in the trusted clock's integer-second units",async()=>{
+  const h=await hostedRig();
+  try{
+    const within=payload();within.data.snapshot=sample(1,N*1000+500);
+    assert.equal((await h.post(within,"same-second")).status,201);
+  }finally{await h.close();}
+  const other=await hostedRig();
+  try{
+    const future=payload();future.data.snapshot=sample(1,N*1000+1000);
+    assert.equal((await other.post(future,"future-second")).status,409);
+  }finally{await other.close();}
+});
 test("status admission rate, one-hour payload TTL and24h receipts cannot resurrect old broker payload",async()=>{
   const h=await hostedRig();
   try{
