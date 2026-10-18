@@ -149,7 +149,8 @@ export async function route(value: unknown, options: {
       scores: scores.value, now, config, capacity }, config.scores.host,
       config.scores.host === config.announceHost && !input.effortOverride);
     if (config.scores.enabled && config.scores.host === config.announceHost) {
-      await routing.flush({ url: config.scores.url, helper: config.scores.tokenHelper, ...(options.fetcher ? { fetch: options.fetcher } : {}) });
+      try { await routing.flush({ url: config.scores.url, helper: config.scores.tokenHelper, ...(options.fetcher ? { fetch: options.fetcher } : {}) }); }
+      catch { reasons.push("Route-change publication deferred; routing continues"); }
       if (routing.pending()) reasons.push("Route-change event retained in durable outbox for retry");
     }
     if (!config.scores.enabled && routing.pending()) reasons.push("Route-change event queued; snapshot transport not configured");

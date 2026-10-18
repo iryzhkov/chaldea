@@ -57,5 +57,13 @@ export function scoreSnapshot(raw: unknown, now: number): ScoreSnapshot {
       inputPrice: p.price_1m_input_tokens, outputPrice: p.price_1m_output_tokens });
   }
   const indexVersion = String(r.intelligence_index_version ?? r.metadata?.intelligence_index_version ?? r.metadata?.artificial_analysis_intelligence_index_version ?? "unversioned");
-  return validateScores({ version: 1, fetchedAt: new Date(now).toISOString(), indexVersion, models, unmapped: unmapped.slice(0, 512) });
+  const diagnostics: string[] = [];
+  let diagnosticBytes = 0;
+  for (const slug of unmapped.slice(0, 511)) {
+    diagnosticBytes += Buffer.byteLength(slug) + 3;
+    if (diagnosticBytes > 8192) break;
+    diagnostics.push(slug);
+  }
+  if (diagnostics.length < unmapped.length) diagnostics.push("unmapped-models-omitted:" + (unmapped.length - diagnostics.length));
+  return validateScores({ version: 1, fetchedAt: new Date(now).toISOString(), indexVersion, models, unmapped: diagnostics });
 }

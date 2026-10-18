@@ -345,8 +345,16 @@ keep local last good data when reads fail.
 Exactly one host, `announceHost`, publishes `route_pick_changed`. Configure
 `scores.host` to the actual host name everywhere; the grant binds it as well.
 The default authority is omarchy-pc, whose route database must be persistent.
-Its durable transaction records each change and one outbox intent, including a
-monotonic transition number and a persistent random database epoch. Rebuilding a
+The event checkpoint and outbox intent share a transaction, with a monotonic
+transition number and a persistent random database epoch. Account or instance
+switches within the same model are silent. Before a delivery attempt, transient
+model changes coalesce into at most one intent per role context. Once attempted,
+the payload and key remain immutable until acknowledgment. The queue is bounded
+at 128 intents and 2 MiB; capacity or write failures defer announcements with an
+explicit reason and do not undo or fail the routing recommendation. A full queue
+keeps the last recorded top pick until a later recommendation can record its
+replacement. Intermediate unattempted changes during an outage are not separate
+feed records. Rebuilding a
 lost database cannot reuse its old publication keys. Delivery retries use the identical idempotency key
 and payload until Akasha acknowledges a visible record. Other router hosts
 reserve probation shares locally but do not announce duplicate fleet changes.
@@ -409,15 +417,21 @@ finally:
    archives that file securely on homelab; agents must not read or copy it.
 5. Install the example service and timer as system units, run
    `sudo systemctl start chaldea-route-scores.service`, and inspect its journal
-   for mapped/unmapped counts and `fetchedAt`. The fetcher requires hostname
+   for mapped/unmapped counts and `fetchedAt`. Compare the actual unrounded API
+   anchor scores against the configured floors and confirm the index version is
+   on the calibrated scale before activating routing. The public anchor tables
+   round their displayed values; configure floors from the actual API values if
+   rounding would exclude an intended anchor. The fetcher requires hostname
    homelab and a regular root-owned, single-link 0600 key file; it rejects
    symlinks and files larger than 4096 bytes. Requests use a fixed AA HTTPS
    origin, no redirects, five-second timeouts and bounded response/pagination.
    Failures use fixed sanitized messages.
 6. Verify an authenticated snapshot read from each router host and a fixture
    route before enabling `sudo systemctl enable --now chaldea-route-scores.timer`.
-   The daily timer is persistent and retries failed runs at five-minute intervals
-   up to its systemd start limit. The fetch cache limits AA attempts to once per UTC calendar day, so timer jitter
+   The daily timer is persistent. Failed publication retries at five-minute
+   intervals up to its systemd start limit. An AA fetch failure reserves that
+   UTC day; a restart can republish last-good data, with the next AA attempt on
+   the following UTC day. The fetch cache limits AA attempts to once per UTC calendar day, so timer jitter
 does not skip every other refresh.
    A fetched snapshot with a lost Akasha receipt is retried with the same key.
    Confirm exactly one visible pick-change event by routing twice on the

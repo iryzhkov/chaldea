@@ -60,7 +60,7 @@ export async function collectScores(config: ScoreTransport, cacheFile: string, n
       payload: { kind: "route_score_snapshot" } }, "read");
     const url = new URL("/api/v1/events", config.url);
     url.searchParams.set("source", "route"); url.searchParams.set("host", "homelab");
-    url.searchParams.set("kind", "route_score_snapshot"); url.searchParams.set("limit", "100");
+    url.searchParams.set("kind", "route_score_snapshot"); url.searchParams.set("limit", "20");
     url.searchParams.set("from", new Date(now - 90 * 86400000).toISOString());
     url.searchParams.set("to", new Date(now).toISOString());
     let best: ScoreSnapshot | null = null;

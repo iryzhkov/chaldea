@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { join } from "node:path";
 import { chmodSync, linkSync, symlinkSync, writeFileSync } from "node:fs";
 import { collectScores, fetchScores, publishScores, readAAKey } from "../../src/route/snapshot.ts";
-import { validateScores, MODEL_MAP } from "../../src/route/scores.ts";
+import { scoreSnapshot, validateScores, MODEL_MAP } from "../../src/route/scores.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
 import { scores, now, iso } from "../fixtures/route/targets.ts";
 import { readJson } from "../../src/route/cache.ts";
@@ -30,6 +30,12 @@ test("AA collector uses a fixed HTTPS API, header key, bounded pagination and pu
   await assert.rejects(fetchScores(now, async () => { throw new Error("fixture-key leaked upstream"); }, () => "fixture-key"),
     e => String(e) === "Error: aa_fetch_failed");
   await assert.rejects(fetchScores(now, async () => response([row], 1, true), () => "fixture-key"), /aa_fetch_failed/);
+});
+test("unmapped diagnostics stay within the snapshot publication budget", () => {
+  const s = scoreSnapshot({ intelligence_index_version: 4.3,
+    data: [row, ...Array.from({ length: 500 }, (_, n) => ({ slug: "unknown-" + n + "-" + "a".repeat(140) }))] }, now);
+  assert.ok(Buffer.byteLength(JSON.stringify(s)) < 16384);
+  assert.match(s.unmapped.at(-1)!, /unmapped-models-omitted/);
 });
 test("AA key reader refuses symlinks, permissive files, hardlinks and oversized files", () => {
   const scratch = routeScratch();

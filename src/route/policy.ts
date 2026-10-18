@@ -29,12 +29,15 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   let scores: ScoreSnapshot | null = null;
   try { if (data.scores && ageSeconds(data.scores.fetchedAt, data.now) !== null) scores = validateScores(data.scores); } catch {}
   const scoreAge = ageSeconds(scores?.fetchedAt, data.now);
+  let overrideFallback = false;
   if (scores && input.effortOverride && !pair.some(model => scoreFor(scores, model, effort))) {
     scores = null;
+    overrideFallback = true;
     reasons.push("Explicit effort override has no mapped role anchors; use fixed role pairs without an AA quality claim");
   }
   reasons.push(pin ? "Fleet pin overrides bans, scores, probation and quota preference; availability, effort, active stops and review separation still apply"
     : scores ? scoreAge! * 1000 >= config.scoreMaxAgeMs ? "AA snapshot stale; use last good snapshot" : "AA role target " + input.role + " with intelligence floor " + config.floors[input.role]
+    : overrideFallback ? "AA has no role anchors at requested effort; use fixed role pairs with Sonnet removed"
     : "AA unavailable; no last good snapshot; use fixed role pairs with Sonnet removed");
   if (scores?.unmapped.length) reasons.push("AA models unmapped, held: " + scores.unmapped.join(", "));
   const candidates: Array<Target & { driver: Provider; pace: number | null }> = [];
@@ -115,7 +118,8 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     };
     const xr = rank(x.providerInstanceId), yr = rank(y.providerInstanceId);
     if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
-    if (hasPace && x.driver !== y.driver && preferred === "claudeAgent" && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
+    const underPaced = (c: typeof x) => c.driver === "claudeAgent" && c.pace !== null && c.pace >= config.paceMargin;
+    if (underPaced(x) !== underPaced(y)) return Number(underPaced(y)) - Number(underPaced(x));
     if (xr !== null && yr !== null && xr !== yr) return xr - yr;
     // Unknown and paced tie, preserving the role default when Claude pacing is unknown.
     // Known quota preference takes precedence over a statistical tie-break.

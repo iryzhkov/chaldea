@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import { recommend } from "../../src/route/policy.ts";
-import { RouteState } from "../../src/route/state.ts";
+import { MAX_ROUTE_EVENTS, RouteState } from "../../src/route/state.ts";
 import { loadRouteConfig } from "../../src/route/config.ts";
 import { classifyCapacity } from "../../src/quota/capacity.ts";
 import { newProvider } from "../../src/quota/headroom.ts";
@@ -67,6 +67,14 @@ test("under-paced Claude precedes Codex credits, then unlimited credits win with
   assert.equal(claude.providerInstanceId, "claudeAgent"); assert.equal(claude.model, newcomer); assert.equal(claude.topPick!.model, newcomer);
   const codex = recommend({ role: "bulk-read" }, { ...base, quota: { claudeAgent: weekly(49) } });
   assert.equal(codex.providerInstanceId, "codex"); assert.equal(codex.model, "gpt-6-luna"); assert.equal(codex.topPick!.model, "gpt-6-luna");
+  const over = { ...base.catalog.find(p => p.providerInstanceId === "claudeAgent")!, providerInstanceId: "claude-over" };
+  const mixed = recommend({ role: "bulk-read" }, { ...base, catalog: [...base.catalog, over],
+    quota: { claudeAgent: weekly(62), "claude-over": weekly(30) },
+    capacity: { ...base.capacity, "claude-over": unknown } });
+  assert.equal(mixed.model, newcomer);
+  const creditIndex = mixed.alternatives.findIndex(t => t.providerInstanceId === "codex");
+  const overIndex = mixed.alternatives.findIndex(t => t.providerInstanceId === "claude-over");
+  assert.ok(creditIndex >= 0 && overIndex > creditIndex);
   const accounts = { ...f, catalog: f.catalog.filter(p => p.providerInstanceId === "claudeAgent").flatMap(p => [
     { ...p, providerInstanceId: "claude-a" }, { ...p, providerInstanceId: "claude-b" },
   ]), quota: { "claude-a": weekly(62), "claude-b": weekly(80) } };
@@ -113,6 +121,7 @@ test("explicit effort overrides use mapped anchors or safe pairs and keep their 
     const r = recommend({ role: "bulk-read", effortOverride }, f);
     assert.equal(r.model, "claude-haiku-5-5"); assert.equal(r.options.effort, effortOverride);
     assert.match(r.reasons.join(" "), /no mapped role anchors/);
+    assert.doesNotMatch(r.reasons.join(" "), /no last good snapshot/);
   }
   f.history.picks["bulk-read:medium"] = { model: newcomer, providerInstanceId: "claudeAgent", options: { effort: "medium" } };
   f.analytics.models[newcomer] = stats(20);
@@ -133,6 +142,57 @@ test("recreated route databases cannot reuse old transition publication keys", a
       state.close();
     }
     assert.notEqual(keys[0], keys[1]);
+  } finally { scratch.remove(); }
+});
+
+test("account switches stay silent and offline model changes coalesce until attempted", async () => {
+  const scratch = routeScratch();
+  try {
+    const state = new RouteState(join(scratch.path, "noise.sqlite")), f = fixture(), sent: any[] = [];
+    const weekly = (remainingPercent: number) => ({ observedAt: iso(now), activeStop: false,
+      windows: [{ kind: "weekly", remainingPercent, windowDurationMins: 10080, resetsAt: iso(now + .4 * 7 * 86400000) }] });
+    const accounts = f.catalog.filter(p => p.providerInstanceId === "claudeAgent").flatMap(p =>
+      ["claude-a", "claude-b"].map(id => ({ ...p, providerInstanceId: id })));
+    const options = { url: "https://akasha.fixture", token: async () => "fixture-token", fetch: async (_: any, init: any) => {
+      sent.push({ key: init.headers["Idempotency-Key"], payload: JSON.parse(init.body) });
+      return new Response(JSON.stringify({ state: "visible", event_id: "a".repeat(64) }), { status: 201 });
+    } };
+    state.recommend({ role: "bulk-read" }, { ...f, catalog: accounts,
+      quota: { "claude-a": weekly(80), "claude-b": weekly(62) } }, "omarchy-pc", true);
+    await state.flush(options);
+    for (let n = 0; n < 20; n++) state.recommend({ role: "bulk-read" }, { ...f, catalog: accounts,
+      quota: { "claude-a": weekly(n % 2 ? 80 : 62), "claude-b": weekly(n % 2 ? 62 : 80) } }, "omarchy-pc", true);
+    assert.equal(state.pending(), 0);
+    for (let n = 0; n < 80; n++) {
+      state.recommend({ role: "bulk-read" }, { ...f,
+        config: { pins: { "bulk-read": { model: n % 2 ? newcomer : "claude-haiku-5-5" } } } }, "omarchy-pc", true);
+      assert.ok(state.pending() <= 1);
+    }
+    state.recommend({ role: "bulk-read" }, { ...f, config: { pins: { "bulk-read": { model: "claude-haiku-5-5" } } } }, "omarchy-pc", true);
+    await state.flush({ ...options, fetch: async (url, init) => { await options.fetch(url, init); throw new Error("lost receipt"); } });
+    const attempted = sent.at(-1);
+    state.recommend({ role: "bulk-read" }, f, "omarchy-pc", true);
+    assert.equal(state.pending(), 2);
+    await state.flush(options);
+    assert.equal(sent.at(-2).key, attempted.key);
+    assert.deepEqual(sent.at(-2).payload, attempted.payload);
+    assert.equal(state.pending(), 0);
+    assert.ok(sent.every(e => e.payload.data.model !== e.payload.data.previous_model));
+    state.close();
+  } finally { scratch.remove(); }
+});
+test("a full event queue defers announcements without breaking recommendations", () => {
+  const scratch = routeScratch();
+  try {
+    const state = new RouteState(join(scratch.path, "bounded.sqlite"));
+    let result;
+    for (let n = 0; n <= MAX_ROUTE_EVENTS; n++) result = state.recommend({
+      role: "critical-review", authorProvider: "writer-" + n,
+    }, { ...fixture(), config: { pins: { "critical-review": { model: "claude-fable-5-1" } } } }, "omarchy-pc", true);
+    assert.equal(state.pending(), MAX_ROUTE_EVENTS);
+    assert.equal(result!.model, "claude-fable-5-1");
+    assert.match(result!.reasons.join(" "), /announcement deferred/);
+    state.close();
   } finally { scratch.remove(); }
 });
 
