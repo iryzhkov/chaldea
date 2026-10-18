@@ -17,7 +17,7 @@ export interface ReaderDependencies {fetch?:typeof fetch;token?:()=>Promise<stri
 async function responseJson(response:Response):Promise<unknown>{
   const reader=response.body?.getReader();if(!reader)throw new Error("missing_body");
   const chunks:Uint8Array[]=[];let bytes=0;
-  try{while(true){const c=await reader.read();if(c.done)break;bytes+=c.value.length;if(bytes>2*1024**2)throw new Error("response_limit");chunks.push(c.value);}}finally{await reader.cancel().catch(()=>{});}
+  try{while(true){const c=await reader.read();if(c.done)break;bytes+=c.value.length;if(bytes>2*1024**2)throw new Error("response_limit");chunks.push(c.value);}}finally{void reader.cancel().catch(()=>{});}
   return strictJson(Buffer.concat(chunks));
 }
 /** One fixed one-hour query per refresh. Pagination never changes its cursor binding. */
