@@ -182,12 +182,12 @@ async function quotaStatus(rest: ReadonlyArray<string>): Promise<number> {
 
 export async function main(argv: ReadonlyArray<string>): Promise<number> {
   if (argv.length === 1 && argv[0] === "--describe") {
-    const commands = (await import("./message.ts")).messageAvailable() ? [...description.commands, {name:"message send",summary:"Queue an authorized existing-thread message",access:"write"},{name:"message status",summary:"Read an authorized message receipt",access:"read"}] : description.commands;
+    const commands = (await import("./message.ts")).messageAvailable() ? [...description.commands, {name:"message send",summary:"Queue an authorized existing-thread message",access:"write"},{name:"message status",summary:"Read an authorized message receipt",access:"read"},{name:"message recover",summary:"Explicitly retry original stored message bytes",access:"write"},{name:"message targets",summary:"List configured message routes",access:"read"}] : description.commands;
     process.stdout.write(JSON.stringify({...description,commands}) + "\n");
     return 0;
   }
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
-    const messaging = (await import("./message.ts")).messageAvailable() ? "\n  chaldea message send|status --host HOST --thread THREAD --request-id ID [--text TEXT]\n" : "";
+    const messaging = (await import("./message.ts")).messageAvailable() ? "\n  chaldea message send|status|recover --host HOST --thread THREAD --request-id ID [--text TEXT]\n" : "";
     process.stdout.write(discoveryHelp + "\n" + USAGE + messaging);
     return 0;
   }

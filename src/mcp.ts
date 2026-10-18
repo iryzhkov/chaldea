@@ -2,10 +2,10 @@
 // Advisory routing reads local T3/observer data and owns its bounded collection caches.
 import { callService } from "./waits/service.ts";
 import { route } from "./route/runtime.ts";
-import { message, messageAvailable } from "./message.ts";
-const messageTools = () => messageAvailable() ? ["send","status"].map(op=>({name:"chaldea_message_"+op,
-  description:op==="send"?"Queue a message to a configured existing thread. Reuse the same requestId and text after uncertainty. accepted means durably queued, not read.":"Read a receipt for a configured existing thread. Never dispatches.",
-  inputSchema:schema({host:str,threadId:str,requestId:identity.requestId,...(op==="send"?{text:str}:{})},["host","threadId","requestId",...(op==="send"?["text"]:[])])})) : [];
+import { message, messageAvailable, messageTargets } from "./message.ts";
+const messageTools = () => messageAvailable() ? ["send","status","recover","targets"].map(op=>({name:"chaldea_message_"+op,
+  description:op==="targets"?"List only locally configured message routes and exact threads; receiver authorization remains authoritative.":op==="recover"?"Explicitly retry stored uncertain intent with its original IDs and bytes.":op==="send"?"Queue a message to a configured existing thread. Reuse the same requestId and text after uncertainty. accepted means durably queued, not read.":"Read a receipt for a configured existing thread. Never dispatches.",
+  inputSchema:op==="targets"?schema({},[]):schema({host:str,threadId:str,requestId:identity.requestId,...(op==="send"?{text:str}:{})},["host","threadId","requestId",...(op==="send"?["text"]:[])])})) : [];
 const str={type:"string"};
 const identity={threadId:{...str,description:"Your own orchestrator_capabilities.parentThreadId on this host"},
   requestId:{...str,description:"Stable retry key: <13-digit epoch milliseconds>:<unique key>; reuse with identical arguments"}};
@@ -48,7 +48,9 @@ export async function runMcp(socket:string):Promise<void>{
         try{
           const result=p.name==="chaldea_route" ? await route(p.arguments??{}) :
             p.name==="chaldea_message_send" ? await message("send",p.arguments??{}) :
-            p.name==="chaldea_message_status" ? await message("status",p.arguments??{}) : await callService(socket,p.name,p.arguments??{});
+            p.name==="chaldea_message_status" ? await message("status",p.arguments??{}) :
+            p.name==="chaldea_message_recover" ? await message("recover",p.arguments??{}) :
+            p.name==="chaldea_message_targets" ? messageTargets(undefined,p.arguments??{}) : await callService(socket,p.name,p.arguments??{});
           reply(id,{content:[{type:"text",text:JSON.stringify(result)}]});
         }catch(e){reply(id,{isError:true,content:[{type:"text",text:e instanceof Error?e.message:"Request failed"}]});}
         return;

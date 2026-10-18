@@ -3,19 +3,18 @@ import test from "node:test";
 import { mkdtempSync, mkdirSync, rmSync, unlinkSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { Readable } from "node:stream";
+import { receiver,broker,transport } from "../helpers/message-config.ts";
 import { MessageStore, WINDOW, RETENTION } from "../../src/message-store.ts";
-import { request, decodeRequest, identity, requestHash, message, senderBinding, sshArgs, type SenderConfig } from "../../src/message.ts";
-import { receive, authorize, payload, readBody, receiverBinding, type ReceiverConfig, type Context } from "../../src/message-receiver.ts";
+import { request, decodeRequest, identity, requestHash, message, senderBinding, type SenderConfig } from "../../src/message.ts";
+import { receive, authorize, payload, receiverBinding, type ReceiverConfig, type Principal } from "../../src/message-receiver.ts";
 
 const now=1_792_300_000_000;
 function fixture(){
   assert.notEqual(homedir(),"/home/igor");assert.notEqual(homedir(),"/root");
   const base=join(homedir(),"message-tests");mkdirSync(base,{recursive:true,mode:0o700});
   const dir=mkdtempSync(join(base,"t-"));
-  const c:ReceiverConfig={host:"target",environment:"fixture",loopbackT3Url:"http://127.0.0.1:1",tokenFile:join(dir,"token"),database:join(dir,"receipts.db"),
-    callers:{pc:{sourceHost:"source",sourceAddresses:["127.0.0.1"],threads:["thread"]}}};
-  const x:Context={caller:"pc",connection:"127.0.0.1 1234 127.0.0.1 22",originalCommand:"chaldea-message-v1"};
+  const c=receiver(dir);
+  const x:Principal={caller:"pc",sourceHost:"source",subject:transport.commandSubject};
   const r=request({v:1,op:"send",host:"target",environment:"fixture",threadId:"thread",requestId:now+":test",text:"hello"});
   const s=new MessageStore(c.database,receiverBinding(c),true);
   return {dir,c,x,r,s,close(){s.close();rmSync(dir,{recursive:true,force:true});}};
@@ -42,12 +41,11 @@ test("identities bind authenticated caller, source and each target field; text c
     assert.deepEqual(p.dispatchMode,{type:"queue_after_active"});assert.equal(p.text,"Chaldea message from pc\nhello");
   }finally{f.close();}
 });
-test("command, peer, caller, destination and exact thread ACL refuse before connecting",async()=>{
+test("broker subject, caller/source, destination and exact thread ACL refuse before connecting",async()=>{
   const f=fixture();try{
     let calls=0;const connect=()=>{calls++;throw new Error("must not connect");};
-    for(const originalCommand of ["","sh","chaldea-message-v1 ","scp -t x","internal-sftp","chaldea-message-v1;id"])
-      assert.throws(()=>authorize(f.c,{...f.x,originalCommand}));
-    for(const connection of ["127.0.0.2 1234 127.0.0.1 22","bad","127.0.0.1 x 127.0.0.1 22"])assert.throws(()=>authorize(f.c,{...f.x,connection}));
+    assert.throws(()=>authorize(f.c,{...f.x,subject:"chaldea.message.command.other"}));
+    assert.throws(()=>authorize(f.c,{...f.x,sourceHost:"other"}));
     assert.throws(()=>authorize(f.c,{...f.x,caller:"other"}));
     for(const r of [{...f.r,host:"other"},{...f.r,environment:"other"},{...f.r,threadId:"unlisted"}])
       await assert.rejects(receive(r,f.x,f.c,f.s,()=>f.c,connect,now));
@@ -151,27 +149,15 @@ test("crash after intent and after dispatch preserves exact payload; failed rece
     assert.equal((await receive({...f.r,op:"status"} as never,f.x,f.c,f.s,()=>f.c,connect,now)).state,"uncertain");
   }finally{f.close();}
 });
-test("sender commits intent before transport, no fallback after loss, immutable duplicate and unknown-route refusal",async()=>{
-  const f=fixture();try{
-    const c:SenderConfig={callerId:"pc",sourceHost:"source",database:join(f.dir,"sender.db"),hosts:{target:{destinationHost:"target",environment:"fixture",
-      address:"127.0.0.1",port:22,keyFile:join(f.dir,"key"),knownHostsFile:join(f.dir,"hosts"),threads:["thread"]}}};
-    const s=new MessageStore(c.database,senderBinding(c),true);s.close();let calls=0;
-    const input={host:"target",threadId:"thread",requestId:f.r.requestId,text:f.r.text};
-    const transport=async(_:unknown,r:ReturnType<typeof request>)=>{
-      calls++;const s=new MessageStore(c.database,senderBinding(c)); // Sender holds lock, proving serialization.
-      s.close();return {...identity("pc","source",r),state:"accepted" as const};
-    };
-    assert.equal((await message("send",input,c,transport,now)).state,"uncertain");assert.equal(calls,1);
-    const s2=new MessageStore(c.database,senderBinding(c));assert.ok(s2.get(identity("pc","source",f.r).commandId)?.payload);s2.close();
-    assert.equal((await message("send",{...input,text:"changed"},c,transport,now)).state,"conflict");assert.equal(calls,1);
-    await assert.rejects(message("send",{...input,host:"unconfigured"},c,transport,now));assert.equal(calls,1);
-    const args=sshArgs(c.hosts.target!);assert.ok(args.includes("ControlMaster=no"));assert.ok(args.includes("IdentityAgent=none"));
-    assert.equal(args.at(-1),"chaldea-message-v1");
-  }finally{f.close();}
-});
-test("body EOF and oversize bounds",async()=>{
-  assert.deepEqual(await readBody(Readable.from([Buffer.from("{}")])),Buffer.from("{}"));
-  await assert.rejects(readBody(Readable.from([Buffer.alloc(8193)])),/size/);
-  const slow=new Readable({read(){}});
-  await assert.rejects(readBody(slow,20),/eof_timeout/);slow.destroy();
+test("sender intent survives unavailable broker, changed content conflicts and unknown route refuses",async()=>{
+ const f=fixture();try{
+  const c:SenderConfig={callerId:"pc",sourceHost:"source",database:join(f.dir,"sender.db"),broker,
+   hosts:{target:{...transport,destinationHost:"target",environment:"fixture",threads:["thread"]}}};
+  new MessageStore(c.database,senderBinding(c),true).close();
+  const i={host:"target",threadId:"thread",requestId:f.r.requestId,text:f.r.text};
+  assert.equal((await message("send",i,c,now)).state,"uncertain");
+  const s=new MessageStore(c.database,senderBinding(c));assert.ok(s.get(identity("pc","source",f.r).commandId)?.payload);s.close();
+  assert.equal((await message("send",{...i,text:"changed"},c,now)).state,"conflict");
+  await assert.rejects(message("send",{...i,host:"unconfigured"},c,now));
+ }finally{f.close();}
 });

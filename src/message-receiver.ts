@@ -1,41 +1,38 @@
-// One bounded forced-command process. No listener and no arbitrary T3 operation.
-import { isIP } from "node:net";
-import { pathToFileURL } from "node:url";
+// Supervised, outbound-only existing-thread receiver. No remote T3 credential.
 import * as Effect from "effect/Effect";
 import * as Stream from "effect/Stream";
 import { readJson, privateFile } from "./config/files.ts";
 import { withClient, dispatchChaldeaWake, WakeRejectedError } from "./t3/adapter.ts";
-import { MessageStore, type Receipt } from "./message-store.ts";
-import { PROTOCOL, object, name, path, field, threads, requireMessage, decodeRequest, identity, requestHash, inWindow, type Request } from "./message.ts";
-
-export interface Caller {sourceHost:string;sourceAddresses:string[];threads:string[]}
-export interface ReceiverConfig {host:string;environment:string;loopbackT3Url:string;tokenFile:string;database:string;callers:Record<string,Caller>}
+import { MessageStore, WINDOW, type Receipt } from "./message-store.ts";
+import { object, name, path, field, threads, requireMessage, decodeRequest, identity, requestHash, inWindow, type Request } from "./message.ts";
+import { brokerConfig, mapping, distinctMappings, publicKey, MAPPING_KEYS, mappingBinding, connection, pull, publish, acknowledge, attempt, type BrokerConfig, type Mapping } from "./message-broker.ts";
+import { backoff, sleep } from "./retry.ts";
+import { boundedLog } from "./config/waits-log.ts";
+export interface Caller extends Mapping {sourceHost:string;publisherKey:string;threads:string[]}
+export interface ReceiverConfig {host:string;environment:string;loopbackT3Url:string;tokenFile:string;database:string;logFile:string;broker:BrokerConfig;callers:Record<string,Caller>}
 export const receiverBinding=(c:ReceiverConfig)=>JSON.stringify(["receiver",c.host,c.environment]);
-export function receiverConfig(file:string):ReceiverConfig {
-  const c=object(readJson(file,false,undefined,{owners:[0],maxBytes:65536}),["host","environment","loopbackT3Url","tokenFile","database","callers"]);
+export function receiverConfig(file="/etc/chaldea/message-receiver.json"):ReceiverConfig {
+  const c=object(readJson(file,false,undefined,{owners:[0],private:true,maxBytes:65536}),
+    ["host","environment","loopbackT3Url","tokenFile","database","logFile","broker","callers"]);
   const url=new URL(field(c.loopbackT3Url));
   requireMessage(url.protocol==="http:" && ["127.0.0.1","[::1]"].includes(url.hostname) &&
-    !url.username && !url.password && url.pathname==="/" && !url.search && !url.hash,"message_t3_url");
-  const callers=object(c.callers);
+    !url.username&&!url.password&&url.pathname==="/"&&!url.search&&!url.hash,"message_t3_url");
+  const callers=object(c.callers),entries:Record<string,Caller>=Object.create(null);
   requireMessage(Object.keys(callers).length<=8,"message_callers");
-  const entries:Record<string,Caller>=Object.create(null);
   for(const [id,value] of Object.entries(callers)){
-    name(id);const a=object(value,["sourceHost","sourceAddresses","threads"]);
-    requireMessage(Array.isArray(a.sourceAddresses) && a.sourceAddresses.length>0 && a.sourceAddresses.length<=8 &&
-      a.sourceAddresses.every(ip=>typeof ip==="string" && isIP(ip)),"message_source_addresses");
-    entries[id]={sourceHost:name(a.sourceHost),sourceAddresses:a.sourceAddresses as string[],threads:threads(a.threads)};
+    name(id);const a=object(value,["sourceHost","publisherKey","threads",...MAPPING_KEYS]);
+    entries[id]={...mapping(a),sourceHost:name(a.sourceHost),publisherKey:publicKey(a.publisherKey),threads:threads(a.threads)};
   }
-  return {host:name(c.host),environment:field(c.environment),loopbackT3Url:url.origin,tokenFile:path(c.tokenFile),database:path(c.database),callers:entries};
+  distinctMappings(Object.values(entries));
+  requireMessage(new Set(Object.values(entries).map(a=>a.publisherKey)).size===Object.keys(entries).length,"message_duplicate_publisher");
+  return {host:name(c.host),environment:field(c.environment),loopbackT3Url:url.origin,tokenFile:path(c.tokenFile),
+    database:path(c.database),logFile:path(c.logFile),broker:brokerConfig(c.broker),callers:entries};
 }
-export interface Context {caller:string;originalCommand:string;connection:string}
-export function authorize(c:ReceiverConfig,x:Context,r?:Request):Caller {
-  requireMessage(x.originalCommand===PROTOCOL,"message_command");
-  const peer=x.connection.split(" ");
-  requireMessage(peer.length===4 && isIP(peer[0]!) && isIP(peer[2]!) &&
-    peer.filter((_,i)=>i%2===1).every(p=>/^\d{1,5}$/.test(p) && Number(p)>0 && Number(p)<=65535),"message_peer");
+export interface Principal {caller:string;sourceHost:string;subject:string}
+export function authorize(c:ReceiverConfig,x:Principal,r?:Request):Caller {
   const a=c.callers[name(x.caller)];
-  requireMessage(a && a.sourceAddresses.includes(peer[0]!),"message_caller");
-  if(r)requireMessage(r.host===c.host && r.environment===c.environment && a.threads.includes(r.threadId),"message_acl");
+  requireMessage(a && a.sourceHost===x.sourceHost && a.commandSubject===x.subject,"message_caller");
+  if(r)requireMessage(r.host===c.host&&r.environment===c.environment&&a.threads.includes(r.threadId),"message_acl");
   return a;
 }
 export interface TargetT3 {preflight(threadId:string):Promise<boolean>;dispatch(payload:string):Promise<void>}
@@ -68,14 +65,15 @@ export function payload(r:Request,caller:string,ids:ReturnType<typeof identity>)
     attachments:[],dispatchMode:{type:"queue_after_active"}});
   requireMessage(Buffer.byteLength(bytes)<=8192,"message_payload_size");return bytes;
 }
-export async function receive(r:Request,x:Context,c:ReceiverConfig,s:MessageStore,
+export async function receive(r:Request,x:Principal,c:ReceiverConfig,s:MessageStore,
   fresh:()=>ReceiverConfig,connect:(c:ReceiverConfig)=>TargetT3=localT3,now=Date.now()):Promise<Receipt> {
   const a=authorize(c,x,r),ids=identity(x.caller,a.sourceHost,r),hash=requestHash(r);
   const reply=(state:Receipt["state"],error?:string):Receipt=>({...ids,state,...(error?{error}:{})});
   const current=()=>{
     const next=fresh(),caller=authorize(next,x,r);
     requireMessage(receiverBinding(next)===receiverBinding(c) && next.database===c.database &&
-      next.tokenFile===c.tokenFile && next.loopbackT3Url===c.loopbackT3Url && caller.sourceHost===a.sourceHost,"message_configuration_changed");
+      next.tokenFile===c.tokenFile && next.loopbackT3Url===c.loopbackT3Url && caller.sourceHost===a.sourceHost && caller.publisherKey===a.publisherKey &&
+      mappingBinding(next.broker,caller)===mappingBinding(c.broker,a),"message_configuration_changed");
   };
   try {
   const clock=s.maintain(now,Object.keys(c.callers)),row=s.get(ids.commandId);
@@ -107,37 +105,77 @@ export async function receive(r:Request,x:Context,c:ReceiverConfig,s:MessageStor
   return result;
   } catch { return reply("uncertain","message_refused"); }
 }
-export function readBody(input:NodeJS.ReadableStream,timeout=5000):Promise<Buffer> {
-  return new Promise((resolve,reject)=>{
-    const chunks:Buffer[]=[];let n=0;
-    const end=(error?:Error)=>{
-      clearTimeout(timer);input.removeListener("data",data);input.removeListener("end",done);input.removeListener("error",fail);
-      if(error){input.pause();reject(error);}else resolve(Buffer.concat(chunks));
-    };
-    const data=(chunk:Buffer|string)=>{const b=Buffer.isBuffer(chunk)?chunk:Buffer.from(chunk);n+=b.length;
-      if(n>8192)end(new Error("message_request_size"));else chunks.push(b);};
-    const done=()=>end(),fail=()=>end(new Error("message_input"));
-    const timer=setTimeout(()=>end(new Error("message_eof_timeout")),timeout);
-    input.on("data",data);input.once("end",done);input.once("error",fail);
-  });
+// One authenticated broker delivery. Stored attempt outcomes never automatically redispatch.
+export async function deliver(nc:Awaited<ReturnType<typeof connection>>,c:ReceiverConfig,caller:string,s:MessageStore,
+  fresh:()=>ReceiverConfig,signal:AbortSignal):Promise<boolean>{
+  const a=c.callers[caller]!;
+  const m=await pull(nc,c.broker,a,signal);if(!m)return false;
+  let r:Request,id:string;
+  try{
+    requireMessage(m.subject===a.commandSubject,"message_command_subject");
+    id=attempt(m.headers?.get("Chaldea-Attempt"));r=decodeRequest(Buffer.from(m.data));
+  }catch{acknowledge(nc,c.broker,a,m,false,true);return true;}
+  const x={caller,sourceHost:a.sourceHost,subject:m.subject},ids=identity(caller,a.sourceHost,r);
+  const binding=JSON.stringify([mappingBinding(c.broker,a),requestHash(r),r.op]),now=Date.now();
+  const prior=s.attempt(id);
+  if(prior&&(prior.binding!==binding||prior.command_id!==ids.commandId)){
+    acknowledge(nc,c.broker,a,m,false,true);return true;
+  }
+  let result:Receipt;
+  try{
+    const current=fresh();authorize(current,x,r);
+    requireMessage(receiverBinding(current)===receiverBinding(c)&&current.database===c.database&&
+      mappingBinding(current.broker,authorize(current,x))===mappingBinding(c.broker,a),"message_configuration_changed");
+    if(prior){
+      requireMessage(prior.binding===binding&&prior.command_id===ids.commandId,"message_attempt_conflict");
+      result=prior.result?JSON.parse(prior.result):{...ids,state:"uncertain",error:"message_uncertain"};
+    }else{
+      s.reserve(id,ids.commandId,binding,now+WINDOW+300000,now,true);
+      result=await receive(r,x,current,s,fresh);
+    }
+  }catch{result={...ids,state:"uncertain",error:"message_refused"};}
+  // No ACK on state/publication failure. A crash recovers to uncertainty, with original IDs.
+  if(s.attempt(id))s.answer(id,result);
+  else{
+    s.reserve(id,ids.commandId,binding,now+WINDOW+300000,now,true);
+    s.answer(id,result);
+  }
+  await publish(nc,c.broker,a,Buffer.from(JSON.stringify(result)),id,true);
+  acknowledge(nc,c.broker,a,m);await nc.flush();return true;
 }
-export async function receiverMain(args:readonly string[]):Promise<number> {
-  // Fixed root-owned launcher argv only; no client-supplied flags or paths.
-  requireMessage(args.length===2,"message_arguments");
-  const [file,caller]=args as [string,string],c=receiverConfig(file);
-  const x={caller,originalCommand:process.env.SSH_ORIGINAL_COMMAND??"",connection:process.env.SSH_CONNECTION??""};
-  authorize(c,x);
-  const s=new MessageStore(c.database,receiverBinding(c));
-  try {
-    const r=decodeRequest(await readBody(process.stdin)),a=authorize(c,x,r),ids=identity(caller,a.sourceHost,r);
-    let result:Receipt;
-    try {result=await receive(r,x,c,s,()=>receiverConfig(file));}
-    catch {result={...ids,state:"uncertain",error:"message_refused"};}
-    process.stdout.write(JSON.stringify(result)+"\n");return 0;
-  }finally{s.close();}
-}
-if(process.argv[1] && import.meta.url===pathToFileURL(process.argv[1]).href) {
-  const timer=setTimeout(()=>process.exit(1),20_000);
-  try{process.exitCode=await receiverMain(process.argv.slice(2));}catch{process.exitCode=1;}
-  finally{clearTimeout(timer);}
+export async function runReceiver(file="/etc/chaldea/message-receiver.json",external?:AbortSignal):Promise<void>{
+  const control=new AbortController(),stop=()=>control.abort();
+  const signal=external?AbortSignal.any([external,control.signal]):control.signal;
+  const initial=receiverConfig(file),s=new MessageStore(initial.database,receiverBinding(initial));
+  let report:ReturnType<typeof boundedLog>;
+  try{report=boundedLog(initial.logFile);}catch(e){s.close();throw e;}
+  process.once("SIGTERM",stop);process.once("SIGINT",stop);
+  let failures=0;
+  const fresh=()=>{
+    const c=receiverConfig(file);
+    requireMessage(c.database===initial.database&&receiverBinding(c)===receiverBinding(initial),"message_configuration_changed");return c;
+  };
+  const maintenance=setInterval(()=>{try{s.maintain(Date.now(),Object.keys(fresh().callers));}catch{report("message_maintenance_refused");}},60000);
+  try{
+    while(!signal.aborted){
+      const cycle=new AbortController(),currentSignal=AbortSignal.any([signal,cycle.signal]);
+      let nc:Awaited<ReturnType<typeof connection>>|undefined;let workers:Promise<void>[]=[];
+      try{
+        const c=fresh();nc=await connection(c.broker);
+        const active=nc;
+        workers=Object.keys(c.callers).map(async caller=>{
+          while(!currentSignal.aborted){
+            const current=fresh();
+            requireMessage(JSON.stringify(current.broker)===JSON.stringify(c.broker)&&
+              mappingBinding(c.broker,c.callers[caller]!)===mappingBinding(current.broker,current.callers[caller]!),"message_configuration_changed");
+            if(await deliver(active,current,caller,s,fresh,currentSignal))failures=0;
+          }
+        });
+        if(!workers.length){await sleep(30000,currentSignal);continue;}
+        await Promise.all(workers);
+      }catch{if(!signal.aborted)report("message_broker_retry");}
+      finally{cycle.abort();await nc?.close();await Promise.allSettled(workers);}
+      if(!signal.aborted){await sleep(backoff(failures),signal);failures=Math.min(failures+1,7);}
+    }
+  }finally{clearInterval(maintenance);s.close();process.removeListener("SIGTERM",stop);process.removeListener("SIGINT",stop);}
 }

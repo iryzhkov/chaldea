@@ -28,7 +28,8 @@ export class MessageStore {
         this.db.exec(`CREATE TABLE meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
           CREATE TABLE receipts(id TEXT PRIMARY KEY,caller TEXT NOT NULL,hash TEXT NOT NULL,
             stamp INTEGER NOT NULL,payload TEXT,state TEXT NOT NULL,result TEXT);
-          CREATE TABLE buckets(caller TEXT PRIMARY KEY,tokens REAL NOT NULL,observed INTEGER NOT NULL);`);
+          CREATE TABLE buckets(caller TEXT PRIMARY KEY,tokens REAL NOT NULL,observed INTEGER NOT NULL);
+          CREATE TABLE attempts(id TEXT PRIMARY KEY,command_id TEXT NOT NULL,binding TEXT NOT NULL,expires INTEGER NOT NULL,result TEXT);`);
         meta(this.db).put("binding",binding); meta(this.db).put("observed","0");
       });
       check(meta(this.db).get("binding")===binding,"message_state_binding");
@@ -49,6 +50,7 @@ export class MessageStore {
   /** Clock rollback is measured against observed wall time, never request order. */
   maintain(now:number,callers?:string[]): boolean {
     return tx(this.db,()=>{
+      this.db.prepare("DELETE FROM attempts WHERE expires<?").run(now);
       const observed=Number(meta(this.db).get("observed"));
       check(Number.isSafeInteger(observed),"message_clock_state");
       if(now<observed-300_000) return false;
@@ -69,6 +71,23 @@ export class MessageStore {
       this.db.prepare("INSERT INTO receipts VALUES(?,?,?,?,?,'dispatching',NULL)").run(row.id,row.caller,row.hash,row.stamp,row.payload);
     });
   }
+  attempt(id:string):{command_id:string;binding:string;expires:number;result:string|null}|undefined {
+    return this.db.prepare("SELECT * FROM attempts WHERE id=?").get(id) as never;
+  }
+  reserve(id:string,command:string,binding:string,expires:number,now:number,receiver=false):void {
+    tx(this.db,()=>{
+      this.db.prepare("DELETE FROM attempts WHERE expires<?").run(now);
+      check(!this.attempt(id),"message_attempt_conflict");
+      check(Number(this.db.prepare("SELECT count(*) AS n FROM attempts").get()!.n)<(receiver?10000:128),"message_attempt_capacity");
+      check(Buffer.byteLength(binding)<=2048,"message_attempt_binding");
+      this.db.prepare("INSERT INTO attempts VALUES(?,?,?,?,NULL)").run(id,command,binding,expires);
+    });
+  }
+  answer(id:string,result:Receipt):void {
+    check(Buffer.byteLength(JSON.stringify(result))<=2048,"message_receipt_size");
+    this.db.prepare("UPDATE attempts SET result=? WHERE id=? AND result IS NULL").run(JSON.stringify(result),id);
+  }
+  forget(id:string):void {this.db.prepare("DELETE FROM attempts WHERE id=?").run(id);}
   consume(caller:string,now:number):void {
     const bucket=this.db.prepare("SELECT * FROM buckets WHERE caller=?").get(caller) as {tokens:number;observed:number}|undefined;
     const tokens=Math.min(2,(bucket?.tokens??2)+Math.max(0,now-(bucket?.observed??now))/6000);

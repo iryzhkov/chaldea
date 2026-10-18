@@ -1,3 +1,4 @@
+import { receiver,transport } from "../helpers/message-config.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
@@ -12,8 +13,7 @@ test("process death at intent, T3 commit and receipt commit never invents accept
   for(const phase of ["intent","dispatch","receipt"]){
     const dir=mkdtempSync(join(base,"t-")),now=Date.now();
     try{
-      const c:ReceiverConfig={host:"target",environment:"fixture",loopbackT3Url:"http://127.0.0.1:1",tokenFile:join(dir,"token"),database:join(dir,"state.db"),
-        callers:{pc:{sourceHost:"source",sourceAddresses:["127.0.0.1"],threads:["thread"]}}};
+      const c=receiver(dir);
       new MessageStore(c.database,receiverBinding(c),true).close();
       const run=(phase:string)=>spawnSync(process.execPath,[resolve("test/helpers/message-crash.ts"),JSON.stringify(c),phase,String(now)],
         {env:{PATH:process.env.PATH,HOME:homedir(),TMPDIR:process.env.TMPDIR},encoding:"utf8",timeout:10_000});

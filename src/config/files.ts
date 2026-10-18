@@ -7,7 +7,7 @@ export class ConfigurationError extends Error {
     super(message); this.file = file; this.reason = reason;
   }
 }
-export interface FilePolicy { maxBytes?: number; secret?: boolean; owners?: readonly number[] }
+export interface FilePolicy { maxBytes?: number; secret?: boolean; private?: boolean; owners?: readonly number[] }
 /** Inspect the opened descriptor, then bound the read even if the file grows.
  * NOFOLLOW refuses a symlink leaf; NONBLOCK keeps FIFOs from blocking startup. */
 export function readTrustedFile(path: string, policy: FilePolicy = {}): Buffer {
@@ -23,7 +23,7 @@ export function readTrustedFile(path: string, policy: FilePolicy = {}): Buffer {
     const uid = process.geteuid?.() ?? process.getuid?.() ?? -1;
     const owners = policy.owners ?? (policy.secret ? [uid] : [0, uid]);
     const reason = !stat.isFile() ? "type" : stat.nlink !== 1 ? "links" : !owners.includes(stat.uid) ? "owner" :
-      (stat.mode & (policy.secret ? 0o077 : 0o022)) !== 0 ? "mode" : stat.size > max ? "size" : undefined;
+      (stat.mode & (policy.secret ? 0o077 : policy.private ? 0o037 : 0o022)) !== 0 ? "mode" : stat.size > max ? "size" : undefined;
     if (reason) throw new ConfigurationError(policy.secret ? "Credential requires owner uid, mode 0600 or stricter and bounded size" : "Unsafe configuration file", path, reason);
     const bytes = Buffer.alloc(max + 1);
     let size = 0, n: number;

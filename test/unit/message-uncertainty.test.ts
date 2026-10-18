@@ -1,3 +1,4 @@
+import { receiver,transport } from "../helpers/message-config.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { mkdtempSync,mkdirSync,rmSync } from "node:fs";
@@ -11,9 +12,8 @@ test("prior possible delivery stays uncertain across rate/clock/write refusals a
   assert.notEqual(homedir(),"/home/igor");assert.notEqual(homedir(),"/root");
   const base=join(homedir(),"message-uncertain");mkdirSync(base,{recursive:true,mode:0o700});
   const dir=mkdtempSync(join(base,"t-")),now=Date.now();
-  const c:ReceiverConfig={host:"target",environment:"fixture",loopbackT3Url:"http://127.0.0.1:1",tokenFile:join(dir,"token"),database:join(dir,"receipts.db"),
-    callers:{pc:{sourceHost:"source",sourceAddresses:["127.0.0.1"],threads:["thread"]}}};
-  const x={caller:"pc",originalCommand:"chaldea-message-v1",connection:"127.0.0.1 1234 127.0.0.1 22"};
+  const c=receiver(dir);
+  const x={caller:"pc",sourceHost:"source",subject:transport.commandSubject};
   const r=request({v:1,op:"send",host:"target",environment:"fixture",threadId:"thread",requestId:now+":r1",text:"possible earlier delivery"});
   const s=new MessageStore(c.database,receiverBinding(c),true),id=identity("pc","source",r).commandId;
   let dispatches=0;
