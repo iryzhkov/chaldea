@@ -11,9 +11,13 @@ Identity prefers rateLimits' accountId, which T3 uses for its workspace binding,
 then falls back to an ID from account/read. If account/read is unsupported,
 the rateLimits read still runs.
 If neither response supplies an ID, observations remain local and are not
-published. Claude uses the organisation/account ID in the usage response or
-a GET of the OAuth profile endpoint when usage omits identity. Both requests
-are GET only. Missing identity also keeps Claude observations local.
+published. Claude native quota uses that T3 instance's hashed `auth.workspaceId`
+binding. Fresh native windows take priority. The optional HTTP fallback uses the
+organisation/account ID in the usage response or a GET of the OAuth profile
+endpoint when usage omits identity. Both requests are GET only. Its account must
+match any native or configured binding; errors never relabel native windows.
+Missing identity keeps Claude observations local, and stale windows retain their
+original observation time.
 
 ## Host configuration
 
