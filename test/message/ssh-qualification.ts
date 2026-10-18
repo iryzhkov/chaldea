@@ -7,11 +7,12 @@ import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createServer, createConnection, type AddressInfo } from "node:net";
 import * as Effect from "effect/Effect";
+import { DatabaseSync } from "node:sqlite";
 import { startDisposableT3, t3Version } from "../helpers/disposable-t3.ts";
 import { ShellWatcher, waitFor } from "../helpers/e2e.ts";
 import { withClient } from "../../src/t3/adapter.ts";
 import { MessageStore } from "../../src/message-store.ts";
-import { receiverBinding, type ReceiverConfig } from "../../src/message-receiver.ts";
+import { receiverBinding, payload, type ReceiverConfig } from "../../src/message-receiver.ts";
 import { identity, request, message, senderBinding, sshRequest, type SenderConfig, type Route } from "../../src/message.ts";
 
 async function port():Promise<number>{
@@ -40,6 +41,7 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
   const run=(cmd:string,args:string[])=>execFileSync(cmd,args,{encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:30_000});
   try{
     assert.notEqual(spawnSync("getent",["passwd",user]).status,0,"refuse any pre-existing account");
+    assert.equal(existsSync("/etc/ssh/sshrc"),false,"system sshrc would run an interpreter before the static login shell");
     run(resolve("node_modules/.bin/esbuild"),["test/helpers/message-receiver-fixture.ts","--bundle","--platform=node","--format=esm","--packages=bundle","--banner:js=import {createRequire} from 'node:module';const require=createRequire(import.meta.url);","--outfile="+bundle]);
     copyFileSync(process.execPath,node);chownSync(node,0,0);chmodSync(node,0o755);
     chownSync(bundle,0,0);chmodSync(bundle,0o644);
@@ -60,7 +62,7 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     const sshd=join(root,"sshd.conf");
     const policy="Port "+sshPort+"\nListenAddress 127.0.0.1\nHostKey "+join(root,"host")+"\nPidFile "+join(root,"sshd.pid")+"\n"+
       "UsePAM no\nPermitRootLogin no\nStrictModes yes\nPermitUserEnvironment no\nLogLevel ERROR\nAllowUsers "+user+"\n"+
-      "AcceptEnv NODE_OPTIONS BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH SSH_AUTH_SOCK SSH_ORIGINAL_COMMAND SSH_CONNECTION\n"+
+      "AcceptEnv NODE_OPTIONS BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH SSH_AUTH_SOCK\n"+
       "Subsystem sftp internal-sftp\nMatch User "+user+"\n"+
       "  AuthenticationMethods publickey\n  PubkeyAuthentication yes\n  PasswordAuthentication no\n  KbdInteractiveAuthentication no\n"+
       "  HostbasedAuthentication no\n  GSSAPIAuthentication no\n  AuthorizedKeysFile "+authorized+"\n  AuthorizedKeysCommand none\n"+
@@ -137,6 +139,7 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     for(const command of [[],["sh"],["chaldea-message-v1 "],["chaldea-message-v1; id"],["scp -t /x"]]){
       const negative=await ssh(command,[],JSON.stringify(r));assert.notEqual(negative.code,0,"command must be refused: "+JSON.stringify(command));
     }
+    assert.notEqual((await ssh([],["-o","SetEnv=SSH_ORIGINAL_COMMAND=chaldea-message-v1"],JSON.stringify(r))).code,0,"shell cannot spoof original command");
     assert.notEqual((await ssh(["sftp"],["-s"],JSON.stringify(r))).code,0,"subsystem refused");
     const pty=await ssh(["chaldea-message-v1"],["-tt"],JSON.stringify(status));assert.match(pty.err,/PTY allocation request failed/i);
     assert.notEqual((await ssh([],["-W","127.0.0.1:"+sshPort])).code,0,"direct TCP forwarding refused");
@@ -168,6 +171,28 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     } finally {await new Promise<void>(r=>agentServer.close(()=>r()));}
     // A source IP outside from= cannot authenticate the same otherwise valid key.
     assert.notEqual((await ssh(["chaldea-message-v1"],["-b","127.0.0.2"],JSON.stringify(status))).code,0);
+    // Fault-inject a lost receiver receipt AFTER the real T3 acceptance above.
+    // Root touches only this ephemeral fixture's idle private DB, never host state.
+    const faults=new DatabaseSync(c.database),command=identity("fixture","source",r);
+    try {
+      faults.prepare("UPDATE receipts SET state='uncertain',result=NULL,payload=? WHERE id=?").run(payload(r,"fixture",command),command.commandId);
+      faults.prepare("UPDATE buckets SET tokens=0,observed=? WHERE caller='fixture'").run(Date.now());
+      const limited=await ssh(["chaldea-message-v1"],[],JSON.stringify(r));
+      assert.equal(limited.code,0,limited.err);assert.equal(JSON.parse(limited.out).state,"uncertain");
+      faults.prepare("UPDATE meta SET value=? WHERE name='observed'").run(String(Date.now()+600_000));
+      const rollback=await ssh(["chaldea-message-v1"],[],JSON.stringify(r));
+      assert.equal(rollback.code,0,rollback.err);assert.equal(JSON.parse(rollback.out).state,"uncertain");
+      faults.prepare("UPDATE meta SET value=? WHERE name='observed'").run(String(Date.now()));
+      faults.prepare("UPDATE buckets SET tokens=2,observed=? WHERE caller='fixture'").run(Date.now());
+      await withClient(opts(),client=>client["orchestration.dispatchCommand"]({
+        type:"thread.archive",commandId:"fixture-archive",threadId,
+      } as never));
+      const archived=await ssh(["chaldea-message-v1"],[],JSON.stringify(r));
+      assert.equal(archived.code,0,archived.err);assert.equal(JSON.parse(archived.out).state,"uncertain");
+      assert.equal(faults.prepare("SELECT state FROM receipts WHERE id=?").get(command.commandId)!.state,"uncertain");
+      const absent=await ssh(["chaldea-message-v1"],[],JSON.stringify({...status,requestId:Date.now()+":absent"}));
+      assert.equal(absent.code,0,absent.err);assert.equal(JSON.parse(absent.out).state,"uncertain");
+    } finally {faults.close();}
     writeFileSync(config,JSON.stringify({...c,callers:{}}),{mode:0o644});
     assert.notEqual((await ssh(["chaldea-message-v1"],[],JSON.stringify(status))).code,0,"revoked ACL checked on replay");
     writeFileSync(config,JSON.stringify(c),{mode:0o644});

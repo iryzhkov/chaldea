@@ -96,7 +96,7 @@ test("out-of-order distinct requests within window work; real clock rollback ref
     assert.equal((await receive(f.r,f.x,f.c,f.s,()=>f.c,t3,now)).state,"accepted");
     const earlier={...f.r,requestId:(now-60_000)+":earlier"};
     assert.equal((await receive(earlier,f.x,f.c,f.s,()=>f.c,t3,now)).state,"accepted");
-    await assert.rejects(receive({...f.r,requestId:(now-600_000)+":rollback"},f.x,f.c,f.s,()=>f.c,t3,now-600_000),/clock_rollback/);
+    assert.equal((await receive({...f.r,requestId:(now-600_000)+":rollback"},f.x,f.c,f.s,()=>f.c,t3,now-600_000)).state,"uncertain");
     const future={...f.r,requestId:(now+300_001)+":future"};
     assert.equal((await receive(future,f.x,f.c,f.s,()=>f.c,t3,now)).error,"message_expired");
   }finally{f.close();}
@@ -125,11 +125,11 @@ test("durable rate bucket, unresolved/row/payload capacity and fail-closed write
   const f=fixture();try{
     const t3=()=>({async preflight(){return true;},async dispatch(){}});
     for(let n=0;n<2;n++)assert.equal((await receive({...f.r,requestId:now+":rate"+n},f.x,f.c,f.s,()=>f.c,t3,now)).state,"accepted");
-    await assert.rejects(receive({...f.r,requestId:now+":rate3"},f.x,f.c,f.s,()=>f.c,t3,now),/message_rate/);
+    assert.equal((await receive({...f.r,requestId:now+":rate3"},f.x,f.c,f.s,()=>f.c,t3,now)).state,"uncertain");
     assert.equal((await receive({...f.r,requestId:now+":rate3"},f.x,f.c,f.s,()=>f.c,t3,now+6000)).state,"accepted");
     f.s.db.exec("PRAGMA query_only=ON");
     let called=false;
-    await assert.rejects(receive({...f.r,requestId:now+":write"},f.x,f.c,f.s,()=>f.c,()=>{called=true;return t3();},now+12000));
+    assert.equal((await receive({...f.r,requestId:now+":write"},f.x,f.c,f.s,()=>f.c,()=>{called=true;return t3();},now+12000)).state,"uncertain");
     assert.equal(called,false);
     f.s.db.exec("PRAGMA query_only=OFF");
     assert.throws(()=>f.s.begin({id:"large",caller:"pc",hash:"h",stamp:now,payload:"x".repeat(8193)}),/payload_size/);

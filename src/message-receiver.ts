@@ -77,12 +77,13 @@ export async function receive(r:Request,x:Context,c:ReceiverConfig,s:MessageStor
     requireMessage(receiverBinding(next)===receiverBinding(c) && next.database===c.database &&
       next.tokenFile===c.tokenFile && next.loopbackT3Url===c.loopbackT3Url && caller.sourceHost===a.sourceHost,"message_configuration_changed");
   };
+  try {
   const clock=s.maintain(now,Object.keys(c.callers)),row=s.get(ids.commandId);
   if(r.op==="send" && row && row.hash!==hash)return reply("conflict","message_conflict");
-  if(r.op==="status")return row?.result?JSON.parse(row.result):reply(row?"uncertain":"rejected",row?"message_uncertain":"message_not_found");
+  if(r.op==="status")return row?.result?JSON.parse(row.result):reply("uncertain",row?"message_uncertain":"message_not_found");
   if(row?.state==="accepted" || row?.state==="rejected")return JSON.parse(row.result!);
   requireMessage(clock,"message_clock_rollback");
-  if(!inWindow(r,now))return reply(row?"uncertain":"rejected","message_expired");
+  if(!inWindow(r,now))return reply("uncertain","message_expired");
   if(row)requireMessage(row.payload!==null,"message_expired");
   const bytes=row?.payload??payload(r,x.caller,ids);
   // Exact immutable intent is committed before reading T3 credentials or dispatch.
@@ -92,7 +93,7 @@ export async function receive(r:Request,x:Context,c:ReceiverConfig,s:MessageStor
   try {
     const t3=connect(c);
     if(!await t3.preflight(r.threadId)) {
-      result=reply("rejected","message_target_unavailable");
+      result=reply(row?"uncertain":"rejected","message_target_unavailable");
     } else {
       current(); // Re-read root-controlled ACL immediately before dispatch/replay.
       await t3.dispatch(bytes);
@@ -104,6 +105,7 @@ export async function receive(r:Request,x:Context,c:ReceiverConfig,s:MessageStor
   try{s.finish(ids.commandId,result);}
   catch{return reply("uncertain","message_state_write");}
   return result;
+  } catch { return reply("uncertain","message_refused"); }
 }
 export function readBody(input:NodeJS.ReadableStream,timeout=5000):Promise<Buffer> {
   return new Promise((resolve,reject)=>{
@@ -130,7 +132,7 @@ export async function receiverMain(args:readonly string[]):Promise<number> {
     const r=decodeRequest(await readBody(process.stdin)),a=authorize(c,x,r),ids=identity(caller,a.sourceHost,r);
     let result:Receipt;
     try {result=await receive(r,x,c,s,()=>receiverConfig(file));}
-    catch {result={...ids,state:"rejected",error:"message_refused"};}
+    catch {result={...ids,state:"uncertain",error:"message_refused"};}
     process.stdout.write(JSON.stringify(result)+"\n");return 0;
   }finally{s.close();}
 }

@@ -72,13 +72,20 @@ equivalent in a local root-controlled provisioning action running as the store
 owner. initialize uses exclusive creation and refuses an existing file. There is
 deliberately no remotely reachable initialization command. After loss, restore a
 consistent receipt DB and clock watermark from backup, or explicitly reinitialize
-with a new environment and retire old grants. Never recreate a receiver DB and
-replay old IDs. This is the lead's correction to the reduced review suggestion.
+with a new environment and retire old grants. For the same T3 environment,
+disable old grants, drain receiver processes and wait more than 24 hours plus
+five minutes with verified healthy time before explicit reinitialization. Never
+recreate a receiver DB while old IDs can still be eligible for dispatch. This is the lead's correction to the reduced review suggestion.
 
 ## Native launcher and SSH policy
 
 Build host/chaldea-message-launcher.c statically with the target architecture's
-compiler and libc static archives:
+compiler and libc static archives. The standard npm test suite now requires
+cc, static libc development archives and readelf. CI qualifies Ubuntu x86_64;
+aarch64 and other target architectures still need their own qualification.
+Static glibc can process GLIBC_TUNABLES before main, so production AcceptEnv must
+exclude GLIBC_*, LD_*, MALLOC_*, SSH_* and other runtime controls:
+
 
     cc -static -O2 -Wall -Wextra -Werror -o chaldea-message-receive host/chaldea-message-launcher.c
     readelf -l chaldea-message-receive
@@ -109,7 +116,12 @@ keys and principals before writing:
 
 Global sshd policy must have PermitUserEnvironment no. It is invalid inside Match.
 Do not attempt to clear AcceptEnv, which is additive. The native launcher cleans
-even explicitly accepted hostile environment. Inspect sshrc and all startup paths.
+even explicitly accepted hostile environment. Refuse activation if
+/etc/ssh/sshrc exists, since sshd can run it through /bin/sh before this launcher.
+Require the effective AcceptEnv set to allow only the needed locale variables,
+with no SSH_* or runtime/loader controls. Inspect all startup paths. The fixture
+deliberately accepts hostile runtime variables to stress the static launcher,
+asserts no system sshrc, and refuses client-supplied SSH identity variables.
 
 Use the ordinary daemon with the account-specific restrictions below. Verify
 sshd -t and sshd -T -C user=chaldea-message,addr=SOURCE,host=SOURCE. Effective
@@ -168,6 +180,10 @@ comes only from the restricted key's root-controlled command and ACL.
 Sender commits intent before SSH. Receiver commits exact immutable T3 JSON before
 any dispatch. Crash or unknown transport/T3 result is uncertain. Accepted and
 durably rejected replay returns the matching stored result after ACL checking.
+A rate/clock/write refusal, missing status, or missing/archived target after a
+prior possible dispatch remains uncertain. Only a durable T3 rejection can close
+a prior uncertain attempt as rejected. Refusing an attempt now does not establish
+whether an earlier attempt reached T3.
 No fallback ID, background worker or resend loop exists. The T3 preflight reads
 only shell metadata after ACL acceptance, refusing absent/archived/deleted
 threads; it does not request a transcript.
