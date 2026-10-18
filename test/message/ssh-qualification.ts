@@ -41,11 +41,12 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
   try{
     assert.notEqual(spawnSync("getent",["passwd",user]).status,0,"refuse any pre-existing account");
     run(resolve("node_modules/.bin/esbuild"),["test/helpers/message-receiver-fixture.ts","--bundle","--platform=node","--format=esm","--packages=bundle","--banner:js=import {createRequire} from 'node:module';const require=createRequire(import.meta.url);","--outfile="+bundle]);
-    copyFileSync(process.execPath,node);chmodSync(node,0o755);
+    copyFileSync(process.execPath,node);chownSync(node,0,0);chmodSync(node,0o755);
+    chownSync(bundle,0,0);chmodSync(bundle,0o644);
     run("cc",["-static","-O2","-Wall","-Wextra","-Werror","-DMESSAGE_NODE="+JSON.stringify(node),"-DMESSAGE_RECEIVER="+JSON.stringify(bundle),
       "-DMESSAGE_CONFIG="+JSON.stringify(config),"-o",binary,resolve("host/chaldea-message-launcher.c")]);chmodSync(binary,0o755);
     assert.doesNotMatch(run("readelf",["-l",binary]),/INTERP/);assert.doesNotMatch(run("readelf",["-d",binary]),/NEEDED/);
-    for(const p of [root,node,binary,bundle]){assert.equal(statSync(p).uid,0);assert.equal(statSync(p).mode&0o022,0);}
+    for(const p of [root,node,binary,bundle]){assert.equal(statSync(p).uid,0,"fixture root ownership: "+p);assert.equal(statSync(p).mode&0o022,0,"fixture write modes: "+p);}
     const login=join(root,"login");mkdirSync(login,{mode:0o755});
     run("useradd",["--no-create-home","--home-dir",login,"--shell",binary,"--password","*",user]);created=true;
     const uid=Number(run("id",["-u",user]).trim()),gid=Number(run("id",["-g",user]).trim());
