@@ -25,7 +25,9 @@ export class MissionModel {
   private total = 0;
   private output = 0;
   private usageObserved: number | null = null;
-  constructor(readonly demo = false, private now = Date.now) {}
+  readonly demo: boolean;
+  private now: () => number;
+  constructor(demo = false, now = Date.now) { this.demo = demo; this.now = now; }
   subscribe(fn: () => void): () => void { this.listeners.add(fn); return () => { this.listeners.delete(fn); }; }
   changed(): void { for (const fn of this.listeners) fn(); }
   cursor(): number | undefined { return this.sequence; }
@@ -40,7 +42,7 @@ export class MissionModel {
       this.total = rows.length;
       const selected = rows.toSorted((a,b) => (a.latestRunStartedAt ?? "").localeCompare(b.latestRunStartedAt ?? "") || a.id.localeCompare(b.id)).slice(0, MAX_AGENTS);
       const previous = this.threads; this.threads = new Map();
-      for (const row of selected) this.threads.set(row.id, { row, observed: now, connected: false, detailObserved: null, steps: [], ...previous.get(row.id), ...{ row, observed: now } });
+      for (const row of selected) this.threads.set(row.id, { connected: false, detailObserved: null, steps: [], ...previous.get(row.id), row, observed: now });
     } else if (event.kind === "thread") {
       const row = event.thread;
       if (row.archived || row.deleted || row.settled) { if (this.threads.delete(row.id)) this.total = Math.max(0, this.total - 1); }

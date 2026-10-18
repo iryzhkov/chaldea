@@ -549,7 +549,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     if (item.kind === "snapshot") {
       for (const turn of item.projection.providerTurns.slice(-512)) {
         onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
-          at: DateTime.toEpochMillis(turn.tokenUsage?.updatedAt ?? turn.startedAt), baseline: true });
+          at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : 0, baseline: true });
       }
       const recent = [...item.projection.turnItems, ...item.projection.visibleTurnItems.map(row => row.item)]
         .filter(row => row.status === "running").toSorted((a,b) => b.ordinal - a.ordinal)[0];
@@ -561,7 +561,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       if (e.type === "provider-turn.updated") {
         const turn = e.payload;
         onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
-          at: DateTime.toEpochMillis(turn.tokenUsage?.updatedAt ?? e.occurredAt), baseline: false });
+          at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : DateTime.toEpochMillis(e.occurredAt), baseline: false });
       } else if (e.type === "turn-item.updated" && e.payload.status === "running") {
         onEvent({ kind: "activity", tool: "toolName" in e.payload && typeof e.payload.toolName === "string" ? e.payload.toolName : null });
       }
