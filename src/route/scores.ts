@@ -47,7 +47,11 @@ export function scoreSnapshot(raw: unknown, now: number): ScoreSnapshot {
     const mapping = MODEL_MAP.find(m => m.aaSlug === row.slug);
     if (!mapping) { if (safe(row.slug)) unmapped.push(row.slug); continue; }
     const e = row.evaluations, p = row.pricing;
-    if (!e || !p) continue;
+    if (!e || !p || ![e.artificial_analysis_intelligence_index, e.artificial_analysis_coding_index,
+      p.price_1m_input_tokens, p.price_1m_output_tokens].every(number) ||
+      e.artificial_analysis_intelligence_index > 100 || e.artificial_analysis_coding_index > 100) {
+      unmapped.push(row.slug); continue;
+    }
     models.push({ model: mapping.model, effort: mapping.effort, aaSlug: mapping.aaSlug,
       intelligence: e.artificial_analysis_intelligence_index, coding: e.artificial_analysis_coding_index,
       inputPrice: p.price_1m_input_tokens, outputPrice: p.price_1m_output_tokens });

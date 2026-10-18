@@ -14,7 +14,7 @@ export const scores: ScoreSnapshot = { version: 1, fetchedAt: iso(now), indexVer
     s("claude-haiku-5-5", 34, 30, .10, .50), s("gpt-6-luna", 30, 32, .10, .50),
     s(newcomer, 36, 35, .05, .20), s("claude-sonnet-5-5", 56, 60, 0, 0),
     s("claude-fable-5-1", 49, 55, 10, 50), s("gpt-6-astra", 50, 56, 5, 20),
-    s("claude-opus-5-5", 52, 58, 5, 25),
+    s("claude-opus-5-5", 52, 58, 5, 25), s("gpt-6.1-sol", 48, 60, 5, 20),
     { ...s("claude-opus-5-5", 54, 60, 5, 25), effort: "high" },
     { ...s("gpt-6.1-sol", 50, 62, 5, 20), effort: "high" },
   ] };

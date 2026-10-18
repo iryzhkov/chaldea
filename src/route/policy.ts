@@ -29,6 +29,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   let scores: ScoreSnapshot | null = null;
   try { if (data.scores && ageSeconds(data.scores.fetchedAt, data.now) !== null) scores = validateScores(data.scores); } catch {}
   const scoreAge = ageSeconds(scores?.fetchedAt, data.now);
+  if (scores && input.effortOverride && !pair.some(model => scoreFor(scores, model, effort))) {
+    scores = null;
+    reasons.push("Explicit effort override has no mapped role anchors; use fixed role pairs without an AA quality claim");
+  }
   reasons.push(pin ? "Fleet pin overrides bans, scores, probation and quota preference; availability, effort, active stops and review separation still apply"
     : scores ? scoreAge! * 1000 >= config.scoreMaxAgeMs ? "AA snapshot stale; use last good snapshot" : "AA role target " + input.role + " with intelligence floor " + config.floors[input.role]
     : "AA unavailable; no last good snapshot; use fixed role pairs with Sonnet removed");
@@ -44,7 +48,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
       continue;
     }
     if (!pin && !scores && model !== (p.driverKind === "claudeAgent" ? pair[0] : p.driverKind === "codex" ? pair[1] : undefined)) continue;
-    const incumbent = history.picks[roleKey(input.role, input.authorProvider)]?.model ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
+    const incumbent = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride)]?.model ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
     if (!pin && scores && !targetEligible(model, effort, input.role, scores, data.analytics, config, data.now, incumbent, reasons)) continue;
     const option = m.options?.find(o => ["reasoningEffort", "effort", "variant"].includes(o.id) &&
       o.type === "select" && o.options?.some(v => v.id === effort))?.id;
@@ -111,11 +115,11 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     };
     const xr = rank(x.providerInstanceId), yr = rank(y.providerInstanceId);
     if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
-    if (hasPace && preferred === "claudeAgent" && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
+    if (hasPace && x.driver !== y.driver && preferred === "claudeAgent" && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
     if (xr !== null && yr !== null && xr !== yr) return xr - yr;
     // Unknown and paced tie, preserving the role default when Claude pacing is unknown.
     // Known quota preference takes precedence over a statistical tie-break.
-    if (hasPace && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
+    if (hasPace && x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
     if (x.driver === y.driver && x.pace !== y.pace) return (y.pace ?? -Infinity) - (x.pace ?? -Infinity);
     if (scores && !pin) {
       const xs = scoreFor(scores, x.model, effort)!, ys = scoreFor(scores, y.model, effort)!;

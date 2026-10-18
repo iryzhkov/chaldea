@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { openDb, tx } from "../store/sqlite.ts";
 import { publish } from "../events/publisher.ts";
 import type { Publication, PublisherOptions } from "../events/publisher.ts";
@@ -17,18 +17,22 @@ import type { RouteInput, RouteResult } from "./types.ts";
  */
 export class RouteState {
   private readonly db;
+  private readonly epoch: string;
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = openDb(path);
     chmodSync(path, 0o600);
     this.db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000; PRAGMA max_page_count=4096");
-    this.db.exec(`CREATE TABLE IF NOT EXISTS history(role TEXT PRIMARY KEY, value TEXT NOT NULL);
+    this.db.exec(`CREATE TABLE IF NOT EXISTS route_meta(name TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS history(role TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS picks(role TEXT PRIMARY KEY, value TEXT NOT NULL, sequence INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS pending(key TEXT PRIMARY KEY, event TEXT NOT NULL)`);
+    this.db.prepare("INSERT OR IGNORE INTO route_meta VALUES(?,?)").run("epoch", randomUUID());
+    this.epoch = String(this.db.prepare("SELECT value FROM route_meta WHERE name=?").get("epoch")!.value);
   }
   recommend(input: RouteInput, data: PolicyData, host: string, announce: boolean): RouteResult {
     return tx(this.db, () => {
-      const key = roleKey(input.role, input.authorProvider) + (input.effortOverride ? ":" + input.effortOverride : "");
+      const key = roleKey(input.role, input.authorProvider, input.effortOverride);
       const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
       const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
       const config = { ...DEFAULT_POLICY, ...data.config };
@@ -56,7 +60,7 @@ export class RouteState {
         if (announce) {
           const previous = prior ? JSON.parse(String(prior.value)).model : "initial defaults";
           const event: Publication = {
-            key: "route-pick:" + createHash("sha256").update(host + ":" + key + ":" + sequence).digest("hex"),
+            key: "route-pick:" + createHash("sha256").update(this.epoch + ":" + host + ":" + key + ":" + sequence).digest("hex"),
             source: "route", host, payload: { v: 1, kind: "route_pick_changed",
               title: "routing changed: " + top.model + " replaces " + previous + " for " + key,
               body: result.reasons.join("; ").slice(0, 16000),

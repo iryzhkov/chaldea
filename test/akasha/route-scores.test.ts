@@ -44,6 +44,12 @@ test("route source grants read homelab scores across hosts without widening othe
     for (const q of ["?kind=route_pick_changed", "?host=agent-b", "?source=foreign", "?project=foreign"]) {
       assert.equal(((await (await get(q)).json()) as { events: Envelope[] }).events.length, 0);
     }
+    const own = { ...original, host: r.r.host, issuer: r.r.issuer, source_id: registration.source_id,
+      kind: "route_pick_changed", data: { model: "own-pick" }, event_id: hash("own-route-pick") } as Envelope;
+    r.store.admit(own, hash("own-route-request"), N); project(r.store);
+    const principal = await auth.authorize(read, "read");
+    assert.equal(r.store.ownedReceipt(own.event_id, principal.scope)?.event_id, own.event_id);
+    assert.equal(r.store.ownedReceipt(original.event_id, principal.scope), undefined);
     assert.throws(() => normalize({ v: 1, kind: "route_score_snapshot", title: "Scores", data: { scores } },
       { ...identity, host: "agent-a" }, false), /scores_publisher_mismatch/);
     assert.throws(() => new Authorization([{ ...registration, source: "foreign" }], r.trust, r.clock), /invalid_route_scores_read/);

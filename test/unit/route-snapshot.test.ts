@@ -12,7 +12,8 @@ const config = { enabled: true, url: "https://akasha.fixture", tokenHelper: "/fi
 const row = { slug: MODEL_MAP[0]!.aaSlug, evaluations: { artificial_analysis_intelligence_index: 50, artificial_analysis_coding_index: 60 },
   pricing: { price_1m_input_tokens: 2, price_1m_output_tokens: 10 }, secret_extra: "must-not-publish" };
 const response = (data: unknown, page = 1, more = false) => new Response(JSON.stringify({
-  intelligence_index_version: 4.3, data, pagination: { page, has_more: more },
+  tier: "free", intelligence_index_version: 4.3, data,
+  pagination: { page, page_size: 200, total_pages: more ? page + 1 : page, has_more: more },
 }));
 test("AA collector uses a fixed HTTPS API, header key, bounded pagination and public allowlist", async () => {
   const calls: string[] = [];
@@ -21,10 +22,10 @@ test("AA collector uses a fixed HTTPS API, header key, bounded pagination and pu
     assert.match(String(url), /^https:\/\/artificialanalysis.ai\/api\/v2\/language\/models\/free\?page=/);
     assert.equal((init?.headers as Record<string,string>)["x-api-key"], "fixture-key");
     assert.equal(init?.redirect, "error");
-    return calls.length === 1 ? response([row], 1, true) : response([{ slug: "new-unmapped" }], 2);
+    return calls.length === 1 ? response([row], 1, true) : response([{ slug: "new-unmapped" }, { ...row, slug: MODEL_MAP[1]!.aaSlug, pricing: {} }], 2);
   }, () => "fixture-key");
   assert.equal(calls.length, 2); assert.equal(s.models[0]!.coding, 60); assert.equal(s.indexVersion, "4.3");
-  assert.deepEqual(s.unmapped, ["new-unmapped"]);
+  assert.deepEqual(s.unmapped, ["new-unmapped", MODEL_MAP[1]!.aaSlug]);
   assert.doesNotMatch(JSON.stringify(s), /fixture-key|secret_extra|must-not-publish/);
   await assert.rejects(fetchScores(now, async () => { throw new Error("fixture-key leaked upstream"); }, () => "fixture-key"),
     e => String(e) === "Error: aa_fetch_failed");
@@ -66,6 +67,22 @@ test("homelab publisher caches one daily fetch and retries the same idempotent p
     assert.deepEqual((readJson(path) as any).value, (last as any).value);
   } finally { scratch.remove(); }
 });
+test("daily fetch follows UTC dates despite randomized timer jitter", async () => {
+  const scratch = routeScratch();
+  try {
+    let gets = 0;
+    const options = { machine: "homelab", keyReader: () => "fixture-key", token: async () => "fixture-token",
+      fetch: async (_: any, init: any) => {
+        if (init.method === "GET") { gets++; return response([row]); }
+        return new Response(JSON.stringify({ state: "visible", event_id: "a".repeat(64) }), { status: 201 });
+      } };
+    const first = Date.parse("2026-10-17T04:14:00Z"), next = Date.parse("2026-10-18T04:01:00Z");
+    await publishScores(config, join(scratch.path, "daily.json"), first, options);
+    await publishScores(config, join(scratch.path, "daily.json"), next, options);
+    assert.equal(gets, 2);
+  } finally { scratch.remove(); }
+});
+
 test("authenticated readers accept only verified homelab route scores and preserve last good on failure", async () => {
   const scratch = routeScratch();
   try {
@@ -76,6 +93,7 @@ test("authenticated readers accept only verified homelab route scores and preser
     const event = { source: "route", host: "homelab", kind: "route_score_snapshot", provenance: { type: "verified" }, data: { scores } };
     const first = await collectScores(config, path, now, async (url, init) => {
       assert.equal(new URL(String(url)).searchParams.get("host"), "homelab");
+      assert.equal(new URL(String(url)).searchParams.get("from"), iso(now - 90 * 86400000));
       assert.equal((init?.headers as Record<string,string>).authorization, "Bearer fixture-token");
       return new Response(JSON.stringify({ events: [
         { ...event, data: { scores: { ...scores, fetchedAt: iso(now + 1000) } } },
@@ -85,7 +103,10 @@ test("authenticated readers accept only verified homelab route scores and preser
     assert.deepEqual(first.value, scores);
     const second = await collectScores(config, path, now + 900001, async () => { throw new Error("offline"); }, token);
     assert.deepEqual(second.value, scores); assert.match(second.reason!, /retained/);
-    assert.equal(tokenReads, 2);
+    const older = await collectScores(config, path, now + 1800002, async () =>
+      new Response(JSON.stringify({ events: [{ ...event, data: { scores: { ...scores, fetchedAt: iso(now - 86400000) } } }], next_cursor: null })), token);
+    assert.deepEqual(older.value, scores);
+    assert.equal(tokenReads, 3);
     assert.throws(() => validateScores({ ...scores, key: "forbidden" }));
     assert.throws(() => validateScores({ ...scores, models: [{ ...scores.models[0], effort: "max" }] }));
   } finally { scratch.remove(); }

@@ -63,8 +63,15 @@ test("under-paced Claude precedes Codex credits, then unlimited credits win with
   const weekly = (remainingPercent: number) => ({ observedAt: iso(now), activeStop: false,
     windows: [{ kind: "weekly", remainingPercent, windowDurationMins: 10080, resetsAt: iso(now + .4 * 7 * 86400000) }] });
   const base = { ...f, capacity: { codex: credit, claudeAgent: unknown } };
-  assert.equal(recommend({ role: "bulk-read" }, { ...base, quota: { claudeAgent: weekly(62) } }).providerInstanceId, "claudeAgent");
-  assert.equal(recommend({ role: "bulk-read" }, { ...base, quota: { claudeAgent: weekly(49) } }).providerInstanceId, "codex");
+  const claude = recommend({ role: "bulk-read" }, { ...base, quota: { claudeAgent: weekly(62) } });
+  assert.equal(claude.providerInstanceId, "claudeAgent"); assert.equal(claude.model, newcomer); assert.equal(claude.topPick!.model, newcomer);
+  const codex = recommend({ role: "bulk-read" }, { ...base, quota: { claudeAgent: weekly(49) } });
+  assert.equal(codex.providerInstanceId, "codex"); assert.equal(codex.model, "gpt-6-luna"); assert.equal(codex.topPick!.model, "gpt-6-luna");
+  const accounts = { ...f, catalog: f.catalog.filter(p => p.providerInstanceId === "claudeAgent").flatMap(p => [
+    { ...p, providerInstanceId: "claude-a" }, { ...p, providerInstanceId: "claude-b" },
+  ]), quota: { "claude-a": weekly(62), "claude-b": weekly(80) } };
+  const account = recommend({ role: "bulk-read" }, accounts);
+  assert.equal(account.providerInstanceId, "claude-b"); assert.equal(account.model, newcomer);
   for (const klass of ["tight", "stopped"] as const) assert.notEqual(recommend({ role: "bulk-read" }, {
     ...base, capacity: { ...base.capacity, codex: { ...credit, class: klass } },
   }).providerInstanceId, "codex");
@@ -100,6 +107,35 @@ test("probation share survives process restart and produces one event per top ch
     state.close();
   } finally { scratch.remove(); }
 });
+test("explicit effort overrides use mapped anchors or safe pairs and keep their own incumbent", () => {
+  const f = fixture();
+  for (const effortOverride of ["low", "high", "xhigh"] as const) {
+    const r = recommend({ role: "bulk-read", effortOverride }, f);
+    assert.equal(r.model, "claude-haiku-5-5"); assert.equal(r.options.effort, effortOverride);
+    assert.match(r.reasons.join(" "), /no mapped role anchors/);
+  }
+  f.history.picks["bulk-read:medium"] = { model: newcomer, providerInstanceId: "claudeAgent", options: { effort: "medium" } };
+  f.analytics.models[newcomer] = stats(20);
+  assert.equal(recommend({ role: "bulk-read", effortOverride: "medium" }, f).model, newcomer);
+});
+
+test("recreated route databases cannot reuse old transition publication keys", async () => {
+  const scratch = routeScratch();
+  try {
+    const keys: string[] = [];
+    for (const name of ["lost.sqlite", "recreated.sqlite"]) {
+      const state = new RouteState(join(scratch.path, name));
+      state.recommend({ role: "bulk-read" }, fixture(), "omarchy-pc", true);
+      await state.flush({ url: "https://akasha.fixture", token: async () => "fixture-token", fetch: async (_, init) => {
+        keys.push((init!.headers as Record<string,string>)["Idempotency-Key"]!);
+        return new Response(JSON.stringify({ state: "visible", event_id: "a".repeat(64) }), { status: 201 });
+      } });
+      state.close();
+    }
+    assert.notEqual(keys[0], keys[1]);
+  } finally { scratch.remove(); }
+});
+
 test("model selection is not limited to the old two drivers", () => {
   const f = fixture();
   const candidate = f.catalog.find(p => p.providerInstanceId === "claudeAgent")!;

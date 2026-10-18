@@ -8,7 +8,8 @@ export interface RoutingHistory {
   allocations: Record<string, { calls: number; trials: number }>;
 }
 export const emptyHistory = (): RoutingHistory => ({ seen: {}, picks: {}, allocations: {} });
-export const roleKey = (role: Role, author?: string) => role + (role === "critical-review" && author ? ":" + author : "");
+export const roleKey = (role: Role, author?: string, effort?: Effort) => role +
+  (role === "critical-review" && author ? ":" + author : "") + (effort ? ":" + effort : "");
 export const banned = (id: string, bans: readonly string[]) => bans.some(pattern =>
   new RegExp("^" + pattern.split("*").map(p => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i").test(id));
 export function usableAnalytics(a: Analytics | null, now: number, config: PolicyConfig): a is Analytics {

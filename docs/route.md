@@ -220,7 +220,20 @@ before returning it. CLI and MCP processes share the counters.
 AA's [API reference](https://artificialanalysis.ai/data-api/docs/reference) supplies
 `artificial_analysis_intelligence_index`, `artificial_analysis_coding_index`,
 `price_1m_input_tokens` and `price_1m_output_tokens`. Prices are USD per million
-tokens. Bulk-read compares a 3:1 uncached input/output blend,
+tokens. The fetcher uses the reference's "Get language models (Free tier)"
+contract, checked 2026-10-18: `GET /api/v2/language/models/free?page=N`, with the
+key in `x-api-key`. This endpoint accepts Free, Pro and Commercial keys. Its
+required top-level fields are `tier`, numeric `intelligence_index_version`,
+`pagination` and `data`. Pagination contains 1-based `page`, `page_size`,
+`total_pages` and boolean `has_more`. The reference's response example uses
+version 4.1 and two pages of 200 rows. The collector follows at most eight pages
+and requires a consistent index version. It intentionally does not guess the
+shape of the older `/api/v2/data/llms/models` endpoint. Incomplete mapped rows
+are reported with unmapped rows and held; other complete rows still publish.
+A fixture follows the documented public shape, with fake model values and no key.
+The real-key activation check is Igor's runbook step 5, before enabling the timer.
+
+Bulk-read compares a 3:1 uncached input/output blend,
 `(3 * inputPrice + outputPrice) / 4`. This avoids requiring a paid API tier or
 assuming a cache hit rate. Builder maximizes Coding Index. Critical review
 maximizes intelligence on a driver different from the author. General maximizes
@@ -325,14 +338,16 @@ Router registrations have `route_scores_read: true`. This permits only verified
 homelab `route_score_snapshot` records in the same profile and project; it does
 not grant reads of route events, other kinds, other projects or all events.
 The helper needs a source-bound `route/read` grant on each router host.
-Readers paginate within a fixed bound, refresh at most every 15 minutes, and
+Readers search the last 90 days, paginate within a fixed bound, refresh at most
+every 15 minutes, and
 keep local last good data when reads fail.
 
 Exactly one host, `announceHost`, publishes `route_pick_changed`. Configure
 `scores.host` to the actual host name everywhere; the grant binds it as well.
 The default authority is omarchy-pc, whose route database must be persistent.
 Its durable transaction records each change and one outbox intent, including a
-monotonic transition number. Delivery retries use the identical idempotency key
+monotonic transition number and a persistent random database epoch. Rebuilding a
+lost database cannot reuse its old publication keys. Delivery retries use the identical idempotency key
 and payload until Akasha acknowledges a visible record. Other router hosts
 reserve probation shares locally but do not announce duplicate fleet changes.
 
@@ -342,7 +357,10 @@ Sampling a probation model does not generate repeated pick-change events.
 Initial selection produces one event; unchanged targets produce none.
 Reviews use a separate top pick per author driver, since cross-provider
 constraints produce different targets. Explicit effort overrides do not
-announce or mutate the normal role's pick. Transient publication failures
+announce or mutate the normal role's pick. An explicit override with no mapped
+role anchors falls back to the fixed pair without claiming its AA floor is met.
+Transitions queue on the authority even before transport is configured.
+Transient publication failures
 appear in reasons and remain queued for the next route invocation. The
 mission-control board can consume the normal Akasha event stream.
 
@@ -399,7 +417,8 @@ finally:
 6. Verify an authenticated snapshot read from each router host and a fixture
    route before enabling `sudo systemctl enable --now chaldea-route-scores.timer`.
    The daily timer is persistent and retries failed runs at five-minute intervals
-   up to its systemd start limit. The fetch cache limits AA attempts to once daily.
+   up to its systemd start limit. The fetch cache limits AA attempts to once per UTC calendar day, so timer jitter
+does not skip every other refresh.
    A fetched snapshot with a lost Akasha receipt is retried with the same key.
    Confirm exactly one visible pick-change event by routing twice on the
    announcement host. Never claim distribution from a source merge alone.

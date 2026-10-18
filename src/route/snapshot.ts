@@ -42,7 +42,7 @@ export async function publishScores(config: ScoreTransport, cacheFile: string, n
   options: PublisherOptions & { keyReader?: typeof readAAKey; machine?: string } = {}): Promise<ScoreSnapshot> {
   if ((options.machine ?? hostname().split(".")[0]) !== "homelab") throw new Error("aa_fetch_homelab_only");
   if (!config.enabled || config.host !== "homelab") throw new Error("aa_publishing_not_configured");
-  const result = await cached(cacheFile, 86400000, now, validateScores,
+  const result = await cached(cacheFile, 86400000, Math.floor(now / 86400000) * 86400000, validateScores,
     () => fetchScores(now, options.fetch, options.keyReader));
   if (!result.value || result.reason) throw new Error("aa_fetch_failed_last_good_retained");
   const s = result.value;
@@ -61,6 +61,8 @@ export async function collectScores(config: ScoreTransport, cacheFile: string, n
     const url = new URL("/api/v1/events", config.url);
     url.searchParams.set("source", "route"); url.searchParams.set("host", "homelab");
     url.searchParams.set("kind", "route_score_snapshot"); url.searchParams.set("limit", "100");
+    url.searchParams.set("from", new Date(now - 90 * 86400000).toISOString());
+    url.searchParams.set("to", new Date(now).toISOString());
     let best: ScoreSnapshot | null = null;
     for (let page = 0; page < 8; page++) {
       const r = await getJson(url.toString(), { headers: { authorization: "Bearer " + token } }, fetcher) as Record<string, any>;
