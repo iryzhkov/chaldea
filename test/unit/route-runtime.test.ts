@@ -20,7 +20,11 @@ test("runtime consumes observer cache/stops without writing observer, collector 
     state.headroom.providers.push(provider); saveState(stateFile, state, now);
     const before = readFileSync(stateFile, "utf8");
     const opts = { home: d.path, configPath, now, catalog: async () => catalog, fetcher: failFetch };
-    assert.equal((await route({ role: "builder" }, opts)).model, "claude-opus-5-5");
+    const initial = await route({ role: "builder" }, opts);
+    assert.equal(initial.model, "claude-opus-5-5");
+    assert.match(initial.reasons.join(" "), /AA snapshot transport disabled/);
+    assert.doesNotMatch(initial.reasons.join(" "), /AA .*collection.*fail/);
+    assert.equal(existsSync(join(d.path, "cache", "aa-scores.json")), false);
     assert.equal(readFileSync(stateFile, "utf8"), before);
     state.parked.set("thread", { provider: "claudeAgent", runId: "r", stopAt: now, seenAt: now, resetAt: null });
     saveState(stateFile, state, now);

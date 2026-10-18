@@ -391,7 +391,10 @@ not grant reads of route events, other kinds, other projects or all events.
 The helper needs a source-bound `route/read` grant on each router host.
 Readers search the last 90 days, paginate within a fixed bound, refresh at most
 every 15 minutes, and
-keep local last good data when reads fail.
+keep local last good data when reads fail. With `scores.enabled: false`, readers
+use valid local last-good scores without running the helper, making requests or
+writing cache reservations and backoff. Reasons report disabled transport; score
+age and stale-snapshot reasons still use the original timestamps.
 
 Exactly one host, `announceHost`, publishes `route_pick_changed`. Configure
 `scores.host` to the actual host name everywhere; the grant binds it as well.
