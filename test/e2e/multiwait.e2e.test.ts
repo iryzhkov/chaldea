@@ -38,7 +38,7 @@ test("eight waits share one durable T3 message across crashes before send and af
         let store=new WakeStore(config.database,environment);
         const now=Date.now();
         const rows=Array.from({length:8},(_,i)=>store.register(store.prepare("wait",{
-          threadId:parent,requestId:now+":"+boundary+i,condition:{kind:"time",at:new Date(now).toISOString()},
+          threadId:parent,requestId:now+":"+boundary+i,...(i===7?{}:{description:"Collect result "+i}),condition:{kind:"time",at:new Date(now).toISOString()},
         }),project,null));
         for(const [i,row] of rows.entries())store.resolve(row.id,{reason:i%2?"timeout":"time"});
         store.close();
@@ -61,8 +61,10 @@ test("eight waits share one durable T3 message across crashes before send and af
         const messages=(await projection()).messages.filter(m=>m.id===command.messageId);
         assert.equal(messages.length,1);
         assert.equal(messages[0]!.text,command.text);
-        for(const row of rows){
-          assert.ok(messages[0]!.text.includes(row.id));
+        for(const [i,row] of rows.entries()){
+          const line=messages[0]!.text.split("\n").find(line=>line.startsWith(row.id+": "))!;
+          assert.ok(line.includes(i===7 ? "Wait until " : 'Context: "Collect result '+i+'"'));
+          assert.ok(line.includes(i%2 ? "wait deadline reached" : "target time reached"));
           assert.equal(service.store.get(row.id).state,"resolved");
         }
         // Exercise omitted requestId through the actual IPC server, then clean up.

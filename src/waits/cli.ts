@@ -4,9 +4,9 @@ import { loadConfig } from "./config.ts";
 import { requestTime } from "./types.ts";
 import { callService, runWaitService } from "./service.ts";
 export const WAIT_USAGE=`chaldea waits serve [--config PATH]
-chaldea wait time --at RFC3339 --thread ID [--request-id EPOCH:KEY] [--deadline RFC3339]
-chaldea wait time --after 30s --thread ID [--request-id EPOCH:KEY]
-chaldea wait thread --target ID [--run ID] --thread ID [--request-id EPOCH:KEY]
+chaldea wait time --at RFC3339 --thread ID [--request-id EPOCH:KEY] [--description TEXT] [--deadline RFC3339]
+chaldea wait time --after 30s --thread ID [--request-id EPOCH:KEY] [--description TEXT]
+chaldea wait thread --target ID [--run ID] --thread ID [--request-id EPOCH:KEY] [--description TEXT]
 chaldea wait status|cancel ID
 chaldea decision prepare --thread ID --dependent-action TEXT --default-action skip|defer
   --deadline RFC3339 --request-id EPOCH:KEY
@@ -24,7 +24,7 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
   const [group,...args]=argv;
   const {values:v,positionals:p}=parseArgs({args,allowPositionals:true,options:{
     config:{type:"string"},thread:{type:"string"},"request-id":{type:"string"},deadline:{type:"string"},
-    at:{type:"string"},after:{type:"string"},target:{type:"string"},run:{type:"string"},
+    description:{type:"string"},at:{type:"string"},after:{type:"string"},target:{type:"string"},run:{type:"string"},
     question:{type:"string"},option:{type:"string",multiple:true},"dependent-action":{type:"string"},
     "runtime-request":{type:"string"},"default-action":{type:"string"},answer:{type:"string"},help:{type:"boolean",short:"h"},
   }});
@@ -47,7 +47,7 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
       }
       condition={kind:"time",at};
     }else condition={kind:"thread",threadId:v.target,...(v.run?{runId:v.run}:{})};
-    method="chaldea_wait";input={threadId:v.thread,requestId,condition,...(v.deadline?{deadline:v.deadline}:{})};
+    method="chaldea_wait";input={threadId:v.thread,requestId,condition,...(v.description === undefined ? {} : {description:v.description}),...(v.deadline?{deadline:v.deadline}:{})};
   }else if(group==="decision"&&["prepare","track"].includes(p[0]??"")){
     if(!v["request-id"])throw new Error("--request-id required for native decision policy");
     method=p[0]==="prepare"?"chaldea_decision_prepare":"chaldea_decision_track";

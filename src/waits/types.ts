@@ -4,7 +4,7 @@ export const DAY = 86_400_000;
 export const MAX_AGE = 42 * DAY;
 export const MAX_DEADLINE = 35 * DAY;
 export type Condition = { kind: "time"; at: string } | { kind: "thread"; threadId: string; runId?: string };
-export interface WaitInput { threadId: string; requestId: string; condition: Condition; deadline?: string }
+export interface WaitInput { threadId: string; requestId: string; condition: Condition; deadline?: string; description?: string }
 export interface DecisionInput {
   threadId: string; requestId: string; question: string; options: string[];
   dependentAction: string; defaultAction: "skip" | "defer"; deadline: string;
@@ -23,6 +23,18 @@ export function object(value: unknown): Record<string, unknown> {
 export function text(value: unknown, name: string, max = 256): string {
   if (typeof value !== "string" || !value.trim() || Buffer.byteLength(value) > max) throw new Error("Invalid " + name);
   return value;
+}
+// Context only: never an executable action or an authorization.
+export function waitDescription(input: WaitInput, targetRun: string | null): string {
+  if (input.description !== undefined) return input.description;
+  const c = input.condition;
+  return c.kind === "time" ? "Wait until " + c.at
+    : "Wait for thread " + c.threadId + " run " + (targetRun ?? c.runId ?? "latest accepted");
+}
+export function description(value: unknown): string {
+  const s = text(value, "description", 512);
+  if (/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(s)) throw new Error("Invalid description: use single-line plain text");
+  return s;
 }
 export function timestamp(value: unknown): number {
   const s = text(value, "RFC3339 timestamp", 64);
@@ -55,7 +67,8 @@ export function validate(kind: "wait" | "decision" | "native", value: unknown, n
       if (condition.threadId === v.threadId) throw new Error("Self dependency");
       deadline = v.deadline === undefined ? requestAt + DAY : timestamp(v.deadline);
     } else throw new Error("Unsupported condition (only time and same-host thread waits)");
-    input = { threadId: v.threadId as string, requestId: v.requestId as string, condition, deadline: new Date(deadline).toISOString() };
+    input = { threadId: v.threadId as string, requestId: v.requestId as string, condition, deadline: new Date(deadline).toISOString(),
+      ...(v.description === undefined ? {} : {description: description(v.description)}) };
   } else if (kind === "native") {
     if (v.defaultAction !== "skip" && v.defaultAction !== "defer") throw new Error("Default action must only skip or defer");
     deadline = timestamp(v.deadline);

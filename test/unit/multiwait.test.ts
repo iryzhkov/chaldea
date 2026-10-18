@@ -44,6 +44,39 @@ test("eight active waits, retry at capacity, optional server keys and independen
     assert.ok(WAIT_TOOLS.find(t=>t.name==="chaldea_decision_prepare")!.inputSchema.required.includes("requestId"));
   }finally{f.close();}
 });
+test("wait descriptions validate, persist, reject changed retries and cover legacy pending rows",()=>{
+  const f=fixture();
+  try{
+    const input={threadId:"parent",requestId:now+":context",condition:{kind:"time",at:iso(now)},description:'Recheck review availability "after reset"'};
+    const row=f.store.register(f.store.prepare("wait",input,now),"project",null,now);
+    assert.equal(f.store.existing(f.store.prepare("wait",input,now))!.id,row.id);
+    assert.throws(()=>f.store.existing(f.store.prepare("wait",{...input,description:"different"},now)),/changed payload/);
+    assert.throws(()=>f.store.existing(f.store.prepare("wait",{...input,description:undefined},now)),/changed payload/);
+    for(const description of ["", " ", "x".repeat(513), "é".repeat(257), "line\nbreak", "tab\ttext", "escape\u001b", "bidi\u202e", "separator\u2028", null, 42])
+      assert.throws(()=>f.store.prepare("wait",{...input,description},now),/description/);
+    f.store.prepare("wait",{...input,description:"é".repeat(256)},now);
+    const legacy=add(f.store,"legacy-pending");
+    const thread=add(f.store,"thread-context","other-parent","target");
+    f.reopen();
+    assert.equal(JSON.parse(f.store.get(row.id).input).description,input.description);
+    assert.equal(f.store.existing(f.store.prepare("wait",JSON.parse(f.store.get(legacy.id).input),now))!.id,legacy.id);
+    f.store.resolve(row.id,{reason:"time"},undefined,now);
+    const single=JSON.parse(f.store.deliveries().find(d=>d.item===row.id)!.payload).text;
+    assert.ok(single.includes(JSON.stringify(input.description)));assert.ok(single.includes("target time reached"));
+    f.store.resolve(legacy.id,{reason:"timeout"},undefined,now);
+    const fallback=JSON.parse(f.store.deliveries().find(d=>d.item===legacy.id)!.payload).text;
+    assert.ok(fallback.includes("Wait until "+iso(now+86_400_000)));assert.ok(fallback.includes("wait deadline reached"));
+    f.store.resolve(thread.id,{reason:"completed",runId:"run"},undefined,now);
+    const threadWake=JSON.parse(f.store.deliveries().find(d=>d.item===thread.id)!.payload).text;
+    assert.ok(threadWake.includes("Wait for thread target run run"));assert.ok(threadWake.includes("target run completed"));
+    const deleted=add(f.store,"deleted-context","deleted-parent","gone");
+    f.store.resolve(deleted.id,{reason:"target_deleted"},undefined,now);
+    assert.ok(JSON.parse(f.store.deliveries().find(d=>d.item===deleted.id)!.payload).text.includes("target thread deleted"));
+    const tool=WAIT_TOOLS.find(t=>t.name==="chaldea_wait")!;
+    assert.ok(!tool.inputSchema.required.includes("description"));
+    assert.equal((tool.inputSchema.properties.description as {maxLength:number}).maxLength,512);
+  }finally{f.close();}
+});
 test("cycle search follows every active edge, ignores time waits and permits convergent paths",()=>{
   const f=fixture();
   try{
@@ -60,7 +93,9 @@ test("cycle search follows every active edge, ignores time waits and permits con
 test("combined wake freezes membership before send and replays byte-identically after crash",()=>{
   const f=fixture();
   try{
-    const rows=Array.from({length:8},(_,i)=>add(f.store,"burst"+i));
+    const rows=Array.from({length:8},(_,i)=>f.store.register(f.store.prepare("wait",{
+      threadId:"parent",requestId:now+":burst"+i,description:"Check result "+i,
+      condition:{kind:"time",at:iso(now)}},now),"project",null,now));
     for(const [i,row] of rows.entries()){
       f.store.resolve(row.id,{reason:i%2?"timeout":"completed",...(i%2?{}:{runId:"run"+i})},undefined,now);
       f.store.resolve(row.id,{reason:"different"},undefined,now);
@@ -72,7 +107,12 @@ test("combined wake freezes membership before send and replays byte-identically 
     const command=JSON.parse(claimed.payload);
     assert.deepEqual(command.dispatchMode,{type:"queue_after_active"});
     assert.equal(command.text.split("\n").length,10);
-    for(const row of rows)assert.ok(command.text.includes(row.id+": "+f.store.get(row.id).outcome));
+    for(const [i,row] of rows.entries()) {
+      const line=command.text.split("\n").find((line:string)=>line.startsWith(row.id+": "))!;
+      assert.ok(line.includes('Context: "Check result '+i+'"'));
+      assert.ok(line.includes(i%2 ? "wait deadline reached" : "target run completed"));
+      assert.ok(line.includes(f.store.get(row.id).outcome!));
+    }
     assert.equal(new Set(f.store.deliveries().map(d=>d.payload)).size,1);
     assert.ok(f.store.deliveries().every(d=>d.state==="sending"&&d.attempts===1));
     for(const d of f.store.deliveries())if(d.id!==leader.id)assert.equal(f.store.claim(d.id),undefined);
@@ -99,6 +139,8 @@ test("legacy outbox migration replays attempted bytes before batching new wakes"
     for(const row of [a,b,c])f.store.resolve(row.id,{reason:"time"},undefined,now);
     const old=f.store.deliveries().find(d=>d.item===a.id)!;
     // Reproduce the pre-multiwait schema and a crash during an ambiguous send.
+    f.store.db.prepare("UPDATE outbox SET payload=? WHERE id=?").run(JSON.stringify({...JSON.parse(old.payload),text:"Chaldea wake (wait "+a.id+'): {"reason":"time"}'}),old.id);
+    old.payload=f.store.deliveries().find(d=>d.id===old.id)!.payload;
     f.store.db.prepare("UPDATE outbox SET state='sending',attempts=1 WHERE id=?").run(old.id);
     f.store.db.exec("ALTER TABLE outbox DROP COLUMN batch_id; PRAGMA user_version=0");
     f.reopen();
@@ -129,7 +171,7 @@ test("a long undelivered backlog remains one combined message with every outcome
     const claimed=f.store.claim(f.store.dispatchable()[0]!.id)!;
     assert.ok(Buffer.byteLength(claimed.payload)>4096);
     const text=JSON.parse(claimed.payload).text;
-    for(const row of rows)assert.ok(text.includes(row.id+": "+f.store.get(row.id).outcome));
+    for(const row of rows) { assert.ok(text.includes(row.id+": Context: ")); assert.ok(text.includes(f.store.get(row.id).outcome!)); }
     f.store.sent(claimed.id);
     assert.equal(f.store.deliveries().length,40);
     assert.ok(f.store.deliveries().every(d=>d.state==="sent"));
