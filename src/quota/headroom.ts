@@ -279,8 +279,23 @@ export class HeadroomMonitor {
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;
+        if (p.driver === "claudeAgent") {
+          // Native windows/reset inventory belong to this instance's account only.
+          next.included = clean.included; next.manualResets = clean.manualResets;
+        }
       }
+      const expected = this.options.config.claudeContexts?.find(ctx => ctx.providerInstanceId === p.instanceId)?.accountKey;
+      if (p.driver === "claudeAgent" && expected && p.quotaAccountKey && expected !== p.quotaAccountKey) {
+        delete next.accountKey; next.included = unknown("t3", "error", "context_mismatch");
+        next.manualResets = newProvider(p.instanceId, p.driver).manualResets;
+        return next;
+      }
+      if (p.driver === "claudeAgent" && p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
       applyT3(next, p);
+      if (p.driver === "claudeAgent" && !p.quotaAccountKey) {
+        if (next.included.source === "t3") delete next.accountKey;
+        next.manualResets = newProvider(p.instanceId, p.driver).manualResets;
+      }
       return next;
     });
     for (const ctx of this.options.config.claudeContexts ?? []) {
@@ -364,24 +379,34 @@ export class HeadroomMonitor {
       if (!ctx.enabled || this.#abort.signal.aborted || !this.options.local) continue;
       const row = this.state.providers.find(p => p.alias === ctx.providerInstanceId);
       if (!row || row.driver !== "claudeAgent") continue;
+      const nativeKey = () => this.#providers.find(p => p.instanceId === ctx.providerInstanceId && p.driver === "claudeAgent")?.quotaAccountKey;
+      const freshNative = () => nativeKey() && row.accountKey === nativeKey() && row.included.source === "t3" && metricNow(row.included, this.now()).state === "fresh";
+      const rejectNativeMismatch = () => {
+        if (!ctx.accountKey || !nativeKey() || ctx.accountKey === nativeKey()) return false;
+        delete row.accountKey; row.included = unknown("t3", "error", "context_mismatch");
+        this.#changed = true; return true;
+      };
+      if (rejectNativeMismatch() || freshNative()) continue;
       const usage = await (this.options.claudeRead ?? collectClaudeUsage)({ ...ctx, enabled: true,
         cacheFile: claudeCacheFile(homedir(), claudeSourceId(ctx)),
         now: this.now() });
+      if (rejectNativeMismatch() || freshNative()) continue; // Native auth may have changed during HTTP.
+      if (usage.value && !usage.value.accountKey && (ctx.accountKey || nativeKey())) continue;
       const error = usage.reason;
-      if (row.included.error !== error) {
+      if ((!row.included.value || row.included.source !== "t3") && row.included.error !== error) {
         row.included = { ...row.included, source: "claude-usage", error,
           state: row.included.value ? row.included.state : error ? "error" : "unknown" };
         this.#changed = true;
       }
       if (!usage.value) continue;
-      if (ctx.accountKey && usage.value.accountKey !== ctx.accountKey) {
+      if (ctx.accountKey && usage.value.accountKey !== ctx.accountKey || nativeKey() && usage.value.accountKey !== nativeKey()) {
         delete row.accountKey;
-        row.included = { ...row.included, state: "error", error: "context_mismatch" };
+        row.included = unknown("claude-usage", "error", "context_mismatch");
         this.#changed = true;
         continue;
       }
       const u = usage.value;
-      if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt) || row.included.source === "t3") {
+      if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt) || row.included.source === "t3" && !nativeKey()) {
         retainBurnSample(row, u.observedAt);
         row.included = { ...observed(u.windows.map(w => ({ ...w, id: w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt), error };
         if (u.accountKey) row.accountKey = u.accountKey; else delete row.accountKey;
