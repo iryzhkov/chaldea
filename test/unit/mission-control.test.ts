@@ -72,6 +72,29 @@ test("source reconnect resumes cursors, rediscovers origin and aborts removed de
   await runSource(model,()=>({serverUrl:++discovered<3?"http://127.0.0.1:1111":"http://127.0.0.1:2222",token:"fixture"}),controller.signal,source,1);
   assert.deepEqual(cursors,[undefined,10,undefined]);assert.equal(stopped,details);assert.equal(model.ids().length,0);assert.equal(model.snapshot().source.state,"disconnected");
 });
+
+test("detail adapter uses only official read subscription and omits unknown raw payload",async()=>{
+  const {createServer}=await import("node:http");
+  const {WebSocketServer}=await import("ws");
+  const {connectMissionThread}=await import("../../src/t3/adapter.ts");
+  const http=createServer(),wss=new WebSocketServer({server:http}),controller=new AbortController();
+  const seen:unknown[]=[],requests:string[]=[];
+  wss.on("connection",socket=>socket.on("message",data=>{
+    const req=JSON.parse(String(data));
+    if(req._tag==="Ping"){socket.send(JSON.stringify({_tag:"Pong"}));return;}
+    if(req._tag!=="Request")return;
+    requests.push(req.tag);assert.equal(req.payload.threadId,"fixture-thread");assert.equal(req.payload.afterSequence,7);
+    assert.equal(req.payload.requestCompletionMarker,true);assert.equal(req.payload.acceptBoundedSnapshot,true);
+    socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"synchronized"}]}));
+  }));
+  await new Promise<void>(resolve=>http.listen(0,"127.0.0.1",resolve));
+  try{
+    const port=(http.address() as {port:number}).port;
+    const done=connectMissionThread({serverUrl:"http://127.0.0.1:"+port,token:"DISPOSABLE_FIXTURE",signal:controller.signal},"fixture-thread",7,event=>{seen.push(event);controller.abort();});
+    await assert.rejects(done);assert.deepEqual(seen,[{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
+  }finally{wss.close();http.close();}
+});
+
 async function get(port:number,path:string,headers:Record<string,string>={},method="GET") {
   return new Promise<{status:number;headers:Record<string,unknown>;body:string}>((resolve,reject)=>{
     const req=request({host:"127.0.0.1",port,path,method,headers},res=>{let body="";res.on("data",chunk=>body+=chunk);res.on("end",()=>resolve({status:res.statusCode!,headers:res.headers,body}));});req.on("error",reject);req.end();

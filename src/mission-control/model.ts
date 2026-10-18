@@ -51,8 +51,8 @@ export class MissionModel {
     } else if (event.kind === "removed") { if (this.threads.delete(event.threadId)) this.total = Math.max(0, this.total - 1); }
     this.observed = now; this.changed();
   }
-  disconnected(): void { this.connected = false; for (const t of this.threads.values()) t.connected = false; this.changed(); }
-  detailDisconnected(id: string): void { const t = this.threads.get(id); if (t) t.connected = false; this.changed(); }
+  disconnected(): void { if (this.connected) this.observed = this.now(); this.connected = false; for (const t of this.threads.values()) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
+  detailDisconnected(id: string): void { const t = this.threads.get(id); if (t) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
   detail(id: string, event: MissionDetailEvent): void {
     const t = this.threads.get(id); if (!t) return;
     const now = this.now(); t.detailObserved = now;
