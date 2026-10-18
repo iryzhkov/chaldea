@@ -161,7 +161,7 @@ export class EventStore {
       guard?.();
       if (status) {
         const observed = (event.data.snapshot as { observedAt:number }).observedAt;
-        ensure(observed <= now*1000 && now*1000-observed <= 120_000, "stale_host_snapshot", 409);
+        ensure(Math.floor(observed/1000) <= now && now*1000-observed <= 120_000, "stale_host_snapshot", 409);
         const priorAdmission=Number(this.get("mission-control-admitted:"+event.source_id)??"-30000");
         ensure(now*1000-priorAdmission>=30_000, "host_snapshot_rate", 429);
         const sample=event.data.snapshot as {epoch:string;sequence:number;observedAt:number},oldSample=this.get("mission-control-sample:"+event.source_id);
