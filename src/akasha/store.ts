@@ -19,6 +19,10 @@ export interface Receipt {
 export interface Pending { event_id: string; envelope: string; bytes: number; attempts: number }
 export interface Query { sql: string; params: SQLInputValue[] }
 export function scopeSql(scope: Scope, prefix = ""): Query {
+  if (scope.routeScores && scope.source === "route") return {
+    sql: prefix + "profile=? AND " + prefix + "project=? AND " + prefix + "source=? AND " + prefix + "host=? AND " + prefix + "kind=?",
+    params: [scope.profile, scope.project, "route", "homelab", "route_score_snapshot"],
+  };
   if (scope.quotaFleet && scope.source === "quota") return {
     sql: prefix + "profile=? AND " + prefix + "project=? AND " + prefix + "source=? AND " + prefix + "kind=?",
     params: [scope.profile, scope.project, "quota", "quota_headroom_snapshot"],

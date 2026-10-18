@@ -20,7 +20,7 @@ const analytics = (claude = stats(95, 3, 2), codex = stats(95, 3, 2)): Analytics
   fetchedAt: iso(now), sourceFetchedAt: iso(now), endExclusive: iso(now - 3600000),
   models: { "claude-opus-5-5": claude, "gpt-6.1-sol": codex },
 });
-test("18-instance catalog uses exact role pairs/options and never Haiku", () => {
+test("18-instance catalog uses safe fallback pairs/options including Haiku", () => {
   assert.equal(catalog.length, 18);
   for (const role of Object.keys(PAIRS) as Array<keyof typeof PAIRS>) {
     const r = recommend({ role }, base);
@@ -29,7 +29,7 @@ test("18-instance catalog uses exact role pairs/options and never Haiku", () => 
     assert.deepEqual(r.options, { effort: role === "builder" ? "high" : "medium" });
     assert.equal(r.alternatives[0]?.model, PAIRS[role][1]);
     assert.deepEqual(r.alternatives[0]?.options, { reasoningEffort: role === "builder" ? "high" : "medium" });
-    assert.doesNotMatch(JSON.stringify(r), /haiku/i);
+    assert.notEqual(r.model, "claude-sonnet-5-5");
   }
 });
 test("Claude under-paced by >=10 points wins; otherwise Codex", () => {

@@ -1,0 +1,92 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { join } from "node:path";
+import { chmodSync, linkSync, symlinkSync, writeFileSync } from "node:fs";
+import { collectScores, fetchScores, publishScores, readAAKey } from "../../src/route/snapshot.ts";
+import { validateScores, MODEL_MAP } from "../../src/route/scores.ts";
+import { routeScratch } from "../fixtures/route/scratch.ts";
+import { scores, now, iso } from "../fixtures/route/targets.ts";
+import { readJson } from "../../src/route/cache.ts";
+
+const config = { enabled: true, url: "https://akasha.fixture", tokenHelper: "/fixture/helper", host: "homelab" };
+const row = { slug: MODEL_MAP[0]!.aaSlug, evaluations: { artificial_analysis_intelligence_index: 50, artificial_analysis_coding_index: 60 },
+  pricing: { price_1m_input_tokens: 2, price_1m_output_tokens: 10 }, secret_extra: "must-not-publish" };
+const response = (data: unknown, page = 1, more = false) => new Response(JSON.stringify({
+  intelligence_index_version: 4.3, data, pagination: { page, has_more: more },
+}));
+test("AA collector uses a fixed HTTPS API, header key, bounded pagination and public allowlist", async () => {
+  const calls: string[] = [];
+  const s = await fetchScores(now, async (url, init) => {
+    calls.push(String(url));
+    assert.match(String(url), /^https:\/\/artificialanalysis.ai\/api\/v2\/language\/models\/free\?page=/);
+    assert.equal((init?.headers as Record<string,string>)["x-api-key"], "fixture-key");
+    assert.equal(init?.redirect, "error");
+    return calls.length === 1 ? response([row], 1, true) : response([{ slug: "new-unmapped" }], 2);
+  }, () => "fixture-key");
+  assert.equal(calls.length, 2); assert.equal(s.models[0]!.coding, 60); assert.equal(s.indexVersion, "4.3");
+  assert.deepEqual(s.unmapped, ["new-unmapped"]);
+  assert.doesNotMatch(JSON.stringify(s), /fixture-key|secret_extra|must-not-publish/);
+  await assert.rejects(fetchScores(now, async () => { throw new Error("fixture-key leaked upstream"); }, () => "fixture-key"),
+    e => String(e) === "Error: aa_fetch_failed");
+  await assert.rejects(fetchScores(now, async () => response([row], 1, true), () => "fixture-key"), /aa_fetch_failed/);
+});
+test("AA key reader refuses symlinks, permissive files, hardlinks and oversized files", () => {
+  const scratch = routeScratch();
+  try {
+    const path = join(scratch.path, "fixture-key");
+    writeFileSync(path, "fake-fixture-key", { mode: 0o600 });
+    if (process.geteuid!() === 0) assert.equal(readAAKey(path), "fake-fixture-key");
+    else assert.throws(() => readAAKey(path), /invalid_aa_key_file/);
+    chmodSync(path, 0o644); assert.throws(() => readAAKey(path)); chmodSync(path, 0o600);
+    const sym = join(scratch.path, "symlink"); symlinkSync(path, sym); assert.throws(() => readAAKey(sym));
+    const hard = join(scratch.path, "hardlink"); linkSync(path, hard); assert.throws(() => readAAKey(hard));
+    const big = join(scratch.path, "big"); writeFileSync(big, "a".repeat(4097), { mode: 0o600 }); assert.throws(() => readAAKey(big));
+  } finally { scratch.remove(); }
+});
+test("homelab publisher caches one daily fetch and retries the same idempotent publication", async () => {
+  const scratch = routeScratch();
+  try {
+    const path = join(scratch.path, "fetch.json"), keys: string[] = [];
+    let reads = 0, gets = 0, posts = 0;
+    const options = { machine: "homelab", keyReader: () => { reads++; return "fixture-key"; },
+      token: async () => "fixture-access-token", fetch: async (url: any, init: any) => {
+        if (init.method === "GET") { gets++; return response([row]); }
+        assert.doesNotMatch(String(init.body), /fixture-key|secret_extra/);
+        posts++; keys.push(init.headers["Idempotency-Key"]);
+        return new Response(JSON.stringify({ state: posts === 1 ? "pending" : "visible", event_id: "a".repeat(64) }), { status: posts === 1 ? 202 : 201 });
+      } };
+    await assert.rejects(publishScores(config, path, now, { ...options, machine: "agent-a" }), /homelab_only/);
+    assert.equal(reads, 0);
+    await assert.rejects(publishScores(config, path, now, options), /publication_pending/);
+    await publishScores(config, path, now + 60000, options);
+    assert.equal(reads, 1); assert.equal(gets, 1); assert.equal(keys[0], keys[1]);
+    const last = readJson(path);
+    await assert.rejects(publishScores(config, path, now + 86400000, { ...options,
+      fetch: async () => { throw new Error("fixture failure"); } }), /last_good_retained/);
+    assert.deepEqual((readJson(path) as any).value, (last as any).value);
+  } finally { scratch.remove(); }
+});
+test("authenticated readers accept only verified homelab route scores and preserve last good on failure", async () => {
+  const scratch = routeScratch();
+  try {
+    const path = join(scratch.path, "scores.json"); let tokenReads = 0;
+    const token = async (_: string, event: any, action: string | undefined) => {
+      tokenReads++; assert.equal(event.source, "route"); assert.equal(action, "read"); return "fixture-token";
+    };
+    const event = { source: "route", host: "homelab", kind: "route_score_snapshot", provenance: { type: "verified" }, data: { scores } };
+    const first = await collectScores(config, path, now, async (url, init) => {
+      assert.equal(new URL(String(url)).searchParams.get("host"), "homelab");
+      assert.equal((init?.headers as Record<string,string>).authorization, "Bearer fixture-token");
+      return new Response(JSON.stringify({ events: [
+        { ...event, data: { scores: { ...scores, fetchedAt: iso(now + 1000) } } },
+        { ...event, host: "attacker" }, { ...event, provenance: { type: "legacy-feed" } }, event,
+      ], next_cursor: null }));
+    }, token);
+    assert.deepEqual(first.value, scores);
+    const second = await collectScores(config, path, now + 900001, async () => { throw new Error("offline"); }, token);
+    assert.deepEqual(second.value, scores); assert.match(second.reason!, /retained/);
+    assert.equal(tokenReads, 2);
+    assert.throws(() => validateScores({ ...scores, key: "forbidden" }));
+    assert.throws(() => validateScores({ ...scores, models: [{ ...scores.models[0], effort: "max" }] }));
+  } finally { scratch.remove(); }
+});

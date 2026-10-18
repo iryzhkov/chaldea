@@ -7,9 +7,9 @@ import type { Identity, Kind } from "./schema.ts";
 export interface Registration {
   issuer: string; source: string; host: string; source_id: string;
   profile: string; project: string; mode: "report" | "service" | "operator";
-  kinds: Kind[]; quota_fleet_read?: boolean; global_read?: boolean; roots?: string[];
+  kinds: Kind[]; route_scores_read?: boolean; quota_fleet_read?: boolean; global_read?: boolean; roots?: string[];
 }
-export interface Scope { issuer: string; profile: string; project: string; source: string; host: string; global: boolean; quotaFleet?: boolean }
+export interface Scope { issuer: string; profile: string; project: string; source: string; host: string; global: boolean; quotaFleet?: boolean; routeScores?: boolean }
 export interface Principal {
   identity: Identity; scope: Scope; registration: Registration; access: VerifiedAccess;
   recheck(): Promise<void>;
@@ -24,7 +24,7 @@ export class Authorization {
     const ids = new Set<string>(), identities = new Set<string>();
     for (const entry of registry) {
       const e = record(entry);
-      fields(e, ["issuer", "source", "host", "source_id", "profile", "project", "mode", "kinds", "global_read", "quota_fleet_read", "roots"]);
+      fields(e, ["issuer", "source", "host", "source_id", "profile", "project", "mode", "kinds", "global_read", "route_scores_read", "quota_fleet_read", "roots"]);
       for (const k of ["issuer", "source", "host", "profile", "project"]) text(e[k], 128, true);
       ensure(entry.issuer === "chaldea:" + entry.host, "registry_host_mismatch");
       ensure(/^[a-z0-9][a-z0-9_-]{0,127}$/.test(entry.source_id) && entry.source_id !== "legacy-feed" &&
@@ -33,6 +33,7 @@ export class Authorization {
       ensure(!identities.has(key), "duplicate_registry_identity"); identities.add(key); ids.add(entry.source_id);
       ensure(["report", "service", "operator"].includes(entry.mode) &&
         Array.isArray(entry.kinds) && entry.kinds.length > 0 && entry.kinds.every(k => KINDS.includes(k)), "invalid_registry");
+      ensure(entry.route_scores_read === undefined || (entry.route_scores_read === true && entry.mode === "service" && entry.source === "route"), "invalid_route_scores_read");
       ensure(entry.quota_fleet_read === undefined || (entry.quota_fleet_read === true && entry.mode === "service" && entry.source === "quota"), "invalid_quota_fleet_read");
       ensure(entry.global_read === undefined || (entry.global_read === true && entry.mode === "operator"), "invalid_global_read");
       ensure(entry.roots === undefined || (Array.isArray(entry.roots) && entry.roots.length <= 32 &&
@@ -57,7 +58,7 @@ export class Authorization {
     const clock = this.clock, trust = this.trust;
     let sequence: number | undefined;
     return { identity, registration: r, access,
-      scope: { issuer: c.iss, profile: c.sub, project: c.project, source: c.source!, host: c.host!, global: r.global_read === true, quotaFleet: action === "read" && r.quota_fleet_read === true },
+      scope: { issuer: c.iss, profile: c.sub, project: c.project, source: c.source!, host: c.host!, global: r.global_read === true, routeScores: action === "read" && r.route_scores_read === true, quotaFleet: action === "read" && r.quota_fleet_read === true },
       async recheck() {
         const bundle = await trust.snapshot(); await access.recheck(); trust.assertCurrent(bundle.sequence);
         ensure(clock.check() < access.validUntil, "expired", 401); sequence = bundle.sequence;

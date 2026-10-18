@@ -1,3 +1,4 @@
+import { MODEL_MAP } from "./scores.ts";
 import { MODEL_NAMES } from "./types.ts";
 import type { Analytics, ModelStats } from "./types.ts";
 import { cached, getJson } from "./cache.ts";
@@ -16,7 +17,7 @@ export function aggregate(raw: unknown, fetchedAt: string): Analytics {
     const id = MODEL_NAMES[row.model];
     if (!id) continue;
     // A model used through a different harness is not evidence about this candidate.
-    if (row.harness !== (id.startsWith("claude-") ? "claudeAgent" : "codex")) continue;
+    if (!MODEL_MAP.some(m => m.model === id && m.harness === row.harness)) continue;
     if (typeof row.day !== "string" || row.day < r.start || row.day >= r.endExclusive) continue;
     if (![row.terminal, row.completed, row.failed, row.interrupted, row.timedTurns, row.durationMs].every(count) ||
       row.completed + row.failed + row.interrupted !== row.terminal || row.timedTurns > row.terminal) throw new Error("Invalid Slopalytics metrics");
