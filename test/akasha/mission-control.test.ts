@@ -52,7 +52,7 @@ test("real HTTP ingest/store/scoped reader/cache/web continue without a PC produ
     const web=missionServer(model);await web.listen(0);const port=(web.server.address()as{port:number}).port;
     try{
       const page=await fetch("http://127.0.0.1:"+port+"/api/snapshot");const dto=await page.json()as any;
-      assert.equal(dto.agents[0].host,"agent-a");assert.equal(dto.agents[0].title,"Task");assert.equal(dto.quota.state,"unknown");assert.equal(dto.source.state,"live");
+      assert.equal(dto.agents[0].host,"agent-a");assert.equal(dto.agents[0].title,"Task");assert.equal(dto.quota.state,"unknown");assert.equal(dto.source.state,"cached");
       now+=91_000;assert.equal(model.snapshot().source.state,"stale");
       const failed=await refreshStatus(h.config,second,{token:async()=>{throw new Error("Akasha offline, no PC relay");},now:()=>now});
       assert.equal(failed.gap,true);assert.equal(failed.snapshots[0]!.observedAt,(N+35)*1000);

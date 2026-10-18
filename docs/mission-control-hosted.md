@@ -93,7 +93,9 @@ under the separate web account:
 ```
 
 Cache mode never discovers T3, reads an orchestration token or invokes a helper.
-Unknown cache/source state does not prevent HTTP startup. The reader owns the
+Unknown cache/source state does not prevent HTTP startup. On restart, retained
+fresh cache is labeled cached until a strictly newer validated source tuple and
+observation arrives. Re-reading the same file or an older epoch cannot warm it. The reader owns the
 2750 SGID cache directory with group mission-control-cache; the web account has
 read-only supplementary group access. Atomic cache files and their same-directory
 temporary files are explicitly 0640 before rename. The reader's private state

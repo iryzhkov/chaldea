@@ -43,21 +43,36 @@ export function mergeStatus(cache:StatusCache,raw:HostSnapshot,now=Date.now()):b
 export class CacheModel {
   private listeners=new Set<()=>void>();
   private cache:StatusCache=emptyCache();
+  private readonly bootSamples=new Map<string,{epoch:string;sequence:number;observedAt:number}>();
+  private readonly warmSources=new Set<string>();
+  private loaded=false;
   private readonly path:string;
   private readonly now:()=>number;
   constructor(path:string,now:()=>number=Date.now){this.path=path;this.now=now;this.reload();}
   subscribe(fn:()=>void):()=>void {this.listeners.add(fn);return()=>{this.listeners.delete(fn);};}
-  reload():void {try{this.cache=loadCache(this.path,this.now());}catch{this.cache.gap=true;}for(const fn of this.listeners)fn();}
+  reload():void {
+    try{
+      const cache=loadCache(this.path,this.now());
+      for(const s of cache.snapshots){
+        const boot=this.bootSamples.get(s.host);
+        if(!this.loaded)this.bootSamples.set(s.host,{epoch:s.epoch,sequence:s.sequence,observedAt:s.observedAt});
+        else if(!boot||s.observedAt>boot.observedAt&&(s.epoch!==boot.epoch||s.sequence>boot.sequence))this.warmSources.add(s.host);
+      }
+      this.cache=cache;
+    }catch{this.cache.gap=true;}
+    this.loaded=true;for(const fn of this.listeners)fn();
+  }
   snapshot():ReturnType<MissionModel["snapshot"]> & {sampled:true}{
     const now=this.now(),base=new MissionModel(false,this.now).snapshot();
     const snapshots=this.cache.snapshots.filter(s=>s.observedAt<=now&&now-s.observedAt<=CACHE_AGE);
     const freshness=(connected:boolean,at:number|null,stale=90_000,lost=600_000)=>at===null?"nosource":now-at>lost?"lost":now-at>stale?"stale":connected?"live":"disconnected";
     base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
-      freshness:freshness(s.connected,s.observedAt),activityFreshness:freshness(a.connected,a.detailObservedAt,60_000,600_000),steps:[...a.steps]}))).slice(0,48);
+      freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:freshness(s.connected&&a.connected&&this.warmSources.has(s.host),a.detailObservedAt,60_000,600_000),steps:[...a.steps]}))).slice(0,48);
     base.shown=base.agents.length;base.total=snapshots.length&&snapshots.every(s=>s.total!==null)?snapshots.reduce((n,s)=>n+s.total!,0):null;
     base.truncated=this.cache.gap||snapshots.some(s=>s.truncated)||snapshots.reduce((n,s)=>n+s.agents.length,0)>48;
     const observedAt=snapshots.length?Math.min(...snapshots.map(s=>s.observedAt)):null;
-    base.source={state:freshness(snapshots.every(s=>s.connected),observedAt),observedAt};
+    const sourceState=freshness(snapshots.every(s=>s.connected),observedAt);
+    base.source={state:sourceState==="live"&&snapshots.some(s=>!this.warmSources.has(s.host))?"cached":sourceState,observedAt};
     const known=snapshots.length>0&&snapshots.every(s=>s.tokens.qualified&&s.tokens.output!==null);
     base.tokens={output:known?snapshots.reduce((n,s)=>n+s.tokens.output!,0):null,
       rate:known&&base.source.state==="live"&&snapshots.every(s=>s.tokens.rate!==null)?snapshots.reduce((n,s)=>n+s.tokens.rate!,0):null,

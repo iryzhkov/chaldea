@@ -65,11 +65,22 @@ test("restarted web treats retained cache as cached until newer source evidence 
     assert.equal(model.snapshot().source.state,"live");assert.equal(model.snapshot().source.observedAt,now);
   }finally{d.close();}
 });
+test("boot fence rejects older epochs and preserves stale/disconnected newer evidence",()=>{
+  const d=scratch();let now=now0;
+  try{
+    const path=join(d.path,"fence.json"),cache=emptyCache();mergeStatus(cache,sample(),now);writeCache(path,cache);
+    const model=new CacheModel(path,()=>now);
+    const oldEpoch={...sample(1,now0-1),epoch:"b".repeat(32)};
+    writeCache(path,{...cache,snapshots:[oldEpoch]});model.reload();assert.equal(model.snapshot().source.state,"cached");assert.equal(model.snapshot().source.observedAt,now0-1);
+    now+=10000;const disconnected=sample(2,now);disconnected.connected=false;disconnected.agents[0]!.connected=false;mergeStatus(cache,disconnected,now);writeCache(path,cache);model.reload();assert.equal(model.snapshot().source.state,"disconnected");
+    now+=110000;const stale=sample(3,now0+20000);mergeStatus(cache,stale,now);writeCache(path,cache);model.reload();assert.equal(model.snapshot().source.state,"stale");assert.equal(model.snapshot().source.observedAt,now0+20000);
+  }finally{d.close();}
+});
 test("atomic group-readable cache survives offline reload, then expires and does not make heartbeats live",async()=>{
   const d=scratch();try{
     const path=join(d.path,"latest.json"),c=emptyCache();mergeStatus(c,sample(),now0);writeCache(path,c);
     assert.equal(statSync(path).mode&0o777,0o640);assert.equal(loadCache(path,now0).snapshots.length,1);
-    let now=now0;const m=new CacheModel(path,()=>now);assert.equal(m.snapshot().source.state,"live");
+    let now=now0;const m=new CacheModel(path,()=>now);assert.equal(m.snapshot().source.state,"cached");
     now+=91_000;m.reload();assert.equal(m.snapshot().source.state,"stale");assert.equal(m.snapshot().source.observedAt,now0);
     const {projectClientSnapshot}=await import("../../src/mission-control/static/client.js" as string);
     const projected=projectClientSnapshot(m.snapshot(),now,true);assert.equal(projected.source.observedAt,now0);assert.equal(projected.agents[0].detailObservedAt,now0);
@@ -136,7 +147,8 @@ test("reader binds pagination to one window, resets410 as a gap and fails closed
 });
 test("hosted HTTP is independent of T3, enforces fixed proxy origin and keeps liveness apart from readiness",async()=>{
   const d=scratch();let now=now0;const path=join(d.path,"cache.json"),c=emptyCache();mergeStatus(c,sample(),now);writeCache(path,c);
-  const model=new CacheModel(path,()=>now),server=missionServer(model,8,{siteOrigin:"https://chaldeas.ryzhkov.dev"});await server.listen(0);
+  const model=new CacheModel(path,()=>now);now++;mergeStatus(c,sample(2,now),now);writeCache(path,c);model.reload();
+  const server=missionServer(model,8,{siteOrigin:"https://chaldeas.ryzhkov.dev"});await server.listen(0);
   const port=(server.server.address()as{port:number}).port;
   const get=(url:string,headers:Record<string,string>={},method="GET")=>new Promise<{status:number;headers:any;body:string}>(resolve=>{
     const req=request({host:"127.0.0.1",port,path:url,method,headers:{Host:"chaldeas.ryzhkov.dev",...headers}},res=>{let body="";res.on("data",b=>body+=b);res.on("end",()=>resolve({status:res.statusCode!,headers:res.headers,body}));});req.end();
