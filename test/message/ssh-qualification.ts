@@ -42,6 +42,7 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
   try{
     assert.notEqual(spawnSync("getent",["passwd",user]).status,0,"refuse any pre-existing account");
     assert.equal(existsSync("/etc/ssh/sshrc"),false,"system sshrc would run an interpreter before the static login shell");
+    t.diagnostic(run(process.execPath,["test/message/bundle-entrypoint.ts"]).trim());
     run(resolve("node_modules/.bin/esbuild"),["test/helpers/message-receiver-fixture.ts","--bundle","--platform=node","--format=esm","--packages=bundle","--banner:js=import {createRequire} from 'node:module';const require=createRequire(import.meta.url);","--outfile="+bundle]);
     copyFileSync(process.execPath,node);chownSync(node,0,0);chmodSync(node,0o755);
     chownSync(bundle,0,0);chmodSync(bundle,0o644);
@@ -107,9 +108,11 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
         env:{PATH:"/usr/bin:/bin",...env},stdio:["pipe","pipe","pipe"]}),body);
     const r=request({v:1,op:"send",host:"target",environment,threadId,requestId:Date.now()+":ssh-success",text:"$(touch "+join(state,"injected")+"); literal shell data"});
     const before=await withClient(opts(),c=>c["orchestration.getThreadProjection"]({threadId} as never));
+    let firstReply:Awaited<ReturnType<typeof sshRequest>>|undefined;
     const first=await message("send",{host:"target",threadId,requestId:r.requestId,text:r.text},sender,async(h,r)=>{
-      const accepted=await sshRequest(h,r);assert.equal(accepted.state,"accepted");throw new Error("discard reply");
+      firstReply=await sshRequest(h,r);throw new Error("discard reply");
     });
+    assert.equal(firstReply?.state,"accepted",JSON.stringify(firstReply??{error:"no_response"}));
     assert.equal(first.state,"uncertain");
     const replay=await message("send",{host:"target",threadId,requestId:r.requestId,text:r.text},sender);
     assert.equal(replay.state,"accepted");
