@@ -1,5 +1,6 @@
 // One collector per host; instrumentation never performs network I/O.
 import { createHash, randomUUID } from "node:crypto";
+import { parseArgs } from "node:util";
 import { closeSync, openSync, readSync, fstatSync, lstatSync, unlinkSync, opendirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { hostname } from "node:os";
@@ -19,7 +20,7 @@ function bytes(fd: number, offset: number, length: number): Buffer {
 export interface CollectorOptions {
   spool: string; timers?: string; host: string; outbox: Outbox;
   publisher?: PublisherOptions; deliver?: (event: Publication) => Promise<boolean>;
-  now?: () => number; maxEvents?: number;
+  now?: () => number; maxEvents?: number; maxAgeDays?: number;
   /** Only configured labels are retained. Raw filesystem paths are never uploaded. */
   roots?: Record<string, string>;
 }
@@ -169,6 +170,14 @@ export async function collect(options: CollectorOptions): Promise<void> {
           let event: Publication;
           try {
             const raw = JSON.parse(line.toString()) as Record<string, unknown>;
+            // A requested shorter ship window skips old tool input without
+            // deleting it. Timers retain their original delivery/retention policy.
+            if (!timer && options.maxAgeDays !== undefined &&
+                Date.parse(String(raw.ts)) < now - options.maxAgeDays * DAY) {
+              budget--;
+              outbox.transaction(() => { outbox.count("outside_ship_window"); outbox.checkpoint(file, next); });
+              cursor = next; continue;
+            }
             if (timer) event = timerPublication(raw, options.host);
             else event = { key: cursor.generation + "/" + rel + "/" + cursor.offset, source: options.host + ".toolfeedback", host: options.host,
               payload: toolPayload(raw, line, rel.split("/")[0]!, options.host, options.roots) };
@@ -186,14 +195,40 @@ export async function collect(options: CollectorOptions): Promise<void> {
     }
   }
 }
-async function main(): Promise<void> {
+export async function collectorMain(args: string[]): Promise<void> {
+  const { values } = parseArgs({ args, options: {
+    url: { type: "string" }, "max-age": { type: "string", default: "90" },
+    "dry-run": { type: "boolean" }, help: { type: "boolean" },
+  } });
+  if (values.help) {
+    console.log("Usage: akasha-collector [--url HTTPS_URL] [--max-age DAYS] [--dry-run]");
+    return;
+  }
+  const maxAgeDays = Number(values["max-age"]);
+  if (!Number.isInteger(maxAgeDays) || maxAgeDays < 1 || maxAgeDays > 90)
+    throw new ConfigurationError("invalid_max_age");
+  if (values.url !== undefined) {
+    const url = new URL(values.url);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash)
+      throw new ConfigurationError("invalid_events_url");
+  }
   const config = eventsConfig();
+  if (values["dry-run"]) {
+    // No outbox initialization, pruning, token minting or network in a preview.
+    let count = 0;
+    for (const _ of files(config.spool)) count++;
+    console.log(JSON.stringify({ dry_run: true, spool_files: count, max_age_days: maxAgeDays }));
+    return;
+  }
   const outbox = new Outbox(config.stateFile);
   try {
     await collect({ outbox, host: hostname().split(".")[0]!, spool: config.spool,
-      timers: config.timerSpool });
-    console.log(JSON.stringify({ counters: outbox.counters(), pending: outbox.next() !== null }));
+      timers: config.timerSpool, maxAgeDays, publisher: values.url === undefined ? {} : { url: values.url } });
+    const counters = outbox.counters(), pending = outbox.next() !== null;
+    console.log(JSON.stringify({ counters, pending }));
+    // A caller must not mistake retained work for successful delivery.
+    if (pending) process.exitCode = EXIT.failure;
   } finally { outbox.close(); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href)
-  main().catch(error => { createLogger().error("akasha collector failed; state retained"); process.exitCode = error instanceof ConfigurationError ? EXIT.config : EXIT.failure; });
+  collectorMain(process.argv.slice(2)).catch(error => { createLogger().error("akasha collector failed; state retained"); process.exitCode = error instanceof ConfigurationError ? EXIT.config : EXIT.failure; });
