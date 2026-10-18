@@ -42,7 +42,9 @@ backlog, using the existing publisher's five-second network timeout. The helper
 has its existing separate two-second bound. Pending identity and bytes survive
 restart unchanged. New admissions are at least 30 seconds apart. A pending
 attempt expires after 120 seconds as an explicit `status_expired_gap`, not a
-delivery. New input must itself be at most 120 seconds old.
+delivery. A terminal server tombstone is also a status gap; ordinary collectors
+retain their existing tombstone acknowledgement behavior. New input must itself
+be at most 120 seconds old.
 
 The canonical collector timer is 30 seconds plus up to five seconds jitter.
 Long ordinary backlog runs may delay subsequent starts. This is sampled state,

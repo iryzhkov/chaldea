@@ -32,36 +32,45 @@ export async function helperToken(helper: string, event: Publication, action: "a
     child.once("close", code => finish(code === 0));
   });
 }
-/** True only after a visible durable receipt. Every other outcome retains the intent. */
+type PublicationResult = "visible" | "expired" | "deferred";
+/** Preserve ordinary terminal acknowledgement semantics, including tombstones. */
 export async function publish(event: Publication, options: PublisherOptions = {}): Promise<boolean> {
+  return await publicationResult(event,options) !== "deferred";
+}
+/** Status expiry is a gap, never a fresh delivery. One request, same frozen key. */
+export async function publishStatus(event: Publication, options: PublisherOptions = {}): Promise<PublicationResult> {
+  return publicationResult(event,options);
+}
+async function publicationResult(event: Publication, options: PublisherOptions): Promise<PublicationResult> {
   try {
-    if (!/^[\x20-\x7e]{1,256}$/.test(event.key)) return false;
+    if (!/^[\x20-\x7e]{1,256}$/.test(event.key)) return "deferred";
     const config = eventsConfig();
     const url = new URL(options.url ?? config.url ?? "");
-    if (url.protocol !== "https:" || url.username || url.password) return false;
+    if (url.protocol !== "https:" || url.username || url.password) return "deferred";
     url.pathname = "/api/v1/events"; url.search = ""; url.hash = "";
     const token = await (options.token ? options.token(event) :
       helperToken(options.helper ?? config.tokenHelper ?? "", event));
     const bytes = JSON.stringify(event.payload);
-    if (Buffer.byteLength(bytes) > 64 * 1024) return false;
+    if (Buffer.byteLength(bytes) > 64 * 1024) return "deferred";
     const response = await (options.fetch ?? fetch)(url, { method: "POST", redirect: "error",
       headers: { authorization: "Bearer " + token, "content-type": "application/json", "Idempotency-Key": event.key },
       body: bytes, signal: AbortSignal.timeout(options.timeoutMs ?? 5000) });
     // Bound even an unexpected proxy response.
     const reader = response.body?.getReader();
-    if (!reader) return false;
+    if (!reader) return "deferred";
     let body = ""; let size = 0;
     try {
       while (true) {
         const chunk = await reader.read(); if (chunk.done) break;
         size += chunk.value.length;
-        if (size > 8192) return false;
+        if (size > 8192) return "deferred";
         body += new TextDecoder().decode(chunk.value);
       }
     } finally { await reader.cancel().catch(() => {}); }
     const receipt = JSON.parse(body);
-    return ((response.status === 201 && receipt.state === "visible") ||
-      (response.status === 410 && receipt.state === "tombstone")) &&
-      typeof receipt.event_id === "string" && /^[a-f0-9]{64}$/.test(receipt.event_id);
-  } catch { return false; }
+    if(typeof receipt.event_id !== "string" || !/^[a-f0-9]{64}$/.test(receipt.event_id))return "deferred";
+    if(response.status===201&&receipt.state==="visible")return "visible";
+    if(response.status===410&&receipt.state==="tombstone")return "expired";
+    return "deferred";
+  } catch { return "deferred"; }
 }

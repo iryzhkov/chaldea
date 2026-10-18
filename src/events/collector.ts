@@ -13,7 +13,7 @@ import { ConfigurationError } from "../config/files.ts";
 import { EXIT } from "../config/exit.ts";
 import { pathToFileURL } from "node:url";
 import { Outbox, type Cursor } from "./outbox.ts";
-import { publish, type Publication, type PublisherOptions } from "./publisher.ts";
+import { publish,publishStatus, type Publication, type PublisherOptions } from "./publisher.ts";
 const LINE_BYTES = 64 * 1024;
 const DAY = 86400_000;
 const sha = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
@@ -122,7 +122,7 @@ export function timerPublication(raw: Record<string, unknown>, host: string): Pu
       data: { job_id: job, invocation_id: invocation, status } } };
 }
 /** One latest sample and one immutable uncertain attempt, never a second collector. */
-export async function collectStatus(options:CollectorOptions,deliver:(e:Publication)=>Promise<boolean>,now:number):Promise<void> {
+export async function collectStatus(options:CollectorOptions,deliver:(e:Publication)=>Promise<"visible"|"expired"|"deferred">,now:number):Promise<void> {
   const outbox=options.outbox,state=outbox.statusState();
   try{
     const snapshot=validateHostSnapshot(strictJson(readTrustedFile(options.missionControlSnapshotFile!,{maxBytes:SNAPSHOT_BYTES,secret:true})));
@@ -139,7 +139,8 @@ export async function collectStatus(options:CollectorOptions,deliver:(e:Publicat
   if(!state.pending&&state.latest&&now-state.admitted>=30_000){state.pending=state.latest;state.latest=null;state.until=now+120_000;state.admitted=now;}
   outbox.saveStatus(state); // Freeze exact identity and bytes before any network attempt.
   if(state.pending){
-    if(await deliver(state.pending)){state.pending=null;outbox.count("status_delivered");}
+    const outcome=await deliver(state.pending);
+    if(outcome!=="deferred"){state.pending=null;outbox.count(outcome==="visible"?"status_delivered":"status_expired_gap");}
     else outbox.count("status_deferred");
     outbox.saveStatus(state);
   }
@@ -147,7 +148,7 @@ export async function collectStatus(options:CollectorOptions,deliver:(e:Publicat
 export async function collect(options: CollectorOptions): Promise<void> {
   const { outbox } = options, now = (options.now ?? Date.now)();
   const deliver = options.deliver ?? ((e: Publication) => publish(e, options.publisher));
-  if (options.missionControlSnapshotFile) await collectStatus(options,deliver,now);
+  if (options.missionControlSnapshotFile) await collectStatus(options,options.deliver?async(e)=>await options.deliver!(e)?"visible":"deferred":(e)=>publishStatus(e,options.publisher),now);
   let budget = options.maxEvents ?? 100;
   async function drain(): Promise<boolean> {
     while (budget > 0) {
