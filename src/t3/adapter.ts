@@ -37,6 +37,7 @@ if (ORCHESTRATION_PROTOCOL_VERSION !== SUPPORTED_PROTOCOL_VERSION) {
 
 /** A thread as the quota observer needs to see it. Times are ISO strings. */
 export interface ShellThread {
+  readonly title?: string;
   readonly id: string;
   readonly status: string;
   readonly providerInstanceId: string;
@@ -361,6 +362,7 @@ export function toShellThread(thread: OrchestrationV2ThreadShell): ShellThread {
   const recovery = thread.limitRecovery ?? null;
   return {
     id: thread.id,
+    title: thread.title,
     status: thread.status,
     providerInstanceId: thread.providerInstanceId,
     modelSelection: thread.modelSelection,
@@ -530,6 +532,48 @@ export async function setAutoResumeLimitedThreads(options: ConnectOptions, enabl
  * ends, the signal aborts, or the connection fails. Resolves when the server
  * ends the stream; rejects with one of the error classes above otherwise.
  */
+
+/** Narrow read-only detail stream for Mission Control. Never exports raw items. */
+export type MissionDetailEvent =
+  | { kind: "synchronized" }
+  | { kind: "cursor"; sequence: number }
+  | { kind: "activity"; tool: string | null }
+  | { kind: "usage"; turnId: string; output: number | null; at: number; baseline: boolean; startedAt?: number | null };
+export async function connectMissionThread(options: ConnectOptions, threadId: string,
+  afterSequence: number | undefined, onEvent: (event: MissionDetailEvent) => void): Promise<void> {
+  await withClient(options, client => client["orchestration.subscribeThread"]({
+    threadId, ...(afterSequence === undefined ? {} : { afterSequence }),
+    requestCompletionMarker: true, acceptBoundedSnapshot: true, acceptCompactTurnItems: true,
+  } as never).pipe(Stream.runForEach(item => Effect.sync(() => {
+    if (item.kind === "synchronized") { onEvent({ kind: "synchronized" }); return; }
+    if (item.kind === "snapshot") {
+      const turns = item.projection.providerTurns.toSorted((a, b) => b.ordinal - a.ordinal);
+      for (const turn of turns.filter((turn, i) => i === 0 || turn.status === "running").slice(0, 8)) {
+        onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
+          startedAt: turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : null,
+          at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : 0, baseline: true });
+      }
+      const recent = [...item.projection.turnItems, ...item.projection.visibleTurnItems.map(row => row.item)]
+        .filter(row => row.status === "running").toSorted((a,b) => b.ordinal - a.ordinal)[0];
+      if (recent) onEvent({ kind: "activity", tool: "toolName" in recent && typeof recent.toolName === "string" ? recent.toolName : null });
+      onEvent({ kind: "cursor", sequence: item.snapshotSequence }); return;
+    }
+    if (item.kind === "unknown-event") { onEvent({ kind: "cursor", sequence: item.sequence }); return; }
+    if (item.kind === "event") {
+      const e = item.event;
+      if (e.type === "provider-turn.updated") {
+        const turn = e.payload;
+        onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
+          startedAt: turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : null,
+          at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : DateTime.toEpochMillis(e.occurredAt), baseline: false });
+      } else if (e.type === "turn-item.updated" && e.payload.status === "running") {
+        onEvent({ kind: "activity", tool: "toolName" in e.payload && typeof e.payload.toolName === "string" ? e.payload.toolName : null });
+      }
+      onEvent({ kind: "cursor", sequence: item.sequence });
+    }
+  }))));
+}
+
 export async function connectShell(options: ConnectOptions, subscription: ShellSubscription): Promise<void> {
   let callbackError: unknown;
   try {
