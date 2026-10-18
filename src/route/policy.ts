@@ -48,7 +48,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     const scoped = providerReasons.get(p.driverKind) ?? [];
     providerReasons.set(p.driverKind, scoped);
     const reject = (reason: string) => { scoped.push(reason); reasons.push(reason); };
-    if (input.role === "critical-review" && p.driverKind === input.authorProvider) {
+    if (input.authorProvider !== undefined && p.driverKind === input.authorProvider) {
       reject(p.providerInstanceId + ": review requires the other provider from " + input.authorProvider); continue;
     }
     if (pin?.providerInstanceId && pin.providerInstanceId !== p.providerInstanceId) {
@@ -161,7 +161,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   });
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
   if (!eligible[0]) throw new Error("No eligible routing candidate: " + reasons.join("; "));
-  if (input.role === "critical-review" && input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
+  if (input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
   eligible = eligible.filter(c => {

@@ -73,3 +73,32 @@ test("CLI and existing MCP route against real T3 cached catalog; no wait service
     assert.equal(t3.fakeClaudeEvents().filter(e => e.event === "turn").length, 0);
   } finally { await t3.stop(); d.remove(); }
 });
+
+test("builder review CLI rejects a same-driver pin through the runtime", { skip, timeout: 120000 }, async () => {
+  const d = routeScratch();
+  const t3 = await startDisposableT3({ scratchRoot: d.path, scenario: "no-reset", autoResume: false,
+    codex: "available", claudeModel: "claude-opus-5-5" });
+  try {
+    const now = Date.now(), cacheDir = join(d.path, "cache"), tokenFile = join(d.path, "token");
+    const configPath = join(d.path, "route.json"), stateFile = join(d.path, "state.json");
+    writeFileSync(tokenFile, t3.issueToken(["orchestration:read"]), { mode: 0o600 });
+    saveState(stateFile, emptyState(), now);
+    // Reserve analytics collection without data or network. AA and Claude collection stay off.
+    writeJson(join(cacheDir, "slopalytics.json"), { attemptedAt: now, fetchedAt: null, value: null });
+    writeFileSync(configPath, JSON.stringify({ t3BaseDir: t3.baseDir, tokenFile, stateFile, cacheDir,
+      pins: { builder: { providerInstanceId: "codex", model: "gpt-6.1-sol" } } }));
+    const cli = spawnSync(process.execPath, ["bin/chaldea", "route", "--role", "builder",
+      "--author-provider", "codex", "--config", configPath],
+      { encoding: "utf8", env: { ...process.env, HOME: d.path }, timeout: 20000 });
+    assert.notEqual(cli.status, 0, "same-provider review must refuse, received: " + cli.stdout);
+    assert.match(cli.stderr, /No eligible.*review requires the other provider/);
+    for (const args of [[], ["--author-provider", "claudeAgent"]]) {
+      const allowed = spawnSync(process.execPath, ["bin/chaldea", "route", "--role", "builder",
+        "--config", configPath, ...args],
+        { encoding: "utf8", env: { ...process.env, HOME: d.path }, timeout: 20000 });
+      assert.equal(allowed.status, 0, allowed.stderr);
+      assert.equal(JSON.parse(allowed.stdout).providerInstanceId, "codex");
+    }
+    assert.equal(t3.fakeClaudeEvents().filter(e => e.event === "turn").length, 0);
+  } finally { await t3.stop(); d.remove(); }
+});
