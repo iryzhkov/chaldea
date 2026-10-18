@@ -279,7 +279,12 @@ export class HeadroomMonitor {
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;
+        if (p.driver === "claudeAgent" && (p.quotaAccountKey || next.included.source === "t3")) {
+          // Native windows/reset inventory belong to this instance's account only.
+          next.included = clean.included; next.manualResets = clean.manualResets;
+        }
       }
+      if (p.driver === "claudeAgent" && p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
       applyT3(next, p);
       return next;
     });
