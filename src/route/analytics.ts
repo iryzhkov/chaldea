@@ -37,12 +37,15 @@ export function validateAnalytics(raw: unknown): Analytics {
   const a = raw as Analytics;
   if (!a || ![a.fetchedAt, a.sourceFetchedAt, a.endExclusive].every(v => typeof v === "string" && Number.isFinite(Date.parse(v))) ||
     !a.models || typeof a.models !== "object") throw new Error("Invalid analytics cache");
+  const models: Record<string, ModelStats> = {};
   for (const [id, s] of Object.entries(a.models)) {
-    if (!Object.values(MODEL_NAMES).includes(id) || !s || !count(s.turns) ||
+    if (!Object.values(MODEL_NAMES).includes(id)) continue;
+    if (!s || !count(s.turns) ||
       ![s.completionRate, s.failedRate, s.interruptedRate].every(v => count(v) && v <= 1) ||
       s.minutesPerTurn !== null && !count(s.minutesPerTurn)) throw new Error("Invalid analytics cache");
+    models[id] = s;
   }
-  return a;
+  return { ...a, models };
 }
 export function collectAnalytics(path: string, now: number, fetcher: typeof fetch = fetch) {
   return cached(path, 86_400_000, now, validateAnalytics,
