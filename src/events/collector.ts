@@ -121,9 +121,17 @@ export function timerPublication(raw: Record<string, unknown>, host: string): Pu
       }),
       data: { job_id: job, invocation_id: invocation, status } } };
 }
+function statusCount(outbox:Outbox,name:string):void {
+  try{outbox.count(name);}catch{/* Optional counters cannot consume ordinary delivery capacity. */}
+}
+function statusStorageDeferred(outbox:Outbox):void {
+  statusCount(outbox,"status_storage_deferred");
+  try{createLogger().warn("mission control status persistence unavailable; ordinary delivery continues");}catch{}
+}
 /** One latest sample and one immutable uncertain attempt, never a second collector. */
 export async function collectStatus(options:CollectorOptions,deliver:(e:Publication)=>Promise<"visible"|"expired"|"deferred">,now:number):Promise<void> {
-  const outbox=options.outbox,state=outbox.statusState();
+  const outbox=options.outbox;let state:ReturnType<Outbox["statusState"]>;
+  try{state=outbox.statusState();}catch{statusStorageDeferred(outbox);return;}
   try{
     const snapshot=validateHostSnapshot(strictJson(readTrustedFile(options.missionControlSnapshotFile!,{maxBytes:SNAPSHOT_BYTES,secret:true})));
     if(snapshot.host!==options.host||snapshot.observedAt>now||now-snapshot.observedAt>120_000)throw new Error("stale_status");
@@ -133,16 +141,17 @@ export async function collectStatus(options:CollectorOptions,deliver:(e:Publicat
         payload:{v:1,kind:"agent_status",source:options.host+".mission-control",host:options.host,project:"chaldea",occurred_at:new Date(snapshot.observedAt).toISOString(),title:"Mission control status",data:{snapshot}}};
       state.seen={epoch:snapshot.epoch,sequence:snapshot.sequence,observedAt:snapshot.observedAt};
     }
-  }catch{outbox.count("status_rejected");}
-  if(state.pending&&now>=state.until){state.pending=null;outbox.count("status_expired_gap");}
-  if(state.latest&&now-(state.latest.payload.data as {snapshot:{observedAt:number}}).snapshot.observedAt>120_000){state.latest=null;outbox.count("status_expired_gap");}
+  }catch{statusCount(outbox,"status_rejected");}
+  if(state.pending&&now>=state.until){state.pending=null;statusCount(outbox,"status_expired_gap");}
+  if(state.latest&&now-(state.latest.payload.data as {snapshot:{observedAt:number}}).snapshot.observedAt>120_000){state.latest=null;statusCount(outbox,"status_expired_gap");}
   if(!state.pending&&state.latest&&now-state.admitted>=30_000){state.pending=state.latest;state.latest=null;state.until=now+120_000;state.admitted=now;}
-  outbox.saveStatus(state); // Freeze exact identity and bytes before any network attempt.
+  // A failed admission never permits a new send. SQLite retains the previous frozen slot.
+  try{outbox.saveStatus(state);}catch{statusStorageDeferred(outbox);return;}
   if(state.pending){
     const outcome=await deliver(state.pending);
-    if(outcome!=="deferred"){state.pending=null;outbox.count(outcome==="visible"?"status_delivered":"status_expired_gap");}
-    else outbox.count("status_deferred");
-    outbox.saveStatus(state);
+    if(outcome!=="deferred")state.pending=null;
+    try{outbox.saveStatus(state);}catch{statusStorageDeferred(outbox);return;}
+    statusCount(outbox,outcome==="visible"?"status_delivered":outcome==="expired"?"status_expired_gap":"status_deferred");
   }
 }
 export async function collect(options: CollectorOptions): Promise<void> {

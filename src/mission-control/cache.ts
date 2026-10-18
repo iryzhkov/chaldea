@@ -32,7 +32,7 @@ export function mergeStatus(cache:StatusCache,raw:HostSnapshot,now=Date.now()):b
   if(prior){
     if(s.epoch===prior.epoch?(s.sequence<=prior.sequence||s.observedAt<prior.observedAt):s.observedAt<=prior.observedAt)return false;
     if(s.epoch===prior.epoch){
-      if(!prior.tokens.qualified)s.tokens={qualified:false,output:null,rate:null,observedAt:null,coverage:"unknown"};
+      if(!prior.tokens.qualified||prior.tokens.coverage==="unknown"||!s.tokens.qualified||s.tokens.coverage==="unknown")s.tokens={qualified:prior.tokens.qualified&&s.tokens.qualified,output:null,rate:null,observedAt:null,coverage:"unknown"};
       else if(prior.tokens.coverage==="partial"||s.tokens.output!==null&&prior.tokens.output!==null&&s.tokens.output<prior.tokens.output)s.tokens.coverage="partial";
     } else cache.gap=true;
     cache.snapshots[i]=s;
@@ -45,7 +45,6 @@ export class CacheModel {
   private cache:StatusCache=emptyCache();
   private readonly bootSamples=new Map<string,{epoch:string;sequence:number;observedAt:number}>();
   private readonly warmSources=new Set<string>();
-  private loaded=false;
   private readonly path:string;
   private readonly now:()=>number;
   constructor(path:string,now:()=>number=Date.now){this.path=path;this.now=now;this.reload();}
@@ -55,12 +54,12 @@ export class CacheModel {
       const cache=loadCache(this.path,this.now());
       for(const s of cache.snapshots){
         const boot=this.bootSamples.get(s.host);
-        if(!this.loaded)this.bootSamples.set(s.host,{epoch:s.epoch,sequence:s.sequence,observedAt:s.observedAt});
-        else if(!boot||s.observedAt>boot.observedAt&&(s.epoch!==boot.epoch||s.sequence>boot.sequence))this.warmSources.add(s.host);
+        if(!boot)this.bootSamples.set(s.host,{epoch:s.epoch,sequence:s.sequence,observedAt:s.observedAt});
+        else if(s.observedAt>boot.observedAt&&(s.epoch!==boot.epoch||s.sequence>boot.sequence))this.warmSources.add(s.host);
       }
       this.cache=cache;
     }catch{this.cache.gap=true;}
-    this.loaded=true;for(const fn of this.listeners)fn();
+    for(const fn of this.listeners)fn();
   }
   snapshot():ReturnType<MissionModel["snapshot"]> & {sampled:true}{
     const now=this.now(),base=new MissionModel(false,this.now).snapshot();

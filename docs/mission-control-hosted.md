@@ -44,7 +44,10 @@ restart unchanged. New admissions are at least 30 seconds apart. A pending
 attempt expires after 120 seconds as an explicit `status_expired_gap`, not a
 delivery. A terminal server tombstone is also a status gap; ordinary collectors
 retain their existing tombstone acknowledgement behavior. New input must itself
-be at most 120 seconds old.
+be at most 120 seconds old. Optional status persistence or counter exhaustion
+cannot prevent ordinary backlog delivery. A new status is sent only after its
+frozen slot is saved; a failed acknowledgement save retains that same slot for
+retry. Optional counters and a fixed deferred diagnostic are best effort.
 
 The canonical collector timer is 30 seconds plus up to five seconds jitter.
 Long ordinary backlog runs may delay subsequent starts. This is sampled state,
@@ -79,7 +82,11 @@ Each refresh binds all pages to one fixed one-hour query. It reads at most four
 128-event pages with a five-second deadline and a 2 MiB response cap. Redirects
 are errors. A 410 cursor reset marks a gap and starts the same bounded query
 without that cursor. Partial, oversized or malformed traversals retain the
-previous good cache and mark a gap. Fetch time never replaces producer time.
+previous good cache and mark a gap. A later complete authorized traversal clears
+that transient transport gap when the current traversal has no reset, epoch
+change or clipped coverage. Intrinsic row truncation and same-epoch unknown or
+partial token evidence remain independent and do not become complete on recovery.
+Fetch time never replaces producer time.
 
 Run `chaldea mission-control serve --config /etc/mission-control/server.json`
 under the separate web account:
@@ -97,7 +104,8 @@ under the separate web account:
 Cache mode never discovers T3, reads an orchestration token or invokes a helper.
 Unknown cache/source state does not prevent HTTP startup. On restart, retained
 fresh cache is labeled cached until a strictly newer validated source tuple and
-observation arrives. Re-reading the same file or an older epoch cannot warm it. The reader owns the
+observation arrives. The first successfully loaded sample for each source is the
+baseline, including after an initially missing or unreadable cache. Re-reading the same file or an older epoch cannot warm it. The reader owns the
 2750 SGID cache directory with group mission-control-cache; the web account has
 read-only supplementary group access. Atomic cache files and their same-directory
 temporary files are explicitly 0640 before rename. The reader's private state

@@ -21,9 +21,10 @@ function live(clock=()=>now0,rows=[row()]){const m=new MissionModel(false,clock)
 const sample=(sequence=1,now=now0)=>captureSnapshot(live(()=>now),"agent-a",epoch,sequence)!;
 
 
-test("R1 full4096page status admission cannot starve100 protected ordinary deliveries",async()=>{
+for(const existingSlot of [false,true])test("R1 full4096page status admission cannot starve100 protected ordinary deliveries, existingSlot="+existingSlot,async()=>{
   const d=scratch(),o=new Outbox(join(d.path,"full.db"));
   try{
+    if(existingSlot)o.statusState();
     const cursor={generation:"fixture",dev:"0",ino:"1",offset:1,prefix:"",prefixLength:0,tail:""};
     for(let i=0;i<280;i++)assert.equal(o.admit({key:"ordinary-"+i,source:"agent-a.toolfeedback",host:"agent-a",payload:{v:1,kind:"tool_call",body:"x".repeat(54000)}},"ordinary",cursor),true);
     o.db.exec("CREATE TABLE fixture_pressure(value BLOB)");

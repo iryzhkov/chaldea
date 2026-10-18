@@ -29,6 +29,8 @@ export async function refreshStatus(c:ReaderConfig,previous:StatusCache,dependen
     const url=new URL("/api/v1/events",c.url);url.searchParams.set("kind","agent_status");url.searchParams.set("project","chaldea");
     url.searchParams.set("from",new Date(now-3600_000).toISOString());url.searchParams.set("to",new Date(now).toISOString());url.searchParams.set("limit","128");
     let reset=false;const seen=new Set<string>(),candidate=structuredClone(next);
+    // This flag describes the current traversal, not an irreversible outage history.
+    candidate.gap=false;
     for(let page=0;page<4;page++){
       const response=await(dependencies.fetch??fetch)(url,{redirect:"error",headers:{authorization:"Bearer "+token},signal});
       if(response.status===410&&!reset){await response.body?.cancel();url.searchParams.delete("cursor");candidate.gap=true;reset=true;continue;}
@@ -42,7 +44,7 @@ export async function refreshStatus(c:ReaderConfig,previous:StatusCache,dependen
         if(e.kind!=="agent_status"||e.provenance.type!=="verified"||!c.allowedSourceIds.includes(e.source_id)||!statusIdentity(e,s)||Date.parse(e.received_at)>now||now-s.observedAt>3600_000)throw new Error("unauthorized_status");
         mergeStatus(candidate,s,now);
       }
-      if(v.next_cursor===null)return candidate;
+      if(v.next_cursor===null){candidate.gap ||= candidate.snapshots.some(s=>s.truncated);return candidate;}
       if(typeof v.next_cursor!=="string"||v.next_cursor.length>1024||!/^[A-Za-z0-9_-]+$/.test(v.next_cursor)||seen.has(v.next_cursor))throw new Error("invalid_cursor");
       seen.add(v.next_cursor);url.searchParams.set("cursor",v.next_cursor);
     }
