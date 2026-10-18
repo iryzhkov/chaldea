@@ -1,3 +1,4 @@
+import { validateScores } from "../route/scores.ts";
 import { createHash } from "node:crypto";
 import { validateSnapshot } from "../quota/capacity-snapshot.ts";
 import { strictJson } from "../access/token.ts";
@@ -5,7 +6,7 @@ import { strictJson } from "../access/token.ts";
 export const KiB = 1024;
 export const MAX_EVENT = 64 * KiB, MAX_LEGACY = 256 * KiB, MAX_ENVELOPE = 320 * KiB;
 export const NEW_FEED_ID = 1_000_000_000_000;
-export const KINDS = ["feed_post", "report", "quota_headroom_snapshot", "quota_headroom_changed", "quota_headroom_low", "quota_parked", "quota_reset_unknown", "quota_resumed", "restart_resumed",
+export const KINDS = ["route_score_snapshot", "route_pick_changed", "feed_post", "report", "quota_headroom_snapshot", "quota_headroom_changed", "quota_headroom_low", "quota_parked", "quota_reset_unknown", "quota_resumed", "restart_resumed",
   "provider_switched", "provider_switch_failed", "tool_call", "deployment_finished", "job_finished",
   "task_started", "task_finished", "review_verdict", "review_note", "agent_status"] as const;
 export type Kind = typeof KINDS[number];
@@ -78,6 +79,7 @@ export function normaliseTags(raw: unknown): string[] {
 }
 const COMMON = ["v", "kind", "source", "host", "run_id", "project", "occurred_at", "severity", "title", "body", "tags", "link", "data"];
 const DATA: Record<Kind, readonly string[]> = {
+  route_score_snapshot: ["scores"], route_pick_changed: ["role", "model", "previous_model", "transition_id"],
   feed_post: [], report: ["status", "checks"],
   quota_headroom_snapshot: ["transition_id", "capacity"],
   quota_headroom_changed: ["transition_id"],
@@ -102,7 +104,9 @@ function validateData(kind: Kind, data: Record<string, unknown>): void {
   fields(data, DATA[kind]);
   ensure(Buffer.byteLength(canonical(data)) <= 48 * KiB, "data_too_large", 413);
   for (const [key, value] of Object.entries(data)) {
-    if (key === "capacity") {
+    if (key === "scores") {
+      try { validateScores(value); } catch { throw new HttpError(400, "invalid_route_scores"); }
+    } else if (key === "capacity") {
       try { validateSnapshot(value); } catch { throw new HttpError(400, "invalid_capacity_snapshot"); }
     } else if (key === "checks") {
       ensure(Array.isArray(value) && value.length <= 100, "invalid_checks");
@@ -145,6 +149,7 @@ export function normalize(payload: Record<string, unknown>, identity: Identity, 
   const data = { ...record(payload.data ?? {}) };
   if (kind === "tool_call" && data.ts !== undefined) data.ts = timestamp(data.ts);
   validateData(kind as Kind, data);
+  if (data.scores !== undefined) ensure(identity.host === "homelab" && identity.source === "route", "scores_publisher_mismatch", 403);
   if (data.capacity !== undefined) ensure(record(data.capacity).host === identity.host, "snapshot_host_mismatch", 403);
   // Tool telemetry is allowlisted data only; general prose could smuggle raw output.
   if (kind === "tool_call") ensure(!payload.body && !payload.title && !link && tags.length === 0, "tool_prose_forbidden");

@@ -1,7 +1,7 @@
 // Sanitized, independently timestamped quota observations. No provider/account payload is persisted wholesale.
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { collectClaudeUsage, claudeCacheFile } from "../route/claude-usage.ts";
+import { collectClaudeUsage, claudeCacheFile, claudeSourceId } from "../route/claude-usage.ts";
 import { capacitySnapshot, publishSnapshot } from "./fleet.ts";
 import { loadCapacityConfig } from "./capacity-config.ts";
 import { accountKey, capacityKey } from "./account.ts";
@@ -364,9 +364,15 @@ export class HeadroomMonitor {
       if (!ctx.enabled || this.#abort.signal.aborted || !this.options.local) continue;
       const row = this.state.providers.find(p => p.alias === ctx.providerInstanceId);
       if (!row || row.driver !== "claudeAgent") continue;
-      const usage = await (this.options.claudeRead ?? collectClaudeUsage)({ enabled: true, credentialFile: ctx.credentialFile,
-        cacheFile: claudeCacheFile(homedir(), ctx.credentialFile),
+      const usage = await (this.options.claudeRead ?? collectClaudeUsage)({ ...ctx, enabled: true,
+        cacheFile: claudeCacheFile(homedir(), claudeSourceId(ctx)),
         now: this.now() });
+      const error = usage.reason;
+      if (row.included.error !== error) {
+        row.included = { ...row.included, source: "claude-usage", error,
+          state: row.included.value ? row.included.state : error ? "error" : "unknown" };
+        this.#changed = true;
+      }
       if (!usage.value) continue;
       if (ctx.accountKey && usage.value.accountKey !== ctx.accountKey) {
         delete row.accountKey;
@@ -377,7 +383,7 @@ export class HeadroomMonitor {
       const u = usage.value;
       if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt) || row.included.source === "t3") {
         retainBurnSample(row, u.observedAt);
-        row.included = observed(u.windows.map(w => ({ ...w, id: w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt);
+        row.included = { ...observed(u.windows.map(w => ({ ...w, id: w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt), error };
         if (u.accountKey) row.accountKey = u.accountKey; else delete row.accountKey;
         this.#changed = true;
       }

@@ -1,0 +1,27 @@
+[Unit]
+Description=Fetch Artificial Analysis routing scores on homelab
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+User=root
+Environment=HOME=/var/lib/chaldea-route
+Environment=TMPDIR=/var/lib/chaldea-route/tmp
+WorkingDirectory=/var/lib/chaldea-route
+ExecStartPre=/usr/bin/mkdir -p /var/lib/chaldea-route/tmp
+ExecStart=/opt/chaldea-route/node/bin/node /opt/chaldea-route/client/bin/chaldea route fetch-scores --config /etc/chaldea-route/route.json
+Restart=on-failure
+RestartSec=5min
+StateDirectory=chaldea-route
+StateDirectoryMode=0700
+UMask=0077
+# The source token helper uses sudo to drop to chaldea-issuer.
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/chaldea-route /var/lib/chaldea-issuer/access
+StandardOutput=journal
+StandardError=journal

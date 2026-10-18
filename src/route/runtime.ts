@@ -11,9 +11,10 @@ import { discoverServerUrl, switchPort } from "../t3/adapter.ts";
 import type { SwitchProvider } from "../t3/adapter.ts";
 import { readToken } from "../quota/run.ts";
 import { loadRouteConfig } from "./config.ts";
-import { collectClaudeUsage, claudeCacheFile } from "./claude-usage.ts";
+import { collectClaudeUsage, claudeCacheFile, claudeSourceId } from "./claude-usage.ts";
 import { collectAnalytics } from "./analytics.ts";
-import { recommend } from "./policy.ts";
+import { collectScores } from "./snapshot.ts";
+import { RouteState } from "./state.ts";
 import { routeInput } from "./types.ts";
 import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
 
@@ -64,7 +65,7 @@ export async function route(value: unknown, options: {
   }
   const id = config.claudeUsage.providerInstanceId;
   const claudeBound = catalog.some(p => p.providerInstanceId === id && p.driverKind === "claudeAgent" && p.canRunChildTask);
-  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: claudeCacheFile(options.home ?? homedir(), config.claudeUsage.credentialFile), now,
+  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: claudeCacheFile(options.home ?? homedir(), claudeSourceId(config.claudeUsage)), now,
     ...(options.fetcher ? { fetcher: options.fetcher } : {}) });
   if (usage.reason) reasons.push(!config.claudeUsage.enabled || claudeBound ? usage.reason : "Claude collector binding absent or unavailable; skipped");
   if (claudeBound) {
@@ -81,6 +82,8 @@ export async function route(value: unknown, options: {
       } else reasons.push("Claude operator weekly target expired or invalid for the current window");
     }
   }
+  const scores = await collectScores(config.scores, join(config.cacheDir, "aa-scores.json"), now, options.fetcher);
+  if (scores.reason) reasons.push("AA " + scores.reason);
   const analytics = await collectAnalytics(join(config.cacheDir, "slopalytics.json"), now, options.fetcher);
   if (analytics.reason) reasons.push("Slopalytics " + analytics.reason);
   const capacityState = { parked: state.parked, headroom: { ...state.headroom, providers: catalog
@@ -140,7 +143,18 @@ export async function route(value: unknown, options: {
     if (row) capacity[p.providerInstanceId] = classifyCapacity(row, account?.activeStop || stop, now, capacityConfig);
     return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId), ...(key ? { accountKey: key } : {}) };
   });
-  const result = recommend(input, { catalog: boundCatalog, quota, analytics: analytics.value, now, config, capacity });
-  result.reasons.unshift(...reasons);
-  return result;
+  const routing = new RouteState(config.routeStateFile);
+  try {
+    const result = routing.recommend(input, { catalog: boundCatalog, quota, analytics: analytics.value,
+      scores: scores.value, now, config, capacity }, config.scores.host,
+      config.scores.host === config.announceHost && !input.effortOverride);
+    if (config.scores.enabled && config.scores.host === config.announceHost) {
+      try { await routing.flush({ url: config.scores.url, helper: config.scores.tokenHelper, ...(options.fetcher ? { fetch: options.fetcher } : {}) }); }
+      catch { reasons.push("Route-change publication deferred; routing continues"); }
+      if (routing.pending()) reasons.push("Route-change event retained in durable outbox for retry");
+    }
+    if (!config.scores.enabled && routing.pending()) reasons.push("Route-change event queued; snapshot transport not configured");
+    result.reasons.unshift(...reasons);
+    return result;
+  } finally { routing.close(); }
 }

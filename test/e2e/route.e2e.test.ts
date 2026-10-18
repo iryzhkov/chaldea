@@ -18,6 +18,8 @@ test("route CLI fixture gives native delegate target without services or credent
     const r = JSON.parse(result.stdout);
     assert.equal(r.providerInstanceId, "claudeAgent"); assert.equal(r.model, "claude-opus-5-5");
     assert.deepEqual(r.options, { effort: "high" }); assert.match(r.reasons.join(" "), /62% left with 40%/);
+    assert.equal(r.byProvider.claudeAgent.model, "claude-opus-5-5");
+    assert.equal(r.byProvider.codex.model, "gpt-6.1-sol");
     const state = emptyState(), p = newProvider("codex", "codex"), at = Date.now();
     p.included = { value: [{ id: "weekly", kind: "weekly", usedPercent: 20, remainingPercent: 80,
       windowDurationMins: 10080, resetsAt: new Date(at + .4 * 7 * 86400000).toISOString() }],
@@ -66,6 +68,7 @@ test("CLI and existing MCP route against real T3 cached catalog; no wait service
     assert.ok(replies[0].result.tools.some((t: { name: string }) => t.name === "chaldea_route"));
     assert.equal(replies[1].result.isError, undefined);
     assert.equal(JSON.parse(replies[1].result.content[0].text).model, target.model);
+    assert.deepEqual(JSON.parse(replies[1].result.content[0].text).byProvider, target.byProvider);
     assert.equal(replies[2].result.isError, true);
     assert.equal(t3.fakeClaudeEvents().filter(e => e.event === "turn").length, 0);
   } finally { await t3.stop(); d.remove(); }

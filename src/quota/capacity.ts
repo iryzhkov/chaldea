@@ -1,5 +1,6 @@
 // Capacity is advice over cached observations. This module performs no IO or redemption.
 import { capacityKey } from "./account.ts";
+import { windowPolicy } from "./window-policy.ts";
 import type { ObserverState } from "./state.ts";
 import type { Metric, ProviderHeadroom, Window } from "./headroom.ts";
 export type CapacityClass = "unlimited" | "use-it" | "paced" | "tight" | "stopped" | "unknown";
@@ -64,7 +65,12 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   const c: Capacity = { class: "unknown", reasons: [], remainingFraction: null, reserveWeeks: 0,
     observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null, observedAt: p.included.observedAt };
   const finish = (kind: CapacityClass, reason: string) => { c.class = kind; c.reasons.push(reason); return c; };
+  const maxAge = p.included.source === "operator-weekly-target" ? 7 * 86400000 : config.maxAgeMs;
+  const windows = fresh(p.included, now, maxAge) ?? [];
+  const advice = windowPolicy(windows, now, config.minimumRemaining, config.paceMargin);
+  c.reasons.push(...advice.reasons);
   if (activeStop) return finish("stopped", "active usage stop; reserves do not authorize redemption");
+  if (advice.gate) return finish(advice.gate, "short window " + (advice.gate === "stopped" ? "exhausted" : "under minimum remaining quota") + "; wait until its reset");
   if (fresh(p.ordinaryUsageAllowed, now, config.maxAgeMs) === false)
     return finish("tight", "provider reports ordinary usage not allowed; credits do not override");
   const reserves = config.providers[p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias] ?? {};
@@ -79,14 +85,9 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
     return finish(creditExpiry && Date.parse(creditExpiry) - now <= config.expiryHorizonMs ? "use-it" : "unlimited",
       "fresh Codex credits available; no credit reserve floor" + (creditExpiry ? "; expiry " + creditExpiry : ""));
   }
-  const maxAge = p.included.source === "operator-weekly-target" ? 7 * 86400000 : config.maxAgeMs;
-  const windows = fresh(p.included, now, maxAge)?.filter(w => unexpired(w.resetsAt, now)) ?? [];
-  if (!windows.length) return finish("unknown", "missing, stale or expired native window; never assumed unlimited");
-  const w = [...windows].filter(w => w.windowDurationMins !== null && w.windowDurationMins > 0)
-    .sort((a, b) => b.windowDurationMins! - a.windowDurationMins!)[0];
-  if (!w) return finish("unknown", "window duration missing");
+  const w = advice.pacing;
+  if (!w) return finish("unknown", "missing, stale or expired weekly/longest included window; short windows never establish pacing");
   const hours = (Date.parse(w.resetsAt!) - now) / 3600000, durationHours = w.windowDurationMins! / 60;
-  if (hours > durationHours) return finish("unknown", "reset outside the native window");
   const remaining = w.remainingPercent / 100;
   c.remainingFraction = remaining;
   c.burnTargetPerHour = Math.max(0, remaining - config.reserveFraction) / hours;
@@ -114,7 +115,7 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
       c.reasons.push(`${refill.count} Claude refills retain native reset: ${timing.reason}; timed value ${timing.weeks.toFixed(3)} weeks`);
     }
   }
-  const low = windows.some(v => v.remainingPercent / 100 < config.minimumRemaining);
+  const low = remaining < config.minimumRemaining;
   if (low && c.reserveWeeks === 0) return finish("tight", "under minimum remaining quota with no usable reserves");
   if (expiring) return finish("use-it", "a reserve will expire unused soon; recommend use before expiry");
   if (!low && remaining - hours / durationHours >= config.paceMargin)

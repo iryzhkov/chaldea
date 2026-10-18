@@ -17,7 +17,19 @@ export function writeJson(path: string, value: unknown): void {
     renameSync(temp, path);
   } finally { rmSync(temp, { force: true }); }
 }
-interface Cache<T> { attemptedAt: number; fetchedAt: string | null; value: T | null }
+const FAILURE_REASONS = ["credential_expired", "credential_unavailable", "rate_limited", "unauthorized", "collection_failed"] as const;
+type FailureReason = typeof FAILURE_REASONS[number];
+/** Only allowlisted categories may reach persistent diagnostics. Never persist raw errors. */
+export class CollectionFailure extends Error {
+  readonly reason: FailureReason; readonly retryDelayMs: number | null;
+  constructor(reason: FailureReason, retryDelayMs: number | null = null) { super(reason); this.reason = reason; this.retryDelayMs = retryDelayMs; }
+}
+export class HttpFailure extends Error {
+  readonly status: number; readonly retryAfter: string | null;
+  constructor(status: number, retryAfter: string | null) { super("Usage request failed"); this.status = status; this.retryAfter = retryAfter; }
+}
+interface Cache<T> { attemptedAt: number; fetchedAt: string | null; value: T | null;
+  failureReason?: FailureReason | null; failureCount?: number; retryAt?: number }
 export interface Cached<T> { value: T | null; fetchedAt: string | null; reason: string | null }
 /** Persistent reservation bounds failures and successes across CLI/MCP processes.
  * Lock contention skips collection. A crashed lock is removed only after its cadence.
@@ -31,12 +43,20 @@ export async function cached<T>(path: string, interval: number, now: number,
       // Preserve the reservation across clock regression and cached-value schema changes.
       let value: T | null = null;
       try { if (raw.value !== null) value = validate(raw.value); } catch { /* Unknown data, reserved attempt. */ }
-      return { attemptedAt: raw.attemptedAt, fetchedAt: typeof raw.fetchedAt === "string" && Number.isFinite(Date.parse(raw.fetchedAt)) ? raw.fetchedAt : null, value };
+      return { attemptedAt: raw.attemptedAt, fetchedAt: typeof raw.fetchedAt === "string" && Number.isFinite(Date.parse(raw.fetchedAt)) ? raw.fetchedAt : null, value,
+        failureReason: FAILURE_REASONS.includes(raw.failureReason!) ? raw.failureReason! : null,
+        failureCount: Number.isSafeInteger(raw.failureCount) && raw.failureCount! >= 0 ? Math.min(raw.failureCount!, 16) : 0,
+        retryAt: Number.isSafeInteger(raw.retryAt) && raw.retryAt! >= 0 && raw.retryAt! < 8.64e15 ? raw.retryAt! : 0 };
     } catch { return { attemptedAt: 0, fetchedAt: null, value: null }; }
   };
   let state = load();
   const result = (reason: string | null): Cached<T> => ({ value: state.value, fetchedAt: state.fetchedAt, reason });
-  if (now - state.attemptedAt < interval) return result(state.value ? null : "cached collection failure");
+  const failureReason = () => state.failureReason
+    ? state.failureReason + (state.value ? "; retained last successful cache, age " + Math.max(0, Math.floor((now - Date.parse(state.fetchedAt!)) / 1000)) + "s" : "; no successful cache") +
+      (state.retryAt ? "; retry at " + new Date(state.retryAt).toISOString() : "")
+    : state.value ? null : "cached collection failure";
+  const reserved = () => now - state.attemptedAt < interval || now < (state.retryAt ?? 0);
+  if (reserved()) return result(failureReason());
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const lock = path + ".lock";
   try {
@@ -52,7 +72,7 @@ export async function cached<T>(path: string, interval: number, now: number,
   }
   try {
     state = load();
-    if (now - state.attemptedAt < interval) return result(state.value ? null : "cached collection failure");
+    if (reserved()) return result(failureReason());
     state = { ...state, attemptedAt: now };
     writeJson(path, state); // Reserve before reading any credential or making a request.
     try {
@@ -60,16 +80,23 @@ export async function cached<T>(path: string, interval: number, now: number,
       state = { attemptedAt: now, fetchedAt: new Date(now).toISOString(), value };
       writeJson(path, state);
       return result(null);
-    } catch {
+    } catch (error) {
       // Never stringify request/response errors: they may contain credentials.
-      return result("collection failed; retained last successful cache");
+      const reason = error instanceof CollectionFailure ? error.reason : "collection_failed";
+      const count = reason === "rate_limited" ? Math.min((state.failureCount ?? 0) + 1, 16) : 0;
+      const delay = reason === "rate_limited" ? error instanceof CollectionFailure && error.retryDelayMs !== null
+        ? error.retryDelayMs : Math.min(5 * 60000 * 2 ** (count - 1), 3600000) : interval;
+      state = { ...state, failureReason: reason, failureCount: count, retryAt: Math.min(8.64e15 - 1, now + Math.max(0, delay)) };
+      writeJson(path, state);
+      return result(failureReason());
     }
   } finally { rmSync(lock, { force: true }); }
 }
 export async function getJson(url: string, init: RequestInit = {}, fetcher: typeof fetch = fetch, maxBytes = 2 * 1024 * 1024): Promise<unknown> {
   const response = await fetcher(url, { ...init, method: "GET", redirect: "error", signal: AbortSignal.timeout(5000) });
   try {
-    if (!response.ok || !response.body) throw new Error("Usage request failed");
+    if (!response.ok) throw new HttpFailure(response.status, response.headers.get("retry-after"));
+    if (!response.body) throw new Error("Usage request failed");
     const chunks: Uint8Array[] = [];
     let size = 0;
     for await (const chunk of response.body) {
