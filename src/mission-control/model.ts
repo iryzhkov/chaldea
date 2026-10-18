@@ -98,7 +98,7 @@ export class MissionModel {
     }
     const agents = [...this.threads.values()].map((t,i) => ({
       id: "agent-" + i, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
-      host: "omarchy-pc", state: t.row.pendingRequest ? "waiting-igor" : ["failed","interrupted"].includes(t.row.status) ? "failed" : t.row.activeRunId ? "working" : "idle",
+      host: "omarchy-pc", state: t.row.pendingRequest ? "waiting-igor" : ["failed","interrupted"].includes(t.row.status) ? "failed" : t.row.status === "waiting" ? "waiting" : t.row.activeRunId ? "working" : "idle",
       startedAt: at(t.row.latestRunStartedAt), observedAt: t.observed, detailObservedAt: t.detailObserved,
       freshness: freshness(this.connected, this.observed, 30_000, 300_000),
       activityFreshness: freshness(t.connected, t.detailObserved, 60_000, 600_000), steps: [...t.steps],

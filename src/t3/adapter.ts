@@ -556,6 +556,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       if (recent) onEvent({ kind: "activity", tool: "toolName" in recent && typeof recent.toolName === "string" ? recent.toolName : null });
       onEvent({ kind: "cursor", sequence: item.snapshotSequence }); return;
     }
+    if (item.kind === "unknown-event") { onEvent({ kind: "cursor", sequence: item.sequence }); return; }
     if (item.kind === "event") {
       const e = item.event;
       if (e.type === "provider-turn.updated") {

@@ -85,13 +85,13 @@ test("detail adapter uses only official read subscription and omits unknown raw 
     if(req._tag!=="Request")return;
     requests.push(req.tag);assert.equal(req.payload.threadId,"fixture-thread");assert.equal(req.payload.afterSequence,7);
     assert.equal(req.payload.requestCompletionMarker,true);assert.equal(req.payload.acceptBoundedSnapshot,true);
-    socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"synchronized"}]}));
+    socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"event",sequence:8,event:{type:"future.safe",payload:{input:"RAW_SECRET"}}},{kind:"synchronized"}]}));
   }));
   await new Promise<void>(resolve=>http.listen(0,"127.0.0.1",resolve));
   try{
     const port=(http.address() as {port:number}).port;
-    const done=connectMissionThread({serverUrl:"http://127.0.0.1:"+port,token:"DISPOSABLE_FIXTURE",signal:controller.signal},"fixture-thread",7,event=>{seen.push(event);controller.abort();});
-    await assert.rejects(done);assert.deepEqual(seen,[{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
+    const done=connectMissionThread({serverUrl:"http://127.0.0.1:"+port,token:"DISPOSABLE_FIXTURE",signal:controller.signal},"fixture-thread",7,event=>{seen.push(event);if(event.kind==="synchronized")controller.abort();});
+    await assert.rejects(done);assert.deepEqual(seen,[{kind:"cursor",sequence:8},{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
   }finally{wss.close();http.close();}
 });
 
@@ -112,6 +112,7 @@ test("HTTP exposes only fixed read paths with security headers and same-origin c
     assert.equal((await get(port,"/api/snapshot",{Origin:"https://evil.example"})).status,403);
     assert.equal((await get(port,"/api/snapshot",{Host:"evil.example"})).status,403);
     assert.equal((await get(port,"/core.css")).status,200);
+    assert.equal((await get(port,"/?mode=agents")).status,200);
   }finally{await app.close();}
 });
 test("SSE client cap releases on disconnect and transports normalized snapshots only",async()=>{

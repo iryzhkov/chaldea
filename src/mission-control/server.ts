@@ -34,7 +34,7 @@ export function missionServer(model: MissionModel, maxClients = 8) {
       res.once("close",release); res.once("error",release);
       res.write("retry: 2000\n\n"); publish(); return;
     }
-    if (req.url === "/") { res.setHeader("Content-Type","text/html"); res.end(html); return; }
+    if (req.url === "/" || req.url?.startsWith("/?")) { res.setHeader("Content-Type","text/html"); res.end(html); return; }
     const asset = assets.get(req.url ?? "");
     if (!asset) { res.writeHead(404).end(); return; }
     res.setHeader("Content-Type",asset.type); res.end(asset.body);
@@ -42,7 +42,7 @@ export function missionServer(model: MissionModel, maxClients = 8) {
   server.maxConnections = 24;
   server.keepAliveTimeout = 5000;
   // Heartbeats only maintain browser transport; they never claim fresh upstream data.
-  const heartbeat = setInterval(() => { for (const r of clients) if (!r.write(": keepalive\n\n")) { clients.delete(r); r.destroy(); } }, 15_000);
+  const heartbeat = setInterval(() => { publish(); for (const r of clients) if (!r.write(": keepalive\n\n")) { clients.delete(r); r.destroy(); } }, 15_000);
   heartbeat.unref();
   server.once("close", () => { clearInterval(heartbeat); unsubscribe(); });
   return {
