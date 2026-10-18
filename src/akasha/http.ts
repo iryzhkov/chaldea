@@ -38,6 +38,20 @@ async function chunk(res: ServerResponse, p: Principal, value: string): Promise<
     finally { clearTimeout(timer); }
   }
 }
+// Coalesce small rows so durable authorization work is per bounded network
+// chunk, not per SQL row. A single already-bounded legacy row may be larger.
+async function fragments(res: ServerResponse, p: Principal, values: Iterable<string>): Promise<void> {
+  let pending = "", bytes = 0;
+  for (const value of values) {
+    const size = Buffer.byteLength(value);
+    if (bytes && bytes + size > 64 * 1024) {
+      await chunk(res, p, pending); pending = ""; bytes = 0;
+    }
+    if (size > 64 * 1024) { await chunk(res, p, value); continue; }
+    pending += value; bytes += size;
+  }
+  if (bytes) await chunk(res, p, pending);
+}
 function receiptView(r: Receipt): Record<string, unknown> {
   return { event_id: r.event_id, state: r.state, feed_id: r.feed_id };
 }
@@ -106,20 +120,26 @@ export function httpServer(ingress: Ingress) {
           const ids: number[] = []; for (const row of rows) ids.push(row.id);
           await p.recheck();
           res.writeHead(200, { "content-type": page ? "text/html; charset=utf-8" : "application/json" });
-          await chunk(res, p, page ? "<!doctype html><meta charset=utf-8><title>fleet feed</title><style>body{font:15px system-ui;max-width:60rem;margin:auto;padding:1rem}article{border-bottom:1px solid #8885}pre{white-space:pre-wrap}</style><h1>fleet feed</h1>" : "[");
-          let first = true;
-          for (const id of ids) {
-            const row = ingress.store.feed(id, p.scope); if (!row) continue;
-            await chunk(res, p, page ? article(row) : (first ? "" : ",") + JSON.stringify(row)); first = false;
+          function* values(): Generator<string> {
+            yield page ? "<!doctype html><meta charset=utf-8><title>fleet feed</title><style>body{font:15px system-ui;max-width:60rem;margin:auto;padding:1rem}article{border-bottom:1px solid #8885}pre{white-space:pre-wrap}</style><h1>fleet feed</h1>" : "[";
+            let first = true;
+            for (const id of ids) {
+              const row = ingress.store.feed(id, p.scope); if (!row) continue;
+              yield page ? article(row) : (first ? "" : ",") + JSON.stringify(row); first = false;
+            }
+            yield page ? "" : "]\n";
           }
-          await chunk(res, p, page ? "" : "]\n"); res.end(); return;
+          await fragments(res, p, values()); res.end(); return;
         }
         if (path === "/api/v1/events") {
           const page = eventPage(ingress.store, url.searchParams, p.scope, ingress.now());
           res.writeHead(200, { "content-type": "application/json" });
-          await chunk(res, p, '{"events":['); let first = true;
-          for (const row of page.rows) { await chunk(res, p, (first ? "" : ",") + JSON.stringify(row)); first = false; }
-          await chunk(res, p, '],"next_cursor":' + JSON.stringify(page.next()) + "}\n"); res.end(); return;
+          function* values(): Generator<string> {
+            yield '{"events":['; let first = true;
+            for (const row of page.rows) { yield (first ? "" : ",") + JSON.stringify(row); first = false; }
+            yield '],"next_cursor":' + JSON.stringify(page.next()) + "}\n";
+          }
+          await fragments(res, p, values()); res.end(); return;
         }
         throw new HttpError(404, "no_such_path");
       } finally { active--; }
