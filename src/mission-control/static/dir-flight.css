@@ -1,0 +1,3 @@
+/* Direction: FLIGHT — NASA mission control. The round-4 core already carries the console headers and lamps; this file only keeps the shape tokens. */
+body.dir-flight { --font-ui: "Helvetica Neue", "Inter", Arial, system-ui, sans-serif; --font-num: var(--font-ui); --radius:0; }
+body.dir-flight .fresh::before { border-radius:0; }
