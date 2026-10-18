@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, unlinkSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createServer, createConnection, type AddressInfo } from "node:net";
 import * as Effect from "effect/Effect";
@@ -91,6 +91,17 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     writeFileSync(c.tokenFile,token,{mode:0o600});chownSync(c.tokenFile,uid,gid);
     const s=new MessageStore(c.database,receiverBinding(c),true);s.close();
     for(const p of [c.database,c.database+".lock",state])chownSync(p,uid,gid);
+    // Requested creation modes are masked by the runner's inherited umask.
+    const publicPaths=[["base",base,0o755],["runtime",root,0o755],["login",login,0o755],
+      ["authorized_keys",authorized,0o644],["config",config,0o644]] as const;
+    const readable=()=>spawnSync("runuser",["-u",user,"--","/usr/bin/test","-r",authorized],{stdio:"ignore"}).status===0;
+    const readableBefore=readable(),modesBefore=publicPaths.map(([label,p])=>[label,(statSync(p).mode&0o777).toString(8)]);
+    const blockedAncestors:string[]=[];
+    for(let p=dirname(authorized);p!==dirname(p);p=dirname(p))
+      if(spawnSync("runuser",["-u",user,"--","/usr/bin/test","-x",p],{stdio:"ignore"}).status!==0)blockedAncestors.push(p);
+    for(const [,p,mode] of publicPaths){assert.equal(statSync(p).uid,0,"fixture public custody: "+p);chmodSync(p,mode);}
+    t.diagnostic(JSON.stringify({probe:"fixture-public-access",umask:process.umask().toString(8),modesBefore,blockedAncestors,readableBefore,readableAfter:readable()}));
+    assert.ok(readable(),"fixture UID must be able to read its root-owned restricted authorized_keys");
     const route:Route={destinationHost:"target",environment,address:"127.0.0.1",port:sshPort,keyFile:clientKey,knownHostsFile:known,threads:[threadId]};
     const sender:SenderConfig={callerId:"fixture",sourceHost:"source",database:join(root,"sender/state.db"),hosts:{target:route}};
     const ss=new MessageStore(sender.database,senderBinding(sender),true);ss.close();
