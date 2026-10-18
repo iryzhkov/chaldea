@@ -54,7 +54,8 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     const clientKey=join(root,"client"),known=join(root,"known_hosts"),sshPort=await port();
     writeFileSync(known,"[127.0.0.1]:"+sshPort+" "+readFileSync(join(root,"host.pub"),"utf8"));
     const forced="/usr/local/libexec/chaldea-message-receive --caller fixture";
-    const authorized=join(root,"authorized_keys"),publicKey=readFileSync(clientKey+".pub","utf8").trim();
+    // Keep strict ownership checking within the fixture account\'s root-owned login home.
+    const authorized=join(login,"authorized_keys"),publicKey=readFileSync(clientKey+".pub","utf8").trim();
     writeFileSync(authorized,'restrict,from="127.0.0.1",command="'+forced+'" '+publicKey+"\n",{mode:0o644});
     const sshd=join(root,"sshd.conf");
     const policy="Port "+sshPort+"\nListenAddress 127.0.0.1\nHostKey "+join(root,"host")+"\nPidFile "+join(root,"sshd.pid")+"\n"+
