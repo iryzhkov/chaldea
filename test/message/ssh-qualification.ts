@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, unlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, unlinkSync, realpathSync, accessSync, constants } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createServer, createConnection, type AddressInfo } from "node:net";
@@ -25,8 +25,10 @@ async function collected(child:ChildProcess,body="",limit=10_000){
   child.stdout?.on("data",b=>out=(out+b).slice(-32768));child.stderr?.on("data",b=>err=(err+b).slice(-4096));
   child.stdin?.on("error",()=>{});child.stdin?.end(body);
   const timer=setTimeout(()=>child.kill("SIGKILL"),limit);
-  const code=await new Promise<number|null>((resolve,reject)=>{child.once("error",reject);child.once("close",resolve);});
-  clearTimeout(timer);return {code,out,err};
+  try {
+    const code=await new Promise<number|null>((resolve,reject)=>{child.once("error",()=>reject(new Error("fixture_spawn_failed")));child.once("close",resolve);});
+    return {code,out,err};
+  }finally{clearTimeout(timer);}
 }
 test("stock SSH: restricted key, static login shell, queued real T3, replay and all channel refusals",{timeout:180_000},async t=>{
   assert.equal(process.env.GITHUB_ACTIONS,"true");assert.equal(process.env.RUNNER_ENVIRONMENT,"github-hosted");
@@ -36,6 +38,9 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
   assert.equal(fixtureHome,"/var/lib/chaldea-fixture-"+process.env.GITHUB_RUN_ID+"-"+process.env.GITHUB_RUN_ATTEMPT);
   assert.equal(homedir(),fixtureHome);assert.equal(realpathSync(fixtureHome),fixtureHome);
   assert.equal(statSync(fixtureHome).uid,0);assert.equal(statSync(fixtureHome).mode&0o777,0o755);
+  const runuser=realpathSync("/usr/sbin/runuser"),utility=statSync(runuser);
+  assert.equal(runuser,"/usr/sbin/runuser");assert.ok(utility.isFile());
+  assert.equal(utility.uid,0);assert.equal(utility.mode&0o022,0);accessSync(runuser,constants.X_OK);
   assert.equal(t3Version(),"t3 v0.1.0","pinned T3 is mandatory");
   const base=join(homedir(),"message-ssh");mkdirSync(base,{recursive:true,mode:0o755});chmodSync(homedir(),0o755);
   const dir=mkdtempSync(join(base,"t-"));chmodSync(dir,0o755);
@@ -62,7 +67,7 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     assert.equal(previousHome,process.env.RUNNER_TEMP+"/chaldea/home");
     const previousAncestors:string[]=[];
     for(let p=previousHome!;p!==dirname(p);p=dirname(p))previousAncestors.unshift(p);
-    const firstBlocked=previousAncestors.find(p=>spawnSync("runuser",["-u",user,"--","/usr/bin/test","-x",p],{stdio:"ignore"}).status!==0);
+    const firstBlocked=previousAncestors.find(p=>spawnSync(runuser,["-u",user,"--","/usr/bin/test","-x",p],{stdio:"ignore"}).status!==0);
     if(firstBlocked){const s=statSync(firstBlocked);t.diagnostic(JSON.stringify({probe:"previous-home-first-block",path:firstBlocked,
       mode:(s.mode&0o777).toString(8),uid:s.uid,gid:s.gid}));}
     for(const key of ["host","client"])run("ssh-keygen",["-q","-t","ed25519","-N","","-f",join(root,key)]);
@@ -105,11 +110,11 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     // Requested creation modes are masked by the runner's inherited umask.
     const publicPaths=[["base",base,0o755],["runtime",root,0o755],["login",login,0o755],
       ["authorized_keys",authorized,0o644],["config",config,0o644]] as const;
-    const readable=()=>spawnSync("runuser",["-u",user,"--","/usr/bin/test","-r",authorized],{stdio:"ignore"}).status===0;
+    const readable=()=>spawnSync(runuser,["-u",user,"--","/usr/bin/test","-r",authorized],{stdio:"ignore"}).status===0;
     const readableBefore=readable(),modesBefore=publicPaths.map(([label,p])=>[label,(statSync(p).mode&0o777).toString(8)]);
     const blockedAncestors:string[]=[];
     for(let p=dirname(authorized);p!==dirname(p);p=dirname(p))
-      if(spawnSync("runuser",["-u",user,"--","/usr/bin/test","-x",p],{stdio:"ignore"}).status!==0)blockedAncestors.push(p);
+      if(spawnSync(runuser,["-u",user,"--","/usr/bin/test","-x",p],{stdio:"ignore"}).status!==0)blockedAncestors.push(p);
     for(const [,p,mode] of publicPaths){assert.equal(statSync(p).uid,0,"fixture public custody: "+p);chmodSync(p,mode);}
     t.diagnostic(JSON.stringify({probe:"fixture-public-access",umask:process.umask().toString(8),modesBefore,blockedAncestors,readableBefore,readableAfter:readable()}));
     assert.ok(readable(),"fixture UID must be able to read its root-owned restricted authorized_keys");
@@ -198,7 +203,7 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     const destination=createServer(socket=>{targetConnections++;socket.on("data",b=>{targetBytes+=b.length;socket.write(b);});});
     await new Promise<void>(r=>destination.listen(remoteSocket,r));chownSync(remoteSocket,uid,gid);chmodSync(remoteSocket,0o600);
     try {
-      const control=await collected(spawn("runuser",["-u",user,"--",node,"-e",
+      const control=await collected(spawn(runuser,["-u",user,"--",node,"-e",
         'const s=require("node:net").createConnection(process.argv[1]);s.on("connect",()=>s.end("streamlocal-control"));s.pipe(process.stdout);',
         remoteSocket],{env:{PATH:"/usr/bin:/bin"},stdio:["pipe","pipe","pipe"]}));
       assert.equal(control.code,0,"fixture UID Unix socket control");
