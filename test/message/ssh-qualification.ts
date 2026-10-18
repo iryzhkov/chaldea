@@ -169,12 +169,12 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     assert.deepEqual(p.thread.modelSelection,before.thread.modelSelection);assert.equal(existsSync(join(state,"injected")),false);
     t.diagnostic("actual SSH send, lost-response identical replay and unchanged model passed");
     const conflict=await ssh(["chaldea-message-v1"],[],JSON.stringify({...r,text:"changed"}));
-    assert.equal(conflict.code,0,conflict.err);assert.equal(JSON.parse(conflict.out).state,"conflict");
+    assert.equal(conflict.code,0,"conflict SSH command");assert.equal(JSON.parse(conflict.out).state,"conflict");
     for(const invalid of [{...statusFor(r),host:"other"},{...statusFor(r),environment:"other"},{...statusFor(r),threadId:"unlisted"},
       {...r,caller:"other"},{...r,extra:true}])assert.notEqual((await ssh(["chaldea-message-v1"],[],JSON.stringify(invalid))).code,0);
     const older={...r,requestId:(Date.now()-60_000)+":older",text:"out of order distinct request"};
     const outOfOrder=await ssh(["chaldea-message-v1"],[],JSON.stringify(older));
-    assert.equal(outOfOrder.code,0,outOfOrder.err);assert.equal(JSON.parse(outOfOrder.out).state,"accepted");
+    assert.equal(outOfOrder.code,0,"out-of-order SSH command");assert.equal(JSON.parse(outOfOrder.out).state,"accepted");
     function statusFor(r:ReturnType<typeof request>){const {text,...s}=r;return {...s,op:"status"};}
     const marker=join(state,"environment-injected"),shell=join(root,"hostile.sh"),source=join(root,"hostile.c"),library=join(root,"hostile.so");
     writeFileSync(shell,"touch "+marker+"\n");
@@ -185,14 +185,14 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
       "SSH_ORIGINAL_COMMAND=chaldea-message-v1",'SSH_CONNECTION="127.0.0.2 1 127.0.0.1 22"'];
     const status={...r,op:"status"};delete status.text;
     const envResult=await ssh(["chaldea-message-v1"],hostile.flatMap(e=>["-o","SetEnv="+e]),JSON.stringify(status));
-    assert.equal(envResult.code,0,envResult.err);assert.equal(JSON.parse(envResult.out).state,"accepted");assert.equal(existsSync(marker),false);
+    assert.equal(envResult.code,0,"hostile-env SSH command");assert.equal(JSON.parse(envResult.out).state,"accepted");assert.equal(existsSync(marker),false);
     assert.ok(readFileSync(config+".env-checked","utf8").includes("clean"));
     for(const command of [[],["sh"],["chaldea-message-v1 "],["chaldea-message-v1; id"],["scp -t /x"]]){
       const negative=await ssh(command,[],JSON.stringify(r));assert.notEqual(negative.code,0,"command must be refused: "+JSON.stringify(command));
     }
     assert.notEqual((await ssh([],["-o","SetEnv=SSH_ORIGINAL_COMMAND=chaldea-message-v1"],JSON.stringify(r))).code,0,"shell cannot spoof original command");
     assert.notEqual((await ssh(["sftp"],["-s"],JSON.stringify(r))).code,0,"subsystem refused");
-    const pty=await ssh(["chaldea-message-v1"],["-tt"],JSON.stringify(status));assert.match(pty.err,/PTY allocation request failed/i);
+    const pty=await ssh(["chaldea-message-v1"],["-tt"],JSON.stringify(status));assert.ok(/PTY allocation request failed/i.test(pty.err),"PTY request must be refused");
     assert.notEqual((await ssh([],["-W","127.0.0.1:"+sshPort])).code,0,"direct TCP forwarding refused");
     assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-R","0:127.0.0.1:"+sshPort])).code,0,"remote TCP forwarding refused");
     assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-R",join(state,"remote.sock")+":127.0.0.1:"+sshPort])).code,0,"remote StreamLocal forwarding refused");
@@ -234,16 +234,35 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
         }
       }
     }finally{await new Promise<void>(r=>destination.close(()=>r()));}
-    // Supply a real local agent socket so the client actually requests agent forwarding.
-    const agentPath=join(root,"agent.sock"),agentServer=createServer(socket=>socket.destroy());
-    await new Promise<void>(r=>agentServer.listen(agentPath,r));
+    // Use an isolated empty real agent. Normal calls retain IdentityAgent=none.
+    for(const p of ["/usr/bin/ssh-agent","/usr/bin/ssh-add"]){
+      const s=statSync(p);assert.ok(s.isFile()&&s.uid===0&&(s.mode&0o022)===0,"trusted fixture agent utility");accessSync(p,constants.X_OK);
+    }
+    const agentPath=join(root,"agent.sock"),agentEnv={PATH:"/usr/bin:/bin",HOME:homedir(),TMPDIR:process.env.TMPDIR!,SSH_AUTH_SOCK:agentPath};
+    const agentDaemon=spawn("/usr/bin/ssh-agent",["-D","-a",agentPath],{env:agentEnv,stdio:"ignore"});
+    cleanupClients.push(agentDaemon);let agentStartFailed=false;
+    agentDaemon.once("error",()=>agentStartFailed=true);
     try {
-      const agent=await ssh(["chaldea-message-v1"],["-v","-A","-X","-o","ForwardX11Trusted=yes"],JSON.stringify(status),
-        {DISPLAY:"localhost:99.0",SSH_AUTH_SOCK:agentPath});
-      assert.equal(agent.code,0,agent.err);assert.equal(JSON.parse(agent.out).state,"accepted");
-      assert.match(agent.err,/Requesting authentication agent forwarding/);
-      assert.match(agent.err,/X11 forwarding request failed/);
-    } finally {await new Promise<void>(r=>agentServer.close(()=>r()));}
+      await waitFor("isolated ssh-agent socket",()=>{assert.ok(!agentStartFailed&&agentDaemon.exitCode===null,"fixture ssh-agent startup");return existsSync(agentPath);},5000);
+      const empty=await collected(spawn("/usr/bin/ssh-add",["-l"],{env:agentEnv,stdio:["pipe","pipe","pipe"]}));
+      assert.equal(empty.code,1,"empty fixture agent control");assert.ok(/agent has no identities/i.test(empty.out),"fixture agent must answer and contain no keys");
+      const attackCommon=common.map(v=>v==="IdentityAgent=none"?"IdentityAgent="+agentPath:v);
+      const agent=await collected(spawn("/usr/bin/ssh",[...attackCommon,"-v","-A","-X","-o","ForwardX11Trusted=yes",user+"@127.0.0.1","chaldea-message-v1"],
+        {env:{...agentEnv,DISPLAY:"localhost:99.0"},stdio:["pipe","pipe","pipe"]}),JSON.stringify(status));
+      const agentRequested=/Requesting authentication agent forwarding/i.test(agent.err);
+      const x11Requested=/Requesting X11 forwarding/i.test(agent.err),x11Refused=/X11 forwarding request failed/i.test(agent.err);
+      const agentRefused=()=>/session_auth_agent_req: agent forwarding disabled/i.test(log);
+      try {
+        assert.equal(agent.code,0,"agent/X11 attack command");assert.equal(JSON.parse(agent.out).state,"accepted");
+        assert.ok(agentRequested,"agent forwarding request must actually be sent");
+        await waitFor("server agent forwarding policy refusal",agentRefused,5000);
+        assert.ok(x11Requested&&x11Refused,"X11 request must actually be sent and refused");
+      }finally{t.diagnostic(JSON.stringify({probe:"agent-x11-denial",exit:agent.code,agentRequested,agentRefused:agentRefused(),x11Requested,x11Refused}));}
+    } finally {
+      if(!agentStartFailed&&agentDaemon.exitCode===null&&agentDaemon.signalCode===null){
+        const stopped=new Promise<void>(r=>agentDaemon.once("close",()=>r()));agentDaemon.kill("SIGTERM");await stopped;
+      }
+    }
     // A source IP outside from= cannot authenticate the same otherwise valid key.
     assert.notEqual((await ssh(["chaldea-message-v1"],["-b","127.0.0.2"],JSON.stringify(status))).code,0);
     // Fault-inject a lost receiver receipt AFTER the real T3 acceptance above.
@@ -253,20 +272,20 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
       faults.prepare("UPDATE receipts SET state='uncertain',result=NULL,payload=? WHERE id=?").run(payload(r,"fixture",command),command.commandId);
       faults.prepare("UPDATE buckets SET tokens=0,observed=? WHERE caller='fixture'").run(Date.now());
       const limited=await ssh(["chaldea-message-v1"],[],JSON.stringify(r));
-      assert.equal(limited.code,0,limited.err);assert.equal(JSON.parse(limited.out).state,"uncertain");
+      assert.equal(limited.code,0,"rate-limited retry SSH command");assert.equal(JSON.parse(limited.out).state,"uncertain");
       faults.prepare("UPDATE meta SET value=? WHERE name='observed'").run(String(Date.now()+600_000));
       const rollback=await ssh(["chaldea-message-v1"],[],JSON.stringify(r));
-      assert.equal(rollback.code,0,rollback.err);assert.equal(JSON.parse(rollback.out).state,"uncertain");
+      assert.equal(rollback.code,0,"clock rollback retry SSH command");assert.equal(JSON.parse(rollback.out).state,"uncertain");
       faults.prepare("UPDATE meta SET value=? WHERE name='observed'").run(String(Date.now()));
       faults.prepare("UPDATE buckets SET tokens=2,observed=? WHERE caller='fixture'").run(Date.now());
       await withClient(opts(),client=>client["orchestration.dispatchCommand"]({
         type:"thread.archive",commandId:"fixture-archive",threadId,
       } as never));
       const archived=await ssh(["chaldea-message-v1"],[],JSON.stringify(r));
-      assert.equal(archived.code,0,archived.err);assert.equal(JSON.parse(archived.out).state,"uncertain");
+      assert.equal(archived.code,0,"archived target retry SSH command");assert.equal(JSON.parse(archived.out).state,"uncertain");
       assert.equal(faults.prepare("SELECT state FROM receipts WHERE id=?").get(command.commandId)!.state,"uncertain");
       const absent=await ssh(["chaldea-message-v1"],[],JSON.stringify({...status,requestId:Date.now()+":absent"}));
-      assert.equal(absent.code,0,absent.err);assert.equal(JSON.parse(absent.out).state,"uncertain");
+      assert.equal(absent.code,0,"absent status SSH command");assert.equal(JSON.parse(absent.out).state,"uncertain");
     } finally {faults.close();}
     writeFileSync(config,JSON.stringify({...c,callers:{}}),{mode:0o644});
     assert.notEqual((await ssh(["chaldea-message-v1"],[],JSON.stringify(status))).code,0,"revoked ACL checked on replay");
