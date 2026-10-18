@@ -56,6 +56,15 @@ fraction minus fraction of native window time left is at least 0.10; otherwise
 it prefers Codex. Missing/stale pacing keeps the role default unless capacity
 preference or usable Slopalytics statistics decide the comparison.
 
+Only the weekly window, or the longest included window when there is no weekly
+window, determines pacing and native quota projections. A session/5-hour window
+never creates use-it capacity because its reset is close. Its only effect is a
+temporary gate: under `minimumRemaining` left, default strictly under 10%, is tight;
+zero left is stopped. These gates override credits and reserves until the short
+reset. An active usage stop is always stopped. A short window alone leaves pacing
+unknown. Reasons show both windows, for example "weekly 62% left with 40% of
+window left: under-paced; 5h window 35% left".
+
 The observer keeps up to 288 previous window observations per provider, sampled
 at least five minutes apart and retained for 48 hours, with a 16 KiB per-provider
 history budget. Burn uses the most recent
@@ -85,8 +94,9 @@ and refill inventories add no timed value.
 
 Fresh, positive, unexpired Codex credits count as unlimited with no reserve
 floor or required creditsPerFullWeek conversion. Credits nearing expiry count
-as use-it. Zero, stale and expired balances do not add capacity. Short native
-windows do not exclude a Codex account with usable credits. An active usage stop
+as use-it. Zero, stale and expired balances do not add capacity. Nearly exhausted
+or exhausted short native windows temporarily exclude even a Codex account with
+usable credits. Weekly quota exhaustion alone does not override credits. An active usage stop
 remains stopped; a fresh provider report that ordinary usage is not allowed
 remains tight. Missing credit and native-window data remains unknown.
 

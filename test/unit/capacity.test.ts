@@ -37,6 +37,35 @@ test("capacity scenario table: light/heavy weeks, reserves, expiring credits, st
   assert.ok(Math.abs(c.projectedHeavyUse! - .432) < 1e-10);
   assert.ok(Math.abs(c.burnTargetPerHour! - .15 / 144) < 1e-10);
 });
+test("short reset proximity never changes weekly pace; short gates override reserves and credits", () => {
+  const short = (left: number, reset = now + 600000): Window => ({ id: "5h", kind: "session",
+    usedPercent: 100 - left, remainingPercent: left, windowDurationMins: 300, resetsAt: iso(reset) });
+  const p = provider("claudeAgent", 40, .01);
+  p.included = metric([...p.included.value!, short(35)]);
+  assert.equal(classifyCapacity(p, false, now).class, "paced");
+  assert.match(classifyCapacity(p, false, now).reasons.join("; "), /weekly 40% left with 40%.*5h window 35%/);
+  const weekly = provider("claudeAgent", 62, .01).included.value![0]!;
+  p.included = metric([weekly, short(5)]);
+  const c = classifyCapacity(p, false, now);
+  assert.equal(c.class, "tight");
+  assert.match(c.reasons.join("; "), /weekly 62% left with 40%.*under-paced.*5h window 5%/);
+  assert.equal(classifyCapacity(p, false, now, { ...DEFAULT_CAPACITY, minimumRemaining: .04 }).class, "use-it");
+  p.included = metric([weekly, short(10)]);
+  assert.equal(classifyCapacity(p, false, now).class, "use-it");
+  p.included = metric([weekly, short(0)]);
+  assert.equal(classifyCapacity(p, false, now).class, "stopped");
+  p.included = metric([weekly, short(0, now)]);
+  assert.equal(classifyCapacity(p, false, now).class, "use-it");
+  p.included = metric([short(80)]);
+  assert.equal(classifyCapacity(p, false, now).class, "unknown");
+  const codex = provider("codex", 62);
+  codex.credits = metric({ balance: "200", hasCredits: true, unlimited: false });
+  codex.manualResets = metric({ availableCount: 2, nextExpiresAt: null });
+  for (const [left, expected] of [[5, "tight"], [0, "stopped"], [10, "unlimited"]] as const) {
+    codex.included = metric([codex.included.value![0]!, short(left)]);
+    assert.equal(classifyCapacity(codex, false, now).class, expected);
+  }
+});
 test("Claude 40% without reserves vs Codex 20% with 2 resets routes Codex", () => {
   const claude = provider("claudeAgent", 40, .0015, 6 / 7), codex = provider("codex", 20, .0015, 6 / 7);
   codex.manualResets = metric({ availableCount: 2, nextExpiresAt: iso(now + 10 * 86400000) });

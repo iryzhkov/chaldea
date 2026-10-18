@@ -1,3 +1,4 @@
+import { windowPolicy } from "../quota/window-policy.ts";
 import type { Capacity } from "../quota/capacity.ts";
 import { banned, compareScores, emptyHistory, inProbation, roleKey, scoreFor, targetEligible, trialAvailable } from "./targets.ts";
 import type { RoutingHistory } from "./targets.ts";
@@ -71,17 +72,15 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     const fresh = age !== null && age * 1000 < (q?.operatorEstimate ? 7 * 86_400_000 : config.quotaMaxAgeMs);
     const windows = fresh ? (q?.windows ?? []).filter(w => Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 &&
       w.remainingPercent <= 100 && (w.resetsAt === null || Date.parse(w.resetsAt) > data.now)) : [];
-    if ((!capacity || capacity.reserveWeeks === 0 && !["unlimited", "use-it"].includes(capacity.class)) && windows.some(w => w.remainingPercent / 100 < config.minimumRemaining)) {
+    const advice = windowPolicy(windows, data.now, config.minimumRemaining, config.paceMargin);
+    reasons.push(...advice.reasons.map(reason => p.providerInstanceId + " " + reason));
+    if (advice.gate) { reasons.push(p.providerInstanceId + ": short window " + advice.gate + ", avoid until reset"); continue; }
+    if ((!capacity || capacity.reserveWeeks === 0 && !["unlimited", "use-it"].includes(capacity.class)) &&
+        advice.pacing && advice.pacing.remainingPercent / 100 < config.minimumRemaining) {
       reasons.push(`${p.providerInstanceId}: under ${config.minimumRemaining * 100}% remaining, avoid`); continue;
     }
-    // Pace the longest known window, normally weekly, while every window gates admission.
-    const weekly = [...windows].filter(w => w.resetsAt !== null && w.windowDurationMins !== null && w.windowDurationMins > 0 &&
-      Date.parse(w.resetsAt!) - data.now <= w.windowDurationMins * 60_000)
-      .sort((a, b) => b.windowDurationMins! - a.windowDurationMins!)[0];
-    const timeLeft = weekly ? (Date.parse(weekly.resetsAt!) - data.now) / (weekly.windowDurationMins! * 60_000) : null;
-    const pace = weekly && timeLeft !== null ? weekly.remainingPercent / 100 - timeLeft : null;
-    if (weekly && timeLeft !== null) reasons.push(`${p.providerInstanceId} ${Math.round(weekly.remainingPercent)}% left with ${Math.round(timeLeft * 100)}% of ${weekly.kind} window left: ${pace! >= config.paceMargin ? "under-paced" : "on/ahead of pace"}`);
-    else reasons.push(`${p.providerInstanceId}: quota pacing unknown${p.driverKind === "codex" ? ", not assumed unlimited" : ""}${age !== null && age * 1000 >= config.quotaMaxAgeMs ? " (stale cache)" : ""}`);
+    const pace = advice.pace;
+    if (!advice.pacing) reasons.push(`${p.providerInstanceId}: quota pacing unknown${p.driverKind === "codex" ? ", not assumed unlimited" : ""}${age !== null && age * 1000 >= config.quotaMaxAgeMs ? " (stale cache)" : ""}`);
     candidates.push({ ...(p.accountKey ? { accountKey: p.accountKey } : {}), providerInstanceId: p.providerInstanceId, model, options: { [option]: effort }, driver: p.driverKind, pace });
     }
   }
