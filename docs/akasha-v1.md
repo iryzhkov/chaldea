@@ -137,10 +137,14 @@ upload. Keep logical keys when retrying 429/503.
 Legacy row keys remain id/created_at/host/source/severity/title/body/tags/link;
 tags remain comma-separated and new metadata stays in the v1 API. Sort is created_at
 DESC then id DESC. Preserve duration/ISO since, host/source/severity/tag and SQLite
-LIKE title/body grep (including LIKE wildcards, max 256 characters); time/scope/equality/tag filters run in candidate SQL. Remaining LIKE grep scans return 503 before headers if they exceed 10,000 candidates, 32 MiB of nonmatching bodies or 250ms SQLite work; only <=1000 matching IDs are buffered, never bodies. Invalid/negative limits return 400,
-zero returns an empty array. Rows stream one bounded SQL row at a time, without a
-reader spanning a network wait. Authorization rechecks before each chunk and after
-waits; expiry closes streams. No bearer/payload/request URL logging.
+LIKE title/body grep (including LIKE wildcards, max 256 characters); time/scope/equality/tag filters run in candidate SQL. Remaining LIKE grep scans return 503 before headers if they exceed 10,000 candidates, 32 MiB of nonmatching bodies or 250ms SQLite work; only <=1000 matching IDs are preflighted. Invalid/negative limits return 400,
+zero returns an empty array. Rows are read individually without a SQLite reader
+spanning a network wait. Serialized feed JSON, HTML and native events coalesce into
+at most 64 KiB UTF-8 network chunks, retaining only one pending chunk and one bounded
+row rather than the response body. A single oversized legacy row retains its
+existing bound (including HTML escaping). Full authorization rechecks before every
+network chunk and after backpressure waits; clocks, revocation, expiry and the 10s
+response deadline remain unchanged. No bearer/payload/request URL logging.
 
 Every JWT in a query string is rejected, including operator-profile JWTs. This slice chooses scoped operator-profile tokens and bearer-header HTML authentication; it implements no static operator credential fallback. Lane L must refuse scoped feed open/url before printing a URL. Responses disable caching and referrers; proxy logging
 must redact query strings/Authorization. No link is fetched by Akasha.
