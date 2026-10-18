@@ -1,0 +1,29 @@
+[Unit]
+Description=Chaldea existing-thread NATS message receiver
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/mise/installs/node/26.10.0/bin/node %h/.local/share/chaldea/app/src/cli.ts message serve --config /etc/chaldea/message-receiver.json
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+StateDirectory=chaldea/message-receiver
+CacheDirectory=chaldea-message
+Environment=TMPDIR=%h/.cache/chaldea-message
+ExecStartPre=/usr/bin/mkdir -p %h/.cache/chaldea-message
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/chaldea/message-receiver %h/.cache/chaldea-message
+PrivateTmp=false
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+StandardOutput=null
+StandardError=null
+# Fixed event names only, in configured private 10 MiB/14-day log.
+
+[Install]
+WantedBy=default.target

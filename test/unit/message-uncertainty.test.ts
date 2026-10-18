@@ -1,0 +1,41 @@
+import { receiver,transport } from "../helpers/message-config.ts";
+import assert from "node:assert/strict";
+import test from "node:test";
+import { mkdtempSync,mkdirSync,rmSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { MessageStore } from "../../src/message-store.ts";
+import { WakeRejectedError } from "../../src/t3/adapter.ts";
+import { identity,request } from "../../src/message.ts";
+import { receive,receiverBinding,type ReceiverConfig } from "../../src/message-receiver.ts";
+test("prior possible delivery stays uncertain across rate/clock/write refusals and archived preflight; absent status is uncertain",async()=>{
+  assert.notEqual(homedir(),"/home/igor");assert.notEqual(homedir(),"/root");
+  const base=join(homedir(),"message-uncertain");mkdirSync(base,{recursive:true,mode:0o700});
+  const dir=mkdtempSync(join(base,"t-")),now=Date.now();
+  const c=receiver(dir);
+  const x={caller:"pc",sourceHost:"source",subject:transport.commandSubject};
+  const r=request({v:1,op:"send",host:"target",environment:"fixture",threadId:"thread",requestId:now+":r1",text:"possible earlier delivery"});
+  const s=new MessageStore(c.database,receiverBinding(c),true),id=identity("pc","source",r).commandId;
+  let dispatches=0;
+  const lost=()=>({async preflight(){return true;},async dispatch(){dispatches++;throw new Error("lost after durable T3 commit");}});
+  const run=(clock=now,connect=lost)=>receive(r,x,c,s,()=>c,connect,clock);
+  try{
+    assert.equal((await run()).state,"uncertain");const bytes=s.get(id)!.payload;
+    assert.equal((await run()).state,"uncertain");assert.equal(dispatches,2);
+    assert.equal((await run()).state,"uncertain","rate limit is no proof of earlier rejection");assert.equal(dispatches,2);
+    assert.equal((await run(now-600_000)).state,"uncertain","rollback cannot terminate uncertainty");
+    s.db.exec("PRAGMA query_only=ON");
+    assert.equal((await run()).state,"uncertain","write refusal cannot terminate uncertainty");
+    assert.equal((await receive({...r,op:"status"},x,c,s,()=>c,lost,now)).state,"uncertain");
+    s.db.exec("PRAGMA query_only=OFF");
+    const archived=()=>({async preflight(){return false;},async dispatch(){dispatches++;}});
+    assert.equal((await receive(r,x,c,s,()=>c,archived,now+6000)).state,"uncertain","archiving after delivery is no proof of rejection");
+    assert.equal(s.get(id)!.state,"uncertain");assert.equal(s.get(id)!.payload,bytes);assert.equal(dispatches,2);
+    const absent=request({v:1,op:"status",host:"target",environment:"fixture",threadId:"thread",requestId:now+":absent"});
+    assert.equal((await receive(absent,x,c,s,()=>c,lost,now+6000)).state,"uncertain","not-found is not a durable rejection");
+    const durableRejection=()=>({async preflight(){return true;},async dispatch(){throw new WakeRejectedError("durable rejection");}});
+    const rejected=await receive(r,x,c,s,()=>c,durableRejection,now+12000);
+    assert.equal(rejected.state,"rejected");assert.equal(s.get(id)!.payload,null);
+    assert.deepEqual(await receive(r,x,c,s,()=>c,()=>{throw new Error("no dispatch on terminal replay");},now+12000),rejected);
+  }finally{s.close();rmSync(dir,{recursive:true,force:true});}
+});
