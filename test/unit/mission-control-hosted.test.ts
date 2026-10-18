@@ -53,6 +53,18 @@ test("cache replaces epoch samples and keeps unknown/partial sticky without fetc
   assert.equal(c2.snapshots[0]!.tokens.output,5);assert.equal(c2.gap,true);
   assert.equal(mergeStatus(c2,{...qualified,sequence:999},now0+3),false);
 });
+test("restarted web treats retained cache as cached until newer source evidence arrives",()=>{
+  const d=scratch();let now=now0;
+  try{
+    const path=join(d.path,"restart.json"),cache=emptyCache();mergeStatus(cache,sample(),now);writeCache(path,cache);
+    const model=new CacheModel(path,()=>now);
+    assert.equal(model.snapshot().source.state,"cached");
+    now+=5000;model.reload();assert.equal(model.snapshot().source.state,"cached");
+    assert.equal(model.snapshot().source.observedAt,now0);
+    mergeStatus(cache,sample(2,now),now);writeCache(path,cache);model.reload();
+    assert.equal(model.snapshot().source.state,"live");assert.equal(model.snapshot().source.observedAt,now);
+  }finally{d.close();}
+});
 test("atomic group-readable cache survives offline reload, then expires and does not make heartbeats live",async()=>{
   const d=scratch();try{
     const path=join(d.path,"latest.json"),c=emptyCache();mergeStatus(c,sample(),now0);writeCache(path,c);
