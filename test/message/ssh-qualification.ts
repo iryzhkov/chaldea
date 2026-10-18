@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, unlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync, unlinkSync, realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createServer, createConnection, type AddressInfo } from "node:net";
@@ -31,7 +31,11 @@ async function collected(child:ChildProcess,body="",limit=10_000){
 test("stock SSH: restricted key, static login shell, queued real T3, replay and all channel refusals",{timeout:180_000},async t=>{
   assert.equal(process.env.GITHUB_ACTIONS,"true");assert.equal(process.env.RUNNER_ENVIRONMENT,"github-hosted");
   assert.equal(process.geteuid!(),0,"fixture account creation is limited to the ephemeral hosted runner");
-  assert.notEqual(homedir(),"/root");assert.ok(homedir().startsWith(process.env.RUNNER_TEMP!+"/"));
+  const fixtureHome=process.env.CHALDEA_MESSAGE_FIXTURE_HOME??"";
+  assert.match(fixtureHome,/^\/var\/lib\/chaldea-fixture-[0-9]{1,20}-[0-9]{1,6}$/);
+  assert.equal(fixtureHome,"/var/lib/chaldea-fixture-"+process.env.GITHUB_RUN_ID+"-"+process.env.GITHUB_RUN_ATTEMPT);
+  assert.equal(homedir(),fixtureHome);assert.equal(realpathSync(fixtureHome),fixtureHome);
+  assert.equal(statSync(fixtureHome).uid,0);assert.equal(statSync(fixtureHome).mode&0o777,0o755);
   assert.equal(t3Version(),"t3 v0.1.0","pinned T3 is mandatory");
   const base=join(homedir(),"message-ssh");mkdirSync(base,{recursive:true,mode:0o755});chmodSync(homedir(),0o755);
   const dir=mkdtempSync(join(base,"t-"));chmodSync(dir,0o755);
@@ -54,6 +58,13 @@ test("stock SSH: restricted key, static login shell, queued real T3, replay and 
     const login=join(root,"login");mkdirSync(login,{mode:0o755});
     run("useradd",["--no-create-home","--home-dir",login,"--shell",binary,"--password","*",user]);created=true;
     const uid=Number(run("id",["-u",user]).trim()),gid=Number(run("id",["-g",user]).trim());
+    const previousHome=process.env.CHALDEA_MESSAGE_PREVIOUS_HOME;
+    assert.equal(previousHome,process.env.RUNNER_TEMP+"/chaldea/home");
+    const previousAncestors:string[]=[];
+    for(let p=previousHome!;p!==dirname(p);p=dirname(p))previousAncestors.unshift(p);
+    const firstBlocked=previousAncestors.find(p=>spawnSync("runuser",["-u",user,"--","/usr/bin/test","-x",p],{stdio:"ignore"}).status!==0);
+    if(firstBlocked){const s=statSync(firstBlocked);t.diagnostic(JSON.stringify({probe:"previous-home-first-block",path:firstBlocked,
+      mode:(s.mode&0o777).toString(8),uid:s.uid,gid:s.gid}));}
     for(const key of ["host","client"])run("ssh-keygen",["-q","-t","ed25519","-N","","-f",join(root,key)]);
     const clientKey=join(root,"client"),known=join(root,"known_hosts"),sshPort=await port();
     writeFileSync(known,"[127.0.0.1]:"+sshPort+" "+readFileSync(join(root,"host.pub"),"utf8"));

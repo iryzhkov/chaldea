@@ -85,8 +85,20 @@ jobs:
         run: |
           set -euo pipefail
           test "$HOME" = "$RUNNER_TEMP/chaldea/home"
-          sh scripts/ci/install-t3 "$HOME/message-t3"
-          mkdir -p "$HOME/tmp"
-          sudo -- env -i PATH="$PATH" HOME="$HOME" TMPDIR="$HOME/tmp" CHALDEA_TEST_SCRATCH="$HOME/s" \
-            CHALDEA_T3_BIN="$HOME/message-t3/t3" GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_TEMP="$RUNNER_TEMP" \
-            "$(command -v node)" --test test/message/ssh-qualification.ts
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]{1,20}$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]{1,6}$ ]]
+          message_home="/var/lib/chaldea-fixture-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ "$message_home" =~ ^/var/lib/chaldea-fixture-[0-9]{1,20}-[0-9]{1,6}$ ]]
+          # mkdir refuses reuse, including a symlink. Only this fresh fixture is removed.
+          sudo mkdir --mode=0755 -- "$message_home"
+          trap 'sudo rm -rf -- "$message_home"' EXIT
+          sudo -- env -i PATH="$PATH" HOME="$message_home" TMPDIR="$message_home/tmp" CHALDEA_TEST_SCRATCH="$message_home/s" \
+            CHALDEA_MESSAGE_FIXTURE_HOME="$message_home" CHALDEA_MESSAGE_PREVIOUS_HOME="$HOME" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            CHALDEA_T3_BIN="$message_home/message-t3/t3" GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_TEMP="$RUNNER_TEMP" \
+            /bin/bash --noprofile --norc -eu -c '
+              test "$HOME" = "/var/lib/chaldea-fixture-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+              test "$(id -u)" = 0
+              mkdir -p "$HOME/tmp" "$HOME/s"
+              sh scripts/ci/install-t3 "$HOME/message-t3"
+              node --test test/message/ssh-qualification.ts
+            '
