@@ -42,13 +42,15 @@ export function mergeStatus(cache:StatusCache,raw:HostSnapshot,now=Date.now()):b
 export class CacheModel {
   private listeners=new Set<()=>void>();
   private cache:StatusCache=emptyCache();
-  constructor(private readonly path:string,private readonly now:()=>number=Date.now){this.reload();}
+  private readonly path:string;
+  private readonly now:()=>number;
+  constructor(path:string,now:()=>number=Date.now){this.path=path;this.now=now;this.reload();}
   subscribe(fn:()=>void):()=>void {this.listeners.add(fn);return()=>{this.listeners.delete(fn);};}
   reload():void {try{this.cache=loadCache(this.path,this.now());}catch{this.cache.gap=true;}for(const fn of this.listeners)fn();}
-  snapshot():ReturnType<MissionModel["snapshot"]>{
+  snapshot():ReturnType<MissionModel["snapshot"]> & {sampled:true}{
     const now=this.now(),base=new MissionModel(false,this.now).snapshot();
     const snapshots=this.cache.snapshots.filter(s=>s.observedAt<=now&&now-s.observedAt<=CACHE_AGE);
-    const freshness=(connected:boolean,at:number|null,stale=30_000,lost=300_000)=>at===null?"nosource":now-at>lost?"lost":now-at>stale?"stale":connected?"live":"disconnected";
+    const freshness=(connected:boolean,at:number|null,stale=90_000,lost=600_000)=>at===null?"nosource":now-at>lost?"lost":now-at>stale?"stale":connected?"live":"disconnected";
     base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
       freshness:freshness(s.connected,s.observedAt),activityFreshness:freshness(a.connected,a.detailObservedAt,60_000,600_000),steps:[...a.steps]}))).slice(0,48);
     base.shown=base.agents.length;base.total=snapshots.length&&snapshots.every(s=>s.total!==null)?snapshots.reduce((n,s)=>n+s.total!,0):null;
@@ -59,9 +61,9 @@ export class CacheModel {
     base.tokens={output:known?snapshots.reduce((n,s)=>n+s.tokens.output!,0):null,
       rate:known&&base.source.state==="live"&&snapshots.every(s=>s.tokens.rate!==null)?snapshots.reduce((n,s)=>n+s.tokens.rate!,0):null,
       observedAt:known?Math.min(...snapshots.map(s=>s.tokens.observedAt!)):null,
-      coverage:this.cache.gap||snapshots.some(s=>s.tokens.coverage==="partial")?"partial":"observed",
+      coverage:!known?"unknown":this.cache.gap||snapshots.some(s=>s.tokens.coverage==="partial")?"partial":"observed",
       scope:known?"Latest observed process-epoch totals per enrolled source; replacement samples, no daily reconciliation."+ (this.cache.gap?" Delivery gap; known lower bound.":""):"Unknown: hosted token semantics are not qualified."};
-    return base;
+    return Object.assign(base,{sampled:true as const});
   }
 }
 export interface WebConfig {mode:"cache";siteOrigin:string;listen:"127.0.0.1";port:number;cacheFile:string}
