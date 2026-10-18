@@ -1,0 +1,171 @@
+// Runs ONLY as root on a GitHub-hosted ephemeral runner. No host/fleet credential.
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { mkdtempSync, mkdirSync, chmodSync, chownSync, copyFileSync, writeFileSync, readFileSync, rmSync, existsSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { homedir } from "node:os";
+import { createServer, createConnection, type AddressInfo } from "node:net";
+import * as Effect from "effect/Effect";
+import { startDisposableT3, t3Version } from "../helpers/disposable-t3.ts";
+import { ShellWatcher, waitFor } from "../helpers/e2e.ts";
+import { withClient } from "../../src/t3/adapter.ts";
+import { MessageStore } from "../../src/message-store.ts";
+import { receiverBinding, type ReceiverConfig } from "../../src/message-receiver.ts";
+import { identity, request, message, senderBinding, sshRequest, type SenderConfig, type Route } from "../../src/message.ts";
+
+async function port():Promise<number>{
+  const s=createServer();await new Promise<void>(r=>s.listen(0,"127.0.0.1",r));
+  const p=(s.address() as AddressInfo).port;await new Promise<void>(r=>s.close(()=>r()));return p;
+}
+async function collected(child:ChildProcess,body="",limit=10_000){
+  let out="",err="";
+  child.stdout?.on("data",b=>out=(out+b).slice(-32768));child.stderr?.on("data",b=>err=(err+b).slice(-4096));
+  child.stdin?.on("error",()=>{});child.stdin?.end(body);
+  const timer=setTimeout(()=>child.kill("SIGKILL"),limit);
+  const code=await new Promise<number|null>((resolve,reject)=>{child.once("error",reject);child.once("close",resolve);});
+  clearTimeout(timer);return {code,out,err};
+}
+test("stock SSH: restricted key, static login shell, queued real T3, replay and all channel refusals",{timeout:180_000},async t=>{
+  assert.equal(process.env.GITHUB_ACTIONS,"true");assert.equal(process.env.RUNNER_ENVIRONMENT,"github-hosted");
+  assert.equal(process.geteuid!(),0,"fixture account creation is limited to the ephemeral hosted runner");
+  assert.notEqual(homedir(),"/root");assert.ok(homedir().startsWith(process.env.RUNNER_TEMP!+"/"));
+  assert.equal(t3Version(),"t3 v0.1.0","pinned T3 is mandatory");
+  const base=join(homedir(),"message-ssh");mkdirSync(base,{recursive:true,mode:0o755});chmodSync(homedir(),0o755);
+  const dir=mkdtempSync(join(base,"t-"));chmodSync(dir,0o755);
+  const root=join(dir,"root"),state=join(dir,"state");mkdirSync(root,{mode:0o755});mkdirSync(state,{mode:0o700});
+  const user="chaldea-message",config=join(root,"receiver.json"),node=join(root,"node"),binary=join(root,"launcher"),bundle=join(root,"receiver.mjs");
+  let daemon:ChildProcess|undefined,watcher:ShellWatcher|undefined,created=false,log="",t3:Awaited<ReturnType<typeof startDisposableT3>>|undefined;
+  const cleanupClients:ChildProcess[]=[];
+  const run=(cmd:string,args:string[])=>execFileSync(cmd,args,{encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:30_000});
+  try{
+    assert.notEqual(spawnSync("getent",["passwd",user]).status,0,"refuse any pre-existing account");
+    run(resolve("node_modules/.bin/esbuild"),["test/helpers/message-receiver-fixture.ts","--bundle","--platform=node","--format=esm","--packages=bundle","--banner:js=import {createRequire} from 'node:module';const require=createRequire(import.meta.url);","--outfile="+bundle]);
+    copyFileSync(process.execPath,node);chmodSync(node,0o755);
+    run("cc",["-static","-O2","-Wall","-Wextra","-Werror","-DMESSAGE_NODE="+JSON.stringify(node),"-DMESSAGE_RECEIVER="+JSON.stringify(bundle),
+      "-DMESSAGE_CONFIG="+JSON.stringify(config),"-o",binary,resolve("host/chaldea-message-launcher.c")]);chmodSync(binary,0o755);
+    assert.doesNotMatch(run("readelf",["-l",binary]),/INTERP/);assert.doesNotMatch(run("readelf",["-d",binary]),/NEEDED/);
+    for(const p of [root,node,binary,bundle]){assert.equal(statSync(p).uid,0);assert.equal(statSync(p).mode&0o022,0);}
+    const login=join(root,"login");mkdirSync(login,{mode:0o755});
+    run("useradd",["--no-create-home","--home-dir",login,"--shell",binary,"--password","*",user]);created=true;
+    const uid=Number(run("id",["-u",user]).trim()),gid=Number(run("id",["-g",user]).trim());
+    for(const key of ["host","client"])run("ssh-keygen",["-q","-t","ed25519","-N","","-f",join(root,key)]);
+    const clientKey=join(root,"client"),known=join(root,"known_hosts"),sshPort=await port();
+    writeFileSync(known,"[127.0.0.1]:"+sshPort+" "+readFileSync(join(root,"host.pub"),"utf8"));
+    const forced="/usr/local/libexec/chaldea-message-receive --caller fixture";
+    const authorized=join(root,"authorized_keys"),publicKey=readFileSync(clientKey+".pub","utf8").trim();
+    writeFileSync(authorized,'restrict,from="127.0.0.1",command="'+forced+'" '+publicKey+"\n",{mode:0o644});
+    const sshd=join(root,"sshd.conf");
+    const policy="Port "+sshPort+"\nListenAddress 127.0.0.1\nHostKey "+join(root,"host")+"\nPidFile "+join(root,"sshd.pid")+"\n"+
+      "UsePAM no\nPermitRootLogin no\nStrictModes yes\nPermitUserEnvironment no\nLogLevel ERROR\nAllowUsers "+user+"\n"+
+      "AcceptEnv NODE_OPTIONS BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH SSH_AUTH_SOCK SSH_ORIGINAL_COMMAND SSH_CONNECTION\n"+
+      "Subsystem sftp internal-sftp\nMatch User "+user+"\n"+
+      "  AuthenticationMethods publickey\n  PubkeyAuthentication yes\n  PasswordAuthentication no\n  KbdInteractiveAuthentication no\n"+
+      "  HostbasedAuthentication no\n  GSSAPIAuthentication no\n  AuthorizedKeysFile "+authorized+"\n  AuthorizedKeysCommand none\n"+
+      "  TrustedUserCAKeys none\n  AuthorizedPrincipalsFile none\n  PermitUserRC no\n  PermitTTY no\n  DisableForwarding yes\n"+
+      "  AllowAgentForwarding no\n  AllowTcpForwarding no\n  AllowStreamLocalForwarding no\n  X11Forwarding no\n  PermitTunnel no\n"+
+      "  PermitOpen none\n  PermitListen none\n  MaxSessions 1\n";
+    writeFileSync(sshd,policy,{mode:0o600});
+    run("/usr/sbin/sshd",["-t","-f",sshd]);
+    const effective=run("/usr/sbin/sshd",["-T","-f",sshd,"-C","user="+user+",addr=127.0.0.1,host=localhost"]);
+    for(const [key,value] of Object.entries({permituserenvironment:"no",forcecommand:"none",authenticationmethods:"publickey",
+      passwordauthentication:"no",kbdinteractiveauthentication:"no",hostbasedauthentication:"no",gssapiauthentication:"no",
+      permituserrc:"no",permittty:"no",disableforwarding:"yes",allowagentforwarding:"no",allowtcpforwarding:"no",
+      allowstreamlocalforwarding:"no",x11forwarding:"no",permittunnel:"no",maxsessions:"1",authorizedkeyscommand:"none",trustedusercakeys:"none"}))
+      assert.ok(effective.split("\n").includes(key+" "+value),key+" effective policy");
+    t.diagnostic("stock sshd -t and effective -T -C policy passed; no overriding ForceCommand");
+    t3=await startDisposableT3({scratchRoot:join(dir,"t3"),scenario:"no-reset",autoResume:false});
+    const token=t3.issueToken(["orchestration:read","orchestration:operate"]),opts=()=>({serverUrl:t3!.serverUrl,token});
+    watcher=new ShellWatcher(t3.serverUrl,token);
+    const threadId=await waitFor("bootstrap thread",()=>watcher!.firstThreadId(),30_000);
+    const environment=await withClient(opts(),c=>c["server.getConfig"]({}).pipe(Effect.map(c=>String(c.environment.environmentId))));
+    const c:ReceiverConfig={host:"target",environment,loopbackT3Url:t3.serverUrl,tokenFile:join(state,"token"),database:join(state,"receipts.db"),
+      callers:{fixture:{sourceHost:"source",sourceAddresses:["127.0.0.1"],threads:[threadId]}}};
+    writeFileSync(config,JSON.stringify(c),{mode:0o644});writeFileSync(config+".env-checked","",{mode:0o600});chownSync(config+".env-checked",uid,gid);
+    writeFileSync(c.tokenFile,token,{mode:0o600});chownSync(c.tokenFile,uid,gid);
+    const s=new MessageStore(c.database,receiverBinding(c),true);s.close();
+    for(const p of [c.database,c.database+".lock",state])chownSync(p,uid,gid);
+    const route:Route={destinationHost:"target",environment,address:"127.0.0.1",port:sshPort,keyFile:clientKey,knownHostsFile:known,threads:[threadId]};
+    const sender:SenderConfig={callerId:"fixture",sourceHost:"source",database:join(root,"sender/state.db"),hosts:{target:route}};
+    const ss=new MessageStore(sender.database,senderBinding(sender),true);ss.close();
+    daemon=spawn("/usr/sbin/sshd",["-D","-e","-f",sshd],{stdio:["ignore","ignore","pipe"]});
+    daemon.stderr!.on("data",b=>log=(log+b).slice(-4096));
+    const deadline=Date.now()+5000;
+    for(;;){
+      const connected=await new Promise<boolean>(r=>{const s=createConnection(sshPort,"127.0.0.1");s.once("connect",()=>{s.destroy();r(true);});s.once("error",()=>r(false));});
+      if(connected)break;assert.ok(Date.now()<deadline,log);await new Promise(r=>setTimeout(r,30));
+    }
+    const common=["-F","/dev/null","-p",String(sshPort),"-i",clientKey,"-o","BatchMode=yes","-o","IdentitiesOnly=yes",
+      "-o","IdentityAgent=none","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile="+known,"-o","GlobalKnownHostsFile=/dev/null",
+      "-o","ControlMaster=no","-o","ConnectTimeout=5"];
+    const ssh=(command:string[]= ["chaldea-message-v1"],extra:string[]=[],body="",env:NodeJS.ProcessEnv={})=>
+      collected(spawn("/usr/bin/ssh",[...common,...extra,user+"@127.0.0.1",...command],{
+        env:{PATH:"/usr/bin:/bin",...env},stdio:["pipe","pipe","pipe"]}),body);
+    const r=request({v:1,op:"send",host:"target",environment,threadId,requestId:Date.now()+":ssh-success",text:"$(touch "+join(state,"injected")+"); literal shell data"});
+    const before=await withClient(opts(),c=>c["orchestration.getThreadProjection"]({threadId} as never));
+    const first=await message("send",{host:"target",threadId,requestId:r.requestId,text:r.text},sender,async(h,r)=>{
+      const accepted=await sshRequest(h,r);assert.equal(accepted.state,"accepted");throw new Error("discard reply");
+    });
+    assert.equal(first.state,"uncertain");
+    const replay=await message("send",{host:"target",threadId,requestId:r.requestId,text:r.text},sender);
+    assert.equal(replay.state,"accepted");
+    const p=await withClient(opts(),c=>c["orchestration.getThreadProjection"]({threadId} as never));
+    assert.equal(p.messages.filter(m=>m.id===identity("fixture","source",r).messageId).length,1);
+    assert.deepEqual(p.thread.modelSelection,before.thread.modelSelection);assert.equal(existsSync(join(state,"injected")),false);
+    t.diagnostic("actual SSH send, lost-response identical replay and unchanged model passed");
+    const marker=join(state,"environment-injected"),shell=join(root,"hostile.sh"),source=join(root,"hostile.c"),library=join(root,"hostile.so");
+    writeFileSync(shell,"touch "+marker+"\n");
+    writeFileSync(source,'#include <stdio.h>\n__attribute__((constructor)) static void injected(void){FILE *f=fopen('+JSON.stringify(marker)+',"w");if(f)fclose(f);}\n');
+    run("cc",["-shared","-fPIC","-o",library,source]);chmodSync(library,0o755);
+    // SetEnv sends values without poisoning the SSH client process itself.
+    const hostile=["NODE_OPTIONS=--import="+shell,"BASH_ENV="+shell,"ENV="+shell,"LD_PRELOAD="+library,"LD_LIBRARY_PATH="+root,"SSH_AUTH_SOCK="+marker,
+      "SSH_ORIGINAL_COMMAND=chaldea-message-v1",'SSH_CONNECTION="127.0.0.2 1 127.0.0.1 22"'];
+    const status={...r,op:"status"};delete status.text;
+    const envResult=await ssh(["chaldea-message-v1"],hostile.flatMap(e=>["-o","SetEnv="+e]),JSON.stringify(status));
+    assert.equal(envResult.code,0,envResult.err);assert.equal(JSON.parse(envResult.out).state,"accepted");assert.equal(existsSync(marker),false);
+    assert.ok(readFileSync(config+".env-checked","utf8").includes("clean"));
+    for(const command of [[],["sh"],["chaldea-message-v1 "],["chaldea-message-v1; id"],["scp -t /x"]]){
+      const negative=await ssh(command,[],JSON.stringify(r));assert.notEqual(negative.code,0,"command must be refused: "+JSON.stringify(command));
+    }
+    assert.notEqual((await ssh(["sftp"],["-s"],JSON.stringify(r))).code,0,"subsystem refused");
+    const pty=await ssh(["chaldea-message-v1"],["-tt"],JSON.stringify(status));assert.match(pty.err,/PTY allocation request failed/i);
+    assert.notEqual((await ssh([],["-W","127.0.0.1:"+sshPort])).code,0,"direct TCP forwarding refused");
+    assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-R","0:127.0.0.1:"+sshPort])).code,0,"remote TCP forwarding refused");
+    assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-R",join(state,"remote.sock")+":127.0.0.1:"+sshPort])).code,0,"remote StreamLocal forwarding refused");
+    assert.notEqual((await ssh([],["-N","-o","ExitOnForwardFailure=yes","-w","any:any"])).code,0,"tunnel refused");
+    // Force a real direct-streamlocal channel attempt through a local socket.
+    const localSocket=join(root,"local.sock"),remoteSocket=join(state,"forbidden.sock");
+    const forwarding=spawn("/usr/bin/ssh",[...common,"-v","-N","-L",localSocket+":"+remoteSocket,user+"@127.0.0.1"],
+      {env:{PATH:"/usr/bin:/bin"},stdio:["ignore","ignore","pipe"]});
+    cleanupClients.push(forwarding);let forwardError="";
+    forwarding.stderr!.on("data",b=>forwardError=(forwardError+b).slice(-8192));
+    await waitFor("local StreamLocal listener",()=>existsSync(localSocket),5000);
+    const channel=createConnection(localSocket);channel.on("error",()=>{});
+    const ended=new Promise<void>(r=>channel.once("close",()=>r()));
+    channel.end("forbidden");
+    await Promise.race([ended,new Promise((_,reject)=>setTimeout(()=>reject(new Error("StreamLocal did not refuse")),5000).unref())]);
+    await waitFor("remote StreamLocal denial",()=>/administratively prohibited/i.test(forwardError),5000);
+    forwarding.kill("SIGTERM");await new Promise<void>(r=>forwarding.once("close",()=>r()));
+    // Supply a real local agent socket so the client actually requests agent forwarding.
+    const agentPath=join(root,"agent.sock"),agentServer=createServer(socket=>socket.destroy());
+    await new Promise<void>(r=>agentServer.listen(agentPath,r));
+    try {
+      const agent=await ssh(["chaldea-message-v1"],["-v","-A","-X","-o","ForwardX11Trusted=yes"],JSON.stringify(status),
+        {DISPLAY:"localhost:99.0",SSH_AUTH_SOCK:agentPath});
+      assert.equal(agent.code,0,agent.err);assert.equal(JSON.parse(agent.out).state,"accepted");
+      assert.match(agent.err,/Requesting authentication agent forwarding/);
+      assert.match(agent.err,/X11 forwarding request failed/);
+    } finally {await new Promise<void>(r=>agentServer.close(()=>r()));}
+    // A source IP outside from= cannot authenticate the same otherwise valid key.
+    assert.notEqual((await ssh(["chaldea-message-v1"],["-b","127.0.0.2"],JSON.stringify(status))).code,0);
+    writeFileSync(config,JSON.stringify({...c,callers:{}}),{mode:0o644});
+    assert.notEqual((await ssh(["chaldea-message-v1"],[],JSON.stringify(status))).code,0,"revoked ACL checked on replay");
+    t.diagnostic("shell/original command/subsystem/PTY/TCP/StreamLocal/tunnel/source/env/ACL gates passed; agent/X11 effective policy asserted");
+  }finally{
+    for(const client of cleanupClients)client.kill("SIGKILL");
+    if(daemon?.pid){daemon.kill("SIGTERM");await new Promise<void>(r=>daemon!.once("close",()=>r()));}
+    await watcher?.close();await t3?.stop();
+    if(created)run("userdel",[user]);
+    rmSync(dir,{recursive:true,force:true});
+  }
+});

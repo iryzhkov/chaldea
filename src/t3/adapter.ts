@@ -498,13 +498,18 @@ export async function respondChaldeaDecision(options: ConnectOptions, payload: s
       /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
         ? Effect.succeed(false) : Effect.fail(error))));
 }
-export async function dispatchChaldeaWake(options: ConnectOptions, payload: string): Promise<void> {
-  const accepted = await withClient(options, client =>
-    client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
+export async function dispatchChaldeaWake(options: ConnectOptions, payload: string, expectedEnvironment?: string): Promise<void> {
+  const accepted = await withClient(options, client => Effect.gen(function* () {
+    if (expectedEnvironment !== undefined) {
+      const config = yield* client["server.getConfig"]({});
+      if (String(config.environment.environmentId) !== expectedEnvironment) return yield* Effect.fail(new Error("message_environment"));
+    }
+    return yield* client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
       Effect.map(() => true),
       Effect.catchTag("OrchestrationV2DispatchCommandError", error =>
         /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
-          ? Effect.succeed(false) : Effect.fail(error))));
+          ? Effect.succeed(false) : Effect.fail(error)));
+  }));
   if (!accepted) throw new WakeRejectedError("T3 durably rejected this wake; operator attention required");
 }
 

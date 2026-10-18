@@ -2,6 +2,10 @@
 // Advisory routing reads local T3/observer data and owns its bounded collection caches.
 import { callService } from "./waits/service.ts";
 import { route } from "./route/runtime.ts";
+import { message, messageAvailable } from "./message.ts";
+const messageTools = () => messageAvailable() ? ["send","status"].map(op=>({name:"chaldea_message_"+op,
+  description:op==="send"?"Queue a message to a configured existing thread. Reuse the same requestId and text after uncertainty. accepted means durably queued, not read.":"Read a receipt for a configured existing thread. Never dispatches.",
+  inputSchema:schema({host:str,threadId:str,requestId:identity.requestId,...(op==="send"?{text:str}:{})},["host","threadId","requestId",...(op==="send"?["text"]:[])])})) : [];
 const str={type:"string"};
 const identity={threadId:{...str,description:"Your own orchestrator_capabilities.parentThreadId on this host"},
   requestId:{...str,description:"Stable retry key: <13-digit epoch milliseconds>:<unique key>; reuse with identical arguments"}};
@@ -37,12 +41,14 @@ export async function runMcp(socket:string):Promise<void>{
     try{
       if(r.method==="initialize"){reply(id,{protocolVersion:"2024-11-05",capabilities:{tools:{}},serverInfo:{name:"chaldea",version:"0.1.0"}});return;}
       if(r.method==="ping"){reply(id,{});return;}
-      if(r.method==="tools/list"){reply(id,{tools:WAIT_TOOLS});return;}
+      if(r.method==="tools/list"){reply(id,{tools:[...WAIT_TOOLS,...messageTools()]});return;}
       if(r.method==="tools/call"){
         const p=r.params as {name:string;arguments?:unknown};
-        if(!WAIT_TOOLS.some(t=>t.name===p?.name))throw new Error("Unknown tool");
+        if(![...WAIT_TOOLS,...messageTools()].some(t=>t.name===p?.name))throw new Error("Unknown tool");
         try{
-          const result=p.name==="chaldea_route" ? await route(p.arguments??{}) : await callService(socket,p.name,p.arguments??{});
+          const result=p.name==="chaldea_route" ? await route(p.arguments??{}) :
+            p.name==="chaldea_message_send" ? await message("send",p.arguments??{}) :
+            p.name==="chaldea_message_status" ? await message("status",p.arguments??{}) : await callService(socket,p.name,p.arguments??{});
           reply(id,{content:[{type:"text",text:JSON.stringify(result)}]});
         }catch(e){reply(id,{isError:true,content:[{type:"text",text:e instanceof Error?e.message:"Request failed"}]});}
         return;

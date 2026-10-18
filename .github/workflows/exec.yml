@@ -81,3 +81,12 @@ jobs:
           test "$HOME" = "$RUNNER_TEMP/chaldea/home"
           trap 'echo "Real exec SSH/sandbox E2E failed; see the test log (no skip)." >> "$GITHUB_STEP_SUMMARY"' ERR
           node --test test/exec/e2e.ts
+      - name: Qualify restricted existing-thread message SSH and pinned T3
+        run: |
+          set -euo pipefail
+          test "$HOME" = "$RUNNER_TEMP/chaldea/home"
+          sh scripts/ci/install-t3 "$HOME/message-t3"
+          mkdir -p "$HOME/tmp"
+          sudo -- env -i PATH="$PATH" HOME="$HOME" TMPDIR="$HOME/tmp" CHALDEA_TEST_SCRATCH="$HOME/s" \
+            CHALDEA_T3_BIN="$HOME/message-t3/t3" GITHUB_ACTIONS=true RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" RUNNER_TEMP="$RUNNER_TEMP" \
+            "$(command -v node)" --test test/message/ssh-qualification.ts

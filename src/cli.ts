@@ -182,11 +182,13 @@ async function quotaStatus(rest: ReadonlyArray<string>): Promise<number> {
 
 export async function main(argv: ReadonlyArray<string>): Promise<number> {
   if (argv.length === 1 && argv[0] === "--describe") {
-    process.stdout.write(JSON.stringify(description) + "\n");
+    const commands = (await import("./message.ts")).messageAvailable() ? [...description.commands, {name:"message send",summary:"Queue an authorized existing-thread message",access:"write"},{name:"message status",summary:"Read an authorized message receipt",access:"read"}] : description.commands;
+    process.stdout.write(JSON.stringify({...description,commands}) + "\n");
     return 0;
   }
   if (argv.length === 1 && (argv[0] === "--help" || argv[0] === "-h")) {
-    process.stdout.write(discoveryHelp + "\n" + USAGE);
+    const messaging = (await import("./message.ts")).messageAvailable() ? "\n  chaldea message send|status --host HOST --thread THREAD --request-id ID [--text TEXT]\n" : "";
+    process.stdout.write(discoveryHelp + "\n" + USAGE + messaging);
     return 0;
   }
   const [group, command, ...rest] = argv;
@@ -199,6 +201,7 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
       const { waitsCli } = await import("./waits/cli.ts");
       return await waitsCli(argv);
     }
+    if (group === "message") return await (await import("./message.ts")).messageCli(argv.slice(1));
     if (group === "route") return await (await import("./route/cli.ts")).routeCli(argv.slice(1));
     if (group === "access") {
       const { accessCli } = await import("./access/cli.ts");
