@@ -81,6 +81,10 @@ grants read; `service` may read its own source/profile/project/host if granted;
 `operator` with explicit `global_read:true` may read globally. All source scope
 conditions are in SQL before rows, cursor or show results leave the process.
 Receipts always require their exact owning principal and logical key, even for operators.
+A quota service registration may opt into quota_fleet_read:true. This permits
+only quota_headroom_snapshot reads across hosts in its same source quota,
+profile and project, with no global read or foreign-receipt access. Snapshot
+data uses the closed [fleet capacity schema](quota-fleet.md).
 
 Structured POST `/api/v1/events` requires `Idempotency-Key` (1–256 printable ASCII)
 and `{v:1,kind,title,...}`. Optional host/source/run_id/project assertions must match

@@ -54,17 +54,17 @@ test("Claude refill keeps native deadline and is capped by remaining window time
   config.providers.claudeAgent.claudeRefills.expiresAt = iso(now - 1);
   assert.equal(classifyCapacity(p, false, now, config).reserveWeeks, 0);
 });
-test("credits require known conversion, stale credits and expired resets cannot establish unlimited", () => {
+test("Codex credits need no conversion or reserve; stale credits and expired resets cannot establish unlimited", () => {
   const p = provider("codex", 20, .01);
   p.credits = metric({ balance: "200", hasCredits: true, unlimited: false });
-  assert.equal(classifyCapacity(p, false, now).class, "paced");
+  assert.equal(classifyCapacity(p, false, now).class, "unlimited");
   const config = { ...DEFAULT_CAPACITY, providers: { codex: { creditsPerFullWeek: 100 } } };
   assert.equal(classifyCapacity(p, false, now, config).class, "unlimited");
   p.credits = { ...p.credits, observedAt: iso(now - 3600000) };
   p.manualResets = metric({ availableCount: 2, nextExpiresAt: iso(now - 1) });
   assert.equal(classifyCapacity(p, false, now, config).class, "paced");
   const missing = newProvider("codex", "codex"); missing.credits = metric({ balance: "999999", hasCredits: true, unlimited: true });
-  assert.equal(classifyCapacity(missing, false, now, config).class, "unknown");
+  assert.equal(classifyCapacity(missing, false, now, config).class, "unlimited");
 });
 test("recent burn resets on refill, respects configurable heavy multiplier, no writes in policy", () => {
   const p = provider("codex", 20, .01), before = JSON.stringify(p);

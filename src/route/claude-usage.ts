@@ -1,10 +1,14 @@
 // Opt-in, GET-only Linux credential reader. No refresh, credential write or logging.
 import { constants, openSync, fstatSync, readFileSync, closeSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { join } from "node:path";
+import { accountKey } from "../quota/account.ts";
 import { cached, getJson } from "./cache.ts";
 import type { QuotaWindow } from "./types.ts";
 export const CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 export const CLAUDE_CADENCE_MS = 5 * 60_000;
-export interface ClaudeUsage { observedAt: string; windows: QuotaWindow[] }
+export const claudeCacheFile = (home: string, credentialFile: string) => join(home, ".cache/chaldea/claude-accounts", createHash("sha256").update(credentialFile).digest("hex") + ".json");
+export interface ClaudeUsage { accountKey?: string; observedAt: string; windows: QuotaWindow[] }
 function percent(v: unknown): v is number { return typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 100; }
 export function parseClaudeUsage(raw: unknown, now: number): ClaudeUsage {
   const r = raw as Record<string, { utilization?: unknown; resets_at?: unknown }> | null;
@@ -16,7 +20,13 @@ export function parseClaudeUsage(raw: unknown, now: number): ClaudeUsage {
       !Number.isFinite(Date.parse(w.resets_at))) throw new Error("Invalid Claude usage");
     windows.push({ kind, remainingPercent: 100 - w.utilization, resetsAt: w.resets_at, windowDurationMins: minutes });
   }
-  return { observedAt: new Date(now).toISOString(), windows };
+  const key = claudeAccountKey(raw);
+  return { ...(key ? { accountKey: key } : {}), observedAt: new Date(now).toISOString(), windows };
+}
+export function claudeAccountKey(raw: unknown): string | undefined {
+  const r = raw as Record<string, any> | null;
+  return accountKey(r?.organization_id ?? r?.organization?.uuid ?? r?.organization?.id ??
+    r?.account_id ?? r?.account?.uuid ?? r?.account?.id);
 }
 function validate(raw: unknown): ClaudeUsage {
   const u = raw as ClaudeUsage;
@@ -25,7 +35,7 @@ function validate(raw: unknown): ClaudeUsage {
     !u.windows.every(w => percent(w.remainingPercent) && typeof w.resetsAt === "string" && Number.isFinite(Date.parse(w.resetsAt)) &&
       (w.kind === "session" && w.windowDurationMins === 300 || w.kind === "weekly" && w.windowDurationMins === 10080))) throw new Error("Invalid Claude usage cache");
   // Project explicitly; no raw OAuth payload ever reaches disk.
-  return { observedAt: u.observedAt, windows: u.windows.map(w => ({
+  return { ...(u.accountKey && /^[a-f0-9]{64}$/.test(u.accountKey) ? { accountKey: u.accountKey } : {}), observedAt: u.observedAt, windows: u.windows.map(w => ({
     kind: w.kind, remainingPercent: w.remainingPercent, resetsAt: w.resetsAt, windowDurationMins: w.windowDurationMins,
   })) };
 }
@@ -49,6 +59,18 @@ export async function collectClaudeUsage(options: {
     const raw = await getJson(CLAUDE_USAGE_URL, { headers: {
       authorization: "Bearer " + token, "anthropic-beta": "oauth-2025-04-20",
     } }, options.fetcher, 64 * 1024);
-    return parseClaudeUsage(raw, options.now);
+    const usage = parseClaudeUsage(raw, options.now);
+    // Some usage responses omit identity. Read the profile with the same bearer;
+    // never derive identity from a token, email or local host.
+    if (!usage.accountKey) {
+      try {
+        const profile = await getJson("https://api.anthropic.com/api/oauth/profile", { headers: {
+          authorization: "Bearer " + token, "anthropic-beta": "oauth-2025-04-20",
+        } }, options.fetcher, 64 * 1024);
+        const key = claudeAccountKey(profile);
+        if (key) usage.accountKey = key;
+      } catch { /* Unidentified windows remain local only. */ }
+    }
+    return usage;
   });
 }

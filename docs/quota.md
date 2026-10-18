@@ -1,5 +1,10 @@
 # Quota resilience (plan step 3)
 
+Account identity, opt-in Claude collection on any host, shared Akasha snapshots
+and the Codex credit policy are documented in [fleet quota accounts](quota-fleet.md).
+The credit policy there supersedes the earlier reporting-only credit limitation
+below for FATE routing advice. Provider switching remains unchanged.
+
 When a provider stops a T3 turn on a usage limit, T3 itself resumes the thread
 at the reported reset time. `chaldea quota observe` records stops and resumes
 in the fleet feed. Optional B3 provider switching can continue the same thread

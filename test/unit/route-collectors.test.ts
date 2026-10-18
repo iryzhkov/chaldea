@@ -46,7 +46,7 @@ test("disabled collector never reads credentials or fetches; enabled GET-only sa
     const fetcher: typeof fetch = async (url, options) => {
       assert.equal(url, CLAUDE_USAGE_URL); assert.equal(options?.method, "GET"); assert.equal(options?.redirect, "error");
       headers.push(new Headers(options.headers));
-      return Response.json({ five_hour: { utilization: 20, resets_at: iso(now + 300 * 60000) },
+      return Response.json({ organization_id: "fixture-account", five_hour: { utilization: 20, resets_at: iso(now + 300 * 60000) },
         seven_day: { utilization: 38, resets_at: iso(now + .4 * 7 * 86400000) }, accessToken: secret });
     };
     const options = { enabled: false, credentialFile, cacheFile, now, fetcher };
@@ -117,7 +117,7 @@ test("new cache concurrency reserves before network, malformed and huge HTTP bod
     let calls = 0;
     const fetcher: typeof fetch = async () => {
       calls++; await new Promise(r => setTimeout(r, 20));
-      return Response.json({ five_hour: { utilization: 10, resets_at: iso(now + 3600000) }, seven_day: { utilization: 20, resets_at: iso(now + 86400000) } });
+      return Response.json({ organization_id: "fixture-account", five_hour: { utilization: 10, resets_at: iso(now + 3600000) }, seven_day: { utilization: 20, resets_at: iso(now + 86400000) } });
     };
     await Promise.all(Array.from({ length: 10 }, () => collectClaudeUsage({
       enabled: true, credentialFile, cacheFile: join(d.path, "usage.json"), now, fetcher,

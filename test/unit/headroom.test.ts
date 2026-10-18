@@ -537,8 +537,9 @@ test("stdio fake verifies the complete allowlisted exchange and redaction; failu
     assert.equal(row.credits.value?.balance, "61951.0098125000");
     assert.doesNotMatch(JSON.stringify(statusSnapshot({ ...emptyHeadroom(), providers: [row] }, START)), /PRIVATE/);
     const requests = readFileSync(join(home, "requests.jsonl"), "utf8").trim().split("\n").map(l => JSON.parse(l));
-    assert.deepEqual(requests.map(r => r.method), ["initialize", "initialized", "account/rateLimits/read"]);
-    assert.deepEqual(requests[2].params, { excludeResetCreditDetails: true, supportsLunaReserve: false });
+    assert.deepEqual(requests.map(r => r.method), ["initialize", "initialized", "account/read", "account/rateLimits/read"]);
+    assert.deepEqual(requests[2].params, { refreshToken: false });
+    assert.deepEqual(requests[3].params, { excludeResetCreditDetails: true, supportsLunaReserve: false });
     await assert.rejects(readCodexBalance({ ...ctx, command: join(f.path, "missing") }, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "spawn_failed");
     chmodSync(command, 0o600);
     await assert.rejects(readCodexBalance(ctx, new AbortController().signal), e => e instanceof BalanceReadError && e.code === "spawn_failed");

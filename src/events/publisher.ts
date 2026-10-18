@@ -7,12 +7,12 @@ export interface PublisherOptions {
   token?: (event: Publication) => Promise<string>;
   fetch?: typeof globalThis.fetch;
 }
-export async function helperToken(helper: string, event: Publication): Promise<string> {
+export async function helperToken(helper: string, event: Publication, action: "append" | "read" = "append"): Promise<string> {
   if (!helper.startsWith("/")) throw new Error("token_helper_unavailable");
   return new Promise((resolve, reject) => {
     const env = { ...process.env };
     for (const k of ["FEED_TOKEN", "FEED_KEY_FILE", "FEED_CONFIG"]) delete env[k];
-    const child = spawn(helper, ["--audience", "akasha", "--action", "append",
+    const child = spawn(helper, ["--audience", "akasha", "--action", action,
       "--source", event.source, "--host", event.host, "--kind", String(event.payload.kind)],
       { env, stdio: ["ignore", "pipe", "ignore"], detached: true });
     let output = "", done = false;

@@ -39,7 +39,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     const fresh = age !== null && age * 1000 < (q?.operatorEstimate ? 7 * 86_400_000 : config.quotaMaxAgeMs);
     const windows = fresh ? (q?.windows ?? []).filter(w => Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 &&
       w.remainingPercent <= 100 && (w.resetsAt === null || Date.parse(w.resetsAt) > data.now)) : [];
-    if ((!capacity || capacity.reserveWeeks === 0) && windows.some(w => w.remainingPercent / 100 < config.minimumRemaining)) {
+    if ((!capacity || capacity.reserveWeeks === 0 && !["unlimited", "use-it"].includes(capacity.class)) && windows.some(w => w.remainingPercent / 100 < config.minimumRemaining)) {
       reasons.push(`${p.providerInstanceId}: under ${config.minimumRemaining * 100}% remaining, avoid`); continue;
     }
     // Pace the longest known window, normally weekly, while every window gates admission.
@@ -50,7 +50,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     const pace = weekly && timeLeft !== null ? weekly.remainingPercent / 100 - timeLeft : null;
     if (weekly && timeLeft !== null) reasons.push(`${p.providerInstanceId} ${Math.round(weekly.remainingPercent)}% left with ${Math.round(timeLeft * 100)}% of ${weekly.kind} window left: ${pace! >= config.paceMargin ? "under-paced" : "on/ahead of pace"}`);
     else reasons.push(`${p.providerInstanceId}: quota pacing unknown${p.driverKind === "codex" ? ", not assumed unlimited" : ""}${age !== null && age * 1000 >= config.quotaMaxAgeMs ? " (stale cache)" : ""}`);
-    candidates.push({ providerInstanceId: p.providerInstanceId, model, options: { [option]: effort }, driver: p.driverKind, pace });
+    candidates.push({ ...(p.accountKey ? { accountKey: p.accountKey } : {}), providerInstanceId: p.providerInstanceId, model, options: { [option]: effort }, driver: p.driverKind, pace });
   }
   const a = data.analytics;
   const analyticsAge = ageSeconds(a?.fetchedAt, data.now);
@@ -101,7 +101,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     if (x.driver !== y.driver) return x.driver === preferred ? -1 : 1;
     return x.providerInstanceId.localeCompare(y.providerInstanceId);
   });
-  const target = (c: Target): Target => ({ providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
+  const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
   if (!eligible[0]) throw new Error("No eligible routing candidate: " + reasons.join("; "));
   if (input.role === "critical-review" && input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
   return { ...target(eligible[0]), alternatives: eligible.slice(1).map(target), reasons,

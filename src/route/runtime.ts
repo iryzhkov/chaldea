@@ -1,14 +1,17 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadState, emptyState } from "../quota/state.ts";
-import { classifyCapacities } from "../quota/capacity.ts";
+import { loadHeadroomConfig } from "../quota/codex-balance.ts";
+import { capacitySnapshot, mergeSnapshots, readSnapshots, snapshotProvider } from "../quota/fleet.ts";
+import { capacityKey } from "../quota/account.ts";
+import { classifyCapacity } from "../quota/capacity.ts";
 import { loadCapacityConfig } from "../quota/capacity-config.ts";
 import { metricNow, newProvider } from "../quota/headroom.ts";
 import { discoverServerUrl, switchPort } from "../t3/adapter.ts";
 import type { SwitchProvider } from "../t3/adapter.ts";
 import { readToken } from "../quota/run.ts";
 import { loadRouteConfig } from "./config.ts";
-import { collectClaudeUsage } from "./claude-usage.ts";
+import { collectClaudeUsage, claudeCacheFile } from "./claude-usage.ts";
 import { collectAnalytics } from "./analytics.ts";
 import { recommend } from "./policy.ts";
 import { routeInput } from "./types.ts";
@@ -19,7 +22,7 @@ import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
  */
 export function routeCatalog(providers: ReadonlyArray<SwitchProvider>): CatalogProvider[] {
   return providers.map(p => ({
-    providerInstanceId: p.instanceId, driverKind: p.driver,
+    providerInstanceId: p.instanceId, ...(p.quotaAccountKey ? { accountKey: p.quotaAccountKey } : {}), driverKind: p.driver,
     canRunChildTask: p.enabled && p.installed && p.availability !== "unavailable" &&
       ["ready", "warning"].includes(p.status) && p.auth.status === "authenticated",
     models: p.models.map(m => ({ id: m.slug, options: m.capabilities?.optionDescriptors ?? [] })),
@@ -61,7 +64,7 @@ export async function route(value: unknown, options: {
   }
   const id = config.claudeUsage.providerInstanceId;
   const claudeBound = catalog.some(p => p.providerInstanceId === id && p.driverKind === "claudeAgent" && p.canRunChildTask);
-  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: join(config.cacheDir, "claude-usage.json"), now,
+  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: claudeCacheFile(options.home ?? homedir(), config.claudeUsage.credentialFile), now,
     ...(options.fetcher ? { fetcher: options.fetcher } : {}) });
   if (usage.reason) reasons.push(!config.claudeUsage.enabled || claudeBound ? usage.reason : "Claude collector binding absent or unavailable; skipped");
   if (claudeBound) {
@@ -84,6 +87,7 @@ export async function route(value: unknown, options: {
     .filter(p => p.driverKind === "codex" || p.driverKind === "claudeAgent").map(p => {
       const original = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
       const row = { ...(original ?? newProvider(p.providerInstanceId, p.driverKind)) };
+      if (p.providerInstanceId === id && usage.value?.accountKey) row.accountKey = usage.value.accountKey;
       const q = quota[p.providerInstanceId];
       if (q) row.included = { state: "fresh", error: null, source: q.operatorEstimate ? "operator-weekly-target" : row.included.source,
         observedAt: q.observedAt, value: q.windows.map(w => ({ ...w, id: (w as { id?: string }).id ?? w.kind, usedPercent: 100 - w.remainingPercent })) };
@@ -91,8 +95,49 @@ export async function route(value: unknown, options: {
     }) } };
   const capacityConfig = { ...loadCapacityConfig(options.home ?? homedir(), config.capacityConfigFile),
     paceMargin: config.paceMargin, minimumRemaining: config.minimumRemaining, maxAgeMs: config.quotaMaxAgeMs };
-  const capacity = classifyCapacities(capacityState, now, capacityConfig);
-  const result = recommend(input, { catalog, quota, analytics: analytics.value, now, config, capacity });
+  const reporting = loadHeadroomConfig(options.home ?? homedir(), config.quotaConfigFile);
+  // Bind a shared account only to a locally known T3 instance. A host alias is not
+  // an account identity and a remote host's alias never selects a local login.
+  const mappings = new Map<string, string>();
+  const blockedInstances = new Set<string>();
+  for (const ctx of reporting.contexts) if (ctx.accountKey)
+    for (const alias of ctx.providers) mappings.set(alias, ctx.accountKey);
+  for (const ctx of reporting.claudeContexts ?? []) if (ctx.accountKey) mappings.set(ctx.providerInstanceId, ctx.accountKey);
+  for (const p of catalog) {
+    const row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
+    if (!row) continue;
+    const configured = mappings.get(p.providerInstanceId);
+    if (configured && p.accountKey && configured !== p.accountKey) {
+      blockedInstances.add(p.providerInstanceId);
+      reasons.push(p.providerInstanceId + ": configured account does not match the live T3 login; excluded");
+    }
+    const key = configured ?? p.accountKey ?? row.accountKey;
+    if (key && row.accountKey !== key) {
+      const clean = newProvider(row.alias, row.driver);
+      clean.accountKey = key;
+      capacityState.headroom.providers[capacityState.headroom.providers.indexOf(row)] = clean;
+      quota[row.alias] = { observedAt: null, windows: [], activeStop: quota[row.alias]?.activeStop ?? false };
+    } else if (key) row.accountKey = key;
+  }
+  const local = capacitySnapshot(reporting.fleet?.host ?? "local", capacityState.headroom.providers,
+    new Set(Object.entries(quota).filter(([, q]) => q.activeStop).map(([id]) => id)), now);
+  const shared = reporting.fleet ? await readSnapshots(reporting.fleet, now, options.fetcher) : [];
+  const merged = mergeSnapshots([...shared, local], now);
+  const capacity: Record<string, ReturnType<typeof classifyCapacity>> = {};
+  const boundCatalog = catalog.map(p => {
+    let row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
+    const key = mappings.get(p.providerInstanceId) ?? p.accountKey ?? row?.accountKey;
+    const account = key ? merged.get(capacityKey(p.driverKind, key)) : undefined;
+    const stop = quota[p.providerInstanceId]?.activeStop ?? false;
+    if (account) {
+      if (account.host !== local.host) row = snapshotProvider(account, p.providerInstanceId);
+      quota[p.providerInstanceId] = { observedAt: account.observedAt, windows: account.windows, activeStop: account.activeStop || stop };
+      reasons.push(p.providerInstanceId + " account " + key + " observed on " + account.host + "; age " + account.ageSeconds + "s");
+    }
+    if (row) capacity[p.providerInstanceId] = classifyCapacity(row, account?.activeStop || stop, now, capacityConfig);
+    return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId), ...(key ? { accountKey: key } : {}) };
+  });
+  const result = recommend(input, { catalog: boundCatalog, quota, analytics: analytics.value, now, config, capacity });
   result.reasons.unshift(...reasons);
   return result;
 }

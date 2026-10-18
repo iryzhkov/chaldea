@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { validateSnapshot } from "../quota/fleet.ts";
 import { strictJson } from "../access/token.ts";
 
 export const KiB = 1024;
@@ -78,7 +79,7 @@ export function normaliseTags(raw: unknown): string[] {
 const COMMON = ["v", "kind", "source", "host", "run_id", "project", "occurred_at", "severity", "title", "body", "tags", "link", "data"];
 const DATA: Record<Kind, readonly string[]> = {
   feed_post: [], report: ["status", "checks"],
-  quota_headroom_snapshot: ["transition_id"],
+  quota_headroom_snapshot: ["transition_id", "capacity"],
   quota_headroom_changed: ["transition_id"],
   quota_headroom_low: ["transition_id"],
   quota_parked: ["thread_id", "run_id", "provider", "reset_at", "transition_id"],
@@ -101,7 +102,9 @@ function validateData(kind: Kind, data: Record<string, unknown>): void {
   fields(data, DATA[kind]);
   ensure(Buffer.byteLength(canonical(data)) <= 48 * KiB, "data_too_large", 413);
   for (const [key, value] of Object.entries(data)) {
-    if (key === "checks") {
+    if (key === "capacity") {
+      try { validateSnapshot(value); } catch { throw new HttpError(400, "invalid_capacity_snapshot"); }
+    } else if (key === "checks") {
       ensure(Array.isArray(value) && value.length <= 100, "invalid_checks");
       for (const item of value) { const c = record(item); fields(c, ["name", "status"]); text(c.name, 128, true); text(c.status, 32, true); }
     } else if (key === "args") {
@@ -142,6 +145,7 @@ export function normalize(payload: Record<string, unknown>, identity: Identity, 
   const data = { ...record(payload.data ?? {}) };
   if (kind === "tool_call" && data.ts !== undefined) data.ts = timestamp(data.ts);
   validateData(kind as Kind, data);
+  if (data.capacity !== undefined) ensure(record(data.capacity).host === identity.host, "snapshot_host_mismatch", 403);
   // Tool telemetry is allowlisted data only; general prose could smuggle raw output.
   if (kind === "tool_call") ensure(!payload.body && !payload.title && !link && tags.length === 0, "tool_prose_forbidden");
   const occurred = payload.occurred_at === undefined ? null : timestamp(payload.occurred_at);
