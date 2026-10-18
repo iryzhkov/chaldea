@@ -5,6 +5,7 @@ import { rig, event, project, N } from "./helpers.ts";
 import { httpServer } from "../../src/akasha/http.ts";
 import { Ingress } from "../../src/akasha/ingress.ts";
 import { hash } from "../../src/akasha/schema.ts";
+import { legacyEnvelope } from "../../src/akasha/migration/feed.ts";
 
 test("613-row real-clock HTTP history stays complete, byte-bounded and cursor compatible", { timeout: 120_000 }, async () => {
   const r = await rig("operator"), boot = performance.now();
@@ -18,8 +19,9 @@ test("613-row real-clock HTTP history stays complete, byte-bounded and cursor co
     checks++; return check();
   };
   for (let i = 1; i <= 613; i++) {
-    const e = event(i); e.body = "🌗".repeat(150); e.title = "history " + i;
-    r.store.admit(e, hash("history-" + i), N);
+    const row = { id: i, created_at: new Date(N * 1000).toISOString(), host: "agent-a",
+      source: r.r.source, severity: "info", title: "history " + i, body: "🌗".repeat(150), tags: "test", link: "" };
+    r.store.admit(legacyEnvelope(row, N), hash(row), N, i);
   }
   project(r.store);
   const server = httpServer(new Ingress(r.auth, r.store, () => {}));
@@ -105,8 +107,10 @@ for (const failure of ["expiry", "revocation", "clock", "disconnect"] as const) 
 }
 
 test("single existing oversized legacy row retains JSON and escaped HTML compatibility", async () => {
-  const r = await rig("operator"), e = event(1);
-  e.body = "<&".repeat(50_000); r.store.admit(e, hash("large-legacy"), N); project(r.store);
+  const r = await rig("operator");
+  const row = { id: 1, created_at: new Date(N * 1000).toISOString(), host: "agent-a",
+    source: r.r.source, severity: "info", title: "large legacy", body: "<&".repeat(50_000), tags: "", link: "" };
+  const e = legacyEnvelope(row, N); r.store.admit(e, hash(row), N, row.id); project(r.store);
   const server = httpServer(new Ingress(r.auth, r.store, () => {}));
   server.listen(0, "127.0.0.1"); await once(server, "listening");
   try {
