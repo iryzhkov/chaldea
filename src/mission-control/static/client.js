@@ -109,7 +109,7 @@ script.onload = () => {
   const compactTokens = n => n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(n>=1e4?0:1)+'K' : String(n);
   UI.agentMetrics = a => {
     const d=a.details, reported=d && (!a.detailCoverage || a.detailCoverage==="reported") && d.fieldCoverage!=="identity-only";
-    const effort=reported?d.effort?.value:null, u=reported?d.usage:null;
+    const effort=reported && d.effort?.source==="reported"?d.effort.value:null, u=reported?d.usage:null;
     const tokens=u && u.coverage!=="not-reported" && Number.isFinite(u.total)?u.total:null;
     return (a.model && a.model!=="unknown"?'<span class="card-model" title="'+esc(a.model)+'">'+esc(a.model)+'</span>':'')
       +(effort?'<span class="card-effort" title="Reported effort">'+esc(effort)+'</span>':'')

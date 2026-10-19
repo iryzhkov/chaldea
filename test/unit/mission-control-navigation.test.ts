@@ -215,7 +215,10 @@ test("cards render sanitized title and footer state with full identity and prove
  b.snapshot(snapshot);
  let html=b.elements.view!.innerHTML;
  assert.match(b.elements.view!.querySelector(".card-status")!.textContent,/Thinking/);
+ assert.equal(b.elements.view!.querySelector(".card-effort"),null);
+ d.effort={value:"high",source:"reported"};b.snapshot(snapshot);
  assert.match(b.elements.view!.querySelector(".card-effort")!.textContent,/high/);
+ d.effort={value:"high",source:"configured"};b.snapshot(snapshot);
  assert.doesNotMatch(b.elements.view!.querySelector("header")!.textContent,/Thinking|high/);
  assert.match(html,/Actual &lt;script&gt;title&lt;\/script&gt;/);
  assert.match(html,/Latest &lt;img/);assert.doesNotMatch(html,/<script>|<img /);
