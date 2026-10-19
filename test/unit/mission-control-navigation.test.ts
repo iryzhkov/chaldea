@@ -73,6 +73,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
       return this.parts.map(p=>typeof p==="string"?p:"<"+p.tag+Object.entries(p.attrs).map(([k,v])=>" "+k+'="'+v+'"').join("")+">"+p.innerHTML+"</"+p.tag+">").join("");
     }
     descendants(): Element[] { return this.children.flatMap(c=>[c,...c.descendants()]); }
+    querySelectorAll(selector: string): Element[] { return this.descendants().filter(e=>e.matches(selector)); }
     querySelector(selector: string): Element | null {
       if (selector === ".on .bar i") return this.children.find(e => e.className === "on")?.bar ?? null;
       if (selector === ".bar i") return this.bar ?? null;
