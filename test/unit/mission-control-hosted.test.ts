@@ -24,6 +24,26 @@ function live(clock=()=>now0,rows=[row()]){const m=new MissionModel(false,clock)
 const sample=(sequence=1,now=now0)=>{const s=captureSnapshot(live(()=>now),"agent-a",epoch,sequence)!;delete s.rich;return s;};
 
 
+test("operations validates source check time at response receipt and still rejects future data",async()=>{
+  const {refreshOperations}=await import("../../src/mission-control/reader.ts");
+  const {emptyOperations}=await import("../../src/mission-control/contract.ts");
+  const config:import("../../src/mission-control/reader.ts").ReaderConfig={url:"https://akasha.example",tokenHelper:"/helper",source:"mission-control-reader",host:"omarchy-normandy",profile:"mission-control-reader",project:"chaldea",allowedSourceIds:["agent-a--mission-control"],cacheFile:"/cache",refreshMs:5000,operationsEnabled:true};
+  let clock=now0;
+  const fetchPage=(extra:number):typeof fetch=>(async()=>{
+    clock=now0+1000;
+    const page=emptyOperations();
+    page.events={...page.events,state:"cached",checkedAt:clock+extra};
+    page.ops.dailyHealth={...page.ops.dailyHealth,state:"cached",checkedAt:clock+extra};
+    return new Response(JSON.stringify(page));
+  }) as typeof fetch;
+  const received=await refreshOperations(config,emptyCache(),{now:()=>clock,token:async()=>"unused",fetch:fetchPage(0)});
+  assert.equal(received.events.state,"cached");assert.equal(received.events.checkedAt,now0+1000);
+  assert.equal(received.ops.dailyHealth.state,"cached");
+  clock=now0;
+  const future=await refreshOperations(config,emptyCache(),{now:()=>clock,token:async()=>"unused",fetch:fetchPage(1000)});
+  assert.equal(future.events.state,"error");assert.equal(future.ops.dailyHealth.state,"error");
+});
+
 for(const existingSlot of [false,true])test("R1 full4096page status admission cannot starve100 protected ordinary deliveries, existingSlot="+existingSlot,async()=>{
   const d=scratch(),o=new Outbox(join(d.path,"full.db"));
   try{
@@ -434,6 +454,48 @@ test("sparse v4 authoritative empty activity survives the public cache projectio
   const actual=new CacheModel(path,()=>now0).snapshot().agents[0]!.details;
   assert.deepEqual(actual.recent,[]);
   assert.equal(actual.assistant.text,"Legacy observation only.");
+ }finally{dir.close();}
+});
+
+
+test("hosted quota uses private observer custody, per-host age and closed compact budget",async()=>{
+ const {emptyHeadroom,newProvider}=await import("../../src/quota/headroom.ts");
+ const {saveState,emptyState}=await import("../../src/quota/state.ts");
+ const {readCaptureQuota}=await import("../../src/mission-control/capture.ts");
+ const {chmodSync,symlinkSync}=await import("node:fs");
+ const dir=scratch(),path=join(dir.path,"quota-observer.json"),m=live();
+ try{
+  chmodSync(dir.path,0o700);const state=emptyState(),head=emptyHeadroom();
+  for(const [alias,driver] of [["PRIVATE-alias","codex"],["PRIVATE-claude","claudeAgent"],["PRIVATE-copy","codex"]]){
+   const p=newProvider(alias!,driver!);p.accountKey=(driver==="codex"?"a":"b").repeat(64);
+   p.included={state:"fresh",observedAt:new Date(now0-100_000).toISOString(),error:null,source:"private",value:[{id:"private",kind:"rolling",usedPercent:0,remainingPercent:100,windowDurationMins:300,resetsAt:new Date(now0+100_000).toISOString()}]};
+   p.credits={state:"fresh",observedAt:new Date(now0-200_000).toISOString(),error:null,source:"private",value:{balance:"0",hasCredits:false,unlimited:true}};
+   head.providers.push(p);
+  }
+  state.headroom=head;saveState(path,state,now0);readCaptureQuota(m,path);
+  const s=captureSnapshot(m,"agent-a",epoch,1)!;
+  assert.equal(s.quota!.accounts.length,2);assert.equal(s.quota!.accounts[0]![3],0);
+  assert.doesNotMatch(JSON.stringify(s.quota),/PRIVATE|accountKey|private|aaaaaaaa/);
+  assert.equal(s.quota!.accounts[0]![11],now0-200_000);
+  const many=live();many.setQuota({...head,providers:Array.from({length:6},(_,i)=>({...head.providers[0]!,accountKey:i.toString(16).padStart(64,"0")}))});
+  const capped=captureSnapshot(many,"agent-a",epoch,1)!.quota!;assert.equal(capped.accounts.length,4);assert.equal(capped.omitted,2);
+  const cache=emptyCache();mergeStatus(cache,s,now0);
+  const next=sample(2,now0+1000);next.quota={state:"byte-budget",observedAt:now0-100_000,omitted:2,accounts:[]};mergeStatus(cache,next,now0+1000);
+  const file=join(dir.path,"cache");writeCache(file,cache);
+  const q=new CacheModel(file,()=>now0+2000).snapshot().quota.hosts![0]!;
+  assert.equal(q.state,"byte-budget");assert.equal(q.accounts.length,2);assert.equal(q.accounts[0]!.ageSeconds,102);
+  assert.equal(q.observedAt,now0-100_000);
+  chmodSync(path,0o644);readCaptureQuota(m,path);assert.equal(captureSnapshot(m,"agent-a",epoch,3)!.quota!.state,"error");
+  chmodSync(path,0o600);chmodSync(dir.path,0o755);readCaptureQuota(m,path);assert.equal(m.snapshot().quota.state,"error");chmodSync(dir.path,0o700);
+  const link=join(dir.path,"link");symlinkSync(path,link);readCaptureQuota(m,link);assert.equal(m.snapshot().quota.state,"error");
+  // Actual two-provider projection must retain useful activity for all nine escaped threads.
+  const rows=Array.from({length:9},(_,i)=>({...row("mcp:quota-budget-"+i),title:"Quota task "+i})),nine=live(()=>now0,rows);nine.setQuota(head);
+  for(const r of rows)nine.detail(r.id,{kind:"recent-item",id:"actual",ordinal:1,type:"assistant",text:'界 🧪 " \\ '.repeat(100),at:now0,status:"completed"});
+  const wire=captureSnapshot(nine,"agent-a",epoch,1)!;
+  const expanded=normalizeRich(wire.rich,new Set(wire.agents.map(a=>a.id)),wire.observedAt);
+  console.log("QUOTA_CAPACITY "+JSON.stringify({bytes:Buffer.byteLength(JSON.stringify(wire)),quotaBytes:Buffer.byteLength(JSON.stringify(wire.quota)),rows:wire.agents.length,useful:expanded.details.filter(d=>d.value.fieldCoverage!=="identity-only"&&d.value.recent?.some(r=>r.preview.text)).length}));
+  assert.equal(wire.quota!.accounts.length,2);assert.equal(wire.agents.length,9);assert.equal(expanded.details.filter(d=>d.value.fieldCoverage!=="identity-only"&&d.value.recent?.some(r=>r.preview.text)).length,9);assert.ok(Buffer.byteLength(JSON.stringify(wire))<=8192);
+  for(const mutate of [(x:any)=>x.quota.accountKey="PRIVATE",(x:any)=>x.quota.accounts[0][0]="private@example.com",(x:any)=>x.quota.accounts[0][2]=now0+1]){const bad=structuredClone(s);mutate(bad);assert.throws(()=>validateHostSnapshot(bad));}
  }finally{dir.close();}
 });
 

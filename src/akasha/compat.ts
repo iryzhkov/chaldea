@@ -1,6 +1,7 @@
 import { ensure, HttpError, hash, record } from "./schema.ts";
 import type { FeedRow, Envelope } from "./schema.ts";
-import { scopeSql } from "./store.ts";
+import { emptyOperations, operationText, validateOperations } from "../mission-control/contract.ts";
+import { OPERATIONS_PAIRS, scopeSql } from "./store.ts";
 import type { EventStore, Query } from "./store.ts";
 import type { Scope } from "./auth.ts";
 
@@ -73,6 +74,7 @@ interface Cursor { v: number; epoch: string; seq: number; binding: string }
 export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, now: number): {
   rows: Generator<Envelope>; next: () => string | null;
 } {
+  ensure(scope.missionControlOperations===undefined,"operations_selector_required",403);
   const count = limit(q), query = new URLSearchParams(q); query.delete("cursor");
   const binding = hash([scope, [...query.entries()].sort()]);
   let seq = 0;
@@ -114,6 +116,36 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
     return Buffer.from(JSON.stringify(c)).toString("base64url");
   } };
 }
+
+/** This selector returns only public fields; authorized private envelopes never leave H. */
+export function operationsPage(store:EventStore,q:URLSearchParams,scope:Scope,now:number):import("../mission-control/contract.ts").OperationsDTO {
+  const kind=q.get("mission_control_operations");
+  ensure((kind==="job_finished"||kind==="report")&&[...q.keys()].length===3&&new Set(q.keys()).size===3&&q.get("window")==="48h"&&q.get("limit")==="16","invalid_operations_selector",403);
+  ensure(scope.missionControlSources!==undefined&&!scope.missionControlOperations,"operations_forbidden",403);
+  const result=emptyOperations(),checkedAt=now*1000;
+  const base=scopeSql({...scope,missionControlOperations:kind});
+  for(const pair of OPERATIONS_PAIRS.filter(p=>p.kind===kind)){
+    const records=store.db.prepare("SELECT json_object('source_id',json_extract(envelope,'$.source_id'),'issuer',issuer,'profile',profile,'project',project,'host',host,'source',source,'kind',kind,'severity',json_extract(envelope,'$.severity'),'occurred_at',occurred_at,'received_at',received_at,'provenance',json_object('type',json_extract(envelope,'$.provenance.type')),'data',json_object('job_id',json_extract(envelope,'$.data.job_id'),'status',json_extract(envelope,'$.data.status'),'checks',json_extract(envelope,'$.data.checks'))) AS envelope FROM events WHERE "+base.sql+" AND json_extract(envelope,'$.source_id')=? AND occurred_at>=? AND occurred_at<=? AND received_at<=? AND expiry>? ORDER BY occurred_at DESC,seq DESC LIMIT 17").all(...base.params,pair.source_id,new Date(checkedAt-48*3600_000).toISOString(),new Date(checkedAt).toISOString(),new Date(checkedAt).toISOString(),now) as {envelope:string}[];
+    result.events.truncated ||= records.length>16;
+    for(const raw of records.slice(0,16)){
+      const e=JSON.parse(raw.envelope) as Envelope;
+      ensure(e.provenance.type==="verified"&&e.source_id===pair.source_id&&e.issuer===pair.issuer&&e.profile===pair.profile&&e.project===pair.project&&e.host===pair.host&&e.source===pair.source&&e.kind===pair.kind,"invalid_operations_pair",403);
+      const occurredAt=Date.parse(e.occurred_at),receivedAt=Date.parse(e.received_at);
+      if(kind==="job_finished"){
+        ensure(["chaldea-fleet-pull","chaldea-retention"].includes(String(e.data.job_id))&&["changed","failed"].includes(String(e.data.status))&&e.severity===(e.data.status==="failed"?"fail":"info"),"invalid_timer_projection");
+        result.events.rows.push({host:pair.host,job:e.data.job_id as "chaldea-fleet-pull"|"chaldea-retention",status:e.data.status as "changed"|"failed",severity:e.severity as "info"|"fail",occurredAt,receivedAt});
+      }else{
+        ensure(operationText(e.data.status,32)&&Array.isArray(e.data.checks)&&e.data.checks.length<=100,"invalid_report_projection");
+        const checks=e.data.checks.map(raw=>{const c=record(raw);ensure(Object.keys(c).length===2&&operationText(c.name,128)&&operationText(c.status,32),"invalid_report_check");return {name:c.name,status:c.status};});
+        if(result.ops.dailyHealth.report===null)result.ops.dailyHealth.report={status:e.data.status,occurredAt,receivedAt,checks:checks.slice(0,16),omitted:Math.max(0,checks.length-16)};
+      }
+    }
+  }
+  if(kind==="job_finished"){result.events.state="cached";result.events.checkedAt=checkedAt;result.events.rows.sort((a,b)=>b.occurredAt-a.occurredAt);}
+  else{result.ops.dailyHealth.state="cached";result.ops.dailyHealth.checkedAt=checkedAt;result.events.truncated=false;}
+  return validateOperations(result,checkedAt);
+}
+
 export function escape(value: string): string {
   return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }

@@ -1,3 +1,4 @@
+import { OPERATIONS_PAIRS } from "./store.ts";
 import { compactParts, strictJson, validateClaims, verifyToken } from "../access/token.ts";
 import type { VerifiedAccess } from "../access/token.ts";
 import type { Clock, TrustStore } from "../access/trust.ts";
@@ -7,9 +8,9 @@ import type { Identity, Kind } from "./schema.ts";
 export interface Registration {
   issuer: string; source: string; host: string; source_id: string;
   profile: string; project: string; mode: "report" | "service" | "operator";
-  kinds: Kind[]; mission_control_read_sources?: string[]; route_scores_read?: boolean; quota_fleet_read?: boolean; global_read?: boolean; roots?: string[];
+  kinds: Kind[]; mission_control_operations_read?:true; mission_control_read_sources?: string[]; route_scores_read?: boolean; quota_fleet_read?: boolean; global_read?: boolean; roots?: string[];
 }
-export interface Scope { issuer: string; profile: string; project: string; source: string; host: string; global: boolean; quotaFleet?: boolean; routeScores?: boolean; missionControlSources?: string[] }
+export interface Scope { issuer: string; profile: string; project: string; source: string; host: string; global: boolean; quotaFleet?: boolean; routeScores?: boolean; missionControlSources?: string[]; missionControlOperations?:"job_finished"|"report" }
 export interface Principal {
   identity: Identity; scope: Scope; registration: Registration; access: VerifiedAccess;
   recheck(): Promise<void>;
@@ -24,7 +25,7 @@ export class Authorization {
     const ids = new Set<string>(), identities = new Set<string>();
     for (const entry of registry) {
       const e = record(entry);
-      fields(e, ["issuer", "source", "host", "source_id", "profile", "project", "mode", "kinds", "global_read", "route_scores_read", "quota_fleet_read", "mission_control_read_sources", "roots"]);
+      fields(e, ["issuer", "source", "host", "source_id", "profile", "project", "mode", "kinds", "global_read", "route_scores_read", "quota_fleet_read", "mission_control_read_sources", "mission_control_operations_read", "roots"]);
       for (const k of ["issuer", "source", "host", "profile", "project"]) text(e[k], 128, true);
       ensure(entry.issuer === "chaldea:" + entry.host, "registry_host_mismatch");
       ensure(/^[a-z0-9][a-z0-9_-]{0,127}$/.test(entry.source_id) && entry.source_id !== "legacy-feed" &&
@@ -36,6 +37,7 @@ export class Authorization {
       ensure(entry.route_scores_read === undefined || (entry.route_scores_read === true && entry.mode === "service" && entry.source === "route"), "invalid_route_scores_read");
       ensure(entry.quota_fleet_read === undefined || (entry.quota_fleet_read === true && entry.mode === "service" && entry.source === "quota"), "invalid_quota_fleet_read");
       ensure(entry.global_read === undefined || (entry.global_read === true && entry.mode === "operator"), "invalid_global_read");
+      ensure(entry.mission_control_operations_read===undefined||entry.mission_control_operations_read===true&&entry.profile==="mission-control-reader"&&entry.mission_control_read_sources!==undefined,"invalid_operations_reader");
       ensure(entry.roots === undefined || (Array.isArray(entry.roots) && entry.roots.length <= 32 &&
         entry.roots.every(r => typeof r === "string" && r.startsWith("/") && r.length <= 512)), "invalid_roots");
     }
@@ -45,9 +47,10 @@ export class Authorization {
     for (const p of registry) if(p.profile==="mission-control-reader") ensure(p.mission_control_read_sources!==undefined,"mission_control_selector_required");
     for (const entry of registry) if (entry.mission_control_read_sources !== undefined) {
       const sources=entry.mission_control_read_sources;
-      ensure(entry.mode==="service"&&entry.profile==="mission-control-reader"&&entry.project==="chaldea"&&entry.source==="mission-control-reader"&&entry.host==="omarchy-normandy"&&entry.kinds.length===1&&entry.kinds[0]==="agent_status"&&!entry.global_read&&!entry.quota_fleet_read&&!entry.route_scores_read, "invalid_mission_control_reader");
+      ensure(entry.mode==="service"&&entry.profile==="mission-control-reader"&&entry.project==="chaldea"&&entry.source==="mission-control-reader"&&entry.host==="omarchy-normandy"&&(entry.mission_control_operations_read?entry.kinds.length===3&&new Set(entry.kinds).size===3&&["agent_status","job_finished","report"].every(k=>entry.kinds.includes(k as Kind)):entry.kinds.length===1&&entry.kinds[0]==="agent_status")&&!entry.global_read&&!entry.quota_fleet_read&&!entry.route_scores_read, "invalid_mission_control_reader");
       ensure(Array.isArray(sources)&&sources.length>0&&sources.length<=4&&new Set(sources).size===sources.length&&sources.every(id=>typeof id==="string"&&publishers.some(p=>p.source_id===id&&p.mode==="service"&&p.project==="chaldea"&&p.issuer==="chaldea:"+p.host&&p.source===p.host+".mission-control"&&p.source_id===p.host+"--mission-control"&&p.kinds.length===1&&p.kinds[0]==="agent_status")), "invalid_mission_control_sources");
     }
+    if(registry.some(r=>r.mission_control_operations_read))for(const pair of OPERATIONS_PAIRS)ensure(registry.some(r=>r.source_id===pair.source_id&&r.issuer===pair.issuer&&r.profile===pair.profile&&r.project===pair.project&&r.host===pair.host&&r.source===pair.source&&r.kinds.includes(pair.kind as Kind)),"missing_operations_pair");
     this.registry = structuredClone(registry); this.trust = trust; this.clock = clock;
   }
   async authorize(token: string, action: "append" | "read"): Promise<Principal> {

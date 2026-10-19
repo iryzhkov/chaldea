@@ -155,6 +155,9 @@ export class MissionModel {
     this.changed();
   }
   setQuota(state: HeadroomState | null, error = false): void { this.quota = state; this.quotaError = error; this.changed(); }
+  quotaTimes():[number|null,number|null][] {
+    const seen=new Set<string>();return (this.quota?.providers??[]).slice(0,32).filter(p=>{const k=p.driver+":"+(p.accountKey??p.alias);if(seen.has(k))return false;seen.add(k);return true;}).map(p=>[at(p.credits.observedAt),at(p.manualResets.observedAt)]);
+  }
   snapshot() {
     const now = this.now();
     const freshness = (connected: boolean, observed: number | null, stale: number, lost: number) =>
@@ -198,7 +201,7 @@ export class MissionModel {
         output: this.usageObserved === null ? null : this.output, observedAt: this.usageObserved,
         coverage: this.accountingPartial ? "partial" : "observed",
         scope: this.accountingPartial ? "Partial accounting: known lower bound after bounded counter eviction. Uncertain returning counters establish new baselines. Daily reconciliation unavailable." : "Observed deltas since this process started; 48-thread cap. Daily reconciliation unavailable." },
-      quota: { state: this.quotaError ? "error" : this.quota === null ? "unknown" : "cached", accounts },
+      quota: { state: this.quotaError ? "error" : this.quota === null ? "unknown" : "cached", accounts } as {state:string;accounts:typeof accounts;hosts?:{host:string;state:string;observedAt:number|null;omitted:number;accounts:typeof accounts}[]},
       unavailable: ["Events","Ops","Lab","host health","exec slots","cost","daily totals"] };
     // Recent text yields before existing identity/resource/base coverage.
     for(const a of [...agents].reverse()){
@@ -211,6 +214,6 @@ export class MissionModel {
       a.details={...emptyDetail(),identity:a.details.identity,fieldCoverage:"identity-only"};
       a.detailCoverage="byte-budget";
     }
-    return result;
+    return result as typeof result & Partial<import("./contract.ts").OperationsDTO>;
   }
 }

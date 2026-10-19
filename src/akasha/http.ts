@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { once } from "node:events";
 import type { Principal } from "./auth.ts";
 import type { Ingress } from "./ingress.ts";
-import { article, eventPage, feedRows, limit } from "./compat.ts";
+import { article, eventPage, operationsPage, feedRows, limit } from "./compat.ts";
 import { ensure, HttpError, MAX_EVENT, MAX_LEGACY, parse } from "./schema.ts";
 import type { Receipt } from "./store.ts";
 
@@ -133,6 +133,11 @@ export function httpServer(ingress: Ingress) {
           await fragments(res, p, values()); res.end(); return;
         }
         if (path === "/api/v1/events") {
+          if(url.searchParams.has("mission_control_operations")){
+            ensure(p.registration.mission_control_operations_read===true&&p.scope.missionControlSources!==undefined,"operations_forbidden",403);
+            const result=operationsPage(ingress.store,url.searchParams,p.scope,ingress.now());
+            await p.recheck();json(res,200,result);return;
+          }
           const page = eventPage(ingress.store, url.searchParams, p.scope, ingress.now());
           res.writeHead(200, { "content-type": "application/json" });
           function* values(): Generator<string> {

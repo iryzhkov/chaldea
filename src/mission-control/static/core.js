@@ -78,7 +78,7 @@
   };
   const compact = n => n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(n >= 1e4 ? 0 : 1) + 'K' : String(n);
   const sev = (pct, w = 80, f = 95) => pct == null ? 'nosrc' : pct >= f ? 'fail' : pct >= w ? 'warn' : '';
-  const FRESH_WORD = { disconnected:'disconnected', live:'observed', stale:'stale', lost:'no data', nosource:'no source', asleep:'asleep', unsupported:'not applicable' };
+  const FRESH_WORD = { cached:'cached', error:'source error', disconnected:'disconnected', live:'observed', stale:'stale', lost:'no data', nosource:'no source', asleep:'asleep', unsupported:'not applicable' };
   const panel = (area, title, body, kind, age, explicit, extra = '') => { const f = freshOf(kind, age, explicit);
     const chip = f === 'live' ? ago(age) : f === 'stale' ? 'stale ' + ago(age) : f === 'lost' ? 'no data ' + ago(age) : FRESH_WORD[f];
     const note = f === 'stale' ? `<div class="lastknown">Last observed ${ago(age)} ago · values are last known · source ${SOURCES[kind].label}</div>` : f === 'lost' ? `<div class="lastknown">No data for ${ago(age)} · last known values · source ${SOURCES[kind].label}</div>` : '';

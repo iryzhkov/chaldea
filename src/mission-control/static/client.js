@@ -20,6 +20,8 @@ document.getElementById("board").style.visibility = "hidden";
 const script = document.createElement("script"); script.src = "/core.js"; document.body.append(script);
 script.onload = () => {
   const { R, UI } = window.MC, { panel, heroStat, gauge, st, budget } = UI;
+  document.getElementById("view").setAttribute("tabindex","0");
+  document.getElementById("view").setAttribute("aria-label","Mission Control page");
   const esc = v => String(v ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const missing = text => '<div class="muted">' + esc(text) + '</div>';
   let snapshot = null, receivedSnapshot = null, transportConnected = false, mode = window.MC.modeFromURL();
@@ -31,17 +33,73 @@ script.onload = () => {
     const reset = a.resetsAt == null ? "Reset unknown" : "Reset in " + Math.max(0,Math.ceil((a.resetsAt-Date.now())/60000)) + " min";
     return '<div class="acard">' + used + '<div class="facts"><div>' + esc(a.state) + '</div><div>' + esc(reset) + '</div><div>' + (a.unlimited === true ? "Credit balance unlimited" : a.credits == null ? "Credit balance unknown" : "Credits " + esc(a.credits) + " remaining") + '</div><div>' + (a.manualResets == null ? "Manual resets unknown" : a.manualResets + " manual resets available") + '</div><div class="t1 muted">Credits ' + esc(a.creditState) + ' · resets ' + esc(a.resetState) + '</div><div class="t1 muted">Cached quota · observed ' + (age(a.observedAt) ?? "unknown") + 's ago</div></div><div class="more">Window history unavailable</div></div>';
   };
-  const quotas = (area="acct") => snapshot?.quota.accounts.length ? budget(snapshot.quota.accounts,6,a=>panel(area,a.label,accountBody(a),"quota",age(a.observedAt),["unknown","error"].includes(a.state) ? "nosource" : a.state === "unsupported" ? "unsupported" : ["stale","lost"].includes(a.state) ? a.state : undefined),"accounts") : unavailable(area,"Quota · " + (snapshot?.quota.state || "unknown"));
+  const agoText = at => age(at) == null ? "unknown" : age(at)<60 ? age(at)+"s ago" : age(at)<3600 ? Math.floor(age(at)/60)+"m ago" : Math.floor(age(at)/3600)+"h ago";
+  const timestamp = at => Number.isFinite(at) ? '<time datetime="'+new Date(at).toISOString()+'">'+esc(new Date(at).toISOString().replace("T"," ").slice(0,19)+" UTC")+'</time>' : "unknown";
+  const quotaHosts = () => snapshot?.quota?.hosts;
+  const quotaFresh = (state,at) => state==="error" ? "error" : at==null ? "nosource" : age(at)>5400 ? "lost" : age(at)>1800 ? "stale" : "cached";
+  const quotaRows = h => h.accounts.slice(0,4).map(a=>{
+    const used=Number.isFinite(a.used)?a.used:null;
+    return '<div class="quota-account"><strong>'+esc(a.label)+'</strong><span class="source-meta">'+esc(a.state)+' · observed '+esc(agoText(a.observedAt))+'</span>'
+      +(used==null?missing(a.state==="unsupported"?"Quota not applicable":"Usage unknown"):resourceMeter(a.label+" used",used,used+"% used · "+Number((100-used).toFixed(2))+"% headroom"))
+      +'<div class="source-meta">'+(a.duration==null?"":esc(a.duration)+" min window · ")+(a.resetsAt==null?"Reset unknown":"Reset "+timestamp(a.resetsAt))+'</div>'
+      +((a.unlimited===true||a.credits!=null||a.manualResets!=null)?'<div class="source-meta">'+[a.unlimited===true?"Credits unlimited":a.credits!=null?"Credits remaining "+esc(a.credits):"",a.manualResets!=null?esc(a.manualResets)+" manual resets available":""].filter(Boolean).join(" · ")+'</div>':"")+'</div>';
+  }).join("") || missing(h.state==="byte-budget"?"Quota withheld · host byte budget":h.state==="error"?"Quota source error · no quota data":"No quota data observed");
+  const quotaHostCard = (h,area="acct") => panel(area,"Observed by "+h.host,
+    '<div class="source-meta">'+esc(h.state)+' · quota source '+esc(agoText(h.observedAt))+'</div>'+quotaRows(h)+(h.omitted?'<div class="more">'+esc(h.omitted)+' account rows omitted by source</div>':""),
+    "quota",age(h.observedAt),quotaFresh(h.state,h.observedAt),"quota-host");
+  const quotas = (area="acct") => Array.isArray(quotaHosts()) ? '<div class="host-coverage">Per-host quota observations · the same account may appear on multiple hosts</div>'+(quotaHosts().map(h=>quotaHostCard(h,area)).join("")||missing("No host quota observations"))
+    : snapshot?.quota.accounts.length ? budget(snapshot.quota.accounts,6,a=>panel(area,a.label,accountBody(a),"quota",age(a.observedAt),["unknown","error"].includes(a.state) ? "nosource" : a.state === "unsupported" ? "unsupported" : ["stale","lost"].includes(a.state) ? a.state : undefined),"accounts") : unavailable(area,"Quota · " + (snapshot?.quota.state || "unknown"));
+  const eventRows = () => (snapshot?.events?.rows||[]).filter(r=>["chaldea-fleet-pull","chaldea-retention"].includes(r.job)&&["changed","failed"].includes(r.status)).slice().sort((a,b)=>b.occurredAt-a.occurredAt);
+  const eventBody = (limit=64) => {
+    const rows=eventRows();
+    return (rows.length?budget(rows,limit,r=>'<div class="item maintenance-event"><div class="l1">'+st(r.status==="failed"?"fail":"ok",r.status)+' <strong>'+esc(r.job==="chaldea-fleet-pull"?"Fleet pull":"Retention")+'</strong> · '+esc(r.host)+'</div><div class="source-meta">Occurred '+timestamp(r.occurredAt)+' · received '+timestamp(r.receivedAt)+'</div></div>',"observed runs"):missing("No changed or failed timer runs observed in 48h"));
+  };
+  const eventCoverage = () => {
+    const e=snapshot?.events;
+    return '<div class="source-meta">Fleet pull and retention timers · 48h window · '+esc(e?.state||"unknown")+' · last checked '+esc(agoText(e?.checkedAt))+(e?.truncated?' · truncated; more runs may be omitted':"")+'</div>';
+  };
+  const eventFresh = () => snapshot?.events?.state==="error"?"error":snapshot?.events?.checkedAt==null?"nosource":age(snapshot.events.checkedAt)>900?"stale":"cached";
   R.overview = () => {
-    const s=snapshot, agents=s?.agents || [], live=s?.source.state === "live";
-    const quotaObserved=s?.quota.accounts.map(a=>a.observedAt).filter(Number.isFinite) || [];
-    const kpi = '<div class="stats hero-row">' + [["—","needs Igor"],["—","open incidents"],[s?agents.filter(a=>a.state==="working").length:"—","working"],[s?agents.filter(a=>a.state==="waiting-igor").length:"—","waiting"],["—","exec slots"],["—","queued jobs"],[s?.tokens.rate == null ? "—" : s.tokens.rate.toFixed(1),s?.tokens.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg"],["—","shipped today"]].map(x=>heroStat(...x)).join("") + '</div>';
-    const rows=agents.slice(0,4).map(a=>'<div class="item"><div class="l1"><span class="t two t1">' + esc(a.title) + '</span></div><div class="l2">' + st(a.state,a.state) + ' · ' + esc(a.model) + ' · ' + esc(a.host) + '</div><div class="t1 muted">' + esc(activityItems(a)[0]?.text ? activityItems(a)[0].kind+": "+activityItems(a)[0].text : "Previews unavailable") + '</div></div>').join("");
-    return sourcePanel("kpi",(s?.sampled?"Enrolled sources · sampled · ":"PC canary · ") + (live?"connected":"last known") + (s?.tokens.coverage==="partial"?" · partial tokens":""),kpi) + unavailable("inbox","Decision inbox") + sourcePanel("threads","Threads · " + threadCoverage(Math.min(4,agents.length)),rows || missing("No observed threads")) + sourcePanel("hosts","Hosts · resources",fleetBody(),"host") + panel("quota","Quota",s?.quota.accounts.length ? budget(s.quota.accounts,2,a=>'<div class="item">' + esc(a.label) + ' · ' + esc(a.state) + ' · ' + (a.used==null?"usage unknown":a.used+"% used") + '</div>',"accounts") : missing("No cached quota"),"quota",quotaObserved.length ? age(Math.max(...quotaObserved)) : null) + unavailable("events","Latest events");
+    const s=snapshot,agents=s?.agents||[],hosts=hostList(),observed=hosts.filter(h=>h.observedAt!=null).length;
+    const stats=[[s?agents.filter(a=>["working","thinking"].includes(a.state)).length:"—","working"],[s?agents.filter(a=>a.state.startsWith("waiting")).length:"—","waiting"],[hosts.length?observed+" / "+hosts.length:"—","hosts observed"]];
+    if(s?.tokens.rate!=null)stats.push([s.tokens.rate.toFixed(1),s.tokens.coverage==="partial"?"rate lower bound":"output tok/s"]);
+    const kpi='<div class="stats hero-row">'+stats.map(x=>heroStat(...x)).join("")+'</div><div class="source-meta">Needs Igor, incidents, exec slots, queued jobs, shipped and daily totals: not connected</div>';
+    const rows=agents.slice(0,4).map(a=>'<div class="item overview-thread"><div class="l1"><span class="t two">'+esc(a.title)+'</span>'+UI.providerMark(a)+'</div><div class="activity-preview">'+esc(activityItems(a)[0]?.text||"Previews unavailable")+'</div><div class="source-meta">'+st(a.state,a.state)+' · '+esc(a.model)+' · '+esc(a.host)+'</div></div>').join("");
+    const q=Array.isArray(quotaHosts())?(quotaHosts().map(h=>'<div class="quota-glance"><strong>Observed by '+esc(h.host)+'</strong><div class="source-meta">'+esc(h.state)+' · quota source '+esc(agoText(h.observedAt))+'</div>'+quotaRows(h)+(h.omitted?'<div class="source-meta">'+esc(h.omitted)+' omitted</div>':"")+'</div>').join("")||missing("No host quota observations")):s?.quota.accounts.length?budget(s.quota.accounts,2,a=>'<div class="item">'+esc(a.label)+' · '+esc(a.state)+' · '+(a.used==null?"usage unknown":a.used+"% used")+'</div>',"accounts"):missing("No cached quota");
+    return sourcePanel("kpi",(s?.sampled?"Enrolled sources · sampled":"Local observations")+" · "+(s?.source.state||"connecting"),kpi)
+      +unavailable("inbox","Decision inbox")
+      +sourcePanel("threads","Threads · "+threadCoverage(Math.min(4,agents.length)),rows||missing("No observed threads"))
+      +panel("hosts","Hosts · CPU / RAM",hosts.map(h=>compactHost(h)).join("")||missing("No host observations"),"host",null,"cached","overview-resources")
+      +panel("quota","Quota by observing host",q,"quota",null,"cached")
+      +panel("events","Latest maintenance changes / failures",eventCoverage()+eventBody(2),"akasha",age(s?.events?.checkedAt),eventFresh());
   };
   R.tokens = () => sourcePanel("thero",snapshot?.tokens.coverage==="partial"?"Partial output · 60 s average":"Output rate · 60 s average",'<div class="stats">' + heroStat(snapshot?.tokens.rate == null ? "—" : snapshot.tokens.rate.toFixed(1),snapshot?.tokens.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg") + heroStat(snapshot?.tokens.output ?? "—",snapshot?.tokens.coverage==="partial"?"output lower bound":"observed output","since process start") + '</div>',"t3thread") + panel("models","Observation scope",missing(snapshot?.tokens.scope || "No usage data") + missing("Updated " + (age(snapshot?.tokens.observedAt) ?? "unknown") + "s ago · daily totals and model history unavailable"),"t3thread",age(snapshot?.tokens.observedAt),snapshot?.source.state === "live" ? undefined : "stale") + unavailable("hourly","Today by hour");
   R.quota=()=>quotas();
-  for(const m of ["events","ops","lab"]) R[m]=()=>unavailable("summary",m + " unavailable");
+  R.events=()=>panel("ecount","Maintenance observations",eventCoverage(),"akasha",age(snapshot?.events?.checkedAt),eventFresh())
+    +panel("timeline","Changed / failed timer runs",eventBody(),"akasha",age(snapshot?.events?.checkedAt),eventFresh());
+  const dailyHealthBody = () => {
+    const d=snapshot?.ops?.dailyHealth,r=d?.report;
+    return '<div class="source-meta">Daily health · '+esc(d?.state||"unknown")+' · last checked '+esc(agoText(d?.checkedAt))+'</div>'
+      +(r?'<div class="item"><strong>'+esc(r.status)+'</strong><div class="source-meta">Report occurred '+timestamp(r.occurredAt)+' · received '+timestamp(r.receivedAt)+'</div></div>'+r.checks.map(c=>'<div class="check-row"><span>'+esc(c.name)+'</span><strong>'+esc(c.status)+'</strong></div>').join("")+(r.omitted?'<div class="more">'+esc(r.omitted)+' checks omitted</div>':""):missing("No report in 48h"));
+  };
+  R.ops=()=>panel("health","Daily health",dailyHealthBody(),"akasha",age(snapshot?.ops?.dailyHealth?.checkedAt),snapshot?.ops?.dailyHealth?.state==="error"?"error":snapshot?.ops?.dailyHealth?.checkedAt==null?"nosource":age(snapshot.ops.dailyHealth.checkedAt)>900?"stale":"cached")
+    +panel("tasks","Maintenance changes / failures",eventCoverage()+eventBody(),"akasha",age(snapshot?.events?.checkedAt),eventFresh())
+    +panel("resources","Host sources / resource pressure",hostList().map(h=>compactHost(h)).join("")||missing("No host observations"),"host",null,"cached");
+  R.lab=()=>{
+    const agents=snapshot?.agents||[],hosts=[...new Set(agents.map(a=>a.host))];
+    const distributions=hosts.map(host=>{
+      const rows=agents.filter(a=>a.host===host),groups=new Map();
+      for(const a of rows){
+        const reported=a.details&&(!a.detailCoverage||a.detailCoverage==="reported")&&a.details.fieldCoverage!=="identity-only";
+        const p=reported?a.details.provider:null,driver=p?.driver||"Provider unknown",instance=p?.instanceId||"",model=a.model||"Model unknown",effort=reported&&a.details.effort?.source==="reported"?a.details.effort.value:null;
+        const key=JSON.stringify([driver,instance,model,effort,a.state]);
+        const group=groups.get(key)||{a,driver,instance,model,effort,state:a.state,count:0};group.count++;groups.set(key,group);
+      }
+      return panel("routing",host+" · "+rows.length+" observed threads",[...groups.values()].map(g=>'<div class="distribution-row"><div class="distribution-provider">'+UI.providerMark(g.a)+'<strong>'+esc(g.driver)+(g.instance?" · "+esc(g.instance):"")+'</strong><span class="num">'+g.count+'</span></div><div>'+esc(g.model)+'</div><div class="source-meta">'+esc(g.state)+' · reported effort '+esc(g.effort||"unknown")+'</div></div>').join(""),"t3thread",age(hostList().find(h=>h.host===host)?.observedAt),"cached","lab-host");
+    }).join("");
+    return panel("summary","Observed thread set",missing(threadCoverage())+missing("Current provider, model, reported effort and activity by host. AA quality scores disabled / unqualified. Exec slots unknown: no read-only capacity source."),"t3thread",age(snapshot?.source.observedAt),snapshot?.source.state==="live"?"live":"nosource")
+      +(distributions||panel("routing","Thread observations",missing("No observed threads"),"t3thread",null,"nosource"));
+  };
   const hostList = () => snapshot?.hostSummary || [];
   const hostFreshness = h => h.observedAt == null ? "nosource" : h.freshness === "live" && age(h.observedAt)>90 ? "stale" : h.freshness;
   const resourceMeter = (label,pct,value) => UI.stacked(esc(label),pct,esc(value),pct == null ? "nosrc" : pct>=95?"fail":pct>=80?"warn":"")
@@ -63,7 +121,14 @@ script.onload = () => {
     const models=(h.models||[]).map(m=>esc(m.model)+": "+esc(m.count)).join(" · ");
     return panel("host",h.host,'<div class="host-status">'+esc(status)+'</div>'+resources(h)+(expanded?'<div class="host-work">'+states+'</div><div class="muted">'+models+'</div>':""),"host",sourceAge,fresh,"host-card");
   };
-  const fleetBody = () => hostList().map(h=>hostCard(h)).join("") || missing("No host observations");
+  const compactHost = h => {
+    const r=h.resources?.sample,fresh=hostFreshness(h),gib=n=>(n/1073741824).toFixed(1),used=r?Math.max(0,r.totalMemoryBytes-r.availableMemoryBytes):null;
+    const cpu=r&&Number.isFinite(r.cpuUtilization)?r.cpuUtilization*100:null,ram=r&&r.totalMemoryBytes>0?used/r.totalMemoryBytes*100:null;
+    return '<div class="host-glance"><div class="host-glance-head"><strong>'+esc(h.host)+'</strong><span>'+esc(fresh)+' · source '+esc(agoText(h.observedAt))+'</span></div>'
+      +resourceMeter(h.host+" CPU",cpu,"CPU "+(cpu==null?"not reported":cpu.toFixed(1)+"% · "+r.cpuCount+" cores"))
+      +resourceMeter(h.host+" RAM",ram,"RAM "+(r?gib(used)+" / "+gib(r.totalMemoryBytes)+" GiB":"not reported"))
+      +'<div class="source-meta">'+(r?'Resource sample '+esc(agoText(r.sampledAt))+(age(r.sampledAt)>90||fresh!=="live"?' · last known / '+esc(fresh):""):h.resources?.state==="byte-budget"?"Resources withheld · host byte budget":"Resource sample unavailable")+'</div></div>';
+  };
   R.fleet=()=>'<div class="host-coverage">Resources · observed CPU and RAM</div>'+hostList().map(h=>hostCard(h,true)).join("");
   const usage = u => !u||u.coverage==="not-reported"?"Usage not reported":("Input "+(u.input??"?")+" · output "+(u.output??"?")+" · observed total "+(u.total??"?")+" · cache read "+(u.cacheRead??"?")+" / write "+(u.cacheWrite??"?")+" · reasoning "+(u.reasoning??"?")+" (subsets) · "+u.coverage+" / "+u.turns+" observed main-agent turns · usage "+age(u.observedAt)+"s ago · generation rate not reported");
   const previewText = p => p && ["reported","truncated","redacted"].includes(p.state) && typeof p.text==="string" ? p.text : null;

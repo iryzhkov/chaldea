@@ -465,3 +465,57 @@ b, strong, .b { font-weight:600; }
 .thread-drawer .recent-activity { display:block; }
 .thread-drawer .activity-item { display:block; margin-top:8px; }
 .thread-drawer .activity-preview { display:block; overflow:visible; }
+
+/* Observed page summaries use content height; the page scrolls when needed. */
+#view:is(.overview,.quota,.events,.ops,.lab) { --t1:clamp(14px,1vw,18px); --t2:clamp(16px,1.25vw,24px); overflow:auto; align-content:start; }
+#view.overview { grid-template-columns:minmax(0,1.25fr) minmax(300px,1fr) minmax(0,1fr); grid-template-rows:auto auto auto; grid-template-areas:"kpi kpi kpi" "threads hosts quota" "inbox events events"; }
+#view.overview .p-kpi .stats { display:grid; grid-auto-flow:column; grid-auto-columns:minmax(0,1fr); grid-template-columns:none; }
+#view.overview .stat .v { font-size:clamp(28px,2.5vw,64px); }
+#view.overview .stat .unit-slot { display:none; }
+#view.overview .panel > .body { overflow:visible; }
+#view.overview .p-quota > .body { max-height:440px; overflow:auto; }
+#view.overview .p-inbox { align-self:start; }
+#view.overview .overview-thread .t { font-size:var(--t2); }
+#view.overview .overview-thread .activity-preview { font-size:var(--t1); }
+.source-meta { font-size:var(--t1); color:var(--ink-2); overflow-wrap:anywhere; }
+.host-glance { padding:8px 0; border-top:1px solid var(--line); display:grid; gap:5px; font-size:var(--t1); }
+.host-glance:first-child { border-top:0; padding-top:0; }
+.host-glance-head { display:flex; flex-wrap:wrap; justify-content:space-between; gap:4px 10px; align-items:baseline; }
+.host-glance-head span { color:var(--ink-2); font-size:var(--t1); }
+.host-glance .metric.stack { grid-template-columns:minmax(0,1fr); grid-template-areas:"v" "m"; gap:3px; }
+.host-glance .metric .l { display:none; }
+.host-glance .metric .v { text-align:left; white-space:normal; font-size:var(--t1); }
+.host-glance .meter { height:5px; }
+.host-glance .source-meta { font-size:var(--t1); }
+.quota-account,.quota-glance,.distribution-row { display:grid; gap:6px; padding:10px 0; border-top:1px solid var(--line); }
+.quota-account:first-child,.quota-glance:first-child,.distribution-row:first-child { border-top:0; padding-top:0; }
+.quota-account .metric .v { white-space:normal; }
+.quota-account .metric.stack { display:flex; flex-wrap:wrap; }
+.quota-account .metric .l { display:none; }
+.quota-account .metric .meter { width:100%; order:2; }
+.quota-account .metric .v { text-align:left; }
+#view.quota { grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr)); grid-template-rows:none; grid-auto-rows:max-content; }
+#view.events { grid-template-columns:minmax(0,1fr); grid-template-rows:auto auto; grid-template-areas:"ecount" "timeline"; }
+#view.ops { grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:auto auto; grid-template-areas:"resources health" "resources tasks"; }
+#view.ops .p-resources { grid-area:resources; }
+#view.lab { grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr)); grid-template-rows:none; grid-template-areas:none; grid-auto-rows:max-content; }
+#view.lab .p-summary { grid-column:1 / -1; }
+#view.lab .p-routing { grid-area:auto; }
+#view:is(.quota,.events,.ops,.lab) .panel > .body { overflow:visible; }
+.distribution-provider,.check-row { display:flex; gap:10px; align-items:center; justify-content:space-between; overflow-wrap:anywhere; }
+.distribution-provider .provider-mark { margin:0; }
+.distribution-provider strong { flex:1; }
+.panel[data-fresh="error"] { border-color:var(--fail); }
+.panel[data-fresh="error"] .fresh { color:var(--fail); }
+.panel[data-fresh="error"] .fresh::before { background:var(--fail); }
+.panel[data-fresh="cached"] .fresh::before { background:transparent; border:1px solid var(--ink-2); }
+@media (max-width:1050px) {
+  #view.overview { grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:none; grid-template-areas:"kpi kpi" "threads hosts" "quota events" "inbox inbox"; }
+}
+@media (max-width:650px) {
+  #view.overview { grid-template-columns:minmax(0,1fr); grid-template-areas:"kpi" "threads" "hosts" "quota" "events" "inbox"; }
+  #view.overview .p-kpi .stats { grid-auto-flow:row; grid-template-columns:repeat(2,minmax(0,1fr)); }
+  #view.ops { grid-template-columns:minmax(0,1fr); grid-template-rows:none; grid-template-areas:"resources" "health" "tasks"; }
+  #view.overview .p-quota > .body { max-height:none; overflow:visible; }
+}
+#view:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }

@@ -11,7 +11,9 @@ import { refreshStatus, type ReaderConfig } from "../../src/mission-control/read
 import { missionServer } from "../../src/mission-control/server.ts";
 import { request } from "node:http";
 import { join } from "node:path";
-async function hostedRig(host="agent-a"){
+import { OPERATIONS_PAIRS } from "../../src/akasha/store.ts";
+import { refreshOperations } from "../../src/mission-control/reader.ts";
+async function hostedRig(host="agent-a",operations=false){
   const identity={issuer:"chaldea:"+host,source:host+".mission-control",host,source_id:host+"--mission-control",profile:"mission-control-publisher",project:"chaldea"};
   const x=await rig("service",host),key=generateKeyPairSync("ed25519");
   const publisher={issuer:identity.issuer,source:identity.source,host:identity.host,source_id:identity.source_id,profile:identity.profile,project:identity.project,mode:"service" as const,kinds:["agent_status" as const]};
@@ -21,8 +23,13 @@ async function hostedRig(host="agent-a"){
   // Disposable key only. Append ceiling proves the server selector independently denies writes.
   bundle.keys.push({issuer:reader.issuer,kid:"reader",public_key:{kty:"OKP",crv:"Ed25519",x:key.publicKey.export({format:"jwk"}).x!},not_before:N-3600,issue_until:N+3600,verify_until:N+4410,
     ceilings:[{audience:"akasha",profile:reader.profile,project:reader.project,source:reader.source,grants:[{resource:reader.source,actions:["read","append"]}]}]});
+  const producers=OPERATIONS_PAIRS.map(({kind,...p})=>({...p,mode:"service" as const,kinds:[kind as "job_finished"|"report"]}));
+  if(operations){
+    Object.assign(reader,{mission_control_operations_read:true,kinds:["agent_status","job_finished","report"]});
+    for(const p of producers.filter(p=>p.host===host))bundle.keys[0]!.ceilings.push({audience:"akasha",profile:p.profile,project:p.project,source:p.source,grants:[{resource:p.source,actions:["append"]}]});
+  }
   await x.install(bundle);
-  const auth=new Authorization([publisher,reader],x.trust,x.clock);
+  const auth=new Authorization([publisher,reader,...(operations?producers:[])],x.trust,x.clock);
   const ingress=new Ingress(auth,x.store,()=>queueMicrotask(()=>project(x.store,x.clock.check())));
   const server=httpServer(ingress);server.listen(0,"127.0.0.1");await once(server,"listening");
   const base="http://127.0.0.1:"+(server.address()as{port:number}).port;
@@ -34,8 +41,79 @@ async function hostedRig(host="agent-a"){
   const get=(path="/api/v1/events"+window,token=readToken)=>fetch(base+path,{headers:{authorization:"Bearer "+token}});
   const config:ReaderConfig={url:"https://akasha.fixture",tokenHelper:"/unused",source:"mission-control-reader",host:"omarchy-normandy",profile:"mission-control-reader",project:"chaldea",allowedSourceIds:[publisher.source_id],cacheFile:join(x.dir.path,"cache.json"),refreshMs:5000};
   const readerFetch:typeof fetch=async(input,init)=>{const url=new URL(String(input));assert.equal(url.origin,"https://akasha.fixture");return fetch(base+url.pathname+url.search,init);};
-  return {x,auth,publisher,reader,config,readerFetch,readerToken,readToken,post,get,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));x.close();}};
+  return {base,x,auth,publisher,reader,config,readerFetch,readerToken,readToken,post,get,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));x.close();}};
 }
+
+
+test("operations authenticated projection binds five complete tuples and keeps status-only clients compatible",async()=>{
+ const h=await hostedRig("agent-a",true),path="/api/v1/events?mission_control_operations=job_finished&window=48h&limit=16";
+ try{
+  for(const change of [{mission_control_operations_read:false},{global_read:true},{kinds:["agent_status","job_finished","tool_call"]},{mission_control_read_sources:Array(5).fill("agent-a--mission-control")}]){
+   const registry=h.auth.registry.map(r=>r.profile==="mission-control-reader"?{...r,...change}:r);
+   assert.throws(()=>new Authorization(registry as any,h.x.trust,h.x.clock));
+  }
+  assert.throws(()=>new Authorization(h.auth.registry.filter(r=>r.source_id!=="agent-a-daily-health") as any,h.x.trust,h.x.clock),/missing_operations_pair/);
+  const append=async(kind:"job_finished"|"report",data:unknown,key:string)=>{
+   const p=OPERATIONS_PAIRS.find(p=>p.host==="agent-a"&&p.kind===kind)!;
+   const token=await h.x.token({source:p.source,host:p.host,sub:p.profile,project:p.project,grants:[{resource:p.source,actions:["append"]}]});
+   return h.post({v:1,kind,title:"PRIVATE event title",body:"PRIVATE body /home/igor/private",severity:"info",occurred_at:new Date((N-20)*1000).toISOString(),data},key,token);
+  };
+  assert.equal((await append("job_finished",{job_id:"chaldea-fleet-pull",invocation_id:"PRIVATE invocation",status:"changed"},"job")).status,201);
+  assert.equal((await append("report",{status:"ok",checks:Array.from({length:20},(_,i)=>({name:"check "+i,status:"ok"}))},"report")).status,201);
+  assert.equal((await h.post(payload(),"ordinary-status")).status,201);
+  const raw=await(await h.get(path)).json() as any;
+  assert.equal(raw.events.rows.length,1);assert.equal(raw.events.rows[0].occurredAt,(N-20)*1000);assert.equal(raw.events.checkedAt,N*1000);
+  assert.doesNotMatch(JSON.stringify(raw),/PRIVATE|body|title|invocation|source_id|run_id/);
+  const page=await(await h.get(path.replace("job_finished","report"))).json() as any;
+  assert.equal(page.ops.dailyHealth.report.checks.length,16);assert.equal(page.ops.dailyHealth.report.omitted,4);
+  assert.equal((await h.get()).status,200);
+  for(const extra of ["&cursor=abc","&from=1h","&host=agent-a","&kind=report","&project=homelab","&source=agent-a.fleet","&window=48h"]){
+   assert.equal((await h.get(path+extra)).status,403);
+  }
+  for(const query of [path.replace("limit=16","limit=17"),path.replace("window=48h","window=1h"),path.replace("job_finished","tool_call")])assert.equal((await h.get(query)).status,403);
+  assert.equal((await h.get("/api/entries")).status,403);
+  const good=await refreshOperations(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
+  assert.equal(good.events.state,"cached");assert.equal(good.ops.dailyHealth.report!.status,"ok");
+  const cache={...emptyCache(),operations:good};
+  const failed=await refreshOperations(h.config,cache,{token:async()=>{throw new Error("grant_not_installed");},now:()=>N*1000});
+  assert.equal(failed.events.state,"error");assert.equal(failed.events.checkedAt,N*1000);assert.equal(failed.events.rows[0]!.occurredAt,(N-20)*1000);
+  writeCache(h.config.cacheFile,{...cache,operations:failed});
+  const dto=new CacheModel(h.config.cacheFile,()=>(N+60)*1000).snapshot();
+  assert.equal(dto.events!.rows[0]!.occurredAt,(N-20)*1000);
+  assert.equal((await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000})).snapshots.length,1);
+  // Simulate a compromised broker/store with mismatched complete tuples. None may be read.
+  const base=JSON.parse(String(h.x.store.db.prepare("SELECT envelope FROM events WHERE kind='job_finished'").get()!.envelope));
+  for(const patch of [{project:"homelab"},{profile:"daily-health"},{source:"chaldea.daily-health.agent-a"},{issuer:"chaldea:agent-b"},{source_id:"agent-a-daily-health"}]){
+   const e={...base,...patch,event_id:hash(patch)};h.x.store.admit(e,hash(e),N);project(h.x.store);
+   assert.throws(()=>h.auth.validateDelivery(e));
+  }
+  const bound=await(await h.get(path)).json()as any;assert.equal(bound.events.rows.length,1);
+  for(const p of OPERATIONS_PAIRS.filter(p=>p.kind==="job_finished"))for(let i=0;i<18;i++){
+   const e={...base,...p,event_id:hash([p.source_id,i]),occurred_at:new Date((N-100-i)*1000).toISOString()};h.x.store.admit(e,hash(e),N);project(h.x.store);
+  }
+  const bounded=await(await h.get(path)).json()as any;
+  assert.equal(bounded.events.rows.length,64);assert.equal(bounded.events.truncated,true);
+  for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"])assert.equal(bounded.events.rows.filter((r:any)=>r.host===host).length,16);
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded))<64*1024);
+  // Report names/statuses are validated before public response, including omitted checks.
+  assert.equal((await append("report",{status:"ok",checks:[{name:"bad\ncheck",status:"ok"}]},"unsafe-report")).status,201);
+  assert.equal((await h.get(path.replace("job_finished","report"))).status,400);
+ }finally{await h.close();}
+ const legacy=await hostedRig();try{assert.equal((await legacy.get(path)).status,403);assert.equal((await legacy.get()).status,200);}finally{await legacy.close();}
+});
+test("quota compact account data crosses authenticated ingest with canonical body and age unchanged",async()=>{
+ const h=await hostedRig();
+ try{
+  const p:any=payload();p.data.snapshot.quota={state:"cached",observedAt:(N-100)*1000,omitted:0,accounts:[["codex","fresh",(N-100)*1000,0,null,300,"0","fresh","unsupported",true,0,(N-101)*1000,null]]};
+  assert.equal((await h.post(p)).status,201);
+  const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});assert.deepEqual(cache.snapshots[0]!.quota,p.data.snapshot.quota);
+  writeCache(h.config.cacheFile,cache);const q=new CacheModel(h.config.cacheFile,()=>N*1000).snapshot().quota.hosts![0]!;
+  assert.equal(q.accounts[0]!.used,0);assert.equal(q.observedAt,(N-100)*1000);assert.equal(q.accounts[0]!.ageSeconds,100);
+  const stored=JSON.parse(String(h.x.store.db.prepare("SELECT envelope FROM events").get()!.envelope));
+  assert.deepEqual(stored.data.snapshot,p.data.snapshot);
+  const bad=structuredClone(p);bad.data.snapshot.quota.accounts[0].push("PRIVATE");assert.equal((await h.post(bad,"quota-private")).status,400);
+ }finally{await h.close();}
+});
 
 test("R1 complete authenticated refresh clears transient gaps but preserves current epoch/reset/clipping and token evidence",async()=>{
   const h=await hostedRig();

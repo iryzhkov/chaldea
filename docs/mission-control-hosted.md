@@ -228,6 +228,60 @@ at most four publishers, inside existing store capacity. Admission refuses
 pressure without evicting unrelated protected data; pending outbox/receipt
 relationships retain existing protections.
 
+## Optional hosted quota and operations
+
+The next compatible host/client batch adds optional per-host quota on the
+existing signed agent_status snapshot. Capture reads only quota-observer.json
+under the effective UID's configured state directory, with a private 0700 parent,
+0600 single-link regular file and no symlink traversal. It parses the existing
+observer version and validated headroom, never account credentials. The compact
+closed account tuples retain included, credit and manual-reset observation times.
+At most four internally deduplicated accounts leave each host, with generic
+provider account labels. Accounts are never merged across hosts.
+
+Base rows, resources and identities fit before quota; compact useful activity
+is offered to every admitted thread before verbose upgrades. Omission is
+byte-budget data, not a cap increase. The reader can retain last-good per-host
+quota independently. Its metric age always comes from the original observation,
+including after another host poll or an omitted sample. Zero remains distinct
+from unknown. Actual capture-UID readability on production hosts still needs
+the later operator preflight.
+
+Operations requires optional reader.json `operationsEnabled: true`, absent by
+default for legacy configurations. Install the compatible reader before rendering
+that new key. The existing N service identity keeps its four status source IDs.
+The registry opts in with `mission_control_operations_read: true` and exactly
+the kinds agent_status, job_finished and report. The local helper gets two
+additive read rows for job_finished and report, using the same N UID, host,
+profile, project chaldea, audience akasha and resource mission-control-reader.
+The helper matches kind locally; the existing signed JWT grants a resource and
+action, not a cryptographically bound kind. No new JWT claim, signing key or
+issuer ceiling is needed. Status-only registry configurations remain accepted.
+
+The only additional query is GET /api/v1/events with exactly
+`mission_control_operations=job_finished|report&window=48h&limit=16`.
+No cursor, extra filter, other window, repeated parameter or different limit is
+accepted. SQL binds complete source ID, issuer, profile, project, host, source
+and kind tuples for the four registered fleet-timers sources in chaldea and
+agent-a-daily-health in homelab. Each pair has its own 16-row limit, so the fleet
+page has at most 64 rows and reports truncation if any pair has more.
+Projection happens at the server before response/cache: no title, body,
+invocation ID, run ID or arbitrary envelope is returned.
+
+The existing reader loop starts operations about every 60 seconds independently
+of its status path. A missing helper grant fails closed for operations while
+status continues. Errors retain original row timestamps and last-good data,
+with the latest check time and error state. The private cache remains 512 KiB
+and the public DTO 128 KiB. Operations rows yield before admitted base identity
+and resource data. Public report checks are capped at 16 with an omitted count;
+all original bounded checks are validated before projection.
+
+Fleet rows describe only changed or failed chaldea-fleet-pull and
+chaldea-retention timer runs. Quiet success emits no event. An empty 48-hour
+window means no observed changed or failed timer runs, without asserting health
+or exec-job activity. No daily-health producer is added here; an absent report
+remains an observed delivery gap.
+
 ## HTTP and activation gates
 
 The trusted configured HTTPS site origin controls Host/Origin checks, never
