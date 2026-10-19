@@ -424,6 +424,29 @@ test("strict rich v2/v3 are separate exact schemas and recent metadata fails clo
  const identityExtra=structuredClone(identity);(identityExtra.details[0]!.value as any).recent=[];assert.throws(()=>validateRich(identityExtra,ids,at));
 });
 
+test("sparse v4 authoritative empty activity survives the public cache projection",()=>{
+ const s=sample(),detail=emptyDetail();detail.assistant={text:"Legacy observation only.",state:"reported"};
+ detail.recent=[];
+ s.rich={v:4,resources:{state:"unavailable",sample:null},details:[{id:s.agents[0]!.id,value:compactDetail(detail)}],omitted:0};
+ const c=emptyCache();mergeStatus(c,validateHostSnapshot(s),now0);const dir=scratch();
+ try{
+  const path=join(dir.path,"empty-activity.json");writeCache(path,c);
+  const actual=new CacheModel(path,()=>now0).snapshot().agents[0]!.details;
+  assert.deepEqual(actual.recent,[]);
+  assert.equal(actual.assistant.text,"Legacy observation only.");
+ }finally{dir.close();}
+});
+
+test("compact telemetry preserves source order when the newest activity timestamp is unknown",()=>{
+ const m=live();
+ m.detail("private-thread",{kind:"recent-item",id:"older",ordinal:1,type:"assistant",text:"Older observation.",at:now0-1000,status:"completed"});
+ m.detail("private-thread",{kind:"recent-item",id:"newer",ordinal:2,type:"assistant",text:"Newest observation.",at:null,status:"completed"});
+ const s=captureSnapshot(m,"agent-a",epoch,1)!;
+ const detail=normalizeRich(s.rich,new Set(s.agents.map(a=>a.id)),s.observedAt).details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+ assert.deepEqual(detail.recent?.map(r=>r.preview.text),["Older observation.","Newest observation."]);
+ assert.equal(detail.recent?.at(-1)?.at,null);
+});
+
 test("compact telemetry gives nine representative threads actual activity within the unchanged host budget",()=>{
  const rows=Array.from({length:9},(_,i)=>({...row("mcp:synthetic-thread-"+i),title:"Synthetic capacity task number "+i,providerInstanceId:"codex",modelSelection:{instanceId:"codex",model:"gpt-6.1-sol",options:[{id:"reasoningEffort",value:"high"}]}})),m=live(()=>now0,rows);
  m.setResources({state:"reported",sample:{sampledAt:now0,cpuUtilization:0,cpuCount:8,availableMemoryBytes:400,totalMemoryBytes:1000}});
