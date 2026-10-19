@@ -3,6 +3,17 @@ import type { ShellEvent, ShellThread, MissionDetailEvent } from "../t3/adapter.
 import type { HeadroomState, Metric } from "../quota/headroom.ts";
 export const MAX_AGENTS = 48, MAX_TURNS = 512, MAX_SAMPLES = 4096;
 const tools = new Set(["read","search","navigate","edit_apply","change_plan","verify_run","chaldea exec","t3_thread_read","t3_thread_list","jocasta","watch_pull_request","html_preview","delegate_task","chaldea_decision_prepare"]);
+const toolAliases = new Map<string,string>();
+for(const tool of tools)for(const prefix of ["","mcp__huyang__","mcp__t3_code__","functions.mcp__huyang__","functions.mcp__t3_code__"])toolAliases.set(prefix+tool,tool);
+toolAliases.set("command_execution","Command running");
+toolAliases.set("Command running","Command running");
+export const fixedTool = (value:unknown):string => typeof value==="string" ? toolAliases.get(value) ?? "Activity unavailable" : "Activity unavailable";
+export interface HostSummary {host:string;shown:number;total:number|null;truncated:boolean;observedAt:number|null;freshness:string;connected:boolean|null;states:Record<string,number>;models:{model:string;count:number}[]}
+export function summarizeHost(host:string,agents:{state:string;model:string}[],total:number|null,truncated:boolean,observedAt:number|null,freshness:string,connected:boolean|null):HostSummary {
+  const states:Record<string,number>={},models=new Map<string,number>();
+  for(const a of agents){states[a.state]=(states[a.state]??0)+1;models.set(a.model,(models.get(a.model)??0)+1);}
+  return {host,shown:agents.length,total,truncated,observedAt,freshness,connected,states,models:[...models].map(([model,count])=>({model,count}))};
+}
 export function safeLabel(value: unknown, fallback = "Task"): string {
   if (typeof value !== "string") return fallback;
   const s = value.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
@@ -74,7 +85,7 @@ export class MissionModel {
     const now = this.now(); t.detailObserved = now;
     if (event.kind === "synchronized") t.connected = true;
     if (event.kind === "activity") {
-      const label = event.tool && tools.has(event.tool) ? event.tool : "Activity unavailable";
+      const label = fixedTool(event.tool);
       if (label !== t.steps[0]) t.steps = [label, ...t.steps].slice(0, 6);
     }
     if (event.kind === "usage" && count(event.output)) {
@@ -140,6 +151,7 @@ export class MissionModel {
     }));
     const usageConnected = agents.length > 0 && [...this.threads.values()].every(t => t.connected);
     return { version: 1, demo: this.demo, now, source: { state: freshness(this.connected, this.observed, 30_000, 300_000), observedAt: this.observed },
+      hostSummary: [summarizeHost("omarchy-pc",agents,this.coverageExact?this.total:null,!this.coverageExact||this.total>agents.length,this.observed,freshness(this.connected,this.observed,30_000,300_000),this.observed===null?null:this.connected)],
       agents, shown: agents.length, total: this.coverageExact ? this.total : null, truncated: !this.coverageExact || this.total > agents.length,
       tokens: { rate: this.usageObserved === null || !usageConnected ? null : this.samples.filter(s => now - s.at <= 60_000).reduce((s,v) => s + v.output, 0) / 60,
         output: this.usageObserved === null ? null : this.output, observedAt: this.usageObserved,

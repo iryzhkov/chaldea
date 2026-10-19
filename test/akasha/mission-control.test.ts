@@ -107,6 +107,18 @@ test("scoped HTTP denies append, raw endpoints, foreign scope, expired tokens, r
   }finally{await h.close();}
 });
 
+test("backend five-second gate rejects early samples and admits the exact boundary",async()=>{
+  const h=await hostedRig();
+  try{
+    assert.equal((await h.post(payload())).status,201);
+    h.x.sample={...h.x.sample,unixSeconds:N+4,monotonicSeconds:104};
+    const next=payload();next.data.snapshot=sample(2,(N+4)*1000);
+    assert.equal((await h.post(next,"early-four")).status,429);
+    h.x.sample={...h.x.sample,unixSeconds:N+5,monotonicSeconds:105};
+    next.data.snapshot=sample(3,(N+5)*1000);
+    assert.equal((await h.post(next,"exact-five")).status,201);
+  }finally{await h.close();}
+});
 test("status admission compares millisecond sample time in the trusted clock's integer-second units",async()=>{
   const h=await hostedRig();
   try{

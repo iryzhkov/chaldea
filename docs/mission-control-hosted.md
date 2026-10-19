@@ -7,6 +7,29 @@ host or the PC. Existing local `mission-control serve` behavior remains availabl
 This is an opt-in source capability. Installation, grants and live activation
 are separate gates. No configuration below grants itself access.
 
+## Activity and views
+
+Agent summary shows bounded per-host state/model counts, including observed zero
+and not-observed hosts. Counts describe shown rows when a source is truncated.
+Live threads keeps the existing density tiers and portrait paging within the
+48-row bound. Its source age and activity age are independent; a quiet connected
+thread remains live while its source is fresh.
+
+The v1 shape, identity and strict privacy validation stay unchanged. The closed
+tool enum adds only `Command running`; known finite MCP tool names normalize to
+existing labels before capture. Command input, output and arbitrary tool names
+never become labels, and targets stay blank. Old snapshots remain valid. Old
+installed validators reject the new enum until upgraded: stage H Akasha and N
+reader/web before any upgraded capture emits it. H's five-second admission gate
+must also precede faster collectors. New qualified client/host assets and ROOT's
+review, CI and deployment packet are still required. No live change is made here.
+
+Storage caps are unchanged. Payload TTL is one hour, receipts one day; ordinary
+maintenance runs at startup and hourly, so expired payloads may remain on disk
+until the next sweep. The main database cap remains 4 GiB, with separate 64 MiB
+per-source and 128 MiB aggregate status budgets. Five seconds is a conservative
+cadence choice, not a claim that all shorter intervals exceed capacity.
+
 ## Processes and configuration
 
 Run `chaldea mission-control capture --config /etc/mission-control/capture.json`
@@ -40,7 +63,7 @@ The native collector keeps one coalesced latest sample and one frozen pending
 publication in its existing 16 MiB database. It attempts status before ordinary
 backlog, using the existing publisher's five-second network timeout. The helper
 has its existing separate two-second bound. Pending identity and bytes survive
-restart unchanged. New admissions are at least 30 seconds apart. A pending
+restart unchanged. New admissions are at least five seconds apart. A pending
 attempt expires after 120 seconds as an explicit `status_expired_gap`, not a
 delivery. A terminal server tombstone is also a status gap; ordinary collectors
 retain their existing tombstone acknowledgement behavior. New input must itself
@@ -49,11 +72,18 @@ cannot prevent ordinary backlog delivery. A new status is sent only after its
 frozen slot is saved; a failed acknowledgement save retains that same slot for
 retry. Optional counters and a fixed deferred diagnostic are best effort.
 
-The canonical collector timer is 30 seconds plus up to five seconds jitter.
-Long ordinary backlog runs may delay subsequent starts. This is sampled state,
-with hosted source stale after 90 seconds and lost after ten minutes. Actual
-selected-source delivery latency below 90 seconds remains a live qualification
-gate. This change does not alter timers or add a faster transport.
+The source timer uses OnUnitInactiveSec=5s, RandomizedDelaySec=1s and
+AccuracySec=1s. Ordinary delivery yields after a two-second elapsed slice at a
+durable ACK/cursor boundary, retaining pending backlog and the existing 100-event
+limit. Each invocation attempts status first and makes ordinary progress.
+An in-flight helper/request can exceed the slice; its existing timeouts remain.
+Retention pruning still runs independently of delivery health.
+
+The reader keeps its five-second refresh and the web reloads cache every second.
+Healthy quiet-path latency is expected in seconds, but five seconds is not a
+delivery guarantee. Deployment measurements must establish actual latency and
+laptop overhead. This remains latest sampled state, not every intermediate step,
+with hosted source stale after 90 seconds and lost after ten minutes.
 
 Run `chaldea mission-control reader --config /etc/mission-control/reader.json`
 under a dedicated non-login reader account:
@@ -78,7 +108,7 @@ illustrated path is installed. Its fixed argv is `--audience akasha --action rea
 Profile/project come from the exact helper enrollment. No token file, browser
 token or arbitrary endpoint option is accepted.
 
-Each refresh binds all pages to one fixed one-hour query. It reads at most four
+Each refresh binds all pages to one fixed latest-120-second query. It reads at most four
 128-event pages with a five-second deadline and a 2 MiB response cap. Redirects
 are errors. A 410 cursor reset marks a gap and starts the same bounded query
 without that cursor. Partial, oversized or malformed traversals retain the

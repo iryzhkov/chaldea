@@ -144,7 +144,7 @@ export async function collectStatus(options:CollectorOptions,deliver:(e:Publicat
   }catch{statusCount(outbox,"status_rejected");}
   if(state.pending&&now>=state.until){state.pending=null;statusCount(outbox,"status_expired_gap");}
   if(state.latest&&now-(state.latest.payload.data as {snapshot:{observedAt:number}}).snapshot.observedAt>120_000){state.latest=null;statusCount(outbox,"status_expired_gap");}
-  if(!state.pending&&state.latest&&now-state.admitted>=30_000){state.pending=state.latest;state.latest=null;state.until=now+120_000;state.admitted=now;}
+  if(!state.pending&&state.latest&&now-state.admitted>=5_000){state.pending=state.latest;state.latest=null;state.until=now+120_000;state.admitted=now;}
   // A failed admission never permits a new send. SQLite retains the previous frozen slot.
   try{outbox.saveStatus(state);}catch{statusStorageDeferred(outbox);return;}
   if(state.pending){
@@ -159,12 +159,17 @@ export async function collect(options: CollectorOptions): Promise<void> {
   const deliver = options.deliver ?? ((e: Publication) => publish(e, options.publisher));
   if (options.missionControlSnapshotFile) await collectStatus(options,options.deliver?async(e)=>await options.deliver!(e)?"visible":"deferred":(e)=>publishStatus(e,options.publisher),now);
   let budget = options.maxEvents ?? 100;
+  // Yield only at durable boundaries. A single in-flight request may exceed the slice.
+  const elapsed = options.now ?? Date.now, deadline = elapsed() + 2000;
+  let delivered = 0;
+  const sliced = () => delivered > 0 && elapsed() >= deadline;
   async function drain(): Promise<boolean> {
-    while (budget > 0) {
+    while (budget > 0 && !sliced()) {
       const pending = outbox.next(); if (!pending) return true;
       budget--;
       if (!await deliver(pending.event)) { outbox.count("deferred"); return false; }
       outbox.acknowledge(pending.event.key);
+      delivered++;
     }
     return outbox.next() === null;
   }
@@ -185,14 +190,14 @@ export async function collect(options: CollectorOptions): Promise<void> {
   if (!await drain()) return;
   for (const [root, timer] of [[options.spool, false], ...(options.timers ? [[options.timers, true]] : [])] as [string, boolean][]) {
     for (const path of files(root, timer, () => outbox.count("scan_errors"))) {
-      if (budget <= 0) return;
+      if (budget <= 0 || sliced()) return;
       const rel = relative(root, path), file = (timer ? "timer/" : "tool/") + rel;
       const st = lstatSync(path);
       if (st.isSymbolicLink() || !st.isFile()) continue;
       const fd = openSync(path, "r");
       try {
         let cursor = generation(fd, outbox.cursor(file));
-        while (budget > 0) {
+        while (budget > 0 && !sliced()) {
           const chunk = bytes(fd, cursor.offset, LINE_BYTES + 1), newline = chunk.indexOf(10);
           if (newline < 0) {
             if (chunk.length > LINE_BYTES) {

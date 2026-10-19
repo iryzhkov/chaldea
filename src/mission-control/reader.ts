@@ -20,14 +20,14 @@ async function responseJson(response:Response):Promise<unknown>{
   try{while(true){const c=await reader.read();if(c.done)break;bytes+=c.value.length;if(bytes>2*1024**2)throw new Error("response_limit");chunks.push(c.value);}}finally{void reader.cancel().catch(()=>{});}
   return strictJson(Buffer.concat(chunks));
 }
-/** One fixed one-hour query per refresh. Pagination never changes its cursor binding. */
+/** One fixed latest-120-second query per refresh. Pagination never changes its cursor binding. */
 export async function refreshStatus(c:ReaderConfig,previous:StatusCache,dependencies:ReaderDependencies={}):Promise<StatusCache>{
   const now=(dependencies.now??Date.now)(),next=structuredClone(previous),signal=AbortSignal.timeout(5000);
   next.snapshots=next.snapshots.filter(s=>now>=s.observedAt&&now-s.observedAt<=86400_000&&c.allowedSourceIds.includes(s.host+"--mission-control"));
   try {
     const token=await(dependencies.token?dependencies.token():helperToken(c.tokenHelper,{key:"",source:c.source,host:c.host,payload:{kind:"agent_status"}},"read"));
     const url=new URL("/api/v1/events",c.url);url.searchParams.set("kind","agent_status");url.searchParams.set("project","chaldea");
-    url.searchParams.set("from",new Date(now-3600_000).toISOString());url.searchParams.set("to",new Date(now).toISOString());url.searchParams.set("limit","128");
+    url.searchParams.set("from",new Date(now-120_000).toISOString());url.searchParams.set("to",new Date(now).toISOString());url.searchParams.set("limit","128");
     let reset=false;const seen=new Set<string>(),candidate=structuredClone(next);
     // This flag describes the current traversal, not an irreversible outage history.
     candidate.gap=false;

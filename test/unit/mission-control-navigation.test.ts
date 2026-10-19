@@ -61,6 +61,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
       location.href = new URL(url, location).href; entries[index] = location.href;
     },
   };
+  let eventSource: EventTarget;
   const intervals: (() => void)[] = []; let frame = () => {};
   const context: any = {
     document, location, history, URL, URLSearchParams, Date, performance, CustomEvent,
@@ -68,7 +69,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     requestAnimationFrame: (fn: () => void) => { frame = fn; },
     setInterval: (fn: () => void) => { intervals.push(fn); },
     addEventListener: window.addEventListener.bind(window),
-    EventSource: class extends EventTarget { close() {} },
+    EventSource: class extends EventTarget { constructor(){super();eventSource=this;} close() {} },
   };
   context.window = context;
   const source = (file: string) => readFileSync(new URL("../../src/mission-control/static/" + file, import.meta.url), "utf8");
@@ -83,7 +84,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   };
   const travel = (delta: number) => { index += delta; location.href = entries[index]!; window.dispatchEvent(new Event("popstate")); };
   return { elements, location, entries, click, travel, frame: () => frame(),
-    refresh: () => intervals.forEach(fn => fn()), window, document };
+    refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document };
 }
 
 for (const reduced of [false, true]) {
@@ -112,6 +113,34 @@ test("picker and keyboard share the URL contract; unknown mode safely falls back
   assert.equal(b.location.searchParams.get("mode"), "tokens"); assert.equal(b.location.hash, "#board");
   const key = new Event("keydown"); Object.assign(key, { key: "2" }); b.document.dispatchEvent(key);
   assert.equal(b.location.searchParams.get("mode"), "agents");
+});
+test("two agent views preserve old URLs, update immediately and disclose bounded coverage",()=>{
+  const b=browser("https://board.example/?mode=agents");
+  const at=Date.now(),agents=Array.from({length:48},(_,i)=>({id:"row-"+i,title:"Task "+i,model:"gpt-6.1-sol",host:"agent-a",state:i===0?"idle":"working",startedAt:at-10000,observedAt:at,detailObservedAt:at-65000,activityFreshness:"live",freshness:"live",steps:[i===0?"Command running":"read"]}));
+  const snapshot={version:1,demo:false,sampled:true,now:at,source:{state:"live",observedAt:at},agents,shown:48,total:60,truncated:true,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},
+    hostSummary:[{host:"agent-a",shown:48,total:60,truncated:true,observedAt:at,freshness:"live",states:{working:47,idle:1},models:[{model:"gpt-6.1-sol",count:48}]},
+      {host:"agent-b",shown:0,total:0,truncated:false,observedAt:at,freshness:"live",states:{},models:[]},
+      {host:"omarchy-pc",shown:0,total:null,truncated:false,observedAt:null,freshness:"nosource",states:{},models:[]}]};
+  b.snapshot(snapshot);
+  assert.equal(b.elements.view!.className,"agents");
+  assert.equal((b.elements.view!.innerHTML.match(/panel tile/g)||[]).length,48);
+  assert.match(b.elements.view!.innerHTML,/Command running/);assert.match(b.elements.view!.innerHTML,/Showing 48 of 60/);
+  assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/activity 1m ago · source 0s ago/);
+  const history=b.entries.length;b.click("agent-summary");assert.equal(b.entries.length,history+1);
+  assert.equal(b.location.searchParams.get("mode"),"agent-summary");
+  assert.match(b.elements.view!.innerHTML,/Agent summary/);assert.match(b.elements.view!.innerHTML,/shown 0 \/ 0/);
+  assert.match(b.elements.view!.innerHTML,/NOT OBSERVED · thread count unknown/);
+  assert.match(b.elements.view!.innerHTML,/gpt-6.1-sol: 48/);assert.doesNotMatch(b.elements.view!.innerHTML,/panel tile/);
+  b.snapshot({...snapshot,shown:47,agents:agents.slice(0,47)});assert.equal(b.entries.length,history+1);
+  assert.match(b.elements.view!.innerHTML,/Showing 47 of 60/);
+  assert.equal(browser(b.location.href).document.body.dataset.mode,"agent-summary");
+  b.travel(-1);b.refresh();assert.equal(b.document.body.dataset.mode,"agents");
+  b.travel(1);b.refresh();assert.equal(b.document.body.dataset.mode,"agent-summary");
+  for(const tool of ["read /private/key","mcp__evil__read","Bearer SECRET","command_execution rm -rf"]){
+    const safe=b.context.MC.safeStep({tool,input:"PRIVATE",output:"PRIVATE",target:"PRIVATE"});
+    assert.equal(safe.tool,"Activity unavailable");assert.equal(safe.target,"");
+  }
+  assert.equal(b.context.MC.safeStep({tool:"Command running",target:"/private/key"}).target,"");
 });
 test("unavailable modes replace previous content without invented data", () => {
   const b = browser();

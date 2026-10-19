@@ -2,10 +2,10 @@
 // agent density tiers, cycling and display care.
 (function () {
   const Q = new URLSearchParams(location.search);
-  const MODES = ['overview','agents','fleet','tokens','quota','events','ops','lab'];
+  const MODES = ['overview','agents','agent-summary','fleet','tokens','quota','events','ops','lab'];
   const MORE = new Set(['ops','lab']);
-  const LABEL = { overview:'Overview', agents:'Agents', fleet:'Fleet', tokens:'Tokens', quota:'Quota', events:'Events', ops:'Ops', lab:'Lab' };
-  const DWELL = { overview:30, agents:20, fleet:20, tokens:20, quota:20, events:20, ops:15, lab:15 };
+  const LABEL = { overview:'Overview', agents:'Live threads', 'agent-summary':'Agent summary', fleet:'Fleet', tokens:'Tokens', quota:'Quota', events:'Events', ops:'Ops', lab:'Lab' };
+  const DWELL = { overview:30, agents:20, 'agent-summary':20, fleet:20, tokens:20, quota:20, events:20, ops:15, lab:15 };
   const CONSOLE = { kpi:'FLIGHT', inbox:'FD', threads:'CAPCOM', hosts:'EECOM', quota:'FAO', events:'PAO', summary:'FLIGHT', config:'EECOM', rollouts:'BOOSTER', trust:'INCO', timers:'BOOSTER', expiring:'FAO', thero:'EECOM', models:'GNC', hourly:'FIDO', acct:'FAO', ecount:'PAO', timeline:'PAO', einbox:'FD', waits:'FD', incidents:'SURGEON', prs:'GUIDO', backups:'EECOM', health:'SURGEON', tasks:'CAPCOM', routing:'GNC', board:'RETRO', eval:'GNC', huyang:'GUIDO', audit:'FLIGHT' };
   const GLYPH = { working:'●', 'waiting-igor':'◆', 'waiting-ci':'◐', failed:'✕', idle:'○', merge:'⑂', deploy:'▲', alert:'!', canary:'◐', decision:'?', 'use-it':'▲', unlimited:'∞', paced:'●', tight:'◆', stopped:'✕', unknown:'?', ok:'●', warn:'◆', fail:'✕', up:'●', down:'✕', late:'◆', none:'—' };
   const CLS = { working:'pri', 'waiting-igor':'warn', 'waiting-ci':'sec', failed:'fail', idle:'stale', merge:'ok', deploy:'pri', alert:'fail', canary:'sec', decision:'warn', 'use-it':'ok', unlimited:'ok', paced:'pri', tight:'warn', stopped:'fail', unknown:'stale', ok:'ok', warn:'warn', fail:'fail', up:'ok', down:'fail', late:'warn', none:'stale' };
@@ -40,7 +40,7 @@
   const $ = (s, el = document) => el.querySelector(s);
   const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
   // A closed fixture dictionary, never item.title, input, arguments, output or arbitrary target text.
-  const WALL_TOOLS = new Set(['read','search','navigate','edit_apply','change_plan','verify_run','chaldea exec','t3_thread_read','t3_thread_list','jocasta','watch_pull_request','html_preview','delegate_task','chaldea_decision_prepare']);
+  const WALL_TOOLS = new Set(['read','search','navigate','edit_apply','change_plan','verify_run','chaldea exec','t3_thread_read','t3_thread_list','jocasta','watch_pull_request','html_preview','delegate_task','chaldea_decision_prepare','Command running']);
   const safeStep = s => {
     if (!s || !WALL_TOOLS.has(s.tool)) return { tool:'Activity unavailable', target:'', age:'' };
     const target = Object.hasOwn(DATA.wallTargets, s.target) ? DATA.wallTargets[s.target] : '';
@@ -143,11 +143,11 @@
   };
 
   // Agents: count-based density. Tiers 1 / 4 / 12 / 24 / 48, page beyond 48 (8 per page in portrait).
-  const agentSet = () => { const n = DATA.demo ? parseInt(Q.get('agents'), 10) : 0; if (!n) return DATA.threads.filter(t => t.state !== 'idle'); const pool = DATA.agentPool; return Array.from({ length: Math.max(1, Math.min(480, n)) }, (_, i) => ({ ...pool[i % pool.length], id: 'a' + i, title: pool[i % pool.length].title + (i >= pool.length ? ' (' + (Math.floor(i / pool.length) + 1) + ')' : '') })); };
+  const agentSet = () => { const n = DATA.demo ? parseInt(Q.get('agents'), 10) : 0; if (!n) return DATA.threads; const pool = DATA.agentPool; return Array.from({ length: Math.max(1, Math.min(480, n)) }, (_, i) => ({ ...pool[i % pool.length], id: 'a' + i, title: pool[i % pool.length].title + (i >= pool.length ? ' (' + (Math.floor(i / pool.length) + 1) + ')' : '') })); };
   const tierOf = n => n <= 1 ? 1 : n <= 4 ? 4 : n <= 12 ? 12 : n <= 24 ? 24 : 48;
   let agentPage = 0;
   R.agents = () => {
-    const incoming = agentSet(); const all = display.source('agents', incoming.length === display.count('agents', incoming.length, performance.now()) ? incoming : null) || incoming;
+    const incoming = agentSet(); const all = !DATA.demo ? incoming : display.source('agents', incoming.length === display.count('agents', incoming.length, performance.now()) ? incoming : null) || incoming;
     const per = portrait() ? 8 : 48; const pages = Math.max(1, Math.ceil(all.length / per)); agentPage = Math.min(agentPage, pages - 1);
     const shown = all.slice(agentPage * per, agentPage * per + per); const tier = tierOf(all.length);
     const count = k => all.filter(a => a.state === k).length;
@@ -158,8 +158,8 @@
       <div class="state">${st(a.state, STATE_LABEL[a.state] + (a.state.startsWith('waiting') ? a.age == null ? ' · duration unknown' : ' · ' + dur(a.age) : ''))}</div>
       <div class="act ell">${step(steps[0])}</div>
       <div class="tail">${steps.slice(1).map(x => `<div class="ell">${step(x)}</div>`).join('')}</div>
-      <div class="meta"><span class="host-name">${esc(a.host)}</span><span class="num">run ${dur(a.run)}</span><span class="model">${esc(a.model)} · ${esc(a.effortx || a.effort || 'high')}</span><span class="observed num">observed ${ago(a.observed)} ago</span></div></div></section>`; }).join('');
-    return `<section class="panel p-summary"><header><h2 data-console="FLIGHT">Agents</h2><span class="fresh">${ago(1)}</span></header><div class="body">${summary}</div></section><div class="agrid c${tier}">${tiles}</div>`;
+      <div class="meta"><span class="host-name">${esc(a.host)}</span><span class="num">run ${dur(a.run)}</span><span class="model">${esc(a.model)} · ${esc(a.effortx || a.effort || 'high')}</span><span class="observed num">activity ${ago(a.observed)} ago · source ${ago(a.sourceObserved ?? a.observed)} ago</span></div></div></section>`; }).join('');
+    return `<section class="panel p-summary"><header><h2 data-console="FLIGHT">Agents</h2><span class="fresh">${ago(DATA.demo ? 1 : DATA.agentSourceAge)}</span></header><div class="body">${summary}</div></section><div class="agrid c${tier}">${tiles}</div>`;
   };
 
   R.fleet = () => {
@@ -261,7 +261,7 @@
       const url = new URL(location.href); url.searchParams.set('mode', m);
       history.pushState(null, '', url.href);
     }
-    cur = m; t0 = performance.now(); view.className = m; view.innerHTML = R[m]();
+    cur = m; t0 = performance.now(); view.className = m === 'agent-summary' ? 'agents' : m; view.innerHTML = R[m]();
     for (const b of tabs.children) {
       const selected = b.dataset.m === m;
       b.classList.toggle('on', selected);

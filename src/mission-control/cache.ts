@@ -3,8 +3,8 @@ import { dirname,isAbsolute } from "node:path";
 import { readTrustedFile, readJson, onlyKeys } from "../config/files.ts";
 import { strictJson } from "../access/token.ts";
 import { atomicWrite } from "../fs/atomic.ts";
-import { MissionModel } from "./model.ts";
-import { validateHostSnapshot, object, exact, type HostSnapshot } from "./contract.ts";
+import { MissionModel,summarizeHost } from "./model.ts";
+import { HOSTS,validateHostSnapshot, object, exact, type HostSnapshot } from "./contract.ts";
 export const CACHE_BYTES=512*1024, CACHE_AGE=86400_000;
 export interface StatusCache {schema:"mission-control.cache.v1";gap:boolean;snapshots:HostSnapshot[]}
 export const emptyCache=():StatusCache=>({schema:"mission-control.cache.v1",gap:false,snapshots:[]});
@@ -66,7 +66,13 @@ export class CacheModel {
     const snapshots=this.cache.snapshots.filter(s=>s.observedAt<=now&&now-s.observedAt<=CACHE_AGE);
     const freshness=(connected:boolean,at:number|null,stale=90_000,lost=600_000)=>at===null?"nosource":now-at>lost?"lost":now-at>stale?"stale":connected?"live":"disconnected";
     base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
-      freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:freshness(s.connected&&a.connected&&this.warmSources.has(s.host),a.detailObservedAt,60_000,600_000),steps:[...a.steps]}))).slice(0,48);
+      freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:s.connected&&a.connected&&this.warmSources.has(s.host)&&freshness(s.connected,s.observedAt)==="live"?"live":freshness(false,a.detailObservedAt,60_000,600_000),steps:[...a.steps]}))).slice(0,48);
+    base.hostSummary=HOSTS.map(host=>{
+      const s=snapshots.find(s=>s.host===host);
+      if(!s)return summarizeHost(host,[],null,false,null,"nosource",null);
+      const state=freshness(s.connected,s.observedAt);
+      return summarizeHost(host,s.agents,s.total,s.truncated,s.observedAt,state==="live"&&!this.warmSources.has(host)?"cached":state,s.connected);
+    });
     base.shown=base.agents.length;base.total=snapshots.length&&snapshots.every(s=>s.total!==null)?snapshots.reduce((n,s)=>n+s.total!,0):null;
     base.truncated=this.cache.gap||snapshots.some(s=>s.truncated)||snapshots.reduce((n,s)=>n+s.agents.length,0)>48;
     const observedAt=snapshots.length?Math.min(...snapshots.map(s=>s.observedAt)):null;

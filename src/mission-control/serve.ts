@@ -22,7 +22,7 @@ async function configuredMission(command:string,path:string):Promise<number> {
     if(command!=="serve")throw new Error("unknown_mission_control_mode");
     const c=webConfig(path),model=new CacheModel(c.cacheFile),server=missionServer(model,8,{siteOrigin:c.siteOrigin});
     await server.listen(c.port);
-    const timer=setInterval(()=>model.reload(),5000);
+    const timer=setInterval(()=>model.reload(),1000);
     try{await new Promise<void>(resolve=>controller.signal.addEventListener("abort",()=>resolve(),{once:true}));}
     finally{clearInterval(timer);await server.close();}
     return 0;
