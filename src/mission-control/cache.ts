@@ -66,8 +66,13 @@ export class CacheModel {
     const now=this.now(),base=new MissionModel(false,this.now).snapshot();
     const snapshots=this.cache.snapshots.filter(s=>s.observedAt<=now&&now-s.observedAt<=CACHE_AGE);
     const freshness=(connected:boolean,at:number|null,stale=90_000,lost=600_000)=>at===null?"nosource":now-at>lost?"lost":now-at>stale?"stale":connected?"live":"disconnected";
+    const publicDetail=(s:HostSnapshot,id:string)=>{
+      const detail={...emptyDetail(),...s.rich?.details.find(d=>d.id===id)?.value};
+      if(s.rich?.v===2){delete detail.provider;delete detail.recent;}
+      return detail;
+    };
     base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:s.rich?.details.find(d=>d.id===a.id)?.value.identity.title.text??"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
-      freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:s.connected&&a.connected&&this.warmSources.has(s.host)&&freshness(s.connected,s.observedAt)==="live"?"live":freshness(false,a.detailObservedAt,60_000,600_000),steps:[...a.steps],details:{...emptyDetail(),...s.rich?.details.find(d=>d.id===a.id)?.value},detailCoverage:s.rich?(s.rich.details.some(d=>d.id===a.id)?"reported":"byte-budget"):"legacy"}))).slice(0,48);
+      freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:s.connected&&a.connected&&this.warmSources.has(s.host)&&freshness(s.connected,s.observedAt)==="live"?"live":freshness(false,a.detailObservedAt,60_000,600_000),steps:[...a.steps],details:publicDetail(s,a.id),detailCoverage:s.rich?(s.rich.details.some(d=>d.id===a.id)?"reported":"byte-budget"):"legacy"}))).slice(0,48);
     base.hostSummary=HOSTS.map(host=>{
       const s=snapshots.find(s=>s.host===host);
       if(!s)return summarizeHost(host,[],null,false,null,"nosource",null);

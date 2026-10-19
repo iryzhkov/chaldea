@@ -66,6 +66,8 @@ script.onload = () => {
   const fleetBody = () => hostList().map(h=>hostCard(h)).join("") || missing("No host observations");
   R.fleet=()=>'<div class="host-coverage">Resources · observed CPU and RAM</div>'+hostList().map(h=>hostCard(h,true)).join("");
   const usage = u => !u||u.coverage==="not-reported"?"Usage not reported":("Input "+(u.input??"?")+" · output "+(u.output??"?")+" · observed total "+(u.total??"?")+" · cache read "+(u.cacheRead??"?")+" / write "+(u.cacheWrite??"?")+" · reasoning "+(u.reasoning??"?")+" (subsets) · "+u.coverage+" / "+u.turns+" observed main-agent turns · usage "+age(u.observedAt)+"s ago · generation rate not reported");
+  const previewText = p => p && ["reported","truncated","redacted"].includes(p.state) && typeof p.text==="string" ? p.text : null;
+  const previewLabel = p => p.state==="reported"?"":" · "+p.state;
   const detailBody = a => {
     const d=a.details;if(!d||a.detailCoverage&&a.detailCoverage!=="reported")return missing(a.detailCoverage==="byte-budget"?"Detail withheld · host byte budget":"Detail not reported · older producer or host byte budget");
     const p=d.assistant,effort=d.effort.value?d.effort.value+" ("+d.effort.source+")":"not reported";
@@ -74,7 +76,7 @@ script.onload = () => {
     const identityBody=id?.text?'<div class="thread-id">App thread <code title="'+esc(id.text)+'">'+esc(id.text.length>26?id.text.slice(0,26)+"…":id.text)+'</code> · '+esc(id.state)+(id.state==="reported"?'<button type="button" data-copy-thread="'+esc(id.text)+'">Copy ID</button>':' · full ID unavailable')+'</div>':missing("App thread ID "+(id?.state??"not reported"));
     if(d.fieldCoverage==="identity-only")return identityBody+missing("Other detail withheld · host byte budget");
     const countWork=c=>c?c.active+" active / "+c.queued+" queued / "+c.completed+" completed observed":"not reported";
-    return '<div class="agent-detail">'+identityBody+'<div class="facts"><div>Effort '+esc(effort)+'</div><div>Assistant: '+esc(p.state==="reported"?p.text??p.state:p.state)+' · '+esc(p.state)+'</div><div>'+esc(commandLabel(a))+': '+(commands.length?commands.map(p=>esc(p.state==="reported"?p.text??p.state:p.state)+" ("+esc(p.state)+")").join(" · "):"not reported / no active observation")+(d.commandsOmitted?" · "+d.commandsOmitted+" omitted":"")+'</div><div>'+esc(usage(d.usage))+'</div><div>Context '+(d.context?d.context.used+" / "+(d.context.max??"?"):"not reported")+'</div><div>Children '+(c?c.active+" active / "+c.queued+" queued / "+c.completed+" completed observed":"not reported")+' · delegates '+esc(countWork(w.delegates))+' · native subagents '+esc(countWork(w.subagents))+' · monitors '+(w.monitors??"not reported")+' · background '+(w.background??"not reported")+' · durable waits unavailable · '+esc(w.coverage)+'</div></div></div>';
+    return '<div class="agent-detail">'+identityBody+'<div class="facts"><div>Effort '+esc(effort)+'</div><div>Assistant: '+esc(previewText(p)??p.state)+' · '+esc(p.state)+'</div><div>'+esc(commandLabel(a))+': '+(commands.length?commands.map(p=>esc(previewText(p)??p.state)+" ("+esc(p.state)+")").join(" · "):"not reported / no active observation")+(d.commandsOmitted?" · "+d.commandsOmitted+" omitted":"")+'</div><div>'+esc(usage(d.usage))+'</div><div>Context '+(d.context?d.context.used+" / "+(d.context.max??"?"):"not reported")+'</div><div>Children '+(c?c.active+" active / "+c.queued+" queued / "+c.completed+" completed observed":"not reported")+' · delegates '+esc(countWork(w.delegates))+' · native subagents '+esc(countWork(w.subagents))+' · monitors '+(w.monitors??"not reported")+' · background '+(w.background??"not reported")+' · durable waits unavailable · '+esc(w.coverage)+'</div></div></div>';
   };
   // Counts describe the received observation set, never an inferred fleet total.
   const threadCoverage = (visible=snapshot?.agents.length??0) => {
@@ -88,13 +90,13 @@ script.onload = () => {
   const activityItems = a => {
     const d=a.details;
     if(!d || a.detailCoverage && a.detailCoverage!=="reported" || d.fieldCoverage==="identity-only")return [];
-    if(Array.isArray(d.recent))return d.recent.slice(0,3).filter(p=>["assistant","command"].includes(p.kind)&&p.preview?.state==="reported"&&p.preview.text).map(p=>({
-      kind:(p.kind==="assistant"?"Assistant":p.status==="running"?(commandIsCurrent(a)?"Active command observed":"Last observed command · outcome unknown"):"Command · "+(["completed","failed","cancelled"].includes(p.status)?p.status:"outcome unknown"))+(!Number.isFinite(p.at)?"":" · observed "+age(p.at)+"s ago"),
+    if(Array.isArray(d.recent))return d.recent.slice(0,3).filter(p=>["assistant","command"].includes(p.kind)&&previewText(p.preview)).map(p=>({
+      kind:(p.kind==="assistant"?"Assistant":p.status==="running"?(commandIsCurrent(a)?"Active command observed":"Last observed command · outcome unknown"):"Command · "+(["completed","failed","cancelled"].includes(p.status)?p.status:"outcome unknown"))+(!Number.isFinite(p.at)?"":" · observed "+age(p.at)+"s ago")+previewLabel(p.preview),
       text:p.preview.text
     }));
     const items=[];
-    if(d.assistant?.state==="reported" && d.assistant.text)items.push({kind:"Assistant",text:d.assistant.text});
-    for(const p of d.commands||[])if(p.state==="reported"&&p.text)items.push({kind:commandLabel(a),text:p.text});
+    if(previewText(d.assistant))items.push({kind:"Assistant"+previewLabel(d.assistant),text:d.assistant.text});
+    for(const p of d.commands||[])if(previewText(p))items.push({kind:commandLabel(a)+previewLabel(p),text:p.text});
     return items.slice(0,3);
   };
   UI.providerMark = a => {

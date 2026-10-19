@@ -347,6 +347,13 @@ test("rich capture crosses ordinary collector/cache with resources, privacy, usa
   const model=new CacheModel(cachePath,()=>now0),view=model.snapshot();
   assert.equal(view.hostSummary.find(h=>h.host==="agent-a")!.resources!.sample!.totalMemoryBytes,1000);
   assert.deepEqual(view.agents[0]!.details.provider,detail.provider);assert.deepEqual(view.agents[0]!.details.recent,detail.recent);
+  const legacy=structuredClone(rich);legacy.rich!.v=2;
+  const legacyDetail=legacy.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+  delete legacyDetail.provider;delete legacyDetail.recent;validateHostSnapshot(legacy);
+  const legacyCache=emptyCache();mergeStatus(legacyCache,legacy,now0);const legacyPath=join(d.path,"legacy-cache");writeCache(legacyPath,legacyCache);
+  const legacyView=new CacheModel(legacyPath,()=>now0).snapshot().agents[0]!.details;
+  assert.equal(Object.hasOwn(legacyView,"recent"),false);assert.equal(Object.hasOwn(legacyView,"provider"),false);
+  assert.equal(legacyView.assistant.text,detail.assistant.text);assert.deepEqual(legacyView.commands,detail.commands);
   assert.equal(view.agents[0]!.details.usage.total,120);
   assert.equal(view.hostSummary.find(h=>h.host==="agent-a")!.details!.usage.total,120);
   m.setResources({state:"unavailable",sample:null});const denied=captureSnapshot(m,"agent-a",epoch,2)!;

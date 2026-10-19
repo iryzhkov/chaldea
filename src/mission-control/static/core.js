@@ -274,12 +274,17 @@
   function renderView(m) {
     const controls = m === 'agents' && view.querySelector('.grid-controls');
     if (!controls) { view.innerHTML = R[m](); return; }
+    const focusedThread = document.activeElement?.getAttribute?.('data-thread-details');
     // Keep controls and their native picker/status nodes mounted across every render.
     const next = document.createElement('div'); next.innerHTML = R[m]();
     for (const selector of ['.p-summary header', '.agents-summary', '.agrid']) {
       const current = view.querySelector(selector), updated = next.querySelector(selector);
-      current.innerHTML = updated.innerHTML;
+      if (current.innerHTML !== updated.innerHTML) current.innerHTML = updated.innerHTML;
       if (selector === '.agrid') current.setAttribute('style', updated.getAttribute('style'));
+    }
+    if (focusedThread != null) {
+      const opener = [...view.querySelectorAll('[data-thread-details]')].find(el=>el.getAttribute('data-thread-details')===focusedThread);
+      (opener || controls.querySelector('[data-thread-grid]')).focus();
     }
     const picker = controls.querySelector('[data-thread-grid]'), updatedPicker = next.querySelector('[data-thread-grid]');
     if (picker.value !== updatedPicker.value) picker.value = updatedPicker.value;

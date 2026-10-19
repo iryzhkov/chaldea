@@ -205,6 +205,7 @@ test("cards render sanitized title, compact real app ID, top state, effort and r
  d.identity={title:{text:"Actual <script>title</script>",state:"reported"},appThreadId:{text:"mcp:real-application-thread-123456789",state:"reported"}};
  d.assistant={text:"Latest <img src=x onerror=alert(1)> paragraph",state:"reported"};
  d.commands=[{text:"go test -race ./...",state:"reported"}];d.effort={value:"high",source:"configured"};
+ delete d.recent; // This fixture intentionally exercises the exact legacy v2 detail.
  const agents=[{id:"opaque-row",title:d.identity.title.text,model:"gpt-6.1-sol",host:"agent-a",state:"thinking",startedAt:now-1000,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[],details:d,detailCoverage:"reported"}];
  const host={host:"agent-a",shown:1,total:1,truncated:false,observedAt:now,freshness:"live",states:{thinking:1},models:[{model:"gpt-6.1-sol",count:1}],resources:{state:"reported",sample:{sampledAt:now,cpuUtilization:0.25,cpuCount:8,availableMemoryBytes:1073741824,totalMemoryBytes:4294967296}}};
  const snapshot={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[host]};
@@ -319,6 +320,7 @@ test("compact cards use current state, bounded previews, safe provider identity 
  const b=browser("https://board.example/?mode=agents&grid=4x3"),now=Date.now(),d:any=emptyDetail();
  d.assistant={text:"Sanitized assistant preview ".repeat(30),state:"reported"};
  d.commands=Array.from({length:3},(_,i)=>({text:"safe command "+i+" ".repeat(20),state:"reported"}));
+ delete d.recent; // Legacy path; later snapshots below exercise authoritative v3 recent.
  const row={id:"one",title:"A meaningful task title ".repeat(6),host:"agent-a",model:"claude-opus-5-5",state:"completed",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:["Command running"],details:d,detailCoverage:"reported"};
  const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[row],shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
  for(const state of ["completed","failed","idle"]){
@@ -331,6 +333,9 @@ test("compact cards use current state, bounded previews, safe provider identity 
   assert.match(card.innerHTML,/activity-fresh/);assert.match(card.innerHTML,/source-fresh/);
   assert.match(card.innerHTML,/aria-label="Provider unknown"/);
  }
+ const opener=b.elements.view!.querySelector('[data-thread-details="one"]')!;
+ opener.focus();b.refresh();assert.equal(b.document.activeElement,b.elements.view!.querySelector('[data-thread-details="one"]'));
+ b.snapshot(snap);assert.equal(b.document.activeElement,b.elements.view!.querySelector('[data-thread-details="one"]'));
  b.openDetails("one");
  const dialog=b.document.body.querySelector(".thread-drawer")!,close=dialog.querySelector("[data-close-details]")!;
  assert.equal(dialog.open,true);assert.equal(b.document.activeElement,close);
@@ -339,11 +344,12 @@ test("compact cards use current state, bounded previews, safe provider identity 
  assert.doesNotMatch(dialog.innerHTML,/Sanitized assistant preview/);
  b.closeDetails();assert.equal(dialog.open,false);assert.equal(b.document.activeElement,b.elements.view!.querySelector('[data-thread-details="one"]'));
  // Actual optional provider/recent metadata wins over legacy data and model names.
- const recent=[{kind:"assistant",preview:{text:"Earlier actual message",state:"reported"},at:now-10000,status:"unknown"},{kind:"command",preview:{text:"Observed completed command",state:"reported"},at:now,status:"completed"},{kind:"command",preview:{text:null,state:"withheld"},at:now,status:"failed"}];
+ const recent=[{kind:"assistant",preview:{text:"Earlier actual message",state:"truncated"},at:now-10000,status:"unknown"},{kind:"command",preview:{text:"Observed completed command",state:"redacted"},at:now,status:"completed"},{kind:"command",preview:{text:null,state:"withheld"},at:now,status:"failed"}];
  b.snapshot({...snap,agents:[{...row,details:{...d,provider:{instanceId:"custom-codex",driver:"codex"},recent}}]});
  let html=b.elements.view!.innerHTML;
  assert.match(html,/OpenAI Codex · custom-codex/);assert.doesNotMatch(html,/Claude ·/);
- assert.match(html,/Earlier actual message/);assert.match(html,/Command · completed/);assert.doesNotMatch(html,/Sanitized assistant preview|safe command/);
+ assert.match(html,/Earlier actual message/);assert.match(html,/Command · completed/);assert.match(html,/truncated/);assert.match(html,/redacted/);assert.doesNotMatch(html,/Sanitized assistant preview|safe command/);
+ b.openDetails("one");assert.match(dialog.innerHTML,/Earlier actual message/);assert.match(dialog.innerHTML,/Observed completed command/);b.closeDetails();
  b.snapshot({...snap,agents:[{...row,details:{...d,provider:{instanceId:"custom-claude",driver:"claudeAgent"},recent:[]}}]});
  html=b.elements.view!.innerHTML;assert.match(html,/Claude · custom-claude/);assert.doesNotMatch(html,/Earlier actual message|Sanitized assistant preview/);
  b.snapshot({...snap,agents:[{...row,state:"working",detailObservedAt:now-90000,details:{...d,recent:[{kind:"command",preview:{text:"Old command",state:"reported"},at:now-90000,status:"running"}]}}]});
