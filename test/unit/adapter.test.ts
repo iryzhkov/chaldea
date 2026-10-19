@@ -189,7 +189,7 @@ for(const denied of ["success","typed","die","decode"])test("host resources shar
 });
 
 
-for(const snapshot of [false,true])test("official detail ownership preserves legacy capture and rolls past 128 owners, snapshot="+snapshot,async()=>{
+for(const overflow of [false,true])for(const snapshot of [false,true])test("official detail ownership preserves legacy capture and rolls past 128 owners, items="+overflow+", snapshot="+snapshot,async()=>{
  const {connectMissionThread}=await import("../../src/t3/adapter.ts");
  const server=createServer(),wss=new WebSocketServer({server}),controller=new AbortController();
  const stamp="2026-10-18T00:00:00.000Z",threadId="owner-fixture";
@@ -198,15 +198,34 @@ for(const snapshot of [false,true])test("official detail ownership preserves leg
  const provider={id:"provider",driver:"codex",providerInstanceId:"custom",providerSessionId:null,appThreadId:threadId,ownerNodeId:"root-0",nativeThreadRef:null,nativeConversationHeadRef:null,status:"active",firstRunOrdinal:1,lastRunOrdinal:130,handoffIds:[],forkedFrom:null,pendingBackgroundTasks:[],contextUsage:{usedTokens:500,maxTokens:1000},nativeMetadata:null,createdAt:stamp,updatedAt:stamp};
  const base={threadId,runId:null,nodeId:null,providerThreadId:"provider",providerTurnId:null,nativeItemRef:null,parentItemId:null,ordinal:1,title:null,startedAt:stamp,completedAt:null,updatedAt:stamp};
  const assistant=(id:string,nodeId:string|null,text=id)=>({...base,id,nodeId,type:"assistant_message",status:"completed",messageId:id,text,streaming:false});
+ // The current root differs from the provider's creation root. Historical item
+ // nodes must not displace it on reconnect or during one long live turn.
+ const itemNodes=overflow?[
+  ...Array.from({length:130},(_,i)=>({...node,id:"execution-"+i,rootNodeId:"root-129",parentNodeId:"root-129",kind:i%2?"reasoning":"tool_call"})),
+  {...node,id:"latest-assistant-node",rootNodeId:"root-129",parentNodeId:"root-129",kind:"assistant_message"},
+  {...node,id:"latest-command-node",rootNodeId:"root-129",parentNodeId:"root-129",kind:"tool_call"},
+  {...node,id:"snapshot-child",rootNodeId:"root-129",parentNodeId:"root-129",kind:"subagent"},
+  {...node,id:"snapshot-child-item",rootNodeId:"root-129",parentNodeId:"snapshot-child",kind:"assistant_message"},
+  {...node,id:"snapshot-foreign",threadId:"foreign",rootNodeId:"root-129",parentNodeId:"root-129",kind:"assistant_message"},
+  {...node,id:"snapshot-unknown-parent",rootNodeId:"root-129",parentNodeId:"unknown-parent",kind:"assistant_message"},
+  {...node,id:"snapshot-old-root",rootNodeId:"root-0",parentNodeId:"root-0",kind:"assistant_message"},
+ ]:[];
+ const overflowItems=overflow?[
+  assistant("overflow-assistant","latest-assistant-node"),
+  {...base,id:"overflow-command",nodeId:"latest-command-node",type:"command_execution",status:"running",input:"npm test",output:"PRIVATE OUTPUT"},
+  ...["execution-0","snapshot-child-item","snapshot-foreign","snapshot-unknown-parent","snapshot-old-root","unknown-node"].map(id=>assistant("rejected-"+id,id)),
+ ]:[];
  let sequence=1;
  const event=(type:string,payload:unknown,scope=threadId)=>({kind:"event",sequence:++sequence,event:{id:"event-"+sequence,threadId:scope,occurredAt:stamp,type,payload}});
  const values:unknown[]=[];
  if(snapshot){
   const thread={id:threadId,projectId:"project",title:"Ownership fixture",providerInstanceId:"custom",modelSelection:{instanceId:"custom",model:"gpt-6.1-sol"},runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,activeProviderThreadId:"provider",lineage:{parentThreadId:null,relationshipToParent:null,rootThreadId:threadId},forkedFrom:null,createdBy:"user",creationSource:"web",createdAt:stamp,updatedAt:stamp,archivedAt:null,deletedAt:null};
-  values.push({kind:"snapshot",snapshotSequence:1,projection:{thread,nodes:roots,providerThreads:[provider],runs:[],attempts:[],subagents:[],providerSessions:[],providerTurns:[],runtimeRequests:[],messages:[],plans:[],turnItems:[assistant("snapshot-main",null)],checkpointScopes:[],checkpoints:[],contextHandoffs:[],contextTransfers:[],visibleTurnItems:[],updatedAt:stamp}});
+  values.push({kind:"snapshot",snapshotSequence:1,projection:{thread,nodes:[...roots,...itemNodes],providerThreads:[provider],runs:[],attempts:[],subagents:[],providerSessions:[],providerTurns:[],runtimeRequests:[],messages:[],plans:[],turnItems:[assistant("snapshot-main",null),...overflowItems],checkpointScopes:[],checkpoints:[],contextHandoffs:[],contextTransfers:[],visibleTurnItems:[],updatedAt:stamp}});
  }else{
   values.push(event("node.updated",roots[0]),event("provider-thread.updated",provider));
   for(const root of roots.slice(1))values.push(event("node.updated",root));
+  for(const itemNode of itemNodes)values.push(event("node.updated",itemNode));
+  for(const item of overflowItems)values.push(event("turn-item.updated",item));
  }
  // Updating the long-lived provider after its creation root was evicted is valid.
  values.push(event("provider-thread.updated",provider),event("turn-item.updated",assistant("old-provider",null)));
@@ -240,7 +259,7 @@ for(const snapshot of [false,true])test("official detail ownership preserves leg
   const serverUrl=await listen(server);
   await assert.rejects(connectMissionThread({serverUrl,token:"fixture",signal:controller.signal},threadId,undefined,e=>{seen.push(e);if(e.kind==="synchronized")controller.abort();}));
   assert.ok(seen.some(e=>e.kind==="synchronized"),"fixture must decode through official contracts");
-  assert.deepEqual(seen.filter(e=>e.kind==="recent-item").map(e=>e.id),[...(snapshot?["snapshot-main"]:[]),"old-provider","main-assistant","main-command"]);
+  assert.deepEqual(seen.filter(e=>e.kind==="recent-item").map(e=>e.id),[...(snapshot?["snapshot-main"]:[]),...(overflow?["overflow-assistant","overflow-command"]:[]),"old-provider","main-assistant","main-command"]);
   assert.ok(seen.some(e=>e.kind==="command"&&e.id==="legacy-command"&&e.running));
   assert.ok(seen.some(e=>e.kind==="assistant"&&e.text==="legacy-assistant"));
   assert.ok(seen.some(e=>e.kind==="activity-state"&&e.id==="legacy-reasoning"&&e.running));

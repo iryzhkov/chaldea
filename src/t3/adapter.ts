@@ -547,10 +547,19 @@ export type MissionDetailEvent =
   | { kind: "usage"; turnId: string; output: number | null; at: number; baseline: boolean; startedAt?: number | null };
 export async function connectMissionThread(options: ConnectOptions, threadId: string,
   afterSequence: number | undefined, onEvent: (event: MissionDetailEvent) => void): Promise<void> {
-  // One bounded cache for verified root turns and their main-thread item nodes.
-  const mainOwners=new Map<string,string>();
+  // Retain at most 128 owner IDs: item overflow cannot evict a running root.
+  const mainRoots=new Set<string>(),mainOwners=new Map<string,string>();
+  const rememberRoot=(root:string)=>{
+    mainRoots.delete(root);mainRoots.add(root);
+    if(mainRoots.size>64){
+      const oldest=mainRoots.values().next().value!;mainRoots.delete(oldest);
+      for(const [id,owner] of mainOwners)if(owner===oldest)mainOwners.delete(id);
+    }
+  };
   const rememberOwner=(id:string,root:string)=>{
-    if(!mainOwners.has(id)&&mainOwners.size>=128)mainOwners.delete(mainOwners.keys().next().value!);
+    rememberRoot(root);
+    mainOwners.delete(id);
+    if(mainOwners.size>=64)mainOwners.delete(mainOwners.keys().next().value!);
     mainOwners.set(id,root);
   };
   const activeCommands=new Map<string,string|null>();
@@ -579,7 +588,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       durableWaits:null,coverage:"observed bounded roster"}});
   };
   const provider=(p:OrchestrationV2ThreadProjection["providerThreads"][number],snapshotOwner=false)=>{
-    if(p.appThreadId!==threadId||p.ownerNodeId===null||!(snapshotOwner||mainOwners.get(p.ownerNodeId)===p.ownerNodeId||providers.get(p.id)?.owner===p.ownerNodeId))return;
+    if(p.appThreadId!==threadId||p.ownerNodeId===null||!(snapshotOwner||mainRoots.has(p.ownerNodeId)||providers.get(p.id)?.owner===p.ownerNodeId))return;
     if(!providers.has(p.id)&&providers.size>=16)return;
     providers.set(p.id,{owner:p.ownerNodeId,updatedAt:DateTime.toEpochMillis(p.updatedAt),reported:p.nativeMetadata?.modelSelection,
       context:p.contextUsage?{used:p.contextUsage.usedTokens,max:p.contextUsage.maxTokens??null}:null,
@@ -597,8 +606,8 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   };
   const node=(n:OrchestrationV2ThreadProjection["nodes"][number])=>{
     if(n.threadId!==threadId)return;
-    if(n.kind==="root_turn"){rememberOwner(n.id,n.id);return;}
-    const rootKnown=mainOwners.get(n.rootNodeId)===n.rootNodeId||[...providers.values()].some(p=>p.owner===n.rootNodeId);
+    if(n.kind==="root_turn"){rememberRoot(n.id);return;}
+    const rootKnown=mainRoots.has(n.rootNodeId);
     if(["assistant_message","reasoning","tool_call"].includes(n.kind)&&rootKnown
       &&(n.parentNodeId===null||n.parentNodeId===n.rootNodeId||mainOwners.get(n.parentNodeId)===n.rootNodeId)
       &&(n.providerThreadId===null||providers.has(n.providerThreadId)))rememberOwner(n.id,n.rootNodeId);
@@ -606,7 +615,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   const activity=(r:OrchestrationV2ThreadProjection["turnItems"][number])=>{
     // Preserve legacy capture even when bounded ownership evidence is unavailable.
     if(r.threadId!==threadId)return;
-    const recentOwner=(r.nodeId!==null?mainOwners.has(r.nodeId):r.providerThreadId!=null&&providers.has(r.providerThreadId))
+    const recentOwner=(r.nodeId!==null?(mainRoots.has(r.nodeId)||mainOwners.has(r.nodeId)):r.providerThreadId!=null&&providers.has(r.providerThreadId))
       &&(r.providerThreadId==null||providers.has(r.providerThreadId));
     if(recentOwner&&(r.type==="assistant_message"||r.type==="command_execution")){
       const status=["running","completed","failed","cancelled"].includes(r.status)?r.status as "running"|"completed"|"failed"|"cancelled":"unknown";
@@ -629,7 +638,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   } as never).pipe(Stream.runForEach(item => Effect.sync(() => {
     if(item.kind==="synchronized"){onEvent({kind:"synchronized"});return;}
     if(item.kind==="snapshot"){
-      providers.clear();children.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
+      providers.clear();children.clear();mainRoots.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
       if(item.projection.thread.id!==threadId)return;
       for(const run of item.projection.runs.slice(-128))if(["completed","failed","cancelled","interrupted"].includes(run.status))terminalRuns.add(run.id);
       for(const n of item.projection.nodes)if(n.kind==="root_turn")node(n);
