@@ -224,6 +224,22 @@ test("cards render sanitized title, compact real app ID, top state, effort and r
  b.click("overview");assert.match(b.elements.view!.innerHTML,/25.0% · 8 cores/);
 });
 
+test("Auto maximizes readable card area for the current count and viewport",()=>{
+ const b=browser("https://board.example/?mode=agents"),now=Date.now();b.resize(3840,2160);
+ const rows=Array.from({length:48},(_,i)=>({id:"auto-"+i,title:"Auto task "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));
+ const snap=(n:number)=>({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:rows.slice(0,n),shown:n,total:n,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]});
+ for(const [n,cols,lines] of [[1,1,1],[2,2,1],[5,3,2],[6,3,2],[7,3,3],[9,3,3],[10,4,3],[12,4,3],[13,4,4],[16,4,4],[48,8,6]]){
+  b.snapshot(snap(n!));const html=b.elements.view!.innerHTML;
+  assert.match(html,new RegExp("Effective fit "+cols+" × "+lines+" ·"));
+  assert.equal((html.match(/class="panel tile"/g)||[]).length,n);
+  assert.match(html,/Page 1 of 1/);
+ }
+ b.snapshot(snap(13));b.resize(1920,1080);assert.match(b.elements.view!.innerHTML,/Effective fit 5 × 3/);
+ b.grid("4x4");b.snapshot(snap(5));assert.match(b.elements.view!.innerHTML,/Effective fit 4 × 3/);
+ b.grid("auto");b.snapshot(snap(5));assert.match(b.elements.view!.innerHTML,/Effective fit 3 × 2/);
+ b.resize(390,600);assert.match(b.elements.view!.innerHTML,/Effective fit 1 × 1/);
+});
+
 test("explicit grids page every row, clamp on resize and SSE shrink, and survive history",()=>{
  const b=browser("https://board.example/?mode=agents#board"),now=Date.now();
  const agents=Array.from({length:48},(_,i)=>({id:"row-"+i,title:"Distinct task "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));

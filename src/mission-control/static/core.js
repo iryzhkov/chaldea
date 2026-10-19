@@ -144,23 +144,33 @@
 
   // Live thread density follows the available CSS viewport and a bounded URL preference.
   const agentSet = () => { const n = DATA.demo ? parseInt(Q.get('agents'), 10) : 0; if (!n) return DATA.threads; const pool = DATA.agentPool; return Array.from({ length: Math.max(1, Math.min(480, n)) }, (_, i) => ({ ...pool[i % pool.length], id: 'a' + i, title: pool[i % pool.length].title + (i >= pool.length ? ' (' + (Math.floor(i / pool.length) + 1) + ')' : '') })); };
-  const GRID_CHOICES = ['auto','2x2','3x3','4x3','5x3','6x4','8x6'];
+  const GRID_CHOICES = ['auto','2x2','3x2','3x3','4x3','4x4','5x3','6x4','8x6'];
   const gridPreference = () => { const v = new URLSearchParams(location.search).get('grid'); return GRID_CHOICES.includes(v) ? v : 'auto'; };
-  const gridFit = () => {
+  const gridFit = count => {
     const rect = view.getBoundingClientRect(), summary = view.querySelector('.p-summary');
     const width = Math.min(rect.width || innerWidth, innerWidth);
     const height = Math.min(rect.height || innerHeight, innerHeight - Math.max(0, rect.top));
-    const room = Math.max(0, height - (summary?.getBoundingClientRect().height || 160) - 12);
-    const maxCols = Math.max(1, Math.min(8, Math.floor((width + 12) / 312)));
-    const maxRows = Math.max(1, Math.min(6, Math.floor((room + 12) / 242)));
-    const pref = gridPreference(), requested = pref === 'auto' ? [maxCols,maxRows] : pref.split('x').map(Number);
+    const gap = parseFloat(globalThis.getComputedStyle?.(view).gap) || 12;
+    const room = Math.max(0, height - (summary?.getBoundingClientRect().height || 160) - gap);
+    const maxCols = Math.max(1, Math.min(8, Math.floor((width + gap) / (300 + gap))));
+    const maxRows = Math.max(1, Math.min(6, Math.floor((room + gap) / (230 + gap))));
+    const needed = Math.max(1, Math.min(count, 48, maxCols * maxRows));
+    let best = { cols:1, rows:1, score:-1 };
+    for (let c=1;c<=maxCols;c++) for (let r=1;r<=maxRows;r++) {
+      if (c*r<needed) continue;
+      const w=(width-gap*(c-1))/c, h=(room-gap*(r-1))/r;
+      // Maximize a readable landscape content rectangle, avoiding skinny cards.
+      const score=Math.min(w*w/1.6,h*h*1.6);
+      if (score>best.score || score===best.score && c*r<best.cols*best.rows) best={cols:c,rows:r,score};
+    }
+    const pref = gridPreference(), requested = pref === 'auto' ? [best.cols,best.rows] : pref.split('x').map(Number);
     const cols = Math.min(requested[0], maxCols), rows = Math.min(requested[1], maxRows);
     return { pref, cols, rows, per: Math.min(48, cols * rows), maxCols, maxRows };
   };
   let agentPage = 0;
   R.agents = () => {
     const incoming = agentSet(); const all = !DATA.demo ? incoming : display.source('agents', incoming.length === display.count('agents', incoming.length, performance.now()) ? incoming : null) || incoming;
-    const fit = gridFit(), per = fit.per; const pages = Math.max(1, Math.ceil(all.length / per)); agentPage = Math.min(agentPage, pages - 1);
+    const fit = gridFit(all.length), per = fit.per; const pages = Math.max(1, Math.ceil(all.length / per)); agentPage = Math.min(agentPage, pages - 1);
     const shown = all.slice(agentPage * per, agentPage * per + per);
     const count = k => all.filter(a => a.state === k).length;
     const summary = `<div class="agents-summary"><span class="t">${all.length} agent${all.length === 1 ? '' : 's'}</span>${st('working', count('working') + ' working')}${st('waiting-igor', count('waiting-igor') + ' waiting for Igor')}${st('waiting-ci', count('waiting-ci') + ' waiting for CI')}${count('failed') ? st('failed', count('failed') + ' failed') : ''}${count('idle') ? st('idle', count('idle') + ' idle') : ''}<span class="muted t1">${esc(window.MC?.UI.threadCoverage ? window.MC.UI.threadCoverage(shown.length, all.length, agentPage * per) : all.length + " observed threads")}</span></div>`;
