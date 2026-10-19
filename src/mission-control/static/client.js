@@ -5,6 +5,8 @@ export function projectClientSnapshot(snapshot, now, connected) {
   return { ...snapshot,
     source: { ...snapshot.source, observedAt: !snapshot.sampled && snapshot.source.state === "live" ? snapshot.now : snapshot.source.observedAt,
       state: lost && snapshot.source.state === "live" ? "disconnected" : snapshot.source.state },
+    ...(snapshot.hostSummary ? { hostSummary: snapshot.hostSummary.map(h => ({ ...h,
+      freshness: lost && h.freshness === "live" ? "disconnected" : h.freshness })) } : {}),
     agents: snapshot.agents.map(a => ({ ...a,
       detailObservedAt: !snapshot.sampled && a.activityFreshness === "live" ? snapshot.now : a.detailObservedAt,
       activityFreshness: lost && a.activityFreshness === "live" ? "disconnected" : a.activityFreshness,
