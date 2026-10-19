@@ -154,6 +154,8 @@ export function applyCodex(row: ProviderHeadroom, raw: unknown, at: string): voi
     row.credits = clean.credits; row.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
     row.spendControlReached = clean.spendControlReached; row.plan = clean.plan;
     if (row.manualResets.source === "codex-app-server") row.manualResets = clean.manualResets;
+    // The cached credit expiry was looked up for the previous account's capacity key.
+    delete row.creditExpiresAt;
   }
   if (key) row.accountKey = key; else delete row.accountKey;
   const map = object(result.rateLimitsByLimitId);

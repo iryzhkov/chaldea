@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { applyCodex, newProvider } from "../../src/quota/headroom.ts";
 import type { Metric, ProviderHeadroom, Window } from "../../src/quota/headroom.ts";
 import { classifyCapacity, DEFAULT_CAPACITY } from "../../src/quota/capacity.ts";
+import { accountKey, capacityKey } from "../../src/quota/account.ts";
 import { recommend } from "../../src/route/policy.ts";
 import type { RouteInput } from "../../src/route/types.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
@@ -146,6 +147,25 @@ test("funding proof never crosses observed account identity; same-account partia
   row.manualResets = { ...metric({ availableCount: 2, nextExpiresAt: null }), source: "t3" };
   applyCodex(row, read("FIXTURE_ACCOUNT_C", { credits: wallet("1") }), iso(now));
   assert.equal(row.manualResets.source, "t3"); assert.equal(row.manualResets.value?.availableCount, 2);
+  // A's cached credit expiry is not B's: B's configured past expiry still refuses funding.
+  const expiring = newProvider("codex", "codex");
+  expiring.binding = "asserted";
+  applyCodex(expiring, a, iso(now));
+  expiring.creditExpiresAt = iso(now + 30 * 86400000);
+  assert.equal(classifyCapacity(expiring, false, now).creditFunded, true);
+  const config = { ...DEFAULT_CAPACITY, providers: { [capacityKey("codex", accountKey("FIXTURE_ACCOUNT_B")!)]: { creditExpiresAt: iso(now - 1) } } };
+  const fundedB = read("FIXTURE_ACCOUNT_B", { spendControlReached: false, credits: wallet("59012.25") }, { ordinaryUsageAllowed: false });
+  applyCodex(expiring, fundedB, iso(now));
+  c = classifyCapacity(expiring, false, now, config);
+  assert.equal(c.creditFunded, undefined, "A's future expiry must not override B's expired credits");
+  assert.equal(c.class, "tight");
+  assert.equal(expiring.creditExpiresAt, undefined);
+  // The same account keeps its cached expiry; losing the identity drops it.
+  expiring.creditExpiresAt = iso(now + 3600000);
+  applyCodex(expiring, fundedB, iso(now));
+  assert.equal(expiring.creditExpiresAt, iso(now + 3600000));
+  applyCodex(expiring, read(null, { credits: wallet("1") }), iso(now));
+  assert.equal(expiring.creditExpiresAt, undefined);
 });
 
 test("active usage stops stay stopped; included short-window gates do not gate the proven paid lane", () => {

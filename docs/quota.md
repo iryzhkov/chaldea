@@ -367,7 +367,8 @@ app-server. They are credits, not dollars or a purchased-only ledger, and are ne
 summed across aliases/buckets. The wallet's decimal string, hasCredits/unlimited
 flags, manual-reset count, ordinaryUsageAllowed and spendControlReached each retain
 their own successful observation time. A read whose account ID differs from the
-retained one (changed, newly known or missing) clears these app-server fields first,
+retained one (changed, newly known or missing) clears these app-server fields and the
+cached account credit expiry first,
 so an omitted field never carries over from another account; T3-sourced windows and
 reset inventory are kept. The only account RPC is
 `account/rateLimits/read`, with `excludeResetCreditDetails:true` and
