@@ -9,8 +9,13 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  suites:
+    name: suite (${{ matrix.lane }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [unit, akasha, e2e-1, e2e-2, e2e-3, messaging, python-vectors]
     env:
       CHALDEA_REQUIRE_E2E: "1"
     steps:
@@ -25,14 +30,19 @@ jobs:
           python-version: '3.13'
       - name: Prepare isolated test directories
         run: |
-          mkdir -p "$RUNNER_TEMP/chaldea/home" "$RUNNER_TEMP/chaldea/tmp"
+          test -n "$RUNNER_TEMP"
+          export HOME="$RUNNER_TEMP/chaldea/home"
+          export TMPDIR="$RUNNER_TEMP/chaldea/tmp"
+          test "$HOME" = "$RUNNER_TEMP/chaldea/home"
+          test "$TMPDIR" = "$RUNNER_TEMP/chaldea/tmp"
+          mkdir -p "$HOME" "$TMPDIR"
           {
-            echo "HOME=$RUNNER_TEMP/chaldea/home"
-            echo "XDG_CONFIG_HOME=$RUNNER_TEMP/chaldea/home/.config"
-            echo "XDG_STATE_HOME=$RUNNER_TEMP/chaldea/home/.local/state"
-            echo "XDG_DATA_HOME=$RUNNER_TEMP/chaldea/home/.local/share"
-            echo "XDG_RUNTIME_DIR=$RUNNER_TEMP/chaldea/home/.cache"
-            echo "TMPDIR=$RUNNER_TEMP/chaldea/tmp"
+            echo "HOME=$HOME"
+            echo "XDG_CONFIG_HOME=$HOME/.config"
+            echo "XDG_STATE_HOME=$HOME/.local/state"
+            echo "XDG_DATA_HOME=$HOME/.local/share"
+            echo "XDG_RUNTIME_DIR=$HOME/.cache"
+            echo "TMPDIR=$TMPDIR"
             echo "CHALDEA_TEST_SCRATCH=$RUNNER_TEMP/chaldea/tests"
           } >> "$GITHUB_ENV"
       - name: Download and verify pinned T3 stable
@@ -40,14 +50,47 @@ jobs:
           sh scripts/ci/install-t3 "$RUNNER_TEMP/chaldea/t3"
           echo "CHALDEA_T3_BIN=$RUNNER_TEMP/chaldea/t3/t3" >> "$GITHUB_ENV"
       - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - name: Qualify dedicated-account NATS messaging with pinned T3
-        run: sudo -- env -i PATH="$PATH" /bin/sh test/message/run.sh
-      - name: Check access v1 vectors independently in Python
+      - name: Check complete, exact-once E2E file assignment
+        run: python3 scripts/ci/e2e-groups.py --check
+      - name: Run required suite
+        env:
+          CI_LANE: ${{ matrix.lane }}
         run: |
-          python3 --version
-          python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), "Python 3.13 is required"'
-          python3 -m venv "$TMPDIR/chaldea-access-python"
-          "$TMPDIR/chaldea-access-python/bin/python" -m pip install -r test/fixtures/access/requirements.txt
-          "$TMPDIR/chaldea-access-python/bin/python" test/fixtures/access/verify.py
+          case "$CI_LANE" in
+            unit)
+              npm run typecheck
+              npm run test:unit
+              ;;
+            akasha) npm run akasha:test ;;
+            e2e-1|e2e-2|e2e-3) python3 scripts/ci/e2e-groups.py "$CI_LANE" ;;
+            messaging)
+              sudo -- env -i PATH="$PATH" /bin/sh test/message/run.sh
+              ;;
+            python-vectors)
+              python3 --version
+              python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), "Python 3.13 is required"'
+              python3 -m venv "$TMPDIR/chaldea-access-python"
+              "$TMPDIR/chaldea-access-python/bin/python" -m pip install -r test/fixtures/access/requirements.txt
+              "$TMPDIR/chaldea-access-python/bin/python" test/fixtures/access/verify.py
+              ;;
+            *) echo "Unknown required CI lane: $CI_LANE" >&2; exit 1 ;;
+          esac
+
+  # Stable branch-protection check. Matrix failures/cancellations cannot skip it.
+  test:
+    name: test
+    if: ${{ always() }}
+    needs: [suites]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every suite to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          needs = json.loads(os.environ["NEEDS"])
+          if set(needs) != {"suites"} or needs["suites"].get("result") != "success":
+              raise SystemExit(f"Required CI suites did not all succeed: {needs}")
+          PY
