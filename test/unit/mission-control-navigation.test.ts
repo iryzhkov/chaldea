@@ -12,10 +12,10 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     style: Record<string, string> = {};
     attrs: Record<string, string> = {};
     children: Element[] = [];
+    parts: (Element | string)[] = [];
+    tag = "div";
     className = "";
     value = "";
-    textContent = "";
-    html = "";
     bar: Element | undefined;
     onload: (() => void) | undefined;
     classList = { toggle: (name: string, on: boolean) => {
@@ -23,34 +23,69 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
       if (on) classes.add(name); else classes.delete(name);
       this.className = [...classes].join(" ");
     }};
-    setAttribute(name: string, value: string) { this.attrs[name] = value; }
+    setAttribute(name: string, value: string) {
+      this.attrs[name] = value;
+      if (name === "class") this.className = value;
+      if (name.startsWith("data-")) this.dataset[name.slice(5).replace(/-([a-z])/g,(_,c)=>c.toUpperCase())] = value;
+    }
     getAttribute(name: string) { return this.attrs[name] ?? null; }
     removeAttribute(name: string) { delete this.attrs[name]; }
     closest(selector: string) { if (selector === "[data-copy-thread]") return null; return selector === "[data-thread-page]" && !this.dataset.threadPage ? null : this; }
-    matches(selector: string) { return selector === "[data-thread-grid]" && this.attrs["data-thread-grid"] !== undefined; }
-    getBoundingClientRect() { return {width,height,top:0}; }
-    append(el: Element) { this.children.push(el); }
-    set innerHTML(html: string) {
-      this.html = html;
-      if (this === elements.tabs) this.children = [...html.matchAll(/data-m="([^"]+)"/g)].map(m => {
-        const el = new Element(); el.dataset.m = m[1]!; el.bar = new Element(); return el;
+    matches(selector: string): boolean {
+      return selector.split(",").some(s => {
+        const attr = s.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/);
+        if (attr) return this.attrs[attr[1]!] !== undefined && (attr[2] === undefined || this.attrs[attr[1]!] === attr[2]);
+        return s.startsWith(".") ? this.className.split(" ").includes(s.slice(1)) : this.tag === s;
       });
     }
-    get innerHTML() { return this.html; }
+    contains(el: Element | null): boolean { return el === this || this.children.some(c=>c.contains(el)); }
+    focus() { document.activeElement = this; }
+    blur() { document.activeElement = document.body; const e=new Event("focusout");Object.defineProperty(e,"target",{value:this});document.dispatchEvent(e); }
+    get options() { return this.children.filter(c=>c.tag === "option"); }
+    get textContent(): string { return this.parts.map(p=>typeof p === "string" ? p : p.textContent).join(""); }
+    set textContent(text: string) { this.children=[];this.parts=[text]; }
+    getBoundingClientRect() { return {width,height:this.matches(".p-summary")?160:height,top:0}; }
+    append(el: Element) { this.children.push(el); this.parts.push(el); }
+    set innerHTML(html: string) {
+      if (this.children.some(c=>c.contains(document.activeElement))) document.activeElement=document.body;
+      this.children=[];this.parts=[];
+      const stack: Element[] = [this];
+      for (const token of html.match(/<[^>]*>|[^<]+/g) || []) {
+        if (token.startsWith("</")) { if(stack.length>1)stack.pop(); continue; }
+        if (!token.startsWith("<")) { stack.at(-1)!.parts.push(token); continue; }
+        const tag=token.match(/^<([\w-]+)/)?.[1];if(!tag)continue;
+        const el=new Element();el.tag=tag;
+        for(const a of token.slice(tag.length+1,-1).matchAll(/([\w-]+)(?:="([^"]*)")?/g))el.setAttribute(a[1]!,a[2]??"");
+        el.value=el.attrs.value??"";
+        stack.at(-1)!.append(el);
+        if(!["br","hr","input","meta","link"].includes(tag)&&!token.endsWith("/>"))stack.push(el);
+      }
+      for (const el of this.descendants()) {
+        if(el.tag==="select")el.value=el.options.find(o=>o.attrs.selected!==undefined)?.value??el.options[0]?.value??"";
+        if(el.tag==="button"&&el.dataset.m)el.bar=el.querySelector("i")??undefined;
+      }
+    }
+    get innerHTML(): string {
+      return this.parts.map(p=>typeof p==="string"?p:"<"+p.tag+Object.entries(p.attrs).map(([k,v])=>" "+k+'="'+v+'"').join("")+">"+p.innerHTML+"</"+p.tag+">").join("");
+    }
+    descendants(): Element[] { return this.children.flatMap(c=>[c,...c.descendants()]); }
     querySelector(selector: string): Element | null {
       if (selector === ".on .bar i") return this.children.find(e => e.className === "on")?.bar ?? null;
       if (selector === ".bar i") return this.bar ?? null;
-      return null;
+      const [parent,child]=selector.split(" ");
+      if(child)return this.descendants().filter(e=>e.matches(parent!)).map(e=>e.querySelector(child)).find(Boolean)??null;
+      return this.descendants().find(e=>e.matches(selector))??null;
     }
   }
   const elements: Record<string, Element> = Object.fromEntries(
     ["board", "view", "tabs", "pick", "navstate", "urgent", "globalfresh", "clock"].map(id => [id, new Element()]));
   const document = Object.assign(new EventTarget(), {
-    body: new Element(), documentElement: { style: { setProperty() {} } }, title: "",
+    body: new Element(), activeElement: null as Element | null, documentElement: { style: { setProperty() {} } }, title: "",
     getElementById: (id: string) => elements[id],
     querySelector: (selector: string) => elements[selector.slice(1)] ?? null,
     createElement: () => new Element(),
   });
+  document.activeElement = document.body;
   document.body.dataset = { defaultDir: "flight", defaultPalette: "mocr-1969" };
   const window = new EventTarget();
   const location = new URL(href);
@@ -88,8 +123,8 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   const travel = (delta: number) => { index += delta; location.href = entries[index]!; window.dispatchEvent(new Event("popstate")); };
   return { elements, location, entries, click, travel, frame: () => frame(),
     resize: (w:number,h:number) => {width=w;height=h;context.innerWidth=w;context.innerHeight=h;window.dispatchEvent(new Event("resize"));},
-    grid: (value:string) => { const el=new Element();el.attrs["data-thread-grid"]="";el.value=value;const e=new Event("change");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
-    page: (delta:number) => {const el=new Element();el.dataset.threadPage=String(delta);const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    grid: (value:string) => { const el=elements.view!.querySelector("[data-thread-grid]")!;el.value=value;const e=new Event("change");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    page: (delta:number) => {const el=elements.view!.querySelector(`[data-thread-page="${delta}"]`)!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document };
 }
 
@@ -209,6 +244,45 @@ test("explicit grids page every row, clamp on resize and SSE shrink, and survive
  b.resize(3840,1800);b.grid("auto");b.snapshot(snapshot);
  assert.equal((b.elements.view!.innerHTML.match(/panel tile/g)||[]).length,48);
 });
+
+test("grid controls retain native nodes and focus through changes, paging and background snapshots",()=>{
+ const b=browser("https://board.example/?mode=agents&grid=3x3"),now=Date.now();
+ const agents=Array.from({length:48},(_,i)=>({id:"synthetic-"+i,title:"Focus task "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));
+ const snapshot={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:48,total:48,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+ b.snapshot(snapshot);
+ const view=b.elements.view!,picker=view.querySelector("[data-thread-grid]")!,option=picker.options[2]!,status=view.querySelector('[role="status"]')!,next=view.querySelector('[data-thread-page="1"]')!;
+ picker.focus();
+ b.grid("4x3");b.grid("5x3");b.refresh();
+ b.snapshot({...snapshot,agents:agents.map(a=>({...a,title:"Latest "+a.title}))});
+ b.resize(1600,1000);
+ assert.equal(b.document.activeElement,picker);
+ assert.equal(view.querySelector("[data-thread-grid]"),picker);
+ assert.equal(picker.options[2],option);
+ assert.equal(view.querySelector('[role="status"]'),status);
+ assert.match(view.innerHTML,/Latest Focus task 0/);
+ assert.equal(b.location.searchParams.get("grid"),"5x3");
+ b.travel(-1);assert.equal(picker.value,"4x3");assert.equal(b.document.activeElement,picker);
+ b.travel(1);assert.equal(picker.value,"5x3");assert.equal(b.document.activeElement,picker);
+ const key=new Event("keydown");Object.defineProperties(key,{target:{value:picker},key:{value:"ArrowRight"}});b.document.dispatchEvent(key);
+ assert.match(status.textContent,/Page 1 of/);
+ picker.blur();
+ assert.match(view.innerHTML,/Latest Focus task 0/);
+ next.focus();b.page(1);b.page(1);
+ assert.equal(b.document.activeElement,next);
+ assert.equal(view.querySelector('[data-thread-page="1"]'),next);
+ assert.match(status.textContent,/Page 3 of/);
+ b.refresh();assert.equal(b.document.activeElement,next);
+ for(let i=0;i<48;i++)b.page(1);
+ assert.equal(next.getAttribute("aria-disabled"),"true");
+ assert.equal(b.document.activeElement,next);
+ const last=status.textContent;b.page(1);assert.equal(status.textContent,last);
+ b.snapshot({...snapshot,agents:agents.slice(0,1),shown:1,total:1});
+ assert.equal(status.textContent,"Page 1 of 1");
+ assert.equal(b.document.activeElement,next);
+ next.blur();b.refresh();assert.equal(b.document.activeElement,b.document.body);
+ b.click("fleet");b.refresh();assert.equal(b.document.activeElement,b.document.body);
+});
+
 test("host cards keep independent ages, observed zero, missing counts and escaped metadata",()=>{
  const b=browser("https://board.example/?mode=agent-summary"),now=Date.now();
  const host=(name:string,observedAt:number|null,freshness:string,total:number|null)=>({host:name,shown:0,total,truncated:false,observedAt,freshness,states:{},models:[]});

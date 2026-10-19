@@ -170,7 +170,7 @@
       <div class="act ell">${step(steps[0])}</div>
       ${window.MC?.UI.agentDetail ? window.MC.UI.agentDetail(a) : ""}<div class="tail">${steps.slice(1).map(x => `<div class="ell">${step(x)}</div>`).join('')}</div>
       <div class="meta"><span class="host-name">${esc(a.host)}</span><span class="num">run ${dur(a.run)}</span><span class="model">${esc(a.model)} · ${esc(a.effortx || a.effort || 'high')}</span><span class="observed num">activity ${ago(a.observed)} ago · source ${ago(a.sourceObserved ?? a.observed)} ago</span></div></div></section>`; }).join('');
-    const controls = `<div class="grid-controls"><label>Thread grid <select data-thread-grid aria-label="Thread grid">${GRID_CHOICES.map(v => `<option value="${v}" ${v === fit.pref ? 'selected' : ''}>${v === 'auto' ? 'Auto' : v.replace('x',' × ')}${v !== 'auto' && (Number(v.split('x')[0]) > fit.maxCols || Number(v.split('x')[1]) > fit.maxRows) ? ' (fit limited)' : ''}</option>`).join('')}</select></label><span>Effective fit ${fit.cols} × ${fit.rows} · ${per} per page</span><button data-thread-page="-1" aria-label="Previous thread page" ${agentPage === 0 ? 'disabled' : ''}>Previous</button><span role="status">Page ${agentPage + 1} of ${pages}</span><button data-thread-page="1" aria-label="Next thread page" ${agentPage === pages - 1 ? 'disabled' : ''}>Next</button></div>`;
+    const controls = `<div class="grid-controls"><label>Thread grid <select data-thread-grid aria-label="Thread grid">${GRID_CHOICES.map(v => `<option value="${v}" ${v === fit.pref ? 'selected' : ''}>${v === 'auto' ? 'Auto' : v.replace('x',' × ')}${v !== 'auto' && (Number(v.split('x')[0]) > fit.maxCols || Number(v.split('x')[1]) > fit.maxRows) ? ' (fit limited)' : ''}</option>`).join('')}</select></label><span data-grid-fit>Effective fit ${fit.cols} × ${fit.rows} · ${per} per page</span><button data-thread-page="-1" aria-label="Previous thread page" aria-disabled="${agentPage === 0}" style="opacity:${agentPage === 0 ? '.5' : '1'}">Previous</button><span role="status">Page ${agentPage + 1} of ${pages}</span><button data-thread-page="1" aria-label="Next thread page" aria-disabled="${agentPage === pages - 1}" style="opacity:${agentPage === pages - 1 ? '.5' : '1'}">Next</button></div>`;
     return `<section class="panel p-summary"><header><h2 data-console="FLIGHT">Agents</h2><span class="fresh">${ago(DATA.demo ? 1 : DATA.agentSourceAge)}</span></header><div class="body">${controls}${summary}</div></section><div class="agrid dynamic-grid" style="grid-template-columns:repeat(${fit.cols},minmax(0,1fr));grid-template-rows:repeat(${fit.rows},minmax(230px,1fr))">${tiles}</div>`;
   };
 
@@ -267,14 +267,42 @@
   tabs.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; select(b.dataset.m); });
   pick.addEventListener('change', () => { select(pick.value); });
   document.addEventListener('keydown', e => { if (e.target.matches?.('input,select,textarea')) return; const i = parseInt(e.key, 10); if (i >= 1 && i <= MODES.length) { select(MODES[i - 1]); } if (e.key === 'ArrowRight' && cur === 'agents') { agentPage++; show('agents'); hold(); } if (e.key === 'ArrowLeft' && cur === 'agents') { agentPage = Math.max(0, agentPage - 1); show('agents'); hold(); } });
+  function renderView(m) {
+    const controls = m === 'agents' && view.querySelector('.grid-controls');
+    if (!controls) { view.innerHTML = R[m](); return; }
+    // Keep controls and their native picker/status nodes mounted across every render.
+    const next = document.createElement('div'); next.innerHTML = R[m]();
+    for (const selector of ['.p-summary header', '.agents-summary', '.agrid']) {
+      const current = view.querySelector(selector), updated = next.querySelector(selector);
+      current.innerHTML = updated.innerHTML;
+      if (selector === '.agrid') current.setAttribute('style', updated.getAttribute('style'));
+    }
+    const picker = controls.querySelector('[data-thread-grid]'), updatedPicker = next.querySelector('[data-thread-grid]');
+    if (picker.value !== updatedPicker.value) picker.value = updatedPicker.value;
+    for (let i = 0; i < picker.options.length; i++) {
+      const label = updatedPicker.options[i].textContent;
+      if (picker.options[i].textContent !== label) picker.options[i].textContent = label;
+    }
+    for (const selector of ['[data-grid-fit]', '[role="status"]']) {
+      const current = controls.querySelector(selector), text = next.querySelector(selector).textContent;
+      if (current.textContent !== text) current.textContent = text;
+    }
+    for (const direction of [-1, 1]) {
+      const selector = `[data-thread-page="${direction}"]`, button = controls.querySelector(selector);
+      const disabled = next.querySelector(selector).getAttribute('aria-disabled');
+      button.setAttribute('aria-disabled', disabled);
+      button.style.opacity = disabled === 'true' ? '.5' : '';
+    }
+  }
   function show(m, navigate = false) {
     if (!MODES.includes(m)) m = 'overview';
     if (navigate && m !== modeFromURL()) {
       const url = new URL(location.href); url.searchParams.set('mode', m);
       history.pushState(null, '', url.href);
     }
-    cur = m; t0 = performance.now(); view.className = m === 'agent-summary' ? 'host-overview' : m; view.innerHTML = R[m]();
-    if (m === 'agents') view.innerHTML = R[m]();
+    cur = m; t0 = performance.now(); view.className = m === 'agent-summary' ? 'host-overview' : m;
+    renderView(m);
+    if (m === 'agents') renderView(m);
     for (const b of tabs.children) {
       const selected = b.dataset.m === m;
       b.classList.toggle('on', selected);
@@ -294,7 +322,7 @@
   });
   document.addEventListener('click', e => {
     const button = e.target.closest?.('[data-thread-page]');
-    if (!button || button.disabled || !button.dataset.threadPage) return;
+    if (!button || button.getAttribute('aria-disabled') === 'true' || !button.dataset.threadPage) return;
     agentPage = Math.max(0, agentPage + Number(button.dataset.threadPage)); show('agents'); hold();
   });
   addEventListener('popstate', () => show(modeFromURL()));
