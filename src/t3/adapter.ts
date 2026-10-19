@@ -265,6 +265,7 @@ export interface ShellSubscription {
   /** Called for every item in order; the next item waits for the promise. */
   readonly onEvent: (event: ShellEvent) => Promise<void> | void;
   readonly onResources?: (resources: Resources) => void;
+  readonly onProviderCatalog?: (providers: ReadonlyArray<{instanceId:string;driver:string}>) => void;
 }
 
 export function socketUrl(serverUrl: string): string {
@@ -590,6 +591,12 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     if(providers.has(t.providerThreadId)&&t.turnTokenUsage)onEvent({kind:"turn-usage",id:t.id,usage:t.turnTokenUsage,at:t.completedAt?DateTime.toEpochMillis(t.completedAt):stamp});
   };
   const activity=(r:OrchestrationV2ThreadProjection["turnItems"][number])=>{
+    // Exclude inherited/foreign items and child-owned activity before reading content.
+    if(r.threadId!==threadId||r.nodeId!==null&&!mainOwners.has(r.nodeId)||r.providerThreadId!=null&&!providers.has(r.providerThreadId)||!(r.nodeId!==null&&mainOwners.has(r.nodeId)||r.providerThreadId!=null&&providers.has(r.providerThreadId)))return;
+    if(r.type==="assistant_message"||r.type==="command_execution"){
+      const status=["running","completed","failed","cancelled"].includes(r.status)?r.status as "running"|"completed"|"failed"|"cancelled":"unknown";
+      onEvent({kind:"recent-item",id:r.id,ordinal:r.ordinal,type:r.type==="assistant_message"?"assistant":"command",text:r.type==="assistant_message"?r.text:r.input,at:DateTime.toEpochMillis(r.updatedAt),status:status==="running"&&r.runId&&terminalRuns.has(r.runId)?"unknown":status==="completed"&&r.type==="command_execution"&&(r.outputIndicatesFailure===true||r.exitCode!==undefined&&r.exitCode!==0)?"failed":status});
+    }
     if(["reasoning","command_execution","tool_call"].includes(r.type))onEvent({kind:"activity-state",id:r.id,type:r.type==="reasoning"?"thinking":"working",running:r.status==="running"&&!(r.runId&&terminalRuns.has(r.runId))});
     if(r.type==="command_execution"){
       const running=r.status==="running"&&!(r.runId&&terminalRuns.has(r.runId));
@@ -608,8 +615,9 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     if(item.kind==="synchronized"){onEvent({kind:"synchronized"});return;}
     if(item.kind==="snapshot"){
       providers.clear();children.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
+      if(item.projection.thread.id!==threadId)return;
       for(const run of item.projection.runs.slice(-128))if(["completed","failed","cancelled","interrupted"].includes(run.status))terminalRuns.add(run.id);
-      for(const n of item.projection.nodes.filter(n=>n.kind==="root_turn").slice(-128))mainOwners.add(n.id);
+      for(const n of item.projection.nodes.filter(n=>n.kind==="root_turn"&&n.threadId===threadId).slice(-128))mainOwners.add(n.id);
       for(const p of item.projection.providerThreads)provider(p);
       for(const c of item.projection.subagents)child(c);
       metadata();
@@ -625,6 +633,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     sequence=item.sequence;
     if(item.kind==="event"){
       const e=item.event;
+      if(e.threadId!==threadId)return;
       if(e.type==="run.updated"&&["completed","failed","cancelled","interrupted"].includes(e.payload.status)){
         onEvent({kind:"clear-activity"});
         if(terminalRuns.size>=128)terminalRuns.delete(terminalRuns.values().next().value!);terminalRuns.add(e.payload.id);
@@ -658,7 +667,16 @@ export async function connectShell(options: ConnectOptions, subscription: ShellS
           }
         })),
       );
-      if(!subscription.onResources)return shell;
+      const catalog=subscription.onProviderCatalog?Effect.gen(function*(){
+        const publish=(providers:ReadonlyArray<{instanceId:string;driver:string}>)=>subscription.onProviderCatalog!(providers.slice(0,128).map(p=>({instanceId:p.instanceId,driver:p.driver})));
+        // The official subscription starts with its config snapshot; no separate getter/poll.
+        yield* client.subscribeServerConfig({}).pipe(Stream.runForEach(event=>Effect.sync(()=>{
+          if(event.type==="snapshot")publish(event.config.providers);
+          else if(event.type==="providerStatuses")publish(event.payload.providers);
+        })));
+      }).pipe(Effect.catchCause(()=>Effect.gen(function*(){subscription.onProviderCatalog!([]);yield* Effect.never;}))):Effect.never;
+      const shellAndCatalog=Effect.raceFirst(shell,catalog);
+      if(!subscription.onResources)return shellAndCatalog;
       const sample=Effect.gen(function*(){
         while(true){
           const resources=yield* client["server.getHostResources"]({}).pipe(
@@ -669,7 +687,7 @@ export async function connectShell(options: ConnectOptions, subscription: ShellS
           yield* Effect.sleep("5 seconds");
         }
       });
-      return Effect.raceFirst(shell,sample.pipe(Effect.catchCause(()=>Effect.gen(function*(){
+      return Effect.raceFirst(shellAndCatalog,sample.pipe(Effect.catchCause(()=>Effect.gen(function*(){
         yield* Effect.sync(()=>subscription.onResources!({state:"unavailable",sample:null})).pipe(Effect.catchCause(()=>Effect.void));
         yield* Effect.never;
       }))));

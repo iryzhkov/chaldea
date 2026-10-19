@@ -187,3 +187,31 @@ for(const denied of ["success","typed","die","decode"])test("host resources shar
   assert.deepEqual(new Set(requests),new Set(["orchestration.subscribeShell","server.getHostResources"]));
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
 });
+
+for(const denied of [false,true])test("provider catalog shares ONE shell client and copies only safe identity fields, denied="+denied,async()=>{
+ const server=createServer(),wss=new WebSocketServer({server}),controller=new AbortController();
+ let connections=0,synchronized=false;const catalogs:unknown[][]=[],requests:string[]=[];
+ const provider={instanceId:"custom-work",driver:"codex",enabled:true,installed:true,version:null,status:"ready",auth:{status:"authenticated",email:"private@example.test",workspaceId:"PRIVATE_ACCOUNT"},runtimePaths:{homePath:"/private/home",shadowHomePath:null},checkedAt:"2026-10-18T00:00:00.000Z",models:[]};
+ const finish=()=>{if(synchronized&&catalogs.length===(denied?1:2))controller.abort();};
+ wss.on("connection",socket=>{connections++;socket.on("message",data=>{
+  const req=JSON.parse(String(data));if(req._tag==="Ping"){socket.send(JSON.stringify({_tag:"Pong"}));return;}if(req._tag!=="Request")return;
+  requests.push(req.tag);
+  if(req.tag==="orchestration.subscribeShell")socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"synchronized"}]}));
+  else if(req.tag==="subscribeServerConfig"){
+   if(denied)socket.send(JSON.stringify({_tag:"Exit",requestId:req.id,exit:{_tag:"Failure",cause:[{_tag:"Fail",error:{_tag:"EnvironmentAuthorizationError",message:"fixture denied",requiredScope:"settings:read"}}]}}));
+   else socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{version:1,type:"providerStatuses",payload:{providers:[provider]}},{version:1,type:"providerStatuses",payload:{providers:[{...provider,driver:"futureDriver"}]}}]}));
+  }
+ });});
+ const timer=setTimeout(()=>controller.abort(),4000);
+ try{
+  const serverUrl=await listen(server);
+  await assert.rejects(connectShell({serverUrl,token:"fixture",signal:controller.signal},{
+   onEvent:e=>{if(e.kind==="synchronized"){synchronized=true;finish();}},
+   onProviderCatalog:rows=>{catalogs.push([...rows]);finish();}
+  }));
+  assert.equal(connections,1);assert.equal(synchronized,true);
+  assert.deepEqual(catalogs,denied?[[]]:[[{instanceId:"custom-work",driver:"codex"}],[{instanceId:"custom-work",driver:"futureDriver"}]]);
+  assert.deepEqual(new Set(requests),new Set(["orchestration.subscribeShell","subscribeServerConfig"]));
+  assert.ok(!JSON.stringify(catalogs).includes("PRIVATE"));assert.ok(!JSON.stringify(catalogs).includes("/private"));
+ }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
+});

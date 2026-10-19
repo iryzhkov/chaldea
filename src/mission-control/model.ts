@@ -1,6 +1,6 @@
 // Browser DTOs are constructed here. Raw source objects never cross this interface.
 import type { ShellEvent, ShellThread, MissionDetailEvent } from "../t3/adapter.ts";
-import { ThreadDetails, aggregateDetails, validResources, titlePreview, appThreadIdPreview, type Resources, emptyDetail } from "./details.ts";
+import { ThreadDetails, aggregateDetails, validResources, safeProviderId, titlePreview, appThreadIdPreview, type Resources, emptyDetail } from "./details.ts";
 import { isolateDetail } from "./detail-contract.ts";
 import type { HeadroomState, Metric } from "../quota/headroom.ts";
 export const MAX_AGENTS = 48, MAX_TURNS = 512, MAX_SAMPLES = 4096;
@@ -43,6 +43,12 @@ function threadState(row:ShellThread,details:import("./details.ts").Detail):stri
 }
 export class MissionModel {
   private detailStates = new Map<string,ThreadDetails>();
+  private providerCatalog=new Map<string,string|null>();
+  setProviderCatalog(rows:ReadonlyArray<{instanceId:string;driver:string}>):void {
+    this.providerCatalog.clear();
+    for(const p of rows.slice(0,128))if(safeProviderId(p.instanceId))this.providerCatalog.set(p.instanceId,this.providerCatalog.has(p.instanceId)?null:safeProviderId(p.driver)?p.driver:null);
+    this.changed();
+  }
   private resources:Resources={state:"unavailable",sample:null};
   setResources(resources:Resources):void {this.resources=resources.state==="reported"&&validResources(resources.sample)&&resources.sample.sampledAt<=this.now()?resources:{state:"unavailable",sample:null};this.changed();}
   private threads = new Map<string, Thread>();
@@ -103,14 +109,14 @@ export class MissionModel {
     }
     this.observed = now; this.changed();
   }
-  disconnected(): void { if (this.connected) this.observed = this.now(); this.connected = false; for (const t of this.threads.values()) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
+  disconnected(): void { this.providerCatalog.clear(); if (this.connected) this.observed = this.now(); this.connected = false; for (const t of this.threads.values()) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
   detailDisconnected(id: string): void { const t = this.threads.get(id); if (t) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
   detail(id: string, event: MissionDetailEvent): void {
     const t = this.threads.get(id); if (!t) return;
     const now = this.now(); t.detailObserved = now;
     let details=this.detailStates.get(id);if(!details){details=new ThreadDetails();this.detailStates.set(id,details);}
     if((event.kind==="turn-usage"||event.kind==="assistant")&&(!Number.isSafeInteger(event.at)||event.at>now))return;
-    if(["reset","clear-activity","assistant","command","metadata","turn-usage","activity-state"].includes(event.kind)){details.apply(event as import("./details.ts").DetailEvent);this.changed();return;}
+    if(["reset","clear-activity","assistant","command","metadata","turn-usage","activity-state","recent-item"].includes(event.kind)){details.apply(event as import("./details.ts").DetailEvent);this.changed();return;}
     if (event.kind === "synchronized") t.connected = true;
     if (event.kind === "activity") {
       const label = fixedTool(event.tool);
@@ -171,7 +177,9 @@ export class MissionModel {
         unlimited: p.credits.value?.unlimited ?? null, manualResets: count(p.manualResets.value?.availableCount) ? p.manualResets.value.availableCount : null });
     }
     const agents = [...this.threads.values()].map((t,i) => {
-      const details={...emptyDetail(),...isolateDetail({...(this.detailStates.get(t.row.id)??new ThreadDetails()).snapshot(t.row.modelSelection,now,t.connected&&this.connected),identity:{title:titlePreview(t.row.title),appThreadId:appThreadIdPreview(t.row.id)}},now)};
+      const instance=t.row.modelSelection?.instanceId??t.row.providerInstanceId;
+      const provider=safeProviderId(instance)&&instance===t.row.providerInstanceId?{instanceId:instance,driver:this.providerCatalog.get(instance)??null}:null;
+      const details={...emptyDetail(),...isolateDetail({...(this.detailStates.get(t.row.id)??new ThreadDetails()).snapshot(t.row.modelSelection,now,t.connected&&this.connected),provider,identity:{title:titlePreview(t.row.title),appThreadId:appThreadIdPreview(t.row.id)}},now)};
       return ({
       id: "agent-" + i, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
       host: "omarchy-pc", state:threadState(t.row,details),
@@ -192,6 +200,11 @@ export class MissionModel {
         scope: this.accountingPartial ? "Partial accounting: known lower bound after bounded counter eviction. Uncertain returning counters establish new baselines. Daily reconciliation unavailable." : "Observed deltas since this process started; 48-thread cap. Daily reconciliation unavailable." },
       quota: { state: this.quotaError ? "error" : this.quota === null ? "unknown" : "cached", accounts },
       unavailable: ["Events","Ops","Lab","host health","exec slots","cost","daily totals"] };
+    // Recent text yields before existing identity/resource/base coverage.
+    for(const a of [...agents].reverse()){
+      if(Buffer.byteLength(JSON.stringify(result))<=128*1024)break;
+      a.details.recent=[];
+    }
     // Keep every admitted base row; shed optional detail in reverse display order.
     for(const a of [...agents].reverse()){
       if(Buffer.byteLength(JSON.stringify(result))<=128*1024)break;

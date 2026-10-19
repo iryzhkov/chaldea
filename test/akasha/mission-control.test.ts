@@ -255,7 +255,7 @@ test("rich v2 fields cross authenticated H store and restricted reader to API/SS
  const {emptyDetail}=await import("../../src/mission-control/details.ts");
  const h=await hostedRig();
  try{
-  const p:any=payload(),d=emptyDetail();
+  const p:any=payload(),d=emptyDetail();delete d.provider;delete d.recent;
   d.identity={title:{text:"Useful actual title",state:"reported"},appThreadId:{text:"mcp:actual-app-thread",state:"reported"}};
   d.assistant={text:"A public assistant paragraph.",state:"reported"};d.effort={value:"high",source:"configured"};
   d.commands=[{text:"go test -race ./...",state:"reported"}];
@@ -278,5 +278,41 @@ test("rich v2 fields cross authenticated H store and restricted reader to API/SS
   assert.equal((await h.post(malformed,"extra-id")).status,400);
   const wrong=structuredClone(p);wrong.data.snapshot.host="agent-b";assert.equal((await h.post(wrong,"wrong-host")).status,403);
   assert.equal(normalize(payload(),identity,false).kind,"agent_status");
+ }finally{await h.close();}
+});
+
+
+test("rich v3 provider and actual recent items cross authenticated ingest/store/restricted reader/API",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ const h=await hostedRig();
+ try{
+  const p:any=payload(),d=emptyDetail();
+  d.identity={title:{text:"Current thread",state:"reported"},appThreadId:{text:"mcp:actual-app-thread",state:"reported"}};
+  d.provider={instanceId:"custom-work",driver:"opencode"};
+  d.recent=[{kind:"command",preview:{text:"go test",state:"reported"},at:null,status:"unknown"},{kind:"assistant",preview:{text:"Last actual paragraph.",state:"reported"},at:N*1000,status:"completed"}];
+  const opaque=createHash("sha256").update(p.data.snapshot.epoch+"\0"+d.identity.appThreadId.text).digest("hex").slice(0,16);p.data.snapshot.agents[0].id=opaque;
+  p.data.snapshot.rich={v:3,resources:{state:"unavailable",sample:null},details:[{id:opaque,value:d}],omitted:0};
+  assert.equal((await h.post(p)).status,201);
+  const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
+  assert.deepEqual(cache.snapshots[0]!.rich,p.data.snapshot.rich);writeCache(h.config.cacheFile,cache);
+  const model=new CacheModel(h.config.cacheFile,()=>N*1000),web=missionServer(model);await web.listen(0);
+  try{
+   const port=(web.server.address()as{port:number}).port;
+   const body:any=await(await fetch("http://127.0.0.1:"+port+"/api/snapshot")).json();
+   assert.deepEqual(body.agents[0].details.provider,d.provider);assert.deepEqual(body.agents[0].details.recent,d.recent);
+  }finally{await web.close();}
+  for(const mutate of [
+   (x:any)=>x.data.snapshot.rich.details[0].value.provider.auth="PRIVATE",
+   (x:any)=>x.data.snapshot.rich.details[0].value.recent[0].output="PRIVATE",
+   (x:any)=>x.data.snapshot.rich.details[0].value.identity.appThreadId.text="mcp:forged-app-thread",
+   (x:any)=>x.data.snapshot.rich.v=2
+  ]){const forged=structuredClone(p);mutate(forged);assert.equal((await h.post(forged,"forged-"+Math.random())).status,400);}
+  const wrong=structuredClone(p);wrong.data.snapshot.host="agent-b";assert.equal((await h.post(wrong,"wrong-v3-host")).status,403);
+  h.x.sample={...h.x.sample,unixSeconds:N+31,monotonicSeconds:131};
+  const identityOnly=structuredClone(p);identityOnly.data.snapshot.sequence=2;identityOnly.data.snapshot.observedAt=(N+31)*1000;
+  identityOnly.data.snapshot.rich.details[0].value={identity:d.identity,fieldCoverage:"identity-only"};
+  assert.equal((await h.post(identityOnly,"identity-v3")).status,201);
+  const next=await refreshStatus(h.config,cache,{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>(N+31)*1000});
+  assert.equal(next.snapshots[0]!.rich!.details[0]!.value.fieldCoverage,"identity-only");
  }finally{await h.close();}
 });

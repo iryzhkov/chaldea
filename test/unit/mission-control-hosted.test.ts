@@ -320,6 +320,9 @@ test("hosted HTTP is independent of T3, enforces fixed proxy origin and keeps li
 test("rich capture crosses ordinary collector/cache with resources, privacy, usage and exact identities",async()=>{
  const d=scratch(),m=live();
  try{
+  m.shell({kind:"thread",sequence:2,thread:{...row(),title:"Actual task",providerInstanceId:"custom-work",modelSelection:{instanceId:"custom-work",model:"gpt-6.1-sol"}}});
+  m.setProviderCatalog([{instanceId:"custom-work",driver:"codex"}]);
+  for(let i=0;i<3;i++)m.detail("private-thread",{kind:"recent-item",id:"actual-"+i,ordinal:i,type:i===1?"command":"assistant",text:i===1?"go test":"Earlier paragraph\n\nActual paragraph "+i,at:now0,status:"unknown"});
   m.setResources({state:"reported",sample:{sampledAt:now0,cpuUtilization:0.25,cpuCount:12,availableMemoryBytes:400,totalMemoryBytes:1000}});
   m.detail("private-thread",{kind:"assistant",text:"Earlier paragraph\n\nThe tests passed <script>alert(1)</script>.",at:now0});
   m.detail("private-thread",{kind:"command",id:"private-command",input:"go test -race ./...",running:true});
@@ -327,6 +330,7 @@ test("rich capture crosses ordinary collector/cache with resources, privacy, usa
   const rich=captureSnapshot(m,"agent-a",epoch,1)!;validateHostSnapshot(rich);
   assert.equal(rich.rich!.resources.sample!.cpuUtilization,0.25);
   const detail=rich.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+  assert.equal(rich.rich!.v,3);assert.deepEqual(detail.provider,{instanceId:"custom-work",driver:"codex"});assert.equal(detail.recent!.length,3);assert.equal(detail.recent![1]!.preview.text,"go test");assert.equal(detail.recent![1]!.status,"unknown");
   assert.equal(detail.commands[0]!.text,"go test -race ./...");assert.equal(detail.usage.total,120);assert.equal(detail.usage.rate,null);
   assert.equal(detail.assistant.text,"The tests passed <script>alert(1)</script>.");
   assert.equal(JSON.stringify(rich).includes("private-turn"),false);
@@ -342,6 +346,7 @@ test("rich capture crosses ordinary collector/cache with resources, privacy, usa
   const cache=emptyCache();mergeStatus(cache,rich,now0);const cachePath=join(d.path,"cache");writeCache(cachePath,cache);
   const model=new CacheModel(cachePath,()=>now0),view=model.snapshot();
   assert.equal(view.hostSummary.find(h=>h.host==="agent-a")!.resources!.sample!.totalMemoryBytes,1000);
+  assert.deepEqual(view.agents[0]!.details.provider,detail.provider);assert.deepEqual(view.agents[0]!.details.recent,detail.recent);
   assert.equal(view.agents[0]!.details.usage.total,120);
   assert.equal(view.hostSummary.find(h=>h.host==="agent-a")!.details!.usage.total,120);
   m.setResources({state:"unavailable",sample:null});const denied=captureSnapshot(m,"agent-a",epoch,2)!;
@@ -383,4 +388,28 @@ test("rich detail byte budget preserves base rows and legacy validation",()=>{
  if(s.rich){assert.equal(s.rich.details.length+s.rich.omitted,s.agents.length);assert.ok(s.rich.omitted>0);}
  const c=emptyCache();mergeStatus(c,s,now0);const second={...structuredClone(s),host:"agent-b"};mergeStatus(c,second,now0);
  for(const value of c.snapshots)validateHostSnapshot(value);
+});
+
+test("strict rich v2/v3 are separate exact schemas and recent metadata fails closed",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts"),{validateRich}=await import("../../src/mission-control/detail-contract.ts");
+ const d=emptyDetail(),ids=new Set(["row"]),at=now0;
+ d.provider={instanceId:"custom-work",driver:"codex"};
+ d.recent=[{kind:"command",preview:{text:"go test",state:"reported"},at:now0,status:"unknown"}];
+ const rich:any={v:3,resources:{state:"unavailable",sample:null},details:[{id:"row",value:d}],omitted:0};
+ assert.deepEqual(validateRich(rich,ids,at),rich);
+ const old=structuredClone(rich);old.v=2;delete old.details[0].value.provider;delete old.details[0].value.recent;validateRich(old,ids,at);
+ const identity={...structuredClone(rich),details:[{id:"row",value:{identity:d.identity,fieldCoverage:"identity-only"}}]};validateRich(identity,ids,at);
+ for(const mutate of [
+  (x:any)=>x.v=4,(x:any)=>x.v=2,(x:any)=>delete x.details[0].value.provider,
+  (x:any)=>x.details[0].value.provider.auth="secret",(x:any)=>x.details[0].value.provider.instanceId="/home/private",
+  (x:any)=>x.details[0].value.recent[0].at=at+1,(x:any)=>x.details[0].value.recent[0].at=-1,
+  (x:any)=>x.details[0].value.recent[0].status="success",(x:any)=>x.details[0].value.recent[0].output="private",
+  (x:any)=>x.details[0].value.recent[0].preview={text:"Bearer secret",state:"reported"},
+  (x:any)=>x.details[0].value.recent[0].preview={text:"git status; cat /private",state:"reported"},
+  (x:any)=>x.details[0].value.recent[0].preview={text:"a".repeat(385),state:"reported"},
+  (x:any)=>x.details[0].value.recent[0].preview={text:"go\u202e test",state:"reported"},
+  (x:any)=>x.details[0].value.recent.push(...Array(3).fill(x.details[0].value.recent[0]))
+ ]){const forged=structuredClone(rich);mutate(forged);assert.throws(()=>validateRich(forged,ids,at));}
+ const extraOld=structuredClone(old);extraOld.details[0].value.provider=null;assert.throws(()=>validateRich(extraOld,ids,at));
+ const identityExtra=structuredClone(identity);(identityExtra.details[0]!.value as any).recent=[];assert.throws(()=>validateRich(identityExtra,ids,at));
 });
