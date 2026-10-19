@@ -30,7 +30,11 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     }
     getAttribute(name: string) { return this.attrs[name] ?? null; }
     removeAttribute(name: string) { delete this.attrs[name]; }
-    closest(selector: string) { if (selector === "[data-copy-thread]") return null; return selector === "[data-thread-page]" && !this.dataset.threadPage ? null : this; }
+    parent: Element | null = null;
+    open = false;
+    showModal() { this.open=true; }
+    close() { this.open=false;this.dispatchEvent(new Event("close")); }
+    closest(selector: string): Element | null { return this.matches(selector)?this:this.parent?.closest(selector)??null; }
     matches(selector: string): boolean {
       return selector.split(",").some(s => {
         const attr = s.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/);
@@ -45,7 +49,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     get textContent(): string { return this.parts.map(p=>typeof p === "string" ? p : p.textContent).join(""); }
     set textContent(text: string) { this.children=[];this.parts=[text]; }
     getBoundingClientRect() { return {width,height:this.matches(".p-summary")?160:height,top:0}; }
-    append(el: Element) { this.children.push(el); this.parts.push(el); }
+    append(el: Element) { el.parent=this;this.children.push(el); this.parts.push(el); }
     set innerHTML(html: string) {
       if (this.children.some(c=>c.contains(document.activeElement))) document.activeElement=document.body;
       this.children=[];this.parts=[];
@@ -83,7 +87,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     body: new Element(), activeElement: null as Element | null, documentElement: { style: { setProperty() {} } }, title: "",
     getElementById: (id: string) => elements[id],
     querySelector: (selector: string) => elements[selector.slice(1)] ?? null,
-    createElement: () => new Element(),
+    createElement: (tag:string) => {const el=new Element();el.tag=tag;return el;},
   });
   document.activeElement = document.body;
   document.body.dataset = { defaultDir: "flight", defaultPalette: "mocr-1969" };
@@ -125,6 +129,8 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     resize: (w:number,h:number) => {width=w;height=h;context.innerWidth=w;context.innerHeight=h;window.dispatchEvent(new Event("resize"));},
     grid: (value:string) => { const el=elements.view!.querySelector("[data-thread-grid]")!;el.value=value;const e=new Event("change");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     page: (delta:number) => {const el=elements.view!.querySelector(`[data-thread-page="${delta}"]`)!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    openDetails: (id:string) => {const el=elements.view!.querySelector('[data-thread-details="'+encodeURIComponent(id)+'"]')!;el.focus();const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    closeDetails: () => {const el=document.body.querySelector("[data-close-details]")!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document };
 }
 
@@ -165,15 +171,15 @@ test("two agent views preserve old URLs, update immediately and disclose bounded
   b.snapshot(snapshot);
   assert.equal(b.elements.view!.className,"agents");
   assert.equal((b.elements.view!.innerHTML.match(/panel tile/g)||[]).length,48);
-  assert.match(b.elements.view!.innerHTML,/Command running/);assert.match(b.elements.view!.innerHTML,/Showing 48 of 60/);
-  assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/activity 1m ago · source 0s ago/);
+  assert.match(b.elements.view!.innerHTML,/Previews unavailable/);assert.match(b.elements.view!.innerHTML,/showing 48 of 48/);
+  assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/activity stale · 1m ago/);
   const history=b.entries.length;b.click("agent-summary");assert.equal(b.entries.length,history+1);
   assert.equal(b.location.searchParams.get("mode"),"agent-summary");
   assert.match(b.elements.view!.innerHTML,/Host overview/);assert.match(b.elements.view!.innerHTML,/shown 0 \/ 0/);
   assert.match(b.elements.view!.innerHTML,/NOT OBSERVED · thread count unknown/);
   assert.match(b.elements.view!.innerHTML,/gpt-6.1-sol: 48/);assert.doesNotMatch(b.elements.view!.innerHTML,/panel tile/);
   b.snapshot({...snapshot,shown:47,agents:agents.slice(0,47)});assert.equal(b.entries.length,history+1);
-  assert.match(b.elements.view!.innerHTML,/Showing 47 of 60/);
+  assert.match(b.elements.view!.innerHTML,/showing 47 of 47/);
   assert.equal(browser(b.location.href).document.body.dataset.mode,"agent-summary");
   b.travel(-1);b.refresh();assert.equal(b.document.body.dataset.mode,"agents");
   b.travel(1);b.refresh();assert.equal(b.document.body.dataset.mode,"agent-summary");
@@ -207,12 +213,13 @@ test("cards render sanitized title, compact real app ID, top state, effort and r
  assert.match(html,/task-label">Task/);assert.match(html,/Thinking/);
  assert.match(html,/Actual &lt;script&gt;title&lt;\/script&gt;/);
  assert.match(html,/Latest &lt;img/);assert.doesNotMatch(html,/<script>|<img /);
+ b.openDetails("opaque-row");html=b.document.body.querySelector(".thread-drawer")!.innerHTML;
  assert.match(html,/data-copy-thread="mcp:real-application-thread-123456789"/);
- assert.match(html,/high \(configured\)/);assert.match(html,/go test -race/);
+ assert.match(html,/high \(configured\)/);assert.match(html,/go test -race/);b.closeDetails();
  b.click("agent-summary");html=b.elements.view!.innerHTML;
  assert.match(html,/Host overview/);assert.doesNotMatch(html,/Actual &lt;script&gt;|App thread|Latest &lt;img|go test -race/);
- b.click("fleet");html=b.elements.view!.innerHTML;assert.match(html,/CPU 25.0%/);assert.match(html,/RAM 3.0 \/ 4.0 GiB \(75.0% used\)/);
- b.click("overview");assert.match(b.elements.view!.innerHTML,/CPU 25.0%/);
+ b.click("fleet");html=b.elements.view!.innerHTML;assert.match(html,/25.0% · 8 cores/);assert.match(html,/3.0 \/ 4.0 GiB · 75.0% used/);
+ b.click("overview");assert.match(b.elements.view!.innerHTML,/25.0% · 8 cores/);
 });
 
 test("explicit grids page every row, clamp on resize and SSE shrink, and survive history",()=>{
@@ -295,4 +302,66 @@ test("host cards keep independent ages, observed zero, missing counts and escape
  assert.match(html,/stale · source 100s ago/);assert.match(html,/disconnected/);
  assert.match(html,/NOT OBSERVED · thread count unknown/);
  assert.equal(browser(b.location.href).document.body.dataset.mode,"agent-summary");
+});
+
+test("Overview count follows the actual four-row budget with five observed rows",()=>{
+ const b=browser(),now=Date.now();
+ const agents=Array.from({length:5},(_,i)=>({id:"count-"+i,title:"Count fixture "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:5,total:5,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]});
+ const html=b.elements.view!.querySelector(".p-threads")!.innerHTML;
+ assert.equal((html.match(/Count fixture /g)||[]).length,4);
+ assert.match(html,/showing 4 of 5 observed threads/);
+ assert.equal((html.match(/showing/gi)||[]).length,1);
+});
+
+test("compact cards use current state, bounded previews, safe provider identity and a stable modal",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ const b=browser("https://board.example/?mode=agents&grid=4x3"),now=Date.now(),d:any=emptyDetail();
+ d.assistant={text:"Sanitized assistant preview ".repeat(30),state:"reported"};
+ d.commands=Array.from({length:3},(_,i)=>({text:"safe command "+i+" ".repeat(20),state:"reported"}));
+ const row={id:"one",title:"A meaningful task title ".repeat(6),host:"agent-a",model:"claude-opus-5-5",state:"completed",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:["Command running"],details:d,detailCoverage:"reported"};
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[row],shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+ for(const state of ["completed","failed","idle"]){
+  b.snapshot({...snap,agents:[{...row,state}]});b.resize(390,834);
+  const card=b.elements.view!.querySelector(".tile")!;
+  assert.match(card.innerHTML,new RegExp(state==="idle"?"Idle":state==="failed"?"Failed":"Completed"));
+  assert.match(card.innerHTML,/Last observed command · outcome unknown/);
+  assert.doesNotMatch(card.innerHTML,/Command running|Active command observed|App thread|Effort|Usage not reported/);
+  assert.equal((card.innerHTML.match(/class="activity-item"/g)||[]).length,3);
+  assert.match(card.innerHTML,/activity-fresh/);assert.match(card.innerHTML,/source-fresh/);
+  assert.match(card.innerHTML,/aria-label="Provider unknown"/);
+ }
+ b.openDetails("one");
+ const dialog=b.document.body.querySelector(".thread-drawer")!,close=dialog.querySelector("[data-close-details]")!;
+ assert.equal(dialog.open,true);assert.equal(b.document.activeElement,close);
+ b.refresh();b.snapshot({...snap,agents:[{...row,state:"failed",details:{...d,assistant:{text:null,state:"withheld"},commands:[]}}]});
+ assert.equal(b.document.activeElement,close);assert.equal(dialog.querySelector("[data-close-details]"),close);
+ assert.doesNotMatch(dialog.innerHTML,/Sanitized assistant preview/);
+ b.closeDetails();assert.equal(dialog.open,false);assert.equal(b.document.activeElement,b.elements.view!.querySelector('[data-thread-details="one"]'));
+ // Actual optional provider/recent metadata wins over legacy data and model names.
+ const recent=[{kind:"assistant",preview:{text:"Earlier actual message",state:"reported"},at:now-10000,status:"unknown"},{kind:"command",preview:{text:"Observed completed command",state:"reported"},at:now,status:"completed"},{kind:"command",preview:{text:null,state:"withheld"},at:now,status:"failed"}];
+ b.snapshot({...snap,agents:[{...row,details:{...d,provider:{instanceId:"custom-codex",driver:"codex"},recent}}]});
+ let html=b.elements.view!.innerHTML;
+ assert.match(html,/OpenAI Codex · custom-codex/);assert.doesNotMatch(html,/Claude ·/);
+ assert.match(html,/Earlier actual message/);assert.match(html,/Command · completed/);assert.doesNotMatch(html,/Sanitized assistant preview|safe command/);
+ b.snapshot({...snap,agents:[{...row,details:{...d,provider:{instanceId:"custom-claude",driver:"claudeAgent"},recent:[]}}]});
+ html=b.elements.view!.innerHTML;assert.match(html,/Claude · custom-claude/);assert.doesNotMatch(html,/Earlier actual message|Sanitized assistant preview/);
+ b.snapshot({...snap,agents:[{...row,state:"working",detailObservedAt:now-90000,details:{...d,recent:[{kind:"command",preview:{text:"Old command",state:"reported"},at:now-90000,status:"running"}]}}]});
+ assert.doesNotMatch(b.elements.view!.innerHTML,/Active command observed/);
+ assert.match(b.elements.view!.innerHTML,/Last observed command/);
+ const css=readFileSync(new URL("../../src/mission-control/static/core.css",import.meta.url),"utf8");
+ assert.doesNotMatch(css,/\.dynamic-grid \.tile > \.body\s*\{[^}]*overflow:\s*(auto|scroll)/);
+ assert.match(css,/grid-template-rows:38px minmax\(0,1fr\) 36px/);
+});
+test("resource instruments preserve measured CPU zero, independent stale samples, units and accessibility",()=>{
+ const b=browser("https://board.example/?mode=fleet"),now=Date.now();
+ const hosts=["agent-a","agent-b","omarchy-pc","laptop"].map((host,i)=>({host,shown:i,total:i,truncated:false,observedAt:now,freshness:i===1?"stale":"live",states:{},models:[],resources:{state:i===2?"unavailable":"reported",sample:i===2?null:{sampledAt:now-(i===1?120000:0),cpuUtilization:i===0?0:null,cpuCount:8,availableMemoryBytes:1073741824,totalMemoryBytes:4294967296}}}));
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],shown:0,total:0,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:hosts});
+ for(const mode of ["fleet","agent-summary"]){
+  b.click(mode);const html=b.elements.view!.innerHTML;
+  assert.equal((html.match(/host-card/g)||[]).length,4);
+  assert.match(html,/aria-valuenow="0.00"/);assert.match(html,/0.0% · 8 cores/);
+  assert.match(html,/1.0 GiB available/);assert.match(html,/3.0 \/ 4.0 GiB/);
+  assert.match(html,/last known \/ stale/);assert.match(html,/Resource sample unavailable/);
+ }
 });

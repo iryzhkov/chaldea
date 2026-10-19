@@ -38,7 +38,7 @@
 
   // ---------- helpers ----------
   const $ = (s, el = document) => el.querySelector(s);
-  const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   // A closed fixture dictionary, never item.title, input, arguments, output or arbitrary target text.
   const WALL_TOOLS = new Set(['read','search','navigate','edit_apply','change_plan','verify_run','chaldea exec','t3_thread_read','t3_thread_list','jocasta','watch_pull_request','html_preview','delegate_task','chaldea_decision_prepare','Command running']);
   const safeStep = s => {
@@ -163,13 +163,17 @@
     const fit = gridFit(), per = fit.per; const pages = Math.max(1, Math.ceil(all.length / per)); agentPage = Math.min(agentPage, pages - 1);
     const shown = all.slice(agentPage * per, agentPage * per + per);
     const count = k => all.filter(a => a.state === k).length;
-    const summary = `<div class="agents-summary"><span class="t">${all.length} agent${all.length === 1 ? '' : 's'}</span>${st('working', count('working') + ' working')}${st('waiting-igor', count('waiting-igor') + ' waiting for Igor')}${st('waiting-ci', count('waiting-ci') + ' waiting for CI')}${count('failed') ? st('failed', count('failed') + ' failed') : ''}${count('idle') ? st('idle', count('idle') + ' idle') : ''}<span class="muted t1">hosts awake ${DATA.hosts.filter(h => h.up).length} of ${DATA.hosts.length} · laptop not observed</span>${pages > 1 ? `<span class="pg">${agentPage * per + 1}–${agentPage * per + shown.length} of ${all.length} · page ${agentPage + 1}/${pages}</span>` : ''}</div>`;
+    const summary = `<div class="agents-summary"><span class="t">${all.length} agent${all.length === 1 ? '' : 's'}</span>${st('working', count('working') + ' working')}${st('waiting-igor', count('waiting-igor') + ' waiting for Igor')}${st('waiting-ci', count('waiting-ci') + ' waiting for CI')}${count('failed') ? st('failed', count('failed') + ' failed') : ''}${count('idle') ? st('idle', count('idle') + ' idle') : ''}<span class="muted t1">${esc(window.MC?.UI.threadCoverage ? window.MC.UI.threadCoverage(shown.length, all.length, agentPage * per) : all.length + " observed threads")}</span></div>`;
     const step = item => { const s = safeStep(item); return `<span class="tool">${esc(s.tool)}</span><span class="tgt ell">${esc(s.target)}</span><span class="el num">${esc(s.age)}</span>`; };
-    const tiles = shown.map(a => { const steps = a.steps || []; return `<section class="panel tile ${a.state}" data-fresh="${a.activityFreshness === 'live' ? 'live' : a.activityFreshness === 'nosource' ? 'nosource' : freshOf('t3thread', a.observed) === 'lost' ? 'lost' : 'stale'}"><header><span class="task-label">Task ${st(a.state, STATE_LABEL[a.state] || a.state)}</span><span class="fresh">${a.activityFreshness === 'live' ? ago(a.observed) : esc(a.activityFreshness || 'unknown') + ' · ' + ago(a.observed)}</span></header><div class="body">
+    const tiles = shown.map(a => {
+      const freshness = a.activityFreshness === 'live' && a.observed != null && a.observed <= 60 ? 'live' : a.activityFreshness === 'nosource' ? 'nosource' : 'stale';
+      const sourceFresh = a.freshness === 'live' ? a.sourceObserved == null ? 'unknown' : a.sourceObserved <= 90 ? 'live' : 'stale' : a.freshness || 'unknown';
+      const host = ({'agent-a':'A','agent-b':'B','omarchy-pc':'PC','laptop':'L'})[a.host] || a.host;
+      return `<section class="panel tile ${esc(a.state)}" data-fresh="${freshness}"><header><span class="task-label">Task ${st(a.state, STATE_LABEL[a.state] || a.state)}</span>${window.MC?.UI.providerMark ? window.MC.UI.providerMark(a) : '<span class="provider-mark" role="img" aria-label="Provider unknown">?</span>'}</header><div class="body">
       <h2 class="title two">${esc(a.title)}</h2>
-      <div class="act ell">${step(steps[0])}</div>
-      ${window.MC?.UI.agentDetail ? window.MC.UI.agentDetail(a) : ""}<div class="tail">${steps.slice(1).map(x => `<div class="ell">${step(x)}</div>`).join('')}</div>
-      <div class="meta"><span class="host-name">${esc(a.host)}</span><span class="num">run ${dur(a.run)}</span><span class="model">${esc(a.model)} · ${esc(a.effortx || a.effort || 'high')}</span><span class="observed num">activity ${ago(a.observed)} ago · source ${ago(a.sourceObserved ?? a.observed)} ago</span></div></div></section>`; }).join('');
+      ${window.MC?.UI.agentActivity ? window.MC.UI.agentActivity(a) : '<div class="muted">Activity unavailable</div>'}
+      <div class="card-foot"><span class="chip activity-fresh">activity ${esc(freshness)} · ${ago(a.observed)} ago</span><span class="chip source-fresh">${esc(host)} source ${esc(sourceFresh)} · ${ago(a.sourceObserved ?? a.observed)} ago</span><button type="button" data-thread-details="${encodeURIComponent(a.id)}" aria-haspopup="dialog">Details</button></div></div></section>`;
+    }).join('');
     const controls = `<div class="grid-controls"><label>Thread grid <select data-thread-grid aria-label="Thread grid">${GRID_CHOICES.map(v => `<option value="${v}" ${v === fit.pref ? 'selected' : ''}>${v === 'auto' ? 'Auto' : v.replace('x',' × ')}${v !== 'auto' && (Number(v.split('x')[0]) > fit.maxCols || Number(v.split('x')[1]) > fit.maxRows) ? ' (fit limited)' : ''}</option>`).join('')}</select></label><span data-grid-fit>Effective fit ${fit.cols} × ${fit.rows} · ${per} per page</span><button data-thread-page="-1" aria-label="Previous thread page" aria-disabled="${agentPage === 0}" style="opacity:${agentPage === 0 ? '.5' : '1'}">Previous</button><span role="status">Page ${agentPage + 1} of ${pages}</span><button data-thread-page="1" aria-label="Next thread page" aria-disabled="${agentPage === pages - 1}" style="opacity:${agentPage === pages - 1 ? '.5' : '1'}">Next</button></div>`;
     return `<section class="panel p-summary"><header><h2 data-console="FLIGHT">Agents</h2><span class="fresh">${ago(DATA.demo ? 1 : DATA.agentSourceAge)}</span></header><div class="body">${controls}${summary}</div></section><div class="agrid dynamic-grid" style="grid-template-columns:repeat(${fit.cols},minmax(0,1fr));grid-template-rows:repeat(${fit.rows},minmax(230px,1fr))">${tiles}</div>`;
   };
@@ -266,7 +270,7 @@
   const hold = () => { holdUntil = performance.now() + 10 * 60e3; };
   tabs.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; select(b.dataset.m); });
   pick.addEventListener('change', () => { select(pick.value); });
-  document.addEventListener('keydown', e => { if (e.target.matches?.('input,select,textarea')) return; const i = parseInt(e.key, 10); if (i >= 1 && i <= MODES.length) { select(MODES[i - 1]); } if (e.key === 'ArrowRight' && cur === 'agents') { agentPage++; show('agents'); hold(); } if (e.key === 'ArrowLeft' && cur === 'agents') { agentPage = Math.max(0, agentPage - 1); show('agents'); hold(); } });
+  document.addEventListener('keydown', e => { if (window.MC?.UI.detailsOpen?.() || e.target.matches?.('input,select,textarea,button')) return; const i = parseInt(e.key, 10); if (i >= 1 && i <= MODES.length) { select(MODES[i - 1]); } if (e.key === 'ArrowRight' && cur === 'agents') { agentPage++; show('agents'); hold(); } if (e.key === 'ArrowLeft' && cur === 'agents') { agentPage = Math.max(0, agentPage - 1); show('agents'); hold(); } });
   function renderView(m) {
     const controls = m === 'agents' && view.querySelector('.grid-controls');
     if (!controls) { view.innerHTML = R[m](); return; }
@@ -331,7 +335,7 @@
     $('#globalfresh').innerHTML = `${st('ok', 'feed')}<span class="muted">${[[stale, 'stale'], [lost, 'lost'], [unavailable, 'n/a'], [asleep, 'asleep']].filter(x => x[0]).map(x => x[0] + ' ' + x[1]).join(' · ') || 'all sources live'}</span>`; if (DATA.demo && !$('#top .demo')) $('#top .brand').insertAdjacentHTML('beforeend', ' <span class="demo">DEMO DATA</span>'); }
   show('overview'); urgent(); globalFresh(); // Boot safely before canary renderers are installed.
   function tick() { const el = (performance.now() - t0) / 1000, d = DWELL[cur]; const b = tabs.querySelector('.on .bar i'); if (b) b.style.width = cycle ? Math.min(100, el / d * 100) + '%' : '100%';
-    const holding = performance.now() < holdUntil; navstate.textContent = pinned ? '' : !cycle ? 'Auto off' : holding ? 'Pinned · ' + Math.ceil((holdUntil - performance.now()) / 60e3) + ' min' : 'Auto · next in ' + Math.max(0, Math.ceil(d - el)) + 's';
+    const holding = performance.now() < holdUntil || window.MC?.UI.detailsOpen?.(); navstate.textContent = pinned ? '' : !cycle ? 'Auto off' : holding ? 'Pinned · ' + Math.ceil((holdUntil - performance.now()) / 60e3) + ' min' : 'Auto · next in ' + Math.max(0, Math.ceil(d - el)) + 's';
     if (cycle && el >= d && !holding) show(seq[(seq.indexOf(cur) + 1) % seq.length]); if (!reduceMotion) requestAnimationFrame(tick); }
   tick();
   addEventListener('resize', () => { setScale(); show(cur); });
@@ -344,5 +348,5 @@
   // ---------- display care: pixel shift unless reduced motion ----------
   const board = $('#board'); const shifts = [[0,0],[3,1],[1,3],[-2,2],[-3,-1],[-1,-3],[2,-2],[3,3]]; let si = 0;
   if (!reduceMotion && !still) setInterval(() => { si = (si + 1) % shifts.length; board.style.transform = `translate(${shifts[si][0]}px, ${shifts[si][1]}px)`; }, 60e3);
-  window.MC = { show, modeFromURL, DATA, P, dir, paletteKey, MODES, SOURCES, safeStep, createDisplayState, R, UI: { panel, heroStat, gauge, st, budget } };
+  window.MC = { show, modeFromURL, DATA, P, dir, paletteKey, MODES, SOURCES, safeStep, createDisplayState, R, UI: { panel, heroStat, gauge, st, budget, stacked, meter } };
 })();
