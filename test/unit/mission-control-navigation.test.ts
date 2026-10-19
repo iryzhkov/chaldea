@@ -231,7 +231,7 @@ test("Auto maximizes readable card area for the current count and viewport",()=>
  for(const [n,cols,lines] of [[1,1,1],[2,2,1],[5,3,2],[6,3,2],[7,3,3],[9,3,3],[10,4,3],[12,4,3],[13,4,4],[16,4,4],[48,8,6]]){
   b.snapshot(snap(n!));const html=b.elements.view!.innerHTML;
   assert.match(html,new RegExp("Effective fit "+cols+" × "+lines+" ·"));
-  assert.equal((html.match(/class="panel tile"/g)||[]).length,n);
+  assert.equal(b.elements.view!.querySelector(".agrid")!.children.length,n);
   assert.match(html,/Page 1 of 1/);
  }
  b.snapshot(snap(13));b.resize(1920,1080);assert.match(b.elements.view!.innerHTML,/Effective fit 5 × 3/);
