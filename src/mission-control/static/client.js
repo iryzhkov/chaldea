@@ -45,6 +45,9 @@ script.onload = () => {
   document.addEventListener("mc:mode",e=>{mode=e.detail;});
   function render() {
     snapshot = projectClientSnapshot(receivedSnapshot, Date.now(), transportConnected);
+    const sourceLabel = snapshot?.sampled ? "Akasha status snapshots" : snapshot ? "Local T3 snapshots" : "No observed source";
+    window.MC.SOURCES.t3shell.label = sourceLabel;
+    window.MC.SOURCES.t3thread.label = sourceLabel;
     if(snapshot) {
       DATA.demo=snapshot.demo;
       DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:age(a.detailObservedAt), age:null, run:age(a.startedAt), effort:"unknown", steps:a.steps.map(tool=>({tool})) }));
