@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { validateRich, isolateDetail, type RichSnapshot } from "./detail-contract.ts";
+import { validateRich, isolateDetail, compactDetail, normalizeRich, type RichSnapshot } from "./detail-contract.ts";
+import { utf8, type Detail, type Preview } from "./details.ts";
 import type { MissionModel } from "./model.ts";
 export const SNAPSHOT_SCHEMA = "mission-control.host.v1", SNAPSHOT_BYTES = 8192;
 export const HOSTS = ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"] as const;
@@ -19,6 +20,9 @@ export function exact(v:Record<string,unknown>,keys:readonly string[]):void {che
 const count=(v:unknown):v is number=>typeof v==="number"&&Number.isSafeInteger(v)&&v>=0;
 const time=(v:unknown):v is number=>count(v)&&v>0&&v<=8_640_000_000_000_000;
 export function validateHostSnapshot(raw:unknown):HostSnapshot {
+  // Bound traversal before serialization or sparse expansion, including hostile in-memory input.
+  let nodes=0;const visit=(v:unknown,depth:number):void=>{check(++nodes<=8192&&depth<=12);check(typeof v!=="string"||v.length<=SNAPSHOT_BYTES);check(!Array.isArray(v)||v.length<=48);if(v&&typeof v==="object")for(const x of Object.values(v))visit(x,depth+1);};
+  visit(raw,0);check(Buffer.byteLength(JSON.stringify(raw))<=SNAPSHOT_BYTES);
   const s=object(raw);exact(s,["schema","host","epoch","sequence","observedAt","connected","total","truncated","agents","tokens",...(Object.hasOwn(s,"rich")?["rich"]:[])]);
   check(s.schema===SNAPSHOT_SCHEMA&&HOSTS.includes(s.host as typeof HOSTS[number])&&typeof s.epoch==="string"&&/^[a-f0-9]{32}$/.test(s.epoch));
   check(count(s.sequence)&&s.sequence>0&&time(s.observedAt)&&typeof s.connected==="boolean"&&typeof s.truncated==="boolean");
@@ -32,7 +36,7 @@ export function validateHostSnapshot(raw:unknown):HostSnapshot {
     check(Array.isArray(a.steps)&&a.steps.length<=6&&a.steps.every(t=>TOOLS.includes(t as typeof TOOLS[number])));
   }
   if(Object.hasOwn(s,"rich")){
-    const rich=validateRich(s.rich,ids,Number(s.observedAt));
+    const rich=normalizeRich(s.rich,ids,Number(s.observedAt));
     for(const row of rich.details){const app=row.value.identity.appThreadId;
       if(app.state==="reported"&&app.text!==null)check(createHash("sha256").update(String(s.epoch)+"\0"+app.text).digest("hex").slice(0,16)===row.id);
     }
@@ -57,7 +61,7 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
       {qualified:false,output:null,rate:null,observedAt:null,coverage:"unknown"}};
   while(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){snapshot.agents.pop();snapshot.truncated=true;}
   // Fit base rows first. Optional metadata never removes another row.
-  const rich:RichSnapshot={v:3,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
+  const rich:RichSnapshot={v:4,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
   snapshot.rich=rich;
   if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
   else {
@@ -66,16 +70,39 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.resources={state:"byte-budget",sample:null};
     for(let i=0;i<snapshot.agents.length;i++){
       const safe=isolateDetail(v.agents[i]!.details,observedAt);
-      const row={id:snapshot.agents[i]!.id,value:{identity:safe.identity,fieldCoverage:"identity-only" as const}};rich.details.push(row);rich.omitted--;
+      const row:{id:string;value:import("./detail-contract.ts").WireDetail}={id:snapshot.agents[i]!.id,value:compactDetail({identity:safe.identity,fieldCoverage:"identity-only"})};rich.details.push(row);rich.omitted--;
       if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES){rich.details.pop();rich.omitted++;}
     }
-    for(const row of rich.details){const i=snapshot.agents.findIndex(a=>a.id===row.id),identity=row.value;const detail=isolateDetail(v.agents[i]!.details,observedAt);row.value=detail.fieldCoverage==="full"?{...detail,recent:[]}:detail;
+    const candidates=new Map<string,Detail>();
+    const preview=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).trimEnd(),state:"truncated"}:p;
+    const command=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).split(" ").slice(0,-1).join(" "),state:"truncated"}:p;
+    const activity=(d:Detail,tier:number):Detail=>({...d,assistant:preview(d.assistant),commands:d.commands.slice(0,1).map(command),
+      commandsOmitted:d.commandsOmitted+Math.max(0,d.commands.length-1),recent:(d.recent??[]).slice(0,tier).map(r=>({...r,preview:r.kind==="command"?command(r.preview):preview(r.preview)})),
+      ...((d.recent??[]).length>tier?{recentOmitted:d.recent!.length-tier}:{})});
+    for(const row of rich.details){
+      const i=snapshot.agents.findIndex(a=>a.id===row.id),detail=isolateDetail(v.agents[i]!.details,observedAt);
+      if(detail.fieldCoverage!=="full")continue;
+      const full=detail as import("./details.ts").Detail;
+      // Keep the source projection newest-first even when timestamps are unknown.
+      const recent=[...(full.recent??[])];
+      candidates.set(row.id,{...full,recent});
+      const identity=row.value;
+      // Every thread gets its latest actual observation before older optional observations.
+      row.value=compactDetail(activity({...full,recent},1));
       if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)row.value=identity;
     }
-    // Recent content is the last optional tier, after every base/identity/resource row.
-    for(const row of rich.details){if(row.value.fieldCoverage!=="full")continue;const i=snapshot.agents.findIndex(a=>a.id===row.id),detail=isolateDetail(v.agents[i]!.details,observedAt);if(detail.fieldCoverage!=="full")continue;
-      const full=row.value as import("./details.ts").Detail;full.recent=detail.recent??[];
-      while(full.recent.length&&Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)full.recent.pop();
+    for(let tier=2;tier<=3;tier++)for(const row of rich.details){
+      if(row.value.fieldCoverage==="identity-only")continue;
+      const full=candidates.get(row.id)!;if((full.recent??[]).length<tier)continue;
+      const previous=row.value;
+      row.value=compactDetail(activity(full,tier));
+      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)row.value=previous;
+    }
+    // Restore verbose previews/active commands only after compact activity has been offered to every row.
+    for(const row of rich.details){
+      if(row.value.fieldCoverage==="identity-only")continue;
+      const previous=row.value;row.value=compactDetail(candidates.get(row.id)!);
+      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)row.value=previous;
     }
   }
   return validateHostSnapshot(snapshot);

@@ -4,6 +4,8 @@ import { mkdtempSync,mkdirSync,writeFileSync,readFileSync,statSync,rmSync } from
 import { join } from "node:path";
 import { request } from "node:http";
 import { MissionModel } from "../../src/mission-control/model.ts";
+import { normalizeRich, compactDetail,validateRich } from "../../src/mission-control/detail-contract.ts";
+import { emptyDetail,assistantPreview } from "../../src/mission-control/details.ts";
 import { captureSnapshot,validateHostSnapshot } from "../../src/mission-control/contract.ts";
 import { CacheModel,emptyCache,mergeStatus,writeCache,loadCache,webConfig } from "../../src/mission-control/cache.ts";
 import { readerConfig,refreshStatus } from "../../src/mission-control/reader.ts";
@@ -329,8 +331,9 @@ test("rich capture crosses ordinary collector/cache with resources, privacy, usa
   m.detail("private-thread",{kind:"turn-usage",id:"private-turn",at:now0,usage:{usageScope:"main_agent",usageStatus:"complete",inputTokens:100,outputTokens:20,cachedInputTokens:30,cacheCreationTokens:10,reasoningTokens:5,hasSubagents:true}});
   const rich=captureSnapshot(m,"agent-a",epoch,1)!;validateHostSnapshot(rich);
   assert.equal(rich.rich!.resources.sample!.cpuUtilization,0.25);
-  const detail=rich.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
-  assert.equal(rich.rich!.v,3);assert.deepEqual(detail.provider,{instanceId:"custom-work",driver:"codex"});assert.equal(detail.recent!.length,3);assert.equal(detail.recent![1]!.preview.text,"go test");assert.equal(detail.recent![1]!.status,"unknown");
+  const decoded=normalizeRich(rich.rich,new Set(rich.agents.map(a=>a.id)),rich.observedAt);
+  const detail=decoded.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+  assert.equal(rich.rich!.v,4);assert.deepEqual(detail.provider,{instanceId:"custom-work",driver:"codex"});assert.equal(detail.recent!.length,3);assert.equal(detail.recent![1]!.preview.text,"go test");assert.equal(detail.recent![1]!.status,"unknown");
   assert.equal(detail.commands[0]!.text,"go test -race ./...");assert.equal(detail.usage.total,120);assert.equal(detail.usage.rate,null);
   assert.equal(detail.assistant.text,"The tests passed <script>alert(1)</script>.");
   assert.equal(JSON.stringify(rich).includes("private-turn"),false);
@@ -347,7 +350,7 @@ test("rich capture crosses ordinary collector/cache with resources, privacy, usa
   const model=new CacheModel(cachePath,()=>now0),view=model.snapshot();
   assert.equal(view.hostSummary.find(h=>h.host==="agent-a")!.resources!.sample!.totalMemoryBytes,1000);
   assert.deepEqual(view.agents[0]!.details.provider,detail.provider);assert.deepEqual(view.agents[0]!.details.recent,detail.recent);
-  const legacy=structuredClone(rich);legacy.rich!.v=2;
+  const legacy=structuredClone(rich);legacy.rich=structuredClone(decoded);legacy.rich!.v=2;
   const legacyDetail=legacy.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
   delete legacyDetail.provider;delete legacyDetail.recent;validateHostSnapshot(legacy);
   const legacyCache=emptyCache();mergeStatus(legacyCache,legacy,now0);const legacyPath=join(d.path,"legacy-cache");writeCache(legacyPath,legacyCache);
@@ -383,7 +386,7 @@ test("optional privacy and malformed detail cannot freeze base capture",()=>{
  assert.equal(s.agents.length,1);assert.equal(s.rich!.resources.state,"unavailable");
  const blank=live();blank.detail("private-thread",{kind:"assistant",text:"\u200b\u001c",at:now0});
  const empty=captureSnapshot(blank,"agent-a",epoch,5)!;validateHostSnapshot(empty);
- assert.equal((empty.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail).assistant.text,null);
+ assert.equal((normalizeRich(empty.rich,new Set(empty.agents.map(a=>a.id)),empty.observedAt).details[0]!.value as import("../../src/mission-control/details.ts").Detail).assistant.text,null);
 });
 test("rich detail byte budget preserves base rows and legacy validation",()=>{
  const rows=Array.from({length:48},(_,i)=>row("thread-"+i)),m=live(()=>now0,rows);
@@ -407,7 +410,7 @@ test("strict rich v2/v3 are separate exact schemas and recent metadata fails clo
  const old=structuredClone(rich);old.v=2;delete old.details[0].value.provider;delete old.details[0].value.recent;validateRich(old,ids,at);
  const identity={...structuredClone(rich),details:[{id:"row",value:{identity:d.identity,fieldCoverage:"identity-only"}}]};validateRich(identity,ids,at);
  for(const mutate of [
-  (x:any)=>x.v=4,(x:any)=>x.v=2,(x:any)=>delete x.details[0].value.provider,
+  (x:any)=>x.v=5,(x:any)=>x.v=2,(x:any)=>delete x.details[0].value.provider,
   (x:any)=>x.details[0].value.provider.auth="secret",(x:any)=>x.details[0].value.provider.instanceId="/home/private",
   (x:any)=>x.details[0].value.recent[0].at=at+1,(x:any)=>x.details[0].value.recent[0].at=-1,
   (x:any)=>x.details[0].value.recent[0].status="success",(x:any)=>x.details[0].value.recent[0].output="private",
@@ -419,4 +422,107 @@ test("strict rich v2/v3 are separate exact schemas and recent metadata fails clo
  ]){const forged=structuredClone(rich);mutate(forged);assert.throws(()=>validateRich(forged,ids,at));}
  const extraOld=structuredClone(old);extraOld.details[0].value.provider=null;assert.throws(()=>validateRich(extraOld,ids,at));
  const identityExtra=structuredClone(identity);(identityExtra.details[0]!.value as any).recent=[];assert.throws(()=>validateRich(identityExtra,ids,at));
+});
+
+test("sparse v4 authoritative empty activity survives the public cache projection",()=>{
+ const s=sample(),detail=emptyDetail();detail.assistant={text:"Legacy observation only.",state:"reported"};
+ detail.recent=[];
+ s.rich={v:4,resources:{state:"unavailable",sample:null},details:[{id:s.agents[0]!.id,value:compactDetail(detail)}],omitted:0};
+ const c=emptyCache();mergeStatus(c,validateHostSnapshot(s),now0);const dir=scratch();
+ try{
+  const path=join(dir.path,"empty-activity.json");writeCache(path,c);
+  const actual=new CacheModel(path,()=>now0).snapshot().agents[0]!.details;
+  assert.deepEqual(actual.recent,[]);
+  assert.equal(actual.assistant.text,"Legacy observation only.");
+ }finally{dir.close();}
+});
+
+test("compact telemetry preserves source order when the newest activity timestamp is unknown",()=>{
+ const m=live();
+ m.detail("private-thread",{kind:"recent-item",id:"older",ordinal:1,type:"assistant",text:"Older observation.",at:now0-1000,status:"completed"});
+ m.detail("private-thread",{kind:"recent-item",id:"newer",ordinal:2,type:"assistant",text:"Newest observation.",at:null,status:"completed"});
+ const s=captureSnapshot(m,"agent-a",epoch,1)!;
+ const detail=normalizeRich(s.rich,new Set(s.agents.map(a=>a.id)),s.observedAt).details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+ assert.deepEqual(detail.recent?.map(r=>r.preview.text),["Newest observation.","Older observation."]);
+ assert.deepEqual(detail.recent,m.snapshot().agents[0]!.details.recent);
+ assert.equal(detail.recent?.[0]?.at,null);
+});
+
+test("compact telemetry gives nine representative threads actual activity within the unchanged host budget",()=>{
+ const rows=Array.from({length:9},(_,i)=>({...row("mcp:synthetic-thread-"+i),title:"Synthetic capacity task number "+i,providerInstanceId:"codex",modelSelection:{instanceId:"codex",model:"gpt-6.1-sol",options:[{id:"reasoningEffort",value:"high"}]}})),m=live(()=>now0,rows);
+ m.setResources({state:"reported",sample:{sampledAt:now0,cpuUtilization:0,cpuCount:8,availableMemoryBytes:400,totalMemoryBytes:1000}});
+ for(const r of rows){
+  const text="Synthetic activity observation. ".repeat(5);
+  m.detail(r.id,{kind:"assistant",text,at:now0});
+  m.detail(r.id,{kind:"recent-item",id:"synthetic-item",ordinal:1,type:"assistant",text,at:now0,status:"completed"});
+  m.detail(r.id,{kind:"turn-usage",id:"synthetic-turn",at:now0,usage:{usageScope:"main_agent",usageStatus:"complete",inputTokens:100,outputTokens:0,cachedInputTokens:0,cacheCreationTokens:0,reasoningTokens:0,hasSubagents:false}});
+ }
+ const s=captureSnapshot(m,"agent-a",epoch,1)!;
+ const cache=emptyCache();mergeStatus(cache,s,now0);const dir=scratch();
+ try{
+  const path=join(dir.path,"capacity.json");writeCache(path,cache);const view=new CacheModel(path,()=>now0).snapshot();
+  const useful=view.agents.filter(a=>a.details.fieldCoverage==="full"&&((a.details.recent??[]).some(r=>r.preview.text)||a.details.assistant.text||a.details.commands.some(c=>c.text))).length;
+  const base=structuredClone(s);delete base.rich;
+  console.log("CAPACITY "+JSON.stringify({threads:9,wireBytes:Buffer.byteLength(JSON.stringify(s)),baseBytes:Buffer.byteLength(JSON.stringify(base)),expandedBytes:Buffer.byteLength(JSON.stringify({...s,rich:normalizeRich(s.rich,new Set(s.agents.map(a=>a.id)),s.observedAt)})),admitted:s.agents.length,useful}));
+  assert.equal(s.agents.length,9);assert.equal(view.hostSummary[0]!.resources!.sample!.cpuUtilization,0);
+  assert.ok(Buffer.byteLength(JSON.stringify(s))<=8192);assert.equal(useful,9);
+ }finally{dir.close();}
+});
+
+test("sparse v4 preserves zero, unknown, withheld and effort provenance through strict normalization",()=>{
+ for(const source of ["configured","reported"] as const){
+  const d=emptyDetail();d.identity={title:{text:null,state:"withheld"},appThreadId:{text:"synthetic-app",state:"reported"}};
+  d.effort={value:"high",source};d.context={used:0,max:null};d.provider={instanceId:"codex",driver:null};
+  d.assistant={text:"Actual sanitized observation.",state:"reported"};
+  d.recent=[{kind:"assistant",preview:d.assistant,at:now0,status:"completed"}];
+  d.usage={...d.usage,input:0,output:0,total:0,cacheRead:0,cacheWrite:0,reasoning:0,turns:1,coverage:"observed",observedAt:now0};
+  d.work={...d.work,children:{active:0,queued:0,completed:0},monitors:0,background:0,coverage:"observed bounded roster"};
+  const raw:any={v:4,resources:{state:"unavailable",sample:null},details:[{id:"row",value:compactDetail(d)}],omitted:0};
+  assert.equal(raw.details[0].value.assistant,undefined);assert.equal(raw.details[0].value.assistantFromRecent,0);
+  assert.deepEqual(validateRich(raw,new Set(["row"]),now0),raw);
+  assert.deepEqual(normalizeRich(raw,new Set(["row"]),now0).details[0]!.value,d);
+  assert.equal(JSON.stringify(raw).match(/Actual sanitized observation/g)!.length,1);
+  for(const mutate of [
+   (x:any)=>x.details[0].value.identity.title.private="forbidden",
+   (x:any)=>x.details[0].value.provider.auth="forbidden",
+   (x:any)=>x.details[0].value.usage.private=1,
+   (x:any)=>x.details[0].value.work.private=1,
+   (x:any)=>x.details[0].value.assistant={text:"collision"},
+   (x:any)=>x.details[0].value.assistantFromRecent=3,
+   (x:any)=>x.details[0].value.recent[0].output="forbidden",
+   (x:any)=>x.details[0].value.recent[0].preview.state="withheld",
+   (x:any)=>x.details[0].value.recentOmitted=3
+  ]){const bad=structuredClone(raw);mutate(bad);assert.throws(()=>validateRich(bad,new Set(["row"]),now0));}
+ }
+ const absent=emptyDetail(),raw={v:4,resources:{state:"unavailable",sample:null},details:[{id:"row",value:compactDetail(absent)}],omitted:0};
+ assert.deepEqual(normalizeRich(raw,new Set(["row"]),now0).details[0]!.value,absent);
+ const wrong=sample();wrong.rich={v:4,resources:{state:"unavailable",sample:null},details:[{id:wrong.agents[0]!.id,value:compactDetail({...emptyDetail(),identity:{title:{text:"Safe",state:"reported"},appThreadId:{text:"mcp:forged",state:"reported"}}})}],omitted:0};
+ assert.throws(()=>validateHostSnapshot(wrong));
+ const tooBig=sample();(tooBig as any).private="x".repeat(8192);assert.throws(()=>validateHostSnapshot(tooBig));
+ const cycle:any=sample();cycle.rich=cycle;assert.throws(()=>validateHostSnapshot(cycle));
+});
+
+test("compact telemetry capacity matrix preserves base, identities and freshness under escaped UTF8 pressure",()=>{
+ for(const count of [9,16,48]){
+  const rows=Array.from({length:count},(_,i)=>({...row("mcp:matrix-"+i),title:"Synthetic matrix task "+i})),m=live(()=>now0,rows);
+  for(const r of rows){
+   const text='界 🧪 " \\ '.repeat(100);
+   const safe=assistantPreview(text);assert.equal(assistantPreview(safe.text).text,safe.text);
+   m.detail(r.id,{kind:"assistant",text,at:now0});
+   for(let i=0;i<3;i++)m.detail(r.id,{kind:"recent-item",id:"observation-"+i,ordinal:i,type:"assistant",text:text+i,at:now0-3000+i*1000,status:"completed"});
+  }
+  const s=captureSnapshot(m,"agent-a",epoch,1)!;assert.deepEqual(validateHostSnapshot(s),s);
+  const base=structuredClone(s);delete base.rich;validateHostSnapshot(base);
+  const expanded=s.rich?normalizeRich(s.rich,new Set(s.agents.map(a=>a.id)),s.observedAt):null;
+  const useful=expanded?.details.filter(d=>d.value.fieldCoverage==="full").length??0;
+  if(count===9)assert.equal(useful,9);
+  console.log("CAPACITY_MATRIX "+JSON.stringify({threads:count,wireBytes:Buffer.byteLength(JSON.stringify(s)),admitted:s.agents.length,identities:expanded?.details.length??0,useful,truncated:s.truncated,richOmitted:s.rich?.omitted??s.agents.length}));
+  assert.equal(s.total,count);assert.equal(s.agents.length,base.agents.length);assert.ok(s.agents.length<=48);
+  assert.ok(Buffer.byteLength(JSON.stringify(s))<=8192);assert.ok(s.agents.every(a=>a.observedAt===now0&&a.detailObservedAt===now0));
+  for(const row of expanded?.details??[]){
+   if(row.value.fieldCoverage!=="full")continue;const d=row.value as import("../../src/mission-control/details.ts").Detail;
+   assert.ok((d.recent?.length??0)<=3);assert.ok((d.recentOmitted??0)+(d.recent?.length??0)<=3);
+   assert.deepEqual(d.recent?.map(r=>r.at),d.recent?.map(r=>r.at).toSorted((a,b)=>Number(b)-Number(a)));
+  }
+ }
 });
