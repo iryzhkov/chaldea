@@ -366,7 +366,10 @@ Codex aggregate credits come from a separate short-lived **installed** Codex
 app-server. They are credits, not dollars or a purchased-only ledger, and are never
 summed across aliases/buckets. The wallet's decimal string, hasCredits/unlimited
 flags, manual-reset count, ordinaryUsageAllowed and spendControlReached each retain
-their own successful observation time. The only account RPC is
+their own successful observation time. A read whose account ID differs from the
+retained one (changed, newly known or missing) clears these app-server fields first,
+so an omitted field never carries over from another account; T3-sourced windows and
+reset inventory are kept. The only account RPC is
 `account/rateLimits/read`, with `excludeResetCreditDetails:true` and
 `supportsLunaReserve:false`, after initialize/initialized. No model thread or turn,
 purchase, reset redemption, login change or explicit credential refresh is requested.

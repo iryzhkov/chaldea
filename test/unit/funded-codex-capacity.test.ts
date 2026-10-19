@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { newProvider } from "../../src/quota/headroom.ts";
+import { applyCodex, newProvider } from "../../src/quota/headroom.ts";
 import type { Metric, ProviderHeadroom, Window } from "../../src/quota/headroom.ts";
 import { classifyCapacity, DEFAULT_CAPACITY } from "../../src/quota/capacity.ts";
 import { recommend } from "../../src/route/policy.ts";
@@ -101,6 +101,51 @@ test("unproven credit funding fails closed while the included lane is denied", (
   const p = fundedCodex(); p.ordinaryUsageAllowed = metric(true); p.spendControlReached = metric(true);
   const c = classifyCapacity(p, false, now);
   assert.equal(c.class, "tight"); assert.match(c.reasons.join("; "), /spend control reached/);
+});
+
+test("funding proof never crosses observed account identity; same-account partial reads keep retained fields", () => {
+  const wallet = (balance: string) => ({ balance, hasCredits: true, unlimited: false });
+  const read = (id: string | null, bucket: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    ({ ...(id ? { accountId: id } : {}), ...extra, rateLimitsByLimitId: { codex: bucket } });
+  const a = read("FIXTURE_ACCOUNT_A", { planType: "pro", spendControlReached: false, credits: wallet("100") },
+    { ordinaryUsageAllowed: true, rateLimitResetCredits: { availableCount: 1 } });
+  const b = read("FIXTURE_ACCOUNT_B", { credits: wallet("59012.25") }, { ordinaryUsageAllowed: false });
+  const row = newProvider("codex", "codex");
+  row.binding = "asserted";
+  row.included = { ...metric([weekly(0)]), source: "t3" };
+  applyCodex(row, a, iso(now - 60000));
+  assert.equal(classifyCapacity(row, false, now).creditFunded, true, "account A proved its own funding");
+  const keyA = row.accountKey;
+  applyCodex(row, b, iso(now));
+  assert.notEqual(row.accountKey, keyA);
+  let c = classifyCapacity(row, false, now);
+  assert.equal(c.creditFunded, undefined, "B must not qualify on A's spend-control proof");
+  assert.equal(c.class, "tight");
+  assert.match(c.reasons.join("; "), /spend control unknown or stale/);
+  assert.equal(row.spendControlReached.value, null, "A's spend control is not B's");
+  assert.equal(row.plan.value, null); assert.equal(row.manualResets.value, null);
+  assert.deepEqual(row.included.value, [weekly(0)], "T3 instance windows are not app-server account metrics");
+  applyCodex(row, read("FIXTURE_ACCOUNT_B", { spendControlReached: false, credits: wallet("59012.25") }), iso(now));
+  assert.equal(row.ordinaryUsageAllowed.value, false, "same account keeps an omitted ordinary-usage field");
+  assert.equal(classifyCapacity(row, false, now).creditFunded, true, "B's own spend proof qualifies");
+  applyCodex(row, b, iso(now));
+  assert.equal(row.spendControlReached.value, false, "same account keeps an omitted spend-control field");
+  assert.equal(classifyCapacity(row, false, now).creditFunded, true);
+  // Known to missing identity: retained B fields are dropped and nothing account-bound remains.
+  applyCodex(row, read(null, { credits: wallet("10") }), iso(now));
+  assert.equal(row.accountKey, undefined);
+  assert.equal(row.spendControlReached.value, null); assert.equal(row.ordinaryUsageAllowed.value, null);
+  assert.equal(classifyCapacity(row, false, now).creditFunded, undefined);
+  // Missing to known identity: proof gathered without an account ID does not bind to the new account.
+  applyCodex(row, read(null, { spendControlReached: false, credits: wallet("10") }, { ordinaryUsageAllowed: false }), iso(now));
+  applyCodex(row, b, iso(now));
+  assert.equal(row.spendControlReached.value, null);
+  c = classifyCapacity(row, false, now);
+  assert.equal(c.class, "tight"); assert.equal(c.creditFunded, undefined);
+  // T3-sourced reset inventory belongs to the T3 instance and survives an app-server identity change.
+  row.manualResets = { ...metric({ availableCount: 2, nextExpiresAt: null }), source: "t3" };
+  applyCodex(row, read("FIXTURE_ACCOUNT_C", { credits: wallet("1") }), iso(now));
+  assert.equal(row.manualResets.source, "t3"); assert.equal(row.manualResets.value?.availableCount, 2);
 });
 
 test("active usage stops stay stopped; included short-window gates do not gate the proven paid lane", () => {

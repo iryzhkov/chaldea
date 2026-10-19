@@ -146,6 +146,15 @@ export function applyCodex(row: ProviderHeadroom, raw: unknown, at: string): voi
   const result = object(raw);
   if (!result) throw new BalanceReadError("protocol");
   const key = accountKey(result.accountId);
+  // App-server metrics belong to the login that reported them. Fields this response omits are
+  // otherwise retained, so a changed, newly known or lost identity starts from clean metrics.
+  // T3-sourced windows and reset inventory belong to the T3 instance and are kept.
+  if (key !== row.accountKey) {
+    const clean = newProvider(row.alias, row.driver);
+    row.credits = clean.credits; row.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
+    row.spendControlReached = clean.spendControlReached; row.plan = clean.plan;
+    if (row.manualResets.source === "codex-app-server") row.manualResets = clean.manualResets;
+  }
   if (key) row.accountKey = key; else delete row.accountKey;
   const map = object(result.rateLimitsByLimitId);
   const buckets = map ? Object.values(map).map(object).filter(b => b !== null) : [object(result.rateLimits)].filter(b => b !== null);
