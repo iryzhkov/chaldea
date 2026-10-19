@@ -7,6 +7,7 @@ import { runInNewContext } from "node:vm";
 // Rendering remains real; no copied navigation implementation.
 function browser(href = "https://board.example/?palette=mocr-1969", reduced = false) {
   let width=3840,height=1800;
+  const animations: string[] = [];
   class Element extends EventTarget {
     dataset: Record<string, string> = {};
     style: Record<string, string> = {};
@@ -45,6 +46,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     contains(el: Element | null): boolean { return el === this || this.children.some(c=>c.contains(el)); }
     focus() { document.activeElement = this; }
     blur() { document.activeElement = document.body; const e=new Event("focusout");Object.defineProperty(e,"target",{value:this});document.dispatchEvent(e); }
+    animate() { animations.push(this.attrs['data-thread-card']!); }
     get options() { return this.children.filter(c=>c.tag === "option"); }
     get textContent(): string { return this.parts.map(p=>typeof p === "string" ? p : p.textContent).join(""); }
     set textContent(text: string) { this.children=[];this.parts=[text]; }
@@ -132,7 +134,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     page: (delta:number) => {const el=elements.view!.querySelector(`[data-thread-page="${delta}"]`)!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     openDetails: (id:string) => {const el=elements.view!.querySelector('[data-thread-details="'+encodeURIComponent(id)+'"]')!;el.focus();const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     closeDetails: () => {const el=document.body.querySelector("[data-close-details]")!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
-    refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document };
+    refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document, animations };
 }
 
 for (const reduced of [false, true]) {
@@ -173,7 +175,7 @@ test("two agent views preserve old URLs, update immediately and disclose bounded
   assert.equal(b.elements.view!.className,"agents");
   assert.equal((b.elements.view!.innerHTML.match(/panel tile/g)||[]).length,48);
   assert.match(b.elements.view!.innerHTML,/Previews unavailable/);assert.match(b.elements.view!.innerHTML,/showing 48 of 48/);
-  assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/activity stale · 1m ago/);
+  assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/Activity stale · 1m ago/);
   const history=b.entries.length;b.click("agent-summary");assert.equal(b.entries.length,history+1);
   assert.equal(b.location.searchParams.get("mode"),"agent-summary");
   assert.match(b.elements.view!.innerHTML,/Host overview/);assert.match(b.elements.view!.innerHTML,/shown 0 \/ 0/);
@@ -200,7 +202,7 @@ test("unavailable modes replace previous content without invented data", () => {
   }
 });
 
-test("cards render sanitized title, compact real app ID, top state, effort and resources without HTML injection",async()=>{
+test("cards render sanitized title and footer state with full identity and provenance in Details",async()=>{
  const {emptyDetail}=await import("../../src/mission-control/details.ts");
  const b=browser("https://board.example/?mode=agents"),now=Date.now(),d=emptyDetail();
  d.identity={title:{text:"Actual <script>title</script>",state:"reported"},appThreadId:{text:"mcp:real-application-thread-123456789",state:"reported"}};
@@ -212,12 +214,15 @@ test("cards render sanitized title, compact real app ID, top state, effort and r
  const snapshot={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[host]};
  b.snapshot(snapshot);
  let html=b.elements.view!.innerHTML;
- assert.match(html,/task-label">Task/);assert.match(html,/Thinking/);
+ assert.match(b.elements.view!.querySelector(".card-status")!.textContent,/Thinking/);
+ assert.match(b.elements.view!.querySelector(".card-effort")!.textContent,/high/);
+ assert.doesNotMatch(b.elements.view!.querySelector("header")!.textContent,/Thinking|high/);
  assert.match(html,/Actual &lt;script&gt;title&lt;\/script&gt;/);
  assert.match(html,/Latest &lt;img/);assert.doesNotMatch(html,/<script>|<img /);
  b.openDetails("opaque-row");html=b.document.body.querySelector(".thread-drawer")!.innerHTML;
  assert.match(html,/data-copy-thread="mcp:real-application-thread-123456789"/);
- assert.match(html,/high \(configured\)/);assert.match(html,/go test -race/);b.closeDetails();
+ assert.match(html,/high \(configured\)/);assert.match(html,/go test -race/);
+ assert.match(html,/detail-freshness/);assert.match(html,/detail coverage reported/);b.closeDetails();
  b.click("agent-summary");html=b.elements.view!.innerHTML;
  assert.match(html,/Host overview/);assert.doesNotMatch(html,/Actual &lt;script&gt;|App thread|Latest &lt;img|go test -race/);
  b.click("fleet");html=b.elements.view!.innerHTML;assert.match(html,/25.0% · 8 cores/);assert.match(html,/3.0 \/ 4.0 GiB · 75.0% used/);
@@ -347,7 +352,11 @@ test("compact cards use current state, bounded previews, safe provider identity 
   assert.match(card.innerHTML,/Last observed command · outcome unknown/);
   assert.doesNotMatch(card.innerHTML,/Command running|Active command observed|App thread|Effort|Usage not reported/);
   assert.equal((card.innerHTML.match(/class="activity-item"/g)||[]).length,3);
-  assert.match(card.innerHTML,/activity-fresh/);assert.match(card.innerHTML,/source-fresh/);
+  assert.match(card.querySelector("header")!.textContent,/A meaningful task title/);
+  assert.doesNotMatch(card.querySelector("header")!.textContent,/Task |Completed|Failed|Idle/);
+  assert.match(card.querySelector(".card-status")!.textContent,new RegExp(state==="idle"?"Idle":state==="failed"?"Failed":"Completed"));
+  assert.doesNotMatch(card.querySelector(".body")!.innerHTML,/card-model|card-effort|card-usage|card-fresh|data-thread-details/);
+  assert.match(card.querySelector(".card-fresh")!.getAttribute("title")!,/Activity live.*A source live/);
   assert.match(card.innerHTML,/aria-label="Provider unknown"/);
  }
  const opener=b.elements.view!.querySelector('[data-thread-details="one"]')!;
@@ -374,8 +383,38 @@ test("compact cards use current state, bounded previews, safe provider identity 
  assert.match(b.elements.view!.innerHTML,/Last observed command/);
  const css=readFileSync(new URL("../../src/mission-control/static/core.css",import.meta.url),"utf8");
  assert.doesNotMatch(css,/\.dynamic-grid \.tile > \.body\s*\{[^}]*overflow:\s*(auto|scroll)/);
- assert.match(css,/grid-template-rows:38px minmax\(0,1fr\) 36px/);
+ assert.match(css,/\.card-foot\s*\{[^}]*flex:0 0 54px/);
+ assert.match(css,/@container \(max-width:460px\).*card-usage/);
 });
+
+test("card metrics stay in the footer and visual updates follow real evidence only",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ for(const reduced of [false,true]){
+  const b=browser("https://board.example/?mode=agents",reduced),now=Date.now(),d:any=emptyDetail();
+  d.effort={value:"high",source:"reported"};
+  d.usage={...d.usage,total:12345,coverage:"observed",observedAt:now};
+  d.recent=[{kind:"assistant",preview:{text:"Real preview",state:"reported"},at:now,status:"unknown"}];
+  const row={id:"glance",title:"Actual task",host:"agent-a",model:"actual-model",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[],details:d,detailCoverage:"reported"};
+  const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[row],shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+  b.snapshot(snap);
+  const foot=b.elements.view!.querySelector(".card-foot")!;
+  assert.match(foot.textContent,/Working.*actual-model.*high.*12K tok/);
+  assert.doesNotMatch(b.elements.view!.querySelector(".tile")!.querySelector(".body")!.textContent,/actual-model|12K tok/);
+  assert.equal(b.animations.length,0);
+  b.refresh();b.snapshot(snap);assert.equal(b.animations.length,0);
+  b.snapshot({...snap,now:now+1,agents:[{...row,observedAt:now+1}]});
+  assert.equal(b.animations.length,reduced?0:1);
+  b.snapshot({...snap,now:now+1,agents:[{...row,observedAt:now+1,details:{...d,recent:[{...d.recent[0],preview:{text:"New real preview",state:"truncated"}}]}}]});
+  assert.equal(b.animations.length,reduced?0:2);
+  b.snapshot({...snap,agents:[{...row,state:"completed",detailObservedAt:now-120000,activityFreshness:"stale",details:{...d,effort:{value:null,source:null},usage:{coverage:"not-reported"},recent:[{kind:"command",preview:{text:"PRIVATE WITHHELD",state:"withheld"},at:now,status:"running"}]}}]});
+  const card=b.elements.view!.querySelector(".tile")!;
+  assert.match(card.querySelector(".card-status")!.textContent,/Completed/);
+  assert.match(card.querySelector(".card-fresh")!.textContent,/Activity stale/);
+  assert.doesNotMatch(card.innerHTML,/PRIVATE WITHHELD|Command · running|card-effort|card-usage|not reported/);
+  assert.equal(card.querySelector(".recent-activity")!.textContent,"Previews unavailable");
+ }
+});
+
 test("resource instruments preserve measured CPU zero, independent stale samples, units and accessibility",()=>{
  const b=browser("https://board.example/?mode=fleet"),now=Date.now();
  const hosts=["agent-a","agent-b","omarchy-pc","laptop"].map((host,i)=>({host,shown:i,total:i,truncated:false,observedAt:now,freshness:i===1?"stale":"live",states:{},models:[],resources:{state:i===2?"unavailable":"reported",sample:i===2?null:{sampledAt:now-(i===1?120000:0),cpuUtilization:i===0?0:null,cpuCount:8,availableMemoryBytes:1073741824,totalMemoryBytes:4294967296}}}));

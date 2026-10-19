@@ -179,10 +179,12 @@
       const freshness = a.activityFreshness === 'live' && a.observed != null && a.observed <= 60 ? 'live' : a.activityFreshness === 'nosource' ? 'nosource' : 'stale';
       const sourceFresh = a.freshness === 'live' ? a.sourceObserved == null ? 'unknown' : a.sourceObserved <= 90 ? 'live' : 'stale' : a.freshness || 'unknown';
       const host = ({'agent-a':'A','agent-b':'B','omarchy-pc':'PC','laptop':'L'})[a.host] || a.host;
-      return `<section class="panel tile ${esc(a.state)}" data-fresh="${freshness}"><header><span class="task-label">Task ${st(a.state, STATE_LABEL[a.state] || a.state)}</span>${window.MC?.UI.providerMark ? window.MC.UI.providerMark(a) : '<span class="provider-mark" role="img" aria-label="Provider unknown">?</span>'}</header><div class="body">
-      <h2 class="title two">${esc(a.title)}</h2>
+      const stamp = window.MC?.UI.agentChangeStamp ? window.MC.UI.agentChangeStamp(a) : JSON.stringify([a.observedAt, a.activityObservedAt, a.state, a.title]);
+      const freshnessNote = `Activity ${freshness} · ${a.observed == null ? 'age unknown' : ago(a.observed) + ' ago'}; ${host} source ${sourceFresh} · ${a.sourceObserved == null ? 'age unknown' : ago(a.sourceObserved) + ' ago'}`;
+      const freshLabel = freshness !== 'live' ? 'Activity ' + freshness : sourceFresh !== 'live' ? 'Source ' + sourceFresh : 'Updated ' + ago(a.observed) + ' ago';
+      return `<section class="panel tile ${esc(a.state)}" data-fresh="${freshness}" data-thread-card="${encodeURIComponent(a.id)}" data-change-stamp="${esc(stamp)}"><header><h2 class="title two">${esc(a.title)}</h2>${window.MC?.UI.providerMark ? window.MC.UI.providerMark(a) : '<span class="provider-mark" role="img" aria-label="Provider unknown">?</span>'}</header><div class="body">
       ${window.MC?.UI.agentActivity ? window.MC.UI.agentActivity(a) : '<div class="muted">Activity unavailable</div>'}
-      <div class="card-foot"><span class="chip activity-fresh">activity ${esc(freshness)} · ${ago(a.observed)} ago</span><span class="chip source-fresh">${esc(host)} source ${esc(sourceFresh)} · ${ago(a.sourceObserved ?? a.observed)} ago</span><button type="button" data-thread-details="${encodeURIComponent(a.id)}" aria-haspopup="dialog">Details</button></div></div></section>`;
+      </div><footer class="card-foot"><div class="card-status">${st(a.state, STATE_LABEL[a.state] || a.state)}${window.MC?.UI.agentMetrics ? window.MC.UI.agentMetrics(a) : ''}</div><div class="card-access"><span class="card-fresh" title="${esc(freshnessNote)}" aria-label="${esc(freshnessNote)}">${esc(freshLabel)}</span><button type="button" data-thread-details="${encodeURIComponent(a.id)}" aria-label="Details for ${esc(a.title)}" aria-haspopup="dialog">Details</button></div></footer></section>`;
     }).join('');
     const controls = `<div class="grid-controls"><label>Thread grid <select data-thread-grid aria-label="Thread grid">${GRID_CHOICES.map(v => `<option value="${v}" ${v === fit.pref ? 'selected' : ''}>${v === 'auto' ? 'Auto' : v.replace('x',' × ')}${v !== 'auto' && (Number(v.split('x')[0]) > fit.maxCols || Number(v.split('x')[1]) > fit.maxRows) ? ' (fit limited)' : ''}</option>`).join('')}</select></label><span data-grid-fit>Effective fit ${fit.cols} × ${fit.rows} · ${per} per page</span><button data-thread-page="-1" aria-label="Previous thread page" aria-disabled="${agentPage === 0}" style="opacity:${agentPage === 0 ? '.5' : '1'}">Previous</button><span role="status">Page ${agentPage + 1} of ${pages}</span><button data-thread-page="1" aria-label="Next thread page" aria-disabled="${agentPage === pages - 1}" style="opacity:${agentPage === pages - 1 ? '.5' : '1'}">Next</button></div>`;
     return `<section class="panel p-summary"><header><h2 data-console="FLIGHT">Agents</h2><span class="fresh">${ago(DATA.demo ? 1 : DATA.agentSourceAge)}</span></header><div class="body">${controls}${summary}</div></section><div class="agrid dynamic-grid" style="grid-template-columns:repeat(${fit.cols},minmax(0,1fr));grid-template-rows:repeat(${fit.rows},minmax(230px,1fr))">${tiles}</div>`;
@@ -289,8 +291,15 @@
     const next = document.createElement('div'); next.innerHTML = R[m]();
     for (const selector of ['.p-summary header', '.agents-summary', '.agrid']) {
       const current = view.querySelector(selector), updated = next.querySelector(selector);
+      const prior = selector === '.agrid' ? new Map([...current.children].slice(0,48).map(el=>[el.getAttribute('data-thread-card'),el.getAttribute('data-change-stamp')])) : null;
       if (current.innerHTML !== updated.innerHTML) current.innerHTML = updated.innerHTML;
-      if (selector === '.agrid') current.setAttribute('style', updated.getAttribute('style'));
+      if (selector === '.agrid') {
+        current.setAttribute('style', updated.getAttribute('style'));
+        if (!reduceMotion && !still) for (const tile of current.children) {
+          const before = prior.get(tile.getAttribute('data-thread-card'));
+          if (before != null && before !== tile.getAttribute('data-change-stamp')) tile.animate?.([{boxShadow:'inset 0 0 0 2px var(--accent)'},{boxShadow:'inset 0 0 0 2px transparent'}],{duration:1200,easing:'ease-out'});
+        }
+      }
     }
     if (focusedThread != null) {
       const opener = [...view.querySelectorAll('[data-thread-details]')].find(el=>el.getAttribute('data-thread-details')===focusedThread);

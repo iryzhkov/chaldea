@@ -106,9 +106,23 @@ script.onload = () => {
     const art=driver==="codex"?'<svg viewBox="0 0 24 24" aria-hidden="true">'+Array.from({length:6},(_,i)=>'<rect x="8" y="2" width="8" height="13" rx="4" fill="none" stroke="currentColor" stroke-width="1.8" transform="rotate('+i*60+' 12 12)"/>').join("")+'</svg>':driver==="claudeAgent"?'<svg viewBox="0 0 24 24" aria-hidden="true">'+Array.from({length:12},(_,i)=>'<path d="M12 3 L12 9" stroke="currentColor" stroke-width="2" transform="rotate('+i*30+' 12 12)"/>').join("")+'</svg>':'?';
     return '<span class="provider-mark'+(known?' branded':'')+'" role="img" aria-label="'+esc(label)+'" title="'+esc(label)+'">'+art+'</span>';
   };
+  const compactTokens = n => n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(n>=1e4?0:1)+'K' : String(n);
+  UI.agentMetrics = a => {
+    const d=a.details, reported=d && (!a.detailCoverage || a.detailCoverage==="reported") && d.fieldCoverage!=="identity-only";
+    const effort=reported?d.effort?.value:null, u=reported?d.usage:null;
+    const tokens=u && u.coverage!=="not-reported" && Number.isFinite(u.total)?u.total:null;
+    return (a.model && a.model!=="unknown"?'<span class="card-model" title="'+esc(a.model)+'">'+esc(a.model)+'</span>':'')
+      +(effort?'<span class="card-effort" title="Reported effort">'+esc(effort)+'</span>':'')
+      +(tokens==null?'':'<span class="card-usage" title="'+esc(usage(u))+'">'+esc(compactTokens(tokens))+' tok</span>');
+  };
+  UI.agentChangeStamp = a => {
+    const d=a.details, reported=d && (!a.detailCoverage || a.detailCoverage==="reported") && d.fieldCoverage!=="identity-only";
+    const previews=!reported?[]:Array.isArray(d.recent)?d.recent.slice(0,3).filter(p=>["assistant","command"].includes(p.kind)&&previewText(p.preview)).map(p=>[p.kind,p.preview.text,p.preview.state,p.at,p.status]):[previewText(d.assistant),(d.commands||[]).map(previewText)];
+    return JSON.stringify([a.observedAt,a.activityObservedAt,a.state,a.title,previews]);
+  };
   UI.agentActivity = a => {
     const items=activityItems(a);
-    return '<div class="recent-activity"><div class="activity-label">'+(Array.isArray(a.details?.recent)?"Recent activity · observed":"Latest available · observed")+'</div>'+(items.length?items.map(p=>'<div class="activity-item"><span class="activity-kind">'+esc(p.kind)+'</span><span class="activity-preview">'+esc(p.text)+'</span></div>').join(""):'<div class="activity-empty">Previews unavailable</div>')+'</div>';
+    return '<div class="recent-activity">'+(items.length?items.map(p=>'<div class="activity-item"><span class="activity-kind" title="'+esc(p.kind)+'">'+esc(p.kind.replace("Active command observed","Command · running").replace("Last observed command · outcome unknown","Command · outcome unknown").replace(" · observed "," · "))+'</span><span class="activity-preview">'+esc(p.text)+'</span></div>').join(""):'<div class="activity-empty">Previews unavailable</div>')+'</div>';
   };
   R["agent-summary"]=()=>'<div class="host-coverage">'+esc("Host overview · "+coverage())+'</div>'+hostList().map(h=>hostCard(h,true)).join("");
   const originalAgents=R.agents;
@@ -124,7 +138,9 @@ script.onload = () => {
   const updateDrawer=()=>{
     if(!selectedThread)return;
     const a=snapshot?.agents.find(a=>a.id===selectedThread);
-    const html=a?'<h2>'+esc(a.title)+'</h2><div>'+st(a.state,a.state)+' · '+esc(a.host)+' · '+esc(a.model)+'</div><p>'+UI.providerMark(a)+'</p>'+detailBody(a)+UI.agentActivity(a)+'<p>Previews are observations, not a transcript. Only explicitly reported command outcomes are shown. Absence does not imply completion.</p>':missing("Thread is no longer in the observed set");
+    const activityAge=age(a?.detailObservedAt),host=snapshot?.hostSummary?.find(h=>h.host===a?.host);
+    const freshness=a?'<p class="detail-freshness">'+esc("Activity "+(a.activityFreshness==="live"&&(activityAge==null||activityAge>60)?"stale":a.activityFreshness??"unknown")+" · "+(activityAge==null?"age unknown":activityAge+"s ago")+"; "+a.host+" source "+(host?hostFreshness(host):a.freshness??"unknown")+" · "+(age(host?.observedAt??a.observedAt)??"unknown")+"s ago · detail coverage "+(a.detailCoverage??"not reported"))+'</p>':'';
+    const html=a?'<h2>'+esc(a.title)+'</h2><div>'+st(a.state,a.state)+' · '+esc(a.host)+' · '+esc(a.model)+'</div><p>'+UI.providerMark(a)+'</p>'+freshness+detailBody(a)+UI.agentActivity(a)+'<p>Previews are observations, not a transcript. Only explicitly reported command outcomes are shown. Absence does not imply completion.</p>':missing("Thread is no longer in the observed set");
     if(html!==drawerHTML){
       const content=drawer.querySelector(".drawer-content");
       if(content.contains(document.activeElement))drawer.querySelector("[data-close-details]").focus();
@@ -150,7 +166,7 @@ script.onload = () => {
     window.MC.SOURCES.t3thread.label = sourceLabel;
     if(snapshot) {
       DATA.demo=snapshot.demo; DATA.agentSourceAge=age(snapshot.source.observedAt);
-      DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
+      DATA.threads=snapshot.agents.map(a=>({ ...a, activityObservedAt:receivedSnapshot.agents.find(raw=>raw.id===a.id)?.detailObservedAt, state:a.state, observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort?.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
       DATA.agentPool=DATA.threads; DATA.sources=[];
     }
     window.MC.show(window.MC.MODES.includes(mode)?mode:"overview");
