@@ -316,3 +316,35 @@ test("rich v3 provider and actual recent items cross authenticated ingest/store/
   assert.equal(next.snapshots[0]!.rich!.details[0]!.value.fieldCoverage,"identity-only");
  }finally{await h.close();}
 });
+
+test("sparse v4 nine-thread capture survives authenticated ingest store restricted reader and public cache",async()=>{
+ const {MissionModel}=await import("../../src/mission-control/model.ts");
+ const {captureSnapshot}=await import("../../src/mission-control/contract.ts");
+ const h=await hostedRig();
+ try{
+  const m=new MissionModel(false,()=>N*1000);
+  const threads=Array.from({length:9},(_,i)=>({id:"mcp:synthetic-auth-"+i,title:"Synthetic authenticated task "+i,status:"running",providerInstanceId:"codex",modelSelection:{instanceId:"codex",model:"gpt-6.1-sol",options:[{id:"reasoningEffort",value:"high"}]},latestRunId:"synthetic-run",activeRunId:"synthetic-run",latestRunStartedAt:new Date((N-1)*1000).toISOString(),latestRunCompletedAt:null,lastErrorClass:null,usageLimitResetAt:null,limitRecovery:null,relationshipToParent:null,archived:false,deleted:false}));
+  m.shell({kind:"snapshot",sequence:1,threads});m.shell({kind:"synchronized"});
+  for(const t of threads){m.detail(t.id,{kind:"synchronized"});m.detail(t.id,{kind:"assistant",text:"Synthetic actual activity "+t.id,at:N*1000});m.detail(t.id,{kind:"recent-item",id:"synthetic-item",ordinal:1,type:"assistant",text:"Synthetic actual activity "+t.id,at:N*1000,status:"completed"});}
+  const snapshot=captureSnapshot(m,"agent-a","a".repeat(32),1)!;
+  const p:any=payload();p.data.snapshot=snapshot;
+  assert.equal(snapshot.rich!.v,4);assert.ok(Buffer.byteLength(JSON.stringify(snapshot))<=8192);
+  assert.equal((await h.post(p)).status,201);
+  const stored=JSON.parse(String(h.x.store.db.prepare("SELECT envelope FROM events").get()!.envelope));
+  assert.deepEqual(stored.data.snapshot,snapshot);
+  const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
+  assert.deepEqual(cache.snapshots[0],snapshot);writeCache(h.config.cacheFile,cache);
+  const dto=new CacheModel(h.config.cacheFile,()=>N*1000).snapshot();
+  assert.equal(dto.agents.length,9);assert.equal(dto.agents.filter(a=>a.details.recent?.some(r=>r.preview.text)).length,9);
+  assert.ok(Buffer.byteLength(JSON.stringify(dto))<=128*1024);
+  assert.ok(dto.agents.every(a=>a.details.effort.source==="configured"&&a.details.usage.output===null));
+  for(const mutate of [
+   (x:any)=>x.data.snapshot.rich.details[0].value.identity.appThreadId.text="mcp:forged",
+   (x:any)=>x.data.snapshot.rich.details[0].value.identity.title.private="forbidden",
+   (x:any)=>x.data.snapshot.rich.details[0].value.recent[0].preview.text="Bearer credential"
+  ]){const bad=structuredClone(p);mutate(bad);assert.equal((await h.post(bad,"v4-negative-"+Math.random())).status,400);}
+  const wrong=structuredClone(p);wrong.data.snapshot.host="agent-b";assert.equal((await h.post(wrong,"wrong-v4-host")).status,403);
+  const append=await h.readerToken({grants:[{resource:"mission-control-reader",actions:["append"]}]});
+  assert.equal((await h.post(p,"v4-reader-append",append)).status,403);
+ }finally{await h.close();}
+});

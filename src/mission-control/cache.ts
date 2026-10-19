@@ -3,6 +3,7 @@ import { dirname,isAbsolute } from "node:path";
 import { readTrustedFile, readJson, onlyKeys } from "../config/files.ts";
 import { strictJson } from "../access/token.ts";
 import { atomicWrite } from "../fs/atomic.ts";
+import { normalizeRich } from "./detail-contract.ts";
 import { aggregateDetails,emptyDetail } from "./details.ts";
 import { MissionModel,summarizeHost } from "./model.ts";
 import { HOSTS,validateHostSnapshot, object, exact, type HostSnapshot } from "./contract.ts";
@@ -64,11 +65,12 @@ export class CacheModel {
   }
   snapshot():ReturnType<MissionModel["snapshot"]> & {sampled:true}{
     const now=this.now(),base=new MissionModel(false,this.now).snapshot();
-    const snapshots=this.cache.snapshots.filter(s=>s.observedAt<=now&&now-s.observedAt<=CACHE_AGE);
+    const snapshots=this.cache.snapshots.filter(s=>s.observedAt<=now&&now-s.observedAt<=CACHE_AGE).map(s=>{const {rich,...base}=s;return {...base,...(rich?{rich:{...normalizeRich(rich,new Set(s.agents.map(a=>a.id)),s.observedAt),v:rich.v}}:{})};});
     const freshness=(connected:boolean,at:number|null,stale=90_000,lost=600_000)=>at===null?"nosource":now-at>lost?"lost":now-at>stale?"stale":connected?"live":"disconnected";
-    const publicDetail=(s:HostSnapshot,id:string)=>{
+    const publicDetail=(s:(typeof snapshots)[number],id:string)=>{
       const detail={...emptyDetail(),...s.rich?.details.find(d=>d.id===id)?.value};
       if(s.rich?.v===2){delete detail.provider;delete detail.recent;}
+      else if(s.rich?.v===4&&detail.recent?.length===0)delete detail.recent;
       return detail;
     };
     base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:s.rich?.details.find(d=>d.id===a.id)?.value.identity.title.text??"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,

@@ -8,7 +8,7 @@ export type Work = {active:number;queued:number;completed:number};
 export type ProviderIdentity = {instanceId:string;driver:string|null};
 export type Recent = {kind:"assistant"|"command";preview:Preview;at:number|null;status:"running"|"completed"|"failed"|"cancelled"|"unknown"};
 export const safeProviderId=(v:unknown):v is string=>typeof v==="string"&&/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(v)&&!/(?:bearer|password|secret|credential|api[_-]?key|token|sk-|gh[pousr]_)/i.test(v);
-export type Detail = {provider?:ProviderIdentity|null;recent?:Recent[];identity:{title:Preview;appThreadId:Preview};fieldCoverage:"full"|"identity-only";activity:"thinking"|"working"|null;assistant:Preview;commands:Preview[];commandsOmitted:number;effort:Effort;usage:Usage;context:{used:number;max:number|null}|null;work:{children:Work|null;delegates:Work|null;subagents:Work|null;monitors:number|null;background:number|null;durableWaits:null;coverage:"observed bounded roster"|"not-reported"}};
+export type Detail = {recentOmitted?:number;provider?:ProviderIdentity|null;recent?:Recent[];identity:{title:Preview;appThreadId:Preview};fieldCoverage:"full"|"identity-only";activity:"thinking"|"working"|null;assistant:Preview;commands:Preview[];commandsOmitted:number;effort:Effort;usage:Usage;context:{used:number;max:number|null}|null;work:{children:Work|null;delegates:Work|null;subagents:Work|null;monitors:number|null;background:number|null;durableWaits:null;coverage:"observed bounded roster"|"not-reported"}};
 export const integer=(n:unknown):n is number=>typeof n==="number"&&Number.isSafeInteger(n)&&n>=0;
 export function utf8(text:string,max:number):string {let result="";for(const c of text){if(Buffer.byteLength(result+c)>max)break;result+=c;}return result;}
 const normalize=(text:string)=>text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g," ");
@@ -21,7 +21,7 @@ export function assistantPreview(value:unknown):Preview {
   if(!normalized.trim())return {text:null,state:"not-reported"};
   if(suspicious.test(normalized.replace(/[\t\n\r]/g," ")))return {text:null,state:"withheld"};
   const paragraph=normalized.trim().split(/\n\s*\n/).filter(s=>s.trim()).at(-1)!.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g," ").trim();
-  const text=utf8(paragraph,384);return {text,state:text===paragraph?"reported":"truncated"};
+  const text=utf8(paragraph,384).trimEnd();return {text,state:text===paragraph?"reported":"truncated"};
 }
 const commands=new Set(["git","go","npm","node","python","python3","pytest","rg","make","tsc","chaldea","jocasta","cargo"]);
 const safeArgs=new Set(["test","run","build","typecheck","check","status","diff","log","show","exec","get","search","--test","--check","--stat","--short","--porcelain","--no-emit","--noEmit","--help","--version","-race","-v","-q","./..."]);
