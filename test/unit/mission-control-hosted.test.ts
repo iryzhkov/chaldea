@@ -79,7 +79,7 @@ test("R1 first successful cache load after missing or invalid startup establishe
   }
 });
 test("four-source cache admits at most48 global rows and labels omitted rows honestly",()=>{
-  const c=emptyCache();for(const host of ["agent-a","agent-b","omarchy-pc","laptop"]){
+  const c=emptyCache();for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"]){
     const s=sample();s.host=host;s.agents=Array.from({length:40},(_,i)=>({...s.agents[0]!,id:i.toString(16).padStart(16,"0")}));s.total=40;s.truncated=false;
     mergeStatus(c,validateHostSnapshot(s),now0);
   }
@@ -87,6 +87,28 @@ test("four-source cache admits at most48 global rows and labels omitted rows hon
   assert.equal(c.snapshots.reduce((n,s)=>n+s.total!,0),160);assert.ok(c.snapshots.every(s=>s.truncated));
   const d=scratch();try{const file=join(d.path,"cache");writeCache(file,c);assert.ok(readFileSync(file).length<=512*1024);const m=new CacheModel(file,()=>now0);assert.equal(m.snapshot().total,160);assert.equal(m.snapshot().agents.length,48);assert.equal(m.snapshot().truncated,true);}finally{d.close();}
 });
+
+test("canonical four-host capture and collector retain exact private snapshot identities",async()=>{
+  const d=scratch(),path=join(d.path,"config.json");
+  const hosts=["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"];
+  try{
+    const reader={url:"https://akasha.example",tokenHelper:"/fixed/helper",source:"mission-control-reader",host:"omarchy-normandy",profile:"mission-control-reader",project:"chaldea",allowedSourceIds:hosts.map(h=>h+"--mission-control"),cacheFile:join(d.path,"cache"),refreshMs:5000};
+    writeFileSync(path,JSON.stringify(reader));assert.deepEqual(readerConfig(path).allowedSourceIds,reader.allowedSourceIds);
+    for(const host of hosts){
+      const config={host,t3BaseDir:"/t3",tokenFile:"/private/token",snapshotFile:join(d.path,"snapshot-"+host)};
+      writeFileSync(path,JSON.stringify(config));assert.equal(captureConfig(path).host,host);
+      const snapshot=captureSnapshot(live(),host,epoch,1)!;writeFileSync(config.snapshotFile,JSON.stringify(snapshot),{mode:0o600});
+      const outbox=new Outbox(join(d.path,host+".db"));
+      try{let sent=0;await collect({outbox,host,spool:join(d.path,"absent"),missionControlSnapshotFile:config.snapshotFile,now:()=>now0,deliver:async e=>{
+        sent++;assert.equal(e.host,host);assert.equal(e.source,host+".mission-control");assert.deepEqual((e.payload.data as any).snapshot,snapshot);return true;
+      }});assert.equal(sent,1);}finally{outbox.close();}
+    }
+    assert.throws(()=>captureSnapshot(live(),"laptop",epoch,1),/invalid_host_snapshot/);
+    writeFileSync(path,JSON.stringify({...reader,allowedSourceIds:["laptop--mission-control"]}));assert.throws(()=>readerConfig(path),/invalid_reader_config/);
+    writeFileSync(path,JSON.stringify({host:"laptop",t3BaseDir:"/t3",tokenFile:"/private/token",snapshotFile:"/private/latest"}));assert.throws(()=>captureConfig(path),/invalid_capture_config/);
+  }finally{d.close();}
+});
+
 test("capture samples quiet live state, preserves activity age and private metadata never escapes",()=>{
   let now=now0;const m=live(()=>now);m.detail("private-thread",{kind:"activity",tool:"read"});
   let s=captureSnapshot(m,"agent-a",epoch,1)!;
