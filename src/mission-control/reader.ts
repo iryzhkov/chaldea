@@ -10,7 +10,7 @@ export interface ReaderConfig {url:string;tokenHelper:string;source:"mission-con
 export function readerConfig(path:string):ReaderConfig {
   const c=readJson(path,false,strictJson);onlyKeys(c,["url","tokenHelper","source","host","profile","project","allowedSourceIds","cacheFile","refreshMs"]);
   const u=new URL(String(c.url)),ids=c.allowedSourceIds;
-  if(u.protocol!=="https:"||u.username||u.password||u.search||u.hash||u.pathname!=="/"||c.source!=="mission-control-reader"||c.host!=="omarchy-normandy"||c.profile!=="mission-control-reader"||c.project!=="chaldea"||c.refreshMs!==5000||!isAbsolute(String(c.tokenHelper))||!isAbsolute(String(c.cacheFile))||!Array.isArray(ids)||!ids.length||ids.length>4||new Set(ids).size!==ids.length||!ids.every(s=>typeof s==="string"&&/^(agent-a|agent-b|omarchy-pc|laptop)--mission-control$/.test(s)))throw new Error("invalid_reader_config");
+  if(u.protocol!=="https:"||u.username||u.password||u.search||u.hash||u.pathname!=="/"||c.source!=="mission-control-reader"||c.host!=="omarchy-normandy"||c.profile!=="mission-control-reader"||c.project!=="chaldea"||c.refreshMs!==5000||!isAbsolute(String(c.tokenHelper))||!isAbsolute(String(c.cacheFile))||!Array.isArray(ids)||!ids.length||ids.length>4||new Set(ids).size!==ids.length||!ids.every(s=>typeof s==="string"&&/^(agent-a|agent-b|omarchy-pc|omarchy-macbook-air-igor)--mission-control$/.test(s)))throw new Error("invalid_reader_config");
   return c as unknown as ReaderConfig;
 }
 export interface ReaderDependencies {fetch?:typeof fetch;token?:()=>Promise<string>;now?:()=>number}

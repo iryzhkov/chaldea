@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { MissionModel } from "./model.ts";
 export const SNAPSHOT_SCHEMA = "mission-control.host.v1", SNAPSHOT_BYTES = 8192;
-export const HOSTS = ["agent-a","agent-b","omarchy-pc","laptop"] as const;
+export const HOSTS = ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"] as const;
 export const MODELS = ["gpt-6.1-sol","gpt-6-sol","gpt-6-astra","gpt-6-luna","gpt-5.6-sol","claude-opus-5-5","claude-haiku-4-5","unknown"] as const;
 export const TOOLS = ["read","search","navigate","edit_apply","change_plan","verify_run"] as const;
 const STATES = ["working","waiting","waiting-igor","idle","failed"] as const;

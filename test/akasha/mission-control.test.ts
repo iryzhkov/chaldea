@@ -11,8 +11,9 @@ import { refreshStatus, type ReaderConfig } from "../../src/mission-control/read
 import { missionServer } from "../../src/mission-control/server.ts";
 import { request } from "node:http";
 import { join } from "node:path";
-async function hostedRig(){
-  const x=await rig("service"),key=generateKeyPairSync("ed25519");
+async function hostedRig(host="agent-a"){
+  const identity={issuer:"chaldea:"+host,source:host+".mission-control",host,source_id:host+"--mission-control",profile:"mission-control-publisher",project:"chaldea"};
+  const x=await rig("service",host),key=generateKeyPairSync("ed25519");
   const publisher={issuer:identity.issuer,source:identity.source,host:identity.host,source_id:identity.source_id,profile:identity.profile,project:identity.project,mode:"service" as const,kinds:["agent_status" as const]};
   const reader={issuer:"chaldea:omarchy-normandy",source:"mission-control-reader",host:"omarchy-normandy",source_id:"omarchy-normandy--mission-control-reader",profile:"mission-control-reader",project:"chaldea",mode:"service" as const,kinds:["agent_status" as const],mission_control_read_sources:[identity.source_id]};
   const bundle=structuredClone(x.bundle);bundle.sequence++;
@@ -25,7 +26,7 @@ async function hostedRig(){
   const ingress=new Ingress(auth,x.store,()=>queueMicrotask(()=>project(x.store,x.clock.check())));
   const server=httpServer(ingress);server.listen(0,"127.0.0.1");await once(server,"listening");
   const base="http://127.0.0.1:"+(server.address()as{port:number}).port;
-  const appendToken=await x.token({sub:publisher.profile,project:publisher.project,source:publisher.source,grants:[{resource:publisher.source,actions:["append"]}]});
+  const appendToken=await x.token({iss:publisher.issuer,host:publisher.host,sub:publisher.profile,project:publisher.project,source:publisher.source,grants:[{resource:publisher.source,actions:["append"]}]});
   const readerToken=async(overrides:Record<string,unknown>={})=>new CompactSign(Buffer.from(JSON.stringify({v:1,iss:reader.issuer,sub:reader.profile,project:reader.project,source:reader.source,host:reader.host,aud:"akasha",run_id:"fixture",iat:N,nbf:N,exp:N+300,jti:"abcdefghijklmnopqrstuv",grants:[{resource:reader.source,actions:["read"]}],...overrides}))).setProtectedHeader({alg:"EdDSA",typ:"chaldea-run+jwt",kid:"reader"}).sign(key.privateKey);
   const readToken=await readerToken();
   const post=(p:unknown,key="status-1",token=appendToken)=>fetch(base+"/api/v1/events",{method:"POST",headers:{authorization:"Bearer "+token,"content-type":"application/json","idempotency-key":key},body:JSON.stringify(p)});
@@ -184,6 +185,23 @@ const sample = (sequence=1, observedAt=N*1000) => ({
 });
 const identity={issuer:"chaldea:agent-a",profile:"mission-control-publisher",project:"chaldea",source:"agent-a.mission-control",host:"agent-a",run_id:"fixture",source_id:"agent-a--mission-control"};
 const payload=()=>({v:1,kind:"agent_status",title:"Mission control status",data:{snapshot:sample()}});
+
+for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"])test("authenticated status roundtrip preserves canonical host "+host,async()=>{
+  const h=await hostedRig(host);
+  try{
+    const p=payload();p.data.snapshot.host=host;
+    assert.equal((await h.post(p)).status,201);
+    const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
+    assert.equal(cache.gap,false);assert.equal(cache.snapshots[0]!.host,host);
+    const wrong=payload();wrong.data.snapshot.host=host==="agent-a"?"agent-b":"agent-a";
+    assert.equal((await h.post(wrong,"mismatch")).status,403);
+    const laptop=payload();laptop.data.snapshot.host="laptop";assert.equal((await h.post(laptop,"unissued-laptop")).status,400);
+    assert.throws(()=>new Authorization([{...h.publisher,issuer:"chaldea:laptop"}],h.x.trust,h.x.clock),/registry_host_mismatch/);
+    assert.throws(()=>new Authorization([{...h.publisher,host:"laptop",issuer:"chaldea:laptop",source:"laptop.mission-control",source_id:"laptop--mission-control"}],h.x.trust,h.x.clock),/invalid_mission_control_publisher/);
+    assert.throws(()=>scopeSql({...h.reader,global:false,missionControlSources:["laptop--mission-control"]}),/invalid_mission_control_scope/);
+  }finally{await h.close();}
+});
+
 test("strict hosted form accepts bounded metadata and rejects all extra prose/identity fields",()=>{
   assert.equal(normalize(payload(),identity,false).kind,"agent_status");
   for (const mutate of [
