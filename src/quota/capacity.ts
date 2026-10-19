@@ -23,6 +23,8 @@ export interface Capacity {
   remainingFraction: number | null; reserveWeeks: number;
   observedBurnPerHour: number | null; projectedHeavyUse: number | null; burnTargetPerHour: number | null;
   observedAt: string | null;
+  /** Set only for the proven credit-funded lane; included-window gates do not apply to it. */
+  creditFunded?: true;
 }
 const fresh = <T>(m: Metric<T>, now: number, maxAge: number): T | null =>
   m.state === "fresh" && m.observedAt !== null && now >= Date.parse(m.observedAt) &&
@@ -69,22 +71,38 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   const windows = fresh(p.included, now, maxAge) ?? [];
   const advice = windowPolicy(windows, now, config.minimumRemaining, config.paceMargin);
   c.reasons.push(...advice.reasons);
+  // An active usage stop is the provider's own refusal; nothing below overrides it.
   if (activeStop) return finish("stopped", "active usage stop; reserves do not authorize redemption");
-  if (advice.gate) return finish(advice.gate, "short window " + (advice.gate === "stopped" ? "exhausted" : "under minimum remaining quota") + "; wait until its reset");
-  if (fresh(p.ordinaryUsageAllowed, now, config.maxAgeMs) === false)
-    return finish("tight", "provider reports ordinary usage not allowed; credits do not override");
   const reserves = config.providers[p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias] ?? {};
   const creditExpiry = p.creditExpiresAt ?? reserves.creditExpiresAt;
   const credits = fresh(p.credits, now, config.maxAgeMs);
   const balance = Number(credits?.balance);
-  if (p.driver === "codex" && credits?.hasCredits &&
-      (credits.unlimited || credits.balance !== null && Number.isFinite(balance) && balance > 0) &&
-      (creditExpiry === undefined || unexpired(creditExpiry, now))) {
+  const wallet = p.driver === "codex" && credits !== null && credits.hasCredits &&
+    (credits.unlimited || credits.balance !== null && Number.isFinite(balance) && balance > 0) &&
+    (creditExpiry === undefined || unexpired(creditExpiry, now));
+  const spendControl = fresh(p.spendControlReached, now, config.maxAgeMs);
+  const creditCapacity = (reason: string) => {
     c.observedAt = p.credits.observedAt;
     c.burnTargetPerHour = null;
     return finish(creditExpiry && Date.parse(creditExpiry) - now <= config.expiryHorizonMs ? "use-it" : "unlimited",
-      "fresh Codex credits available; no credit reserve floor" + (creditExpiry ? "; expiry " + creditExpiry : ""));
+      reason + (creditExpiry ? "; expiry " + creditExpiry : ""));
+  };
+  // Igor's 2026-10-19 policy: credits are a separate, credit-funded lane. Fresh account-bound
+  // credits with a fresh "spend control not reached" count as unlimited even when included
+  // quota is exhausted or ordinary included usage is denied. Unknown evidence never qualifies.
+  if (wallet && p.accountKey && spendControl === false) {
+    c.creditFunded = true;
+    return creditCapacity("credit-funded lane: fresh account-bound Codex credits, spend control not reached; " +
+      "included windows and ordinary-usage denial do not gate it; no credit reserve floor");
   }
+  if (advice.gate) return finish(advice.gate, "short window " + (advice.gate === "stopped" ? "exhausted" : "under minimum remaining quota") + "; wait until its reset");
+  if (fresh(p.ordinaryUsageAllowed, now, config.maxAgeMs) === false)
+    return finish("tight", "provider reports ordinary included usage not allowed; credit-funded lane unproven: " +
+      (!wallet ? "no fresh positive unexpired credits" : !p.accountKey ? "credits not account-bound"
+        : spendControl === true ? "spend control reached" : "spend control unknown or stale"));
+  // With the included lane open, credits keep their earlier advisory meaning unless spend is known blocked.
+  if (wallet && spendControl !== true) return creditCapacity("fresh Codex credits available; no credit reserve floor");
+  if (wallet) c.reasons.push("spend control reached; credits do not add capacity");
   const w = advice.pacing;
   if (!w) return finish("unknown", "missing, stale or expired weekly/longest included window; short windows never establish pacing");
   const hours = (Date.parse(w.resetsAt!) - now) / 3600000, durationHours = w.windowDurationMins! / 60;

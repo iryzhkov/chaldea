@@ -480,11 +480,15 @@ restarts replay durable delivery intents through the existing poster path.
 Legacy feed attempts retain their existing at-most-once semantics; scoped Akasha
 delivery retains its receipt/retry behavior. Status does not post feed records.
 
-Routing receives these three lanes as read-only inputs. Credit-funded admission
-and automatic reset redemption are always disabled in this design. Inventory
+Routing receives these three lanes as read-only inputs. Automatic provider
+switching never uses the credit-funded lane, so `creditFunded.admissionAllowed`
+stays false, and automatic reset redemption is always disabled. Inventory
 cannot admit a provider switch; a fresh ordinary-usage denial blocks the included
-lane, while spend controls remain separate in the credit-funded lane. A future paid-routing policy would need an explicit budget, adequate
-**fresh** balance, spend-control checks and actual provider acceptance. Existing
+lane, while spend controls remain separate in the credit-funded lane. FATE route
+recommendations do consider that lane: fresh account-bound credits with fresh
+`spendControlReached: false` classify as credit-funded unlimited capacity (see
+[route](route.md#capacity-and-preference)). Chaldea still spends, buys and
+redeems nothing; the provider's own usage stop always wins. Existing
 usage-limit stop/resume behavior remains in place.
 
 The fake Codex stdio fixture verifies the exact allowlisted request sequence,

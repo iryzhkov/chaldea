@@ -174,7 +174,9 @@ export function failCodex(row: ProviderHeadroom, error: string): void {
   if (row.manualResets.source === "codex-app-server") row.manualResets = { ...row.manualResets, state: "error", error };
 }
 
-/** Public, identity-free lanes: reporting inputs only; paid admission stays false without a future policy. */
+/** Public, identity-free lanes: reporting inputs only. admissionAllowed describes automatic provider
+ * switching, which admits only the included lane and stays false. FATE recommendations judge the
+ * credit-funded lane separately through the capacity classifier (`creditFunded`). */
 export function routingLanes(row: ProviderHeadroom, nowMs: number) {
   return {
     ...(row.binding ? { binding: row.binding } : {}),

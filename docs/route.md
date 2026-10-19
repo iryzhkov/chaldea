@@ -66,8 +66,9 @@ Only the weekly window, or the longest included window when there is no weekly
 window, determines pacing and native quota projections. A session/5-hour window
 never creates use-it capacity because its reset is close. Its only effect is a
 temporary gate: under `minimumRemaining` left, default strictly under 10%, is tight;
-zero left is stopped. These gates override credits and reserves until the short
-reset. An active usage stop is always stopped. A short window alone leaves pacing
+zero left is stopped. These gates override advisory credits and reserves until the
+short reset; they do not gate the proven credit-funded lane described below. An
+active usage stop is always stopped. A short window alone leaves pacing
 unknown. Reasons show both windows, for example "weekly 62% left with 40% of
 window left: under-paced; 5h window 35% left".
 
@@ -100,11 +101,24 @@ and refill inventories add no timed value.
 
 Fresh, positive, unexpired Codex credits count as unlimited with no reserve
 floor or required creditsPerFullWeek conversion. Credits nearing expiry count
-as use-it. Zero, stale and expired balances do not add capacity. Nearly exhausted
-or exhausted short native windows temporarily exclude even a Codex account with
-usable credits. Weekly quota exhaustion alone does not override credits. An active usage stop
-remains stopped; a fresh provider report that ordinary usage is not allowed
-remains tight. Missing credit and native-window data remains unknown.
+as use-it. Zero, stale and expired balances do not add capacity. Weekly quota
+exhaustion alone does not override credits. Missing credit and native-window data
+remains unknown. An active usage stop always remains stopped.
+
+Credits are a separate, credit-funded lane (Igor's policy, 2026-10-19). When the
+observer holds fresh, positive, unexpired, account-bound Codex credits and a fresh
+`spendControlReached: false`, the class is unlimited (use-it near expiry) with
+`creditFunded: true`, even if included quota is exhausted, short included windows
+are gated, or the provider reports that ordinary included usage is not allowed.
+Routing then ranks it like any unlimited provider: ahead of paced Claude, behind
+use-it capacity and under-paced Claude. Review separation, bans, pins, quality
+floors and catalog effort checks still apply. Without that proof, the included
+lane decides: a fresh ordinary-usage denial is tight, short gates exclude the
+account, and a fresh `spendControlReached: true` means credits add no capacity.
+Unknown, stale or errored spend control, and credits from fleet snapshots (which
+do not carry spend control), never establish the credit-funded lane. This is a
+recommendation input only; automatic provider switching still admits only the
+included lane.
 
 Chaldea never spends credits, purchases capacity, redeems resets, refreshes
 credentials, or calls any purchase, reset-redemption or refresh method.
