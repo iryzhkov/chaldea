@@ -436,7 +436,7 @@ b, strong, .b { font-weight:600; }
 .thread-drawer .drawer-content { overflow-wrap:anywhere; }
 .thread-drawer .facts { display:grid; gap:12px; }
 :is(button,select):focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-#view.fleet { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr)); grid-auto-rows:max-content; grid-template-rows:none; align-content:start; overflow:auto; }
+#view.fleet { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr)); grid-template-areas:none; grid-auto-rows:max-content; grid-template-rows:none; align-content:start; overflow:auto; }
 #view:is(.fleet,.host-overview) { --t1:clamp(14px,1vw,18px); --t2:clamp(16px,1.25vw,24px); }
 #view .host-card { grid-area:auto; }
 .host-card > .body { gap:12px; overflow:visible; }
