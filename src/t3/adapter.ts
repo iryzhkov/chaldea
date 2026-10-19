@@ -555,7 +555,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       }
       const recent = [...item.projection.turnItems, ...item.projection.visibleTurnItems.map(row => row.item)]
         .filter(row => row.status === "running").toSorted((a,b) => b.ordinal - a.ordinal)[0];
-      if (recent) onEvent({ kind: "activity", tool: "toolName" in recent && typeof recent.toolName === "string" ? recent.toolName : null });
+      if (recent) onEvent({ kind: "activity", tool: recent.type === "command_execution" ? "command_execution" : "toolName" in recent && typeof recent.toolName === "string" ? recent.toolName : null });
       onEvent({ kind: "cursor", sequence: item.snapshotSequence }); return;
     }
     if (item.kind === "unknown-event") { onEvent({ kind: "cursor", sequence: item.sequence }); return; }
