@@ -33,7 +33,8 @@ def validate_groups(groups, actual):
     duplicates = sorted(path for path, count in counts.items() if count != 1)
     unassigned = sorted(set(actual) - counts.keys())
     missing = sorted(counts.keys() - set(actual))
-    if duplicates or unassigned or missing or any(not files for files in groups.values()):
+    if (set(groups) != {"e2e-1", "e2e-2", "e2e-3"} or duplicates or unassigned
+            or missing or any(not files for files in groups.values())):
         raise ValueError(
             f"E2E coverage mismatch: duplicate={duplicates}, "
             f"unassigned={unassigned}, missing={missing}; groups must be nonempty"
