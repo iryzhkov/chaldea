@@ -9,6 +9,7 @@ export const TOOLS = ["read","search","navigate","edit_apply","change_plan","ver
 const STATES = ["thinking","working","waiting","waiting-igor","waiting-approval","waiting-children","waiting-monitor","queued","completed","cancelled","idle","failed"] as const;
 export interface HostSnapshot {
   rich?:RichSnapshot;
+  quota?:HostQuota;
   schema: typeof SNAPSHOT_SCHEMA; host: string; epoch: string; sequence: number; observedAt: number; connected: boolean;
   total: number|null; truncated: boolean;
   agents: {id:string;model:string;state:string;startedAt:number|null;observedAt:number;detailObservedAt:number|null;connected:boolean;steps:string[]}[];
@@ -23,7 +24,7 @@ export function validateHostSnapshot(raw:unknown):HostSnapshot {
   // Bound traversal before serialization or sparse expansion, including hostile in-memory input.
   let nodes=0;const visit=(v:unknown,depth:number):void=>{check(++nodes<=8192&&depth<=12);check(typeof v!=="string"||v.length<=SNAPSHOT_BYTES);check(!Array.isArray(v)||v.length<=48);if(v&&typeof v==="object")for(const x of Object.values(v))visit(x,depth+1);};
   visit(raw,0);check(Buffer.byteLength(JSON.stringify(raw))<=SNAPSHOT_BYTES);
-  const s=object(raw);exact(s,["schema","host","epoch","sequence","observedAt","connected","total","truncated","agents","tokens",...(Object.hasOwn(s,"rich")?["rich"]:[])]);
+  const s=object(raw);exact(s,["schema","host","epoch","sequence","observedAt","connected","total","truncated","agents","tokens",...(Object.hasOwn(s,"rich")?["rich"]:[]),...(Object.hasOwn(s,"quota")?["quota"]:[])]);
   check(s.schema===SNAPSHOT_SCHEMA&&HOSTS.includes(s.host as typeof HOSTS[number])&&typeof s.epoch==="string"&&/^[a-f0-9]{32}$/.test(s.epoch));
   check(count(s.sequence)&&s.sequence>0&&time(s.observedAt)&&typeof s.connected==="boolean"&&typeof s.truncated==="boolean");
   check(Array.isArray(s.agents)&&s.agents.length<=48&&(s.total===null||count(s.total)&&s.total>=s.agents.length));
@@ -41,6 +42,7 @@ export function validateHostSnapshot(raw:unknown):HostSnapshot {
       if(app.state==="reported"&&app.text!==null)check(createHash("sha256").update(String(s.epoch)+"\0"+app.text).digest("hex").slice(0,16)===row.id);
     }
   }
+  if(Object.hasOwn(s,"quota"))validateHostQuota(s.quota,Number(s.observedAt));
   const t=object(s.tokens);exact(t,["qualified","output","rate","observedAt","coverage"]);
   check(typeof t.qualified==="boolean"&&["unknown","observed","partial"].includes(t.coverage as string));
   check(t.output===null||count(t.output));check(t.rate===null||typeof t.rate==="number"&&Number.isFinite(t.rate)&&t.rate>=0&&t.rate<=Number.MAX_SAFE_INTEGER);
@@ -73,6 +75,10 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
       const row:{id:string;value:import("./detail-contract.ts").WireDetail}={id:snapshot.agents[i]!.id,value:compactDetail({identity:safe.identity,fieldCoverage:"identity-only"})};rich.details.push(row);rich.omitted--;
       if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES){rich.details.pop();rich.omitted++;}
     }
+    // Quota yields before admitted identities and resources, and before activity upgrades.
+    try{snapshot.quota=quotaProjection(v.quota,observedAt,model.quotaTimes());}catch{snapshot.quota={state:"error",observedAt:null,omitted:0,accounts:[]};}
+    if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)snapshot.quota={state:"byte-budget",observedAt:snapshot.quota.observedAt,omitted:snapshot.quota.accounts.length+snapshot.quota.omitted,accounts:[]};
+    if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.quota;
     const candidates=new Map<string,Detail>();
     const preview=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).trimEnd(),state:"truncated"}:p;
     const command=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).split(" ").slice(0,-1).join(" "),state:"truncated"}:p;
@@ -107,6 +113,63 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
   }
   return validateHostSnapshot(snapshot);
 }
+
+// Compact, fixed-order account rows carry no account key, alias or source string.
+// [provider, included state/time, used, reset, duration, credits/state, reset state,
+// unlimited, manual resets, credits time, manual resets time].
+export type QuotaRow=[string,string,number|null,number|null,number|null,number|null,string|null,string,string,boolean|null,number|null,number|null,number|null];
+export interface HostQuota {state:"unknown"|"cached"|"error"|"byte-budget";observedAt:number|null;omitted:number;accounts:QuotaRow[]}
+const metricStates=["fresh","stale","lost","unknown","unsupported","error"];
+export function validateHostQuota(raw:unknown,at:number):HostQuota {
+  const q=object(raw);exact(q,["state","observedAt","omitted","accounts"]);
+  check(["unknown","cached","error","byte-budget"].includes(String(q.state))&&count(q.omitted)&&Array.isArray(q.accounts)&&q.accounts.length<=4);
+  const stamp=(v:unknown)=>v===null||time(v)&&v<=at;
+  check(stamp(q.observedAt));
+  for(const row of q.accounts){check(Array.isArray(row)&&row.length===13);const r=row as QuotaRow;
+    check(["codex","claudeAgent","opencode","Provider"].includes(r[0])&&metricStates.includes(r[1])&&stamp(r[2]));
+    check(r[3]===null||typeof r[3]==="number"&&Number.isFinite(r[3])&&r[3]>=0&&r[3]<=100);
+    check(r[4]===null||time(r[4]));check(r[5]===null||count(r[5]));
+    check(r[6]===null||typeof r[6]==="string"&&/^\d+(?:\.\d+)?$/.test(r[6])&&r[6].length<=24);
+    check(metricStates.includes(r[7])&&metricStates.includes(r[8])&&(r[9]===null||typeof r[9]==="boolean")&&(r[10]===null||count(r[10]))&&stamp(r[11])&&stamp(r[12]));
+  }
+  check(q.state!=="byte-budget"||q.accounts.length===0);
+  return structuredClone(q) as unknown as HostQuota;
+}
+export function quotaProjection(q:ReturnType<MissionModel["snapshot"]>["quota"],at:number,times:[number|null,number|null][]=[]):HostQuota {
+  const accounts:QuotaRow[]=q.accounts.slice(0,4).map((a,i)=>[a.label.startsWith("codex " )?"codex":a.label.startsWith("claudeAgent ")?"claudeAgent":a.label.startsWith("opencode ")?"opencode":"Provider",a.state,a.observedAt,a.used,a.resetsAt,a.duration,a.credits,a.creditState,a.resetState,a.unlimited,a.manualResets,times[i]?.[0]??null,times[i]?.[1]??null]);
+  return validateHostQuota({state:q.state,observedAt:accounts.some(a=>a[2]!==null||a[11]!==null||a[12]!==null)?Math.max(...accounts.flatMap(a=>[a[2]??0,a[11]??0,a[12]??0])):null,omitted:Math.max(0,q.accounts.length-4),accounts},at);
+}
+export function quotaAccounts(q:HostQuota,now:number):ReturnType<MissionModel["snapshot"]>["quota"]["accounts"] {
+  const state=(s:string,t:number|null)=>t!==null&&now-t>5400_000?"lost":t!==null&&now-t>1800_000?"stale":s;
+  return q.accounts.map((r,i)=>({label:r[0]+" account "+(i+1),state:state(r[1],r[2]),observedAt:r[2],ageSeconds:r[2]===null?null:Math.max(0,(now-r[2])/1000),used:r[3],resetsAt:r[4],duration:r[5],credits:r[6],creditState:state(r[7],r[11]),resetState:state(r[8],r[12]),unlimited:r[9],manualResets:r[10]}));
+}
+
+
+export interface FleetEvent {host:string;job:"chaldea-fleet-pull"|"chaldea-retention";status:"changed"|"failed";occurredAt:number;receivedAt:number;severity:"info"|"fail"}
+export interface HealthReport {status:string;occurredAt:number;receivedAt:number;checks:{name:string;status:string}[];omitted:number}
+export interface OperationsDTO {
+  events:{state:"unknown"|"cached"|"error";checkedAt:number|null;windowHours:48;rows:FleetEvent[];truncated:boolean};
+  ops:{dailyHealth:{state:"unknown"|"cached"|"error";checkedAt:number|null;report:HealthReport|null}};
+}
+export const emptyOperations=():OperationsDTO=>({events:{state:"unknown",checkedAt:null,windowHours:48,rows:[],truncated:false},ops:{dailyHealth:{state:"unknown",checkedAt:null,report:null}}});
+export const operationText=(v:unknown,max:number):v is string=>typeof v==="string"&&v.length>0&&v.length<=max&&/^[a-zA-Z0-9][a-zA-Z0-9 ._-]*$/.test(v)&&!/(?:bearer|token|secret|password|api.?key|[A-Za-z0-9_-]{32,})/i.test(v);
+export function validateOperations(raw:unknown,now=Date.now()):OperationsDTO {
+  const v=object(raw);exact(v,["events","ops"]);const e=object(v.events),o=object(v.ops);exact(o,["dailyHealth"]);const d=object(o.dailyHealth);
+  exact(e,["state","checkedAt","windowHours","rows","truncated"]);exact(d,["state","checkedAt","report"]);
+  const stamp=(v:unknown):v is number=>time(v)&&v<=now;
+  for(const x of [e,d])check(["unknown","cached","error"].includes(String(x.state))&&(x.checkedAt===null||stamp(x.checkedAt))&&(x.state!=="cached"||x.checkedAt!==null));
+  check(e.windowHours===48&&typeof e.truncated==="boolean"&&Array.isArray(e.rows)&&e.rows.length<=64);
+  const counts=new Map<string,number>();for(const raw of e.rows){const r=object(raw);exact(r,["host","job","status","occurredAt","receivedAt","severity"]);
+    check(HOSTS.includes(r.host as typeof HOSTS[number])&&["chaldea-fleet-pull","chaldea-retention"].includes(String(r.job))&&["changed","failed"].includes(String(r.status))&&r.severity===(r.status==="failed"?"fail":"info")&&stamp(r.occurredAt)&&stamp(r.receivedAt)&&e.checkedAt!==null&&Number(r.receivedAt)<=Number(e.checkedAt)&&Number(r.occurredAt)<=Number(e.checkedAt));
+    counts.set(String(r.host),(counts.get(String(r.host))??0)+1);check(counts.get(String(r.host))!<=16);
+  }
+  if(d.report!==null){const r=object(d.report);exact(r,["status","occurredAt","receivedAt","checks","omitted"]);
+    check(operationText(r.status,32)&&stamp(r.occurredAt)&&stamp(r.receivedAt)&&d.checkedAt!==null&&Number(r.receivedAt)<=Number(d.checkedAt)&&Number(r.occurredAt)<=Number(d.checkedAt)&&count(r.omitted)&&r.omitted<=100&&Array.isArray(r.checks)&&r.checks.length<=16&&r.checks.length+Number(r.omitted)<=100);
+    for(const raw of r.checks){const c=object(raw);exact(c,["name","status"]);check(operationText(c.name,128)&&operationText(c.status,32));}
+  }
+  return structuredClone(v) as unknown as OperationsDTO;
+}
+
 export function statusIdentity(e:{host:string;source:string;issuer:string;profile:string;project:string;source_id?:string},snapshot:HostSnapshot):boolean {
   return e.host===snapshot.host&&e.source===snapshot.host+".mission-control"&&e.issuer==="chaldea:"+snapshot.host&&e.profile==="mission-control-publisher"&&e.project==="chaldea"&&(e.source_id===undefined||e.source_id===snapshot.host+"--mission-control");
 }

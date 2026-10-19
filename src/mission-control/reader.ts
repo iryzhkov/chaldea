@@ -4,7 +4,7 @@ import { readJson,onlyKeys } from "../config/files.ts";
 import { strictJson } from "../access/token.ts";
 import { helperToken } from "../events/publisher.ts";
 import { validateEnvelope } from "../akasha/schema.ts";
-import { validateHostSnapshot,statusIdentity } from "./contract.ts";
+import { validateHostSnapshot,statusIdentity,validateOperations,emptyOperations } from "./contract.ts";
 import { emptyCache,loadCache,mergeStatus,writeCache,type StatusCache } from "./cache.ts";
 export interface ReaderConfig {url:string;tokenHelper:string;source:"mission-control-reader";host:"omarchy-normandy";profile:"mission-control-reader";project:"chaldea";allowedSourceIds:string[];cacheFile:string;refreshMs:5000}
 export function readerConfig(path:string):ReaderConfig {
@@ -13,11 +13,11 @@ export function readerConfig(path:string):ReaderConfig {
   if(u.protocol!=="https:"||u.username||u.password||u.search||u.hash||u.pathname!=="/"||c.source!=="mission-control-reader"||c.host!=="omarchy-normandy"||c.profile!=="mission-control-reader"||c.project!=="chaldea"||c.refreshMs!==5000||!isAbsolute(String(c.tokenHelper))||!isAbsolute(String(c.cacheFile))||!Array.isArray(ids)||!ids.length||ids.length>4||new Set(ids).size!==ids.length||!ids.every(s=>typeof s==="string"&&/^(agent-a|agent-b|omarchy-pc|omarchy-macbook-air-igor)--mission-control$/.test(s)))throw new Error("invalid_reader_config");
   return c as unknown as ReaderConfig;
 }
-export interface ReaderDependencies {fetch?:typeof fetch;token?:()=>Promise<string>;now?:()=>number}
-async function responseJson(response:Response):Promise<unknown>{
+export interface ReaderDependencies {fetch?:typeof fetch;token?:(kind?:"job_finished"|"report")=>Promise<string>;now?:()=>number}
+async function responseJson(response:Response,max=2*1024**2):Promise<unknown>{
   const reader=response.body?.getReader();if(!reader)throw new Error("missing_body");
   const chunks:Uint8Array[]=[];let bytes=0;
-  try{while(true){const c=await reader.read();if(c.done)break;bytes+=c.value.length;if(bytes>2*1024**2)throw new Error("response_limit");chunks.push(c.value);}}finally{void reader.cancel().catch(()=>{});}
+  try{while(true){const c=await reader.read();if(c.done)break;bytes+=c.value.length;if(bytes>max)throw new Error("response_limit");chunks.push(c.value);}}finally{void reader.cancel().catch(()=>{});}
   return strictJson(Buffer.concat(chunks));
 }
 /** One fixed latest-120-second query per refresh. Pagination never changes its cursor binding. */
@@ -51,11 +51,34 @@ export async function refreshStatus(c:ReaderConfig,previous:StatusCache,dependen
   }catch{/* Retain last good observations, never replace their observation time with fetch time. */}
   next.gap=true;return next;
 }
+/** Independent 60-second read. Failure preserves observation times and last good data. */
+export async function refreshOperations(c:ReaderConfig,previous:StatusCache,dependencies:ReaderDependencies={}):Promise<NonNullable<StatusCache["operations"]>>{
+  const now=(dependencies.now??Date.now)(),next=structuredClone(previous.operations??emptyOperations());
+  await Promise.all((["job_finished","report"] as const).map(async kind=>{
+    try{
+      const token=await(dependencies.token?dependencies.token(kind):helperToken(c.tokenHelper,{key:"",source:c.source,host:c.host,payload:{kind}},"read"));
+      const url=new URL("/api/v1/events",c.url);url.searchParams.set("mission_control_operations",kind);url.searchParams.set("window","48h");url.searchParams.set("limit","16");
+      const response=await(dependencies.fetch??fetch)(url,{redirect:"error",headers:{authorization:"Bearer "+token},signal:AbortSignal.timeout(5000)});
+      if(!response.ok){await response.body?.cancel();throw new Error("operations_unavailable");}
+      const page=validateOperations(await responseJson(response,64*1024),now);
+      const selected=kind==="job_finished"?page.events:page.ops.dailyHealth;
+      if(selected.state!=="cached"||selected.checkedAt===null||now-selected.checkedAt>60_000)throw new Error("invalid_operation_check");
+      if(kind==="job_finished")next.events=page.events;else next.ops.dailyHealth=page.ops.dailyHealth;
+    }catch{if(kind==="job_finished"){next.events.state="error";next.events.checkedAt=now;}else{next.ops.dailyHealth.state="error";next.ops.dailyHealth.checkedAt=now;}}
+  }));
+  return next;
+}
 export async function runReader(c:ReaderConfig,signal:AbortSignal):Promise<void>{
   let cache=emptyCache();try{cache=loadCache(c.cacheFile);}catch{}
+  let operationRead:Promise<void>|undefined,nextOperation=0;
   while(!signal.aborted){
-    cache=await refreshStatus(c,cache);
+    const refreshed=await refreshStatus(c,cache);if(cache.operations)refreshed.operations=cache.operations;cache=refreshed;
+    if(!operationRead&&Date.now()>=nextOperation){
+      nextOperation=Date.now()+60_000;
+      operationRead=refreshOperations(c,cache).then(operations=>{cache.operations=operations;}).finally(()=>{operationRead=undefined;});
+    }
     writeCache(c.cacheFile,cache);
     if(!signal.aborted)await delay(c.refreshMs,undefined,{signal}).catch(()=>{});
   }
+  await operationRead;
 }

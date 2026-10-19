@@ -437,6 +437,46 @@ test("sparse v4 authoritative empty activity survives the public cache projectio
  }finally{dir.close();}
 });
 
+
+test("hosted quota uses private observer custody, per-host age and closed compact budget",async()=>{
+ const {emptyHeadroom,newProvider}=await import("../../src/quota/headroom.ts");
+ const {saveState,emptyState}=await import("../../src/quota/state.ts");
+ const {readCaptureQuota}=await import("../../src/mission-control/capture.ts");
+ const {chmodSync,symlinkSync}=await import("node:fs");
+ const dir=scratch(),path=join(dir.path,"quota-observer.json"),m=live();
+ try{
+  chmodSync(dir.path,0o700);const state=emptyState(),head=emptyHeadroom();
+  for(const [alias,driver] of [["PRIVATE-alias","codex"],["PRIVATE-claude","claudeAgent"],["PRIVATE-copy","codex"]]){
+   const p=newProvider(alias!,driver!);p.accountKey=(driver==="codex"?"a":"b").repeat(64);
+   p.included={state:"fresh",observedAt:new Date(now0-100_000).toISOString(),error:null,source:"private",value:[{id:"private",kind:"rolling",usedPercent:0,remainingPercent:100,windowDurationMins:300,resetsAt:new Date(now0+100_000).toISOString()}]};
+   p.credits={state:"fresh",observedAt:new Date(now0-200_000).toISOString(),error:null,source:"private",value:{balance:"0",hasCredits:false,unlimited:true}};
+   head.providers.push(p);
+  }
+  state.headroom=head;saveState(path,state,now0);readCaptureQuota(m,path);
+  const s=captureSnapshot(m,"agent-a",epoch,1)!;
+  assert.equal(s.quota!.accounts.length,2);assert.equal(s.quota!.accounts[0]![3],0);
+  assert.doesNotMatch(JSON.stringify(s.quota),/PRIVATE|accountKey|private|aaaaaaaa/);
+  assert.equal(s.quota!.accounts[0]![11],now0-200_000);
+  const cache=emptyCache();mergeStatus(cache,s,now0);
+  const next=sample(2,now0+1000);next.quota={state:"byte-budget",observedAt:now0-100_000,omitted:2,accounts:[]};mergeStatus(cache,next,now0+1000);
+  const file=join(dir.path,"cache");writeCache(file,cache);
+  const q=new CacheModel(file,()=>now0+2000).snapshot().quota.hosts![0]!;
+  assert.equal(q.state,"byte-budget");assert.equal(q.accounts.length,2);assert.equal(q.accounts[0]!.ageSeconds,102);
+  assert.equal(q.observedAt,now0-100_000);
+  chmodSync(path,0o644);readCaptureQuota(m,path);assert.equal(captureSnapshot(m,"agent-a",epoch,3)!.quota!.state,"error");
+  chmodSync(path,0o600);chmodSync(dir.path,0o755);readCaptureQuota(m,path);assert.equal(m.snapshot().quota.state,"error");chmodSync(dir.path,0o700);
+  const link=join(dir.path,"link");symlinkSync(path,link);readCaptureQuota(m,link);assert.equal(m.snapshot().quota.state,"error");
+  // Actual two-provider projection must retain useful activity for all nine escaped threads.
+  const rows=Array.from({length:9},(_,i)=>({...row("mcp:quota-budget-"+i),title:"Quota task "+i})),nine=live(()=>now0,rows);nine.setQuota(head);
+  for(const r of rows)nine.detail(r.id,{kind:"recent-item",id:"actual",ordinal:1,type:"assistant",text:'界 🧪 " \\ '.repeat(100),at:now0,status:"completed"});
+  const wire=captureSnapshot(nine,"agent-a",epoch,1)!;
+  const expanded=normalizeRich(wire.rich,new Set(wire.agents.map(a=>a.id)),wire.observedAt);
+  console.log("QUOTA_CAPACITY "+JSON.stringify({bytes:Buffer.byteLength(JSON.stringify(wire)),quotaBytes:Buffer.byteLength(JSON.stringify(wire.quota)),rows:wire.agents.length,useful:expanded.details.filter(d=>d.value.recent?.some(r=>r.preview.text)).length}));
+  assert.equal(wire.quota!.accounts.length,2);assert.equal(wire.agents.length,9);assert.equal(expanded.details.filter(d=>d.value.recent?.some(r=>r.preview.text)).length,9);assert.ok(Buffer.byteLength(JSON.stringify(wire))<=8192);
+  for(const mutate of [(x:any)=>x.quota.accountKey="PRIVATE",(x:any)=>x.quota.accounts[0][0]="private@example.com",(x:any)=>x.quota.accounts[0][2]=now0+1]){const bad=structuredClone(s);mutate(bad);assert.throws(()=>validateHostSnapshot(bad));}
+ }finally{dir.close();}
+});
+
 test("compact telemetry preserves source order when the newest activity timestamp is unknown",()=>{
  const m=live();
  m.detail("private-thread",{kind:"recent-item",id:"older",ordinal:1,type:"assistant",text:"Older observation.",at:now0-1000,status:"completed"});

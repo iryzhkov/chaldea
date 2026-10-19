@@ -9,6 +9,12 @@ import { canonical, ensure, hash, MAX_ENVELOPE, NEW_FEED_ID, validateEnvelope } 
 import type { Envelope, FeedRow } from "./schema.ts";
 import type { Scope } from "./auth.ts";
 
+/** Fixed complete tuples. This is deliberately not a source/kind/project cross product. */
+export const OPERATIONS_PAIRS=[
+  {source_id:"agent-a-fleet",host:"agent-a",source:"agent-a.fleet",kind:"job_finished",profile:"fleet-timers",project:"chaldea"},
+  ...["agent-b","omarchy-pc","omarchy-macbook-air-igor"].map(host=>({source_id:host+"--"+host+"_fleet",host,source:host+".fleet",kind:"job_finished",profile:"fleet-timers",project:"chaldea"})),
+  {source_id:"agent-a-daily-health",host:"agent-a",source:"chaldea.daily-health.agent-a",kind:"report",profile:"daily-health",project:"homelab"}
+].map(p=>({...p,issuer:"chaldea:"+p.host}));
 export const DAY = 86400;
 export const DEFAULT_BUDGET = { main: 4 * 1024 ** 3, wal: 64 * 1024 ** 2, outbox: 128 * 1024 ** 2, quarantine: 16 * 1024 ** 2 };
 export interface Budget { main: number; wal: number; outbox: number; quarantine: number }
@@ -19,6 +25,13 @@ export interface Receipt {
 export interface Pending { event_id: string; envelope: string; bytes: number; attempts: number }
 export interface Query { sql: string; params: SQLInputValue[] }
 export function scopeSql(scope: Scope, prefix = ""): Query {
+  if(scope.missionControlOperations!==undefined){
+    ensure(scope.missionControlSources!==undefined&&["job_finished","report"].includes(scope.missionControlOperations),"invalid_operations_scope",403);
+    const {missionControlOperations:_kind,...statusScope}=scope;scopeSql(statusScope,prefix);
+    const pairs=OPERATIONS_PAIRS.filter(p=>p.kind===scope.missionControlOperations);
+    return {sql:"("+pairs.map(()=>"("+["source_id","issuer","profile","project","host","source","kind"].map(k=>(k==="source_id"?"json_extract("+prefix+"envelope,'$.source_id')":prefix+k)+"=?").join(" AND ")+")").join(" OR ")+")",
+      params:pairs.flatMap(p=>[p.source_id,p.issuer,p.profile,p.project,p.host,p.source,p.kind])};
+  }
   if (scope.missionControlSources !== undefined) {
     ensure(scope.source==="mission-control-reader"&&scope.profile==="mission-control-reader"&&scope.project==="chaldea"&&scope.host==="omarchy-normandy"&&scope.issuer==="chaldea:omarchy-normandy"&&!scope.global&&!scope.quotaFleet&&!scope.routeScores&&Array.isArray(scope.missionControlSources)&&scope.missionControlSources.length>0&&scope.missionControlSources.length<=4&&new Set(scope.missionControlSources).size===scope.missionControlSources.length&&scope.missionControlSources.every(s=>/^(agent-a|agent-b|omarchy-pc|omarchy-macbook-air-igor)--mission-control$/.test(s)), "invalid_mission_control_scope", 403);
     return {sql: "json_extract("+prefix+"envelope,'$.source_id') IN ("+scope.missionControlSources.map(()=>"?").join(",")+") AND "+prefix+"kind=? AND "+prefix+"profile=? AND "+prefix+"project=? AND json_extract("+prefix+"envelope,'$.data.snapshot.schema')=?",

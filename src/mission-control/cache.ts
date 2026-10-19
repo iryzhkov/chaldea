@@ -6,16 +6,17 @@ import { atomicWrite } from "../fs/atomic.ts";
 import { normalizeRich } from "./detail-contract.ts";
 import { aggregateDetails,emptyDetail } from "./details.ts";
 import { MissionModel,summarizeHost } from "./model.ts";
-import { HOSTS,validateHostSnapshot, object, exact, type HostSnapshot } from "./contract.ts";
+import { HOSTS,validateHostSnapshot, validateHostQuota,quotaAccounts,emptyOperations,validateOperations,object,exact,type HostSnapshot,type HostQuota,type OperationsDTO } from "./contract.ts";
 export const CACHE_BYTES=512*1024, CACHE_AGE=86400_000;
-export interface StatusCache {schema:"mission-control.cache.v1";gap:boolean;snapshots:HostSnapshot[]}
+export interface StatusCache {schema:"mission-control.cache.v1";gap:boolean;snapshots:HostSnapshot[];quotas?:{host:string;quota:HostQuota}[];operations?:OperationsDTO}
 export const emptyCache=():StatusCache=>({schema:"mission-control.cache.v1",gap:false,snapshots:[]});
 export function validateCache(raw:unknown):StatusCache {
-  const v=object(raw);exact(v,["schema","gap","snapshots"]);
+  const v=object(raw);exact(v,["schema","gap","snapshots",...(Object.hasOwn(v,"quotas")?["quotas"]:[]),...(Object.hasOwn(v,"operations")?["operations"]:[])]);
   if(v.schema!=="mission-control.cache.v1"||typeof v.gap!=="boolean"||!Array.isArray(v.snapshots)||v.snapshots.length>4)throw new Error("invalid_status_cache");
   const snapshots=v.snapshots.map(validateHostSnapshot);
   if(snapshots.reduce((n,s)=>n+s.agents.length,0)>48||new Set(snapshots.map(s=>s.host)).size!==snapshots.length||Buffer.byteLength(JSON.stringify(v))>CACHE_BYTES)throw new Error("invalid_status_cache");
-  return {schema:"mission-control.cache.v1",gap:v.gap,snapshots};
+  if(v.quotas!==undefined){if(!Array.isArray(v.quotas)||v.quotas.length>4)throw new Error("invalid_quotas");const hosts=new Set();for(const raw of v.quotas){const r=object(raw);exact(r,["host","quota"]);if(!HOSTS.includes(r.host as typeof HOSTS[number])||hosts.has(r.host))throw new Error("invalid_quotas");hosts.add(r.host);validateHostQuota(r.quota,Date.now());}}
+  return {schema:"mission-control.cache.v1",gap:v.gap,snapshots,...(v.quotas!==undefined?{quotas:structuredClone(v.quotas) as NonNullable<StatusCache["quotas"]>}:{}),...(v.operations!==undefined?{operations:validateOperations(v.operations)}:{})};
 }
 export function loadCache(path:string,now=Date.now()):StatusCache {
   // The web UID reads a distinct reader-owned file in a root-configured SGID directory.
@@ -39,6 +40,12 @@ export function mergeStatus(cache:StatusCache,raw:HostSnapshot,now=Date.now()):b
     } else cache.gap=true;
     cache.snapshots[i]=s;
   }else {if(cache.snapshots.length===4)throw new Error("source_limit");cache.snapshots.push(s);}
+  if(s.quota?.state==="cached"){
+    cache.quotas??=[];const q=cache.quotas.findIndex(q=>q.host===s.host),prior=cache.quotas[q];
+    if(!prior||(s.quota.observedAt??0)>=(prior.quota.observedAt??0)){
+      const row={host:s.host,quota:structuredClone(s.quota)};if(q<0)cache.quotas.push(row);else cache.quotas[q]=row;
+    }
+  }
   while(cache.snapshots.reduce((n,v)=>n+v.agents.length,0)>48){const largest=cache.snapshots.toSorted((a,b)=>b.agents.length-a.agents.length||a.host.localeCompare(b.host))[0]!;const removed=largest.agents.pop();largest.truncated=true;if(largest.rich){largest.rich.details=largest.rich.details.filter(d=>d.id!==removed?.id);largest.rich.omitted=largest.agents.length-largest.rich.details.length;}}
   return true;
 }
@@ -93,6 +100,22 @@ export class CacheModel {
       observedAt:known?Math.min(...snapshots.map(s=>s.tokens.observedAt!)):null,
       coverage:!known?"unknown":this.cache.gap||snapshots.some(s=>s.tokens.coverage==="partial")?"partial":"observed",
       scope:known?"Latest observed process-epoch totals per enrolled source; replacement samples, no daily reconciliation."+ (this.cache.gap?" Delivery gap; known lower bound.":""):"Unknown: hosted token semantics are not qualified."};
+    base.quota.hosts=HOSTS.map(host=>{
+      const s=snapshots.find(s=>s.host===host),retained=this.cache.quotas?.find(q=>q.host===host)?.quota;
+      const q=s?.quota?.state==="cached"?s.quota:retained??s?.quota;
+      return {host,state:s?.quota?.state??(retained?"byte-budget":"unknown"),observedAt:q?.observedAt??null,omitted:s?.quota?.omitted??q?.omitted??0,accounts:q?quotaAccounts(q,now):[]};
+    });
+    base.quota.state=base.quota.hosts.some(q=>q.state==="error")?"error":base.quota.hosts.some(q=>q.state==="cached"||q.accounts.length)?"cached":"unknown";
+    const operations=this.cache.operations??emptyOperations();
+    base.events=structuredClone(operations.events);base.ops=structuredClone(operations.ops);
+    base.events.rows=base.events.rows.filter(r=>now-r.occurredAt<=48*3600_000);
+    const report=base.ops.dailyHealth.report;if(report&&now-report.occurredAt>48*3600_000)base.ops.dailyHealth.report=null;
+    const bytes=()=>Buffer.byteLength(JSON.stringify(base));
+    while(bytes()>128*1024&&base.events.rows.length){base.events.rows.pop();base.events.truncated=true;}
+    while(bytes()>128*1024&&base.ops.dailyHealth.report?.checks.length){base.ops.dailyHealth.report.checks.pop();base.ops.dailyHealth.report.omitted++;}
+    for(const q of [...base.quota.hosts].reverse())while(bytes()>128*1024&&q.accounts.length){q.accounts.pop();q.omitted++;q.state="byte-budget";}
+    for(const a of [...base.agents].reverse()){if(bytes()<=128*1024)break;a.details.recent=[];}
+    for(const a of [...base.agents].reverse()){if(bytes()<=128*1024)break;a.details={...emptyDetail(),identity:a.details.identity,fieldCoverage:"identity-only"};a.detailCoverage="byte-budget";}
     return Object.assign(base,{sampled:true as const});
   }
 }
