@@ -187,3 +187,112 @@ for(const denied of ["success","typed","die","decode"])test("host resources shar
   assert.deepEqual(new Set(requests),new Set(["orchestration.subscribeShell","server.getHostResources"]));
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
 });
+
+
+for(const overflow of [false,true])for(const snapshot of [false,true])test("official detail ownership preserves legacy capture and rolls past 128 owners, items="+overflow+", snapshot="+snapshot,async()=>{
+ const {connectMissionThread}=await import("../../src/t3/adapter.ts");
+ const server=createServer(),wss=new WebSocketServer({server}),controller=new AbortController();
+ const stamp="2026-10-18T00:00:00.000Z",threadId="owner-fixture";
+ const node={id:"root-0",threadId,runId:null,parentNodeId:null,rootNodeId:"root-0",kind:"root_turn",status:"running",countsForRun:true,providerThreadId:"provider",providerTurnId:null,nativeItemRef:null,runtimeRequestId:null,checkpointScopeId:null,startedAt:stamp,completedAt:null};
+ const roots=Array.from({length:130},(_,i)=>({...node,id:"root-"+i,rootNodeId:"root-"+i}));
+ const provider={id:"provider",driver:"codex",providerInstanceId:"custom",providerSessionId:null,appThreadId:threadId,ownerNodeId:"root-0",nativeThreadRef:null,nativeConversationHeadRef:null,status:"active",firstRunOrdinal:1,lastRunOrdinal:130,handoffIds:[],forkedFrom:null,pendingBackgroundTasks:[],contextUsage:{usedTokens:500,maxTokens:1000},nativeMetadata:null,createdAt:stamp,updatedAt:stamp};
+ const base={threadId,runId:null,nodeId:null,providerThreadId:"provider",providerTurnId:null,nativeItemRef:null,parentItemId:null,ordinal:1,title:null,startedAt:stamp,completedAt:null,updatedAt:stamp};
+ const assistant=(id:string,nodeId:string|null,text=id)=>({...base,id,nodeId,type:"assistant_message",status:"completed",messageId:id,text,streaming:false});
+ // The current root differs from the provider's creation root. Historical item
+ // nodes must not displace it on reconnect or during one long live turn.
+ const itemNodes=overflow?[
+  ...Array.from({length:130},(_,i)=>({...node,id:"execution-"+i,rootNodeId:"root-129",parentNodeId:"root-129",kind:i%2?"reasoning":"tool_call"})),
+  {...node,id:"latest-assistant-node",rootNodeId:"root-129",parentNodeId:"root-129",kind:"assistant_message"},
+  {...node,id:"latest-command-node",rootNodeId:"root-129",parentNodeId:"root-129",kind:"tool_call"},
+  {...node,id:"snapshot-child",rootNodeId:"root-129",parentNodeId:"root-129",kind:"subagent"},
+  {...node,id:"snapshot-child-item",rootNodeId:"root-129",parentNodeId:"snapshot-child",kind:"assistant_message"},
+  {...node,id:"snapshot-foreign",threadId:"foreign",rootNodeId:"root-129",parentNodeId:"root-129",kind:"assistant_message"},
+  {...node,id:"snapshot-unknown-parent",rootNodeId:"root-129",parentNodeId:"unknown-parent",kind:"assistant_message"},
+  {...node,id:"snapshot-old-root",rootNodeId:"root-0",parentNodeId:"root-0",kind:"assistant_message"},
+ ]:[];
+ const overflowItems=overflow?[
+  assistant("overflow-assistant","latest-assistant-node"),
+  {...base,id:"overflow-command",nodeId:"latest-command-node",type:"command_execution",status:"running",input:"npm test",output:"PRIVATE OUTPUT"},
+  ...["execution-0","snapshot-child-item","snapshot-foreign","snapshot-unknown-parent","snapshot-old-root","unknown-node"].map(id=>assistant("rejected-"+id,id)),
+ ]:[];
+ let sequence=1;
+ const event=(type:string,payload:unknown,scope=threadId)=>({kind:"event",sequence:++sequence,event:{id:"event-"+sequence,threadId:scope,occurredAt:stamp,type,payload}});
+ const values:unknown[]=[];
+ if(snapshot){
+  const thread={id:threadId,projectId:"project",title:"Ownership fixture",providerInstanceId:"custom",modelSelection:{instanceId:"custom",model:"gpt-6.1-sol"},runtimeMode:"full-access",interactionMode:"default",branch:null,worktreePath:null,activeProviderThreadId:"provider",lineage:{parentThreadId:null,relationshipToParent:null,rootThreadId:threadId},forkedFrom:null,createdBy:"user",creationSource:"web",createdAt:stamp,updatedAt:stamp,archivedAt:null,deletedAt:null};
+  values.push({kind:"snapshot",snapshotSequence:1,projection:{thread,nodes:[...roots,...itemNodes],providerThreads:[provider],runs:[],attempts:[],subagents:[],providerSessions:[],providerTurns:[],runtimeRequests:[],messages:[],plans:[],turnItems:[assistant("snapshot-main",null),...overflowItems],checkpointScopes:[],checkpoints:[],contextHandoffs:[],contextTransfers:[],visibleTurnItems:[],updatedAt:stamp}});
+ }else{
+  values.push(event("node.updated",roots[0]),event("provider-thread.updated",provider));
+  for(const root of roots.slice(1))values.push(event("node.updated",root));
+  for(const itemNode of itemNodes)values.push(event("node.updated",itemNode));
+  for(const item of overflowItems)values.push(event("turn-item.updated",item));
+ }
+ // Updating the long-lived provider after its creation root was evicted is valid.
+ values.push(event("provider-thread.updated",provider),event("turn-item.updated",assistant("old-provider",null)));
+ values.push(event("node.updated",{...node,id:"root-new",rootNodeId:"root-new"}));
+ values.push(event("node.updated",{...node,id:"assistant-node",parentNodeId:"root-new",rootNodeId:"root-new",kind:"assistant_message"}));
+ values.push(event("turn-item.updated",assistant("main-assistant","assistant-node")));
+ values.push(event("node.updated",{...node,id:"tool-node",parentNodeId:"root-new",rootNodeId:"root-new",kind:"tool_call"}));
+ values.push(event("turn-item.updated",{...base,id:"main-command",nodeId:"tool-node",type:"command_execution",status:"running",input:"go test",output:"PRIVATE OUTPUT"}));
+ // Missing owner evidence must not break established activity and command paths.
+ values.push(event("turn-item.updated",{...base,id:"legacy-command",nodeId:"unseen-node",providerThreadId:null,type:"command_execution",status:"running",input:"npm test"}));
+ values.push(event("turn-item.updated",assistant("legacy-assistant","unseen-node")));
+ values.push(event("turn-item.updated",{...base,id:"legacy-reasoning",nodeId:"unseen-node",providerThreadId:null,type:"reasoning",status:"running",text:"PRIVATE REASONING",streaming:true}));
+ // Actual child/foreign/unknown nodes never become recent observations.
+ values.push(event("node.updated",{...node,id:"child-node",kind:"subagent",parentNodeId:"root-new",rootNodeId:"root-new"}));
+ values.push(event("node.updated",{...node,id:"child-assistant-node",kind:"assistant_message",parentNodeId:"child-node",rootNodeId:"root-new"}));
+ values.push(event("turn-item.updated",assistant("child-item","child-assistant-node")));
+ values.push(event("node.updated",{...node,id:"foreign-node",threadId:"foreign",kind:"assistant_message",parentNodeId:"root-new",rootNodeId:"root-new"}));
+ values.push(event("turn-item.updated",assistant("foreign-node-item","foreign-node")));
+ values.push(event("turn-item.updated",{...assistant("foreign-payload",null),threadId:"foreign"}));
+ values.push(event("turn-item.updated",assistant("foreign-envelope",null),"foreign"));
+ values.push(event("turn-item.updated",{...assistant("foreign-provider","assistant-node"),providerThreadId:"child-provider"}));
+ values.push(event("turn-item.updated",{...assistant("evicted-root","root-0"),providerThreadId:null}));
+ values.push({kind:"synchronized"});
+ const seen:import("../../src/t3/adapter.ts").MissionDetailEvent[]=[];
+ wss.on("connection",socket=>socket.on("message",data=>{
+  const req=JSON.parse(String(data));if(req._tag==="Ping")socket.send(JSON.stringify({_tag:"Pong"}));
+  if(req._tag==="Request")socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values}));
+ }));
+ const timer=setTimeout(()=>controller.abort(),4000);
+ try{
+  const serverUrl=await listen(server);
+  await assert.rejects(connectMissionThread({serverUrl,token:"fixture",signal:controller.signal},threadId,undefined,e=>{seen.push(e);if(e.kind==="synchronized")controller.abort();}));
+  assert.ok(seen.some(e=>e.kind==="synchronized"),"fixture must decode through official contracts");
+  assert.deepEqual(seen.filter(e=>e.kind==="recent-item").map(e=>e.id),[...(snapshot?["snapshot-main"]:[]),...(overflow?["overflow-assistant","overflow-command"]:[]),"old-provider","main-assistant","main-command"]);
+  assert.ok(seen.some(e=>e.kind==="command"&&e.id==="legacy-command"&&e.running));
+  assert.ok(seen.some(e=>e.kind==="assistant"&&e.text==="legacy-assistant"));
+  assert.ok(seen.some(e=>e.kind==="activity-state"&&e.id==="legacy-reasoning"&&e.running));
+  assert.ok(seen.some(e=>e.kind==="metadata"&&e.context?.used===500));
+  assert.ok(!seen.some(e=>e.kind==="assistant"&&["foreign-payload","foreign-envelope"].includes(e.text)));
+  assert.ok(!JSON.stringify(seen).includes("PRIVATE OUTPUT"));assert.ok(!JSON.stringify(seen).includes("PRIVATE REASONING"));
+ }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
+});
+
+for(const denied of [false,true])test("provider catalog shares ONE shell client and copies only safe identity fields, denied="+denied,async()=>{
+ const server=createServer(),wss=new WebSocketServer({server}),controller=new AbortController();
+ let connections=0,synchronized=false;const catalogs:unknown[][]=[],requests:string[]=[];
+ const provider={instanceId:"custom-work",driver:"codex",enabled:true,installed:true,version:null,status:"ready",auth:{status:"authenticated",email:"private@example.test",workspaceId:"PRIVATE_ACCOUNT"},runtimePaths:{homePath:"/private/home",shadowHomePath:null},checkedAt:"2026-10-18T00:00:00.000Z",models:[]};
+ const finish=()=>{if(synchronized&&catalogs.length===(denied?1:2))controller.abort();};
+ wss.on("connection",socket=>{connections++;socket.on("message",data=>{
+  const req=JSON.parse(String(data));if(req._tag==="Ping"){socket.send(JSON.stringify({_tag:"Pong"}));return;}if(req._tag!=="Request")return;
+  requests.push(req.tag);
+  if(req.tag==="orchestration.subscribeShell")socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"synchronized"}]}));
+  else if(req.tag==="subscribeServerConfig"){
+   if(denied)socket.send(JSON.stringify({_tag:"Exit",requestId:req.id,exit:{_tag:"Failure",cause:[{_tag:"Fail",error:{_tag:"EnvironmentAuthorizationError",message:"fixture denied",requiredScope:"settings:read"}}]}}));
+   else socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{version:1,type:"providerStatuses",payload:{providers:[provider]}},{version:1,type:"providerStatuses",payload:{providers:[{...provider,driver:"futureDriver"}]}}]}));
+  }
+ });});
+ const timer=setTimeout(()=>controller.abort(),4000);
+ try{
+  const serverUrl=await listen(server);
+  await assert.rejects(connectShell({serverUrl,token:"fixture",signal:controller.signal},{
+   onEvent:e=>{if(e.kind==="synchronized"){synchronized=true;finish();}},
+   onProviderCatalog:rows=>{catalogs.push([...rows]);finish();}
+  }));
+  assert.equal(connections,1);assert.equal(synchronized,true);
+  assert.deepEqual(catalogs,denied?[[]]:[[{instanceId:"custom-work",driver:"codex"}],[{instanceId:"custom-work",driver:"futureDriver"}]]);
+  assert.deepEqual(new Set(requests),new Set(["orchestration.subscribeShell","subscribeServerConfig"]));
+  assert.ok(!JSON.stringify(catalogs).includes("PRIVATE"));assert.ok(!JSON.stringify(catalogs).includes("/private"));
+ }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
+});

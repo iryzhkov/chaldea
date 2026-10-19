@@ -38,7 +38,7 @@ test("allowlisted DTOs redact titles and ignore raw payloads; legitimate zero su
   p.credits={value:{balance:"0",unlimited:false,hasCredits:false},state:"fresh",source:"fixture",observedAt:new Date().toISOString(),error:null};
   const h=emptyHeadroom();h.providers=[p,{...p,alias:"duplicate"}];m.setQuota(h);
   const s=m.snapshot(), serialized=JSON.stringify(s);
-  for(const secret of ["SECRET","private-account","private-run","secret source","secret-window","RAW_","/home/igor"]) assert.equal(serialized.includes(secret),false,secret);
+  for(const secret of ["SECRET","private-run","secret source","secret-window","RAW_","/home/igor"]) assert.equal(serialized.includes(secret),false,secret);
   assert.equal(s.agents[0]!.title,"Task");assert.equal(s.agents[0]!.steps[0],"Activity unavailable");
   assert.equal(s.quota.accounts.length,1);assert.equal(s.quota.accounts[0]!.used,0);assert.equal(s.quota.accounts[0]!.credits,"0");
   assert.equal(safeLabel("Normal bounded task"),"Normal bounded task");
@@ -260,6 +260,7 @@ test("48 maximally escaped legitimate detail rows fit local HTTP and SSE publica
   for(const r of rows){
    m.detail(r.id,{kind:"synchronized"});
    m.detail(r.id,{kind:"assistant",text:'"\\\\'.repeat(192),at:now});
+   for(let i=0;i<3;i++)m.detail(r.id,{kind:"recent-item",id:"actual-"+i,ordinal:i,type:"assistant",text:'"'+String.fromCharCode(92).repeat(2).repeat(191),at:now,status:"completed"});
    for(let i=0;i<3;i++)m.detail(r.id,{kind:"command",id:String(i),input:"chaldea "+Array(12).fill("--porcelain").join(" "),running:true});
    m.detail(r.id,{kind:"metadata",reported:{options:{effort:"high"}},context:{used:Number.MAX_SAFE_INTEGER,max:Number.MAX_SAFE_INTEGER},work:{children:{active:2176,queued:2176,completed:2176},delegates:{active:2176,queued:2176,completed:2176},subagents:{active:2176,queued:2176,completed:2176},monitors:2176,background:2176,durableWaits:null,coverage:"observed bounded roster"}});
    m.detail(r.id,{kind:"turn-usage",id:"turn",at:now,usage:{usageScope:"main_agent",usageStatus:"complete",inputTokens:4000000000000000,outputTokens:4000000000000000,cachedInputTokens:3000000000000000,cacheCreationTokens:1000000000000000,reasoningTokens:3000000000000000,hasSubagents:true}});
@@ -350,8 +351,12 @@ test("official detail events carry real metadata, deduplicate child roster and c
   event("provider-turn.updated",turn),
   event("turn-item.updated",{...base,id:"command",type:"command_execution",status:"running",input:"go test -race ./...",output:"PRIVATE OUTPUT"}),
   event("turn-item.updated",{...base,id:"reasoning",type:"reasoning",status:"running",text:"HIDDEN REASONING",streaming:true}),
-  event("turn-item.updated",{...base,id:"assistant",type:"assistant_message",status:"completed",messageId:"message",text:"First paragraph\n\nLatest public paragraph.",streaming:false}),
+  event("turn-item.updated",{...base,id:"assistant",ordinal:2,type:"assistant_message",status:"completed",messageId:"message",text:"First paragraph\n\nLatest public paragraph.",streaming:false}),
   event("turn-item.updated",{...base,id:"command",type:"command_execution",status:"completed",input:"go test -race ./...",exitCode:0}),
+  event("turn-item.updated",{...base,id:"second-command",ordinal:3,type:"command_execution",status:"completed",input:"npm test",exitCode:1}),
+  event("turn-item.updated",{...base,id:"foreign",threadId:"foreign-thread",ordinal:99,type:"assistant_message",status:"completed",messageId:"foreign",text:"FOREIGN CONTENT",streaming:false}),
+  event("turn-item.updated",{...base,id:"child-item",nodeId:"child",ordinal:100,type:"command_execution",status:"completed",input:"git status"}),
+  event("turn-item.updated",{...base,id:"second-command",ordinal:3,type:"command_execution",status:"completed",input:"npm test",exitCode:1}),
   event("subagent.updated",{...child,status:"completed",completedAt:stamp}),
   event("subagent.updated",{...child,id:"failed-child",childThreadId:"failed-child-thread",status:"failed",completedAt:stamp}),
   event("subagent.updated",{...child,id:"idle-child",childThreadId:"idle-child-thread",status:"idle"}),
@@ -367,6 +372,8 @@ test("official detail events carry real metadata, deduplicate child roster and c
   assert.equal(d.usage.total,120);assert.equal(d.commands.length,0);assert.equal(d.assistant.text,"Latest public paragraph.");
   assert.equal(result.agents[0]!.state,"thinking");assert.equal(d.work.children!.completed,1);assert.equal(d.work.children!.active,2);assert.equal(d.work.delegates!.active,1);assert.equal(d.work.subagents!.active,1);assert.equal(d.work.delegates!.completed,1);
   assert.equal(d.work.monitors,1);assert.equal(d.work.durableWaits,null);
+  assert.deepEqual(d.recent?.map(r=>[r.kind,r.preview.text,r.at,r.status]),[["command","npm test",now,"failed"],["assistant","Latest public paragraph.",now,"completed"],["command","go test -race ./...",now,"completed"]]);
+  for(const forbidden of ["FOREIGN CONTENT","child-item"])assert.equal(JSON.stringify(result).includes(forbidden),false);
   for(const forbidden of ["HIDDEN REASONING","PRIVATE OUTPUT","PRIVATE PROMPT","private-provider"])assert.equal(JSON.stringify(result).includes(forbidden),false);
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();http.close();}
 });
@@ -382,4 +389,47 @@ test("titles and actual app IDs are bounded; Thinking and waiting variants requi
  }
  m.shell({kind:"thread",sequence:m.cursor()!+1,thread:{...row(),title:"PRIVATE /home/igor/key"}});
  assert.equal(m.snapshot().agents[0]!.details.identity.title.state,"withheld");
+});
+
+test("actual current providers follow switches and catalog updates without model inference",()=>{
+ const m=initialized(),id="private-thread-id";
+ assert.deepEqual(m.snapshot().agents[0]!.details.provider,{instanceId:"private-account",driver:null});
+ m.setProviderCatalog([{instanceId:"private-account",driver:"codex"}]);
+ assert.equal(m.snapshot().agents[0]!.details.provider!.driver,"codex");
+ const custom={...row(),providerInstanceId:"work-custom",modelSelection:{instanceId:"work-custom",model:"gpt-6.1-sol"}};
+ m.shell({kind:"thread",sequence:2,thread:custom});
+ assert.deepEqual(m.snapshot().agents[0]!.details.provider,{instanceId:"work-custom",driver:null});
+ m.setProviderCatalog([{instanceId:"work-custom",driver:"opencode"}]);
+ assert.equal(m.snapshot().agents[0]!.details.provider!.driver,"opencode");
+ m.setProviderCatalog([{instanceId:"work-custom",driver:"futureDriver"}]);
+ assert.equal(m.snapshot().agents[0]!.details.provider!.driver,"futureDriver");
+ m.setProviderCatalog([{instanceId:"work-custom",driver:"codex"},{instanceId:"work-custom",driver:"claudeAgent"}]);
+ assert.equal(m.snapshot().agents[0]!.details.provider!.driver,null);
+ m.shell({kind:"thread",sequence:3,thread:{...custom,modelSelection:{instanceId:"mismatch",model:"claude-opus-5-5"}}});
+ assert.equal(m.snapshot().agents[0]!.details.provider,null);
+ m.shell({kind:"thread",sequence:4,thread:{...custom,providerInstanceId:"Bearer-secret",modelSelection:{instanceId:"Bearer-secret",model:"gpt-6.1-sol"}}});
+ assert.equal(m.snapshot().agents[0]!.details.provider,null);
+ m.shell({kind:"thread",sequence:5,thread:custom});m.setProviderCatalog([{instanceId:"work-custom",driver:"codex"}]);m.disconnected();assert.equal(m.snapshot().agents[0]!.details.provider!.driver,null);
+});
+test("recent real-item projection bounds source order, replacement, privacy and unknown times/outcomes",()=>{
+ const d=new ThreadDetails(),now=1000;
+ const item=(id:string,ordinal:number,text:string,at:number|null,status:"running"|"completed"|"unknown"="unknown",type:"assistant"|"command"="assistant")=>d.apply({kind:"recent-item",id,ordinal,text,at,status,type});
+ item("one",1,"First public paragraph.",900,"completed");
+ item("two",2,"go test",null,"unknown","command");
+ item("three",3,"Old\n\nLast public paragraph.",1100,"running");
+ item("two",2,"go test -race ./...",950,"completed","command");
+ let recent=d.snapshot(null,now,true).recent!;
+ assert.deepEqual(recent.map(r=>r.preview.text),["Last public paragraph.","go test -race ./...","First public paragraph."]);
+ assert.deepEqual(recent.map(r=>r.at),[null,950,900]);
+ d.apply({kind:"clear-activity"});assert.equal(d.snapshot(null,now,true).recent![0]!.status,"unknown");
+ item("four",4,"git status; cat /private",0,"unknown","command");
+ item("five",5,"Bearer secret",null);
+ item("six",6,"x".repeat(65537),-1);
+ recent=d.snapshot(null,now,true).recent!;
+ assert.equal(recent.length,3);assert.ok(recent.every(r=>r.preview.state==="withheld"&&r.preview.text===null&&r.at===null));
+ item("older",1,"Older content",900);assert.ok(!d.snapshot(null,now,true).recent!.some(r=>r.preview.text==="Older content"));
+ item("six",6,"Safe\u202e paragraph.",950,"running");
+ assert.equal(d.snapshot(null,now,true).recent![0]!.preview.text,"Safe  paragraph.");
+ assert.equal(d.snapshot(null,now,false).recent![0]!.status,"unknown");
+ d.apply({kind:"reset"});assert.deepEqual(d.snapshot(null,now,true).recent,[]);
 });

@@ -7,6 +7,7 @@ import { runInNewContext } from "node:vm";
 // Rendering remains real; no copied navigation implementation.
 function browser(href = "https://board.example/?palette=mocr-1969", reduced = false) {
   let width=3840,height=1800;
+  const animations: string[] = [];
   class Element extends EventTarget {
     dataset: Record<string, string> = {};
     style: Record<string, string> = {};
@@ -30,7 +31,11 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     }
     getAttribute(name: string) { return this.attrs[name] ?? null; }
     removeAttribute(name: string) { delete this.attrs[name]; }
-    closest(selector: string) { if (selector === "[data-copy-thread]") return null; return selector === "[data-thread-page]" && !this.dataset.threadPage ? null : this; }
+    parent: Element | null = null;
+    open = false;
+    showModal() { this.open=true; }
+    close() { this.open=false;this.dispatchEvent(new Event("close")); }
+    closest(selector: string): Element | null { return this.matches(selector)?this:this.parent?.closest(selector)??null; }
     matches(selector: string): boolean {
       return selector.split(",").some(s => {
         const attr = s.match(/^\[([^=\]]+)(?:="([^"]*)")?\]$/);
@@ -41,11 +46,12 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     contains(el: Element | null): boolean { return el === this || this.children.some(c=>c.contains(el)); }
     focus() { document.activeElement = this; }
     blur() { document.activeElement = document.body; const e=new Event("focusout");Object.defineProperty(e,"target",{value:this});document.dispatchEvent(e); }
+    animate() { animations.push(this.attrs['data-thread-card']!); }
     get options() { return this.children.filter(c=>c.tag === "option"); }
     get textContent(): string { return this.parts.map(p=>typeof p === "string" ? p : p.textContent).join(""); }
     set textContent(text: string) { this.children=[];this.parts=[text]; }
     getBoundingClientRect() { return {width,height:this.matches(".p-summary")?160:height,top:0}; }
-    append(el: Element) { this.children.push(el); this.parts.push(el); }
+    append(el: Element) { el.parent=this;this.children.push(el); this.parts.push(el); }
     set innerHTML(html: string) {
       if (this.children.some(c=>c.contains(document.activeElement))) document.activeElement=document.body;
       this.children=[];this.parts=[];
@@ -69,6 +75,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
       return this.parts.map(p=>typeof p==="string"?p:"<"+p.tag+Object.entries(p.attrs).map(([k,v])=>" "+k+'="'+v+'"').join("")+">"+p.innerHTML+"</"+p.tag+">").join("");
     }
     descendants(): Element[] { return this.children.flatMap(c=>[c,...c.descendants()]); }
+    querySelectorAll(selector: string): Element[] { return this.descendants().filter(e=>e.matches(selector)); }
     querySelector(selector: string): Element | null {
       if (selector === ".on .bar i") return this.children.find(e => e.className === "on")?.bar ?? null;
       if (selector === ".bar i") return this.bar ?? null;
@@ -83,7 +90,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     body: new Element(), activeElement: null as Element | null, documentElement: { style: { setProperty() {} } }, title: "",
     getElementById: (id: string) => elements[id],
     querySelector: (selector: string) => elements[selector.slice(1)] ?? null,
-    createElement: () => new Element(),
+    createElement: (tag:string) => {const el=new Element();el.tag=tag;return el;},
   });
   document.activeElement = document.body;
   document.body.dataset = { defaultDir: "flight", defaultPalette: "mocr-1969" };
@@ -125,7 +132,9 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     resize: (w:number,h:number) => {width=w;height=h;context.innerWidth=w;context.innerHeight=h;window.dispatchEvent(new Event("resize"));},
     grid: (value:string) => { const el=elements.view!.querySelector("[data-thread-grid]")!;el.value=value;const e=new Event("change");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     page: (delta:number) => {const el=elements.view!.querySelector(`[data-thread-page="${delta}"]`)!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
-    refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document };
+    openDetails: (id:string) => {const el=elements.view!.querySelector('[data-thread-details="'+encodeURIComponent(id)+'"]')!;el.focus();const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    closeDetails: () => {const el=document.body.querySelector("[data-close-details]")!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document, animations };
 }
 
 for (const reduced of [false, true]) {
@@ -165,15 +174,15 @@ test("two agent views preserve old URLs, update immediately and disclose bounded
   b.snapshot(snapshot);
   assert.equal(b.elements.view!.className,"agents");
   assert.equal((b.elements.view!.innerHTML.match(/panel tile/g)||[]).length,48);
-  assert.match(b.elements.view!.innerHTML,/Command running/);assert.match(b.elements.view!.innerHTML,/Showing 48 of 60/);
-  assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/activity 1m ago · source 0s ago/);
+  assert.match(b.elements.view!.innerHTML,/Previews unavailable/);assert.match(b.elements.view!.innerHTML,/showing 48 of 48/);
+  assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/Activity stale · 1m ago/);
   const history=b.entries.length;b.click("agent-summary");assert.equal(b.entries.length,history+1);
   assert.equal(b.location.searchParams.get("mode"),"agent-summary");
   assert.match(b.elements.view!.innerHTML,/Host overview/);assert.match(b.elements.view!.innerHTML,/shown 0 \/ 0/);
   assert.match(b.elements.view!.innerHTML,/NOT OBSERVED · thread count unknown/);
   assert.match(b.elements.view!.innerHTML,/gpt-6.1-sol: 48/);assert.doesNotMatch(b.elements.view!.innerHTML,/panel tile/);
   b.snapshot({...snapshot,shown:47,agents:agents.slice(0,47)});assert.equal(b.entries.length,history+1);
-  assert.match(b.elements.view!.innerHTML,/Showing 47 of 60/);
+  assert.match(b.elements.view!.innerHTML,/showing 47 of 47/);
   assert.equal(browser(b.location.href).document.body.dataset.mode,"agent-summary");
   b.travel(-1);b.refresh();assert.equal(b.document.body.dataset.mode,"agents");
   b.travel(1);b.refresh();assert.equal(b.document.body.dataset.mode,"agent-summary");
@@ -193,26 +202,50 @@ test("unavailable modes replace previous content without invented data", () => {
   }
 });
 
-test("cards render sanitized title, compact real app ID, top state, effort and resources without HTML injection",async()=>{
+test("cards render sanitized title and footer state with full identity and provenance in Details",async()=>{
  const {emptyDetail}=await import("../../src/mission-control/details.ts");
  const b=browser("https://board.example/?mode=agents"),now=Date.now(),d=emptyDetail();
  d.identity={title:{text:"Actual <script>title</script>",state:"reported"},appThreadId:{text:"mcp:real-application-thread-123456789",state:"reported"}};
  d.assistant={text:"Latest <img src=x onerror=alert(1)> paragraph",state:"reported"};
  d.commands=[{text:"go test -race ./...",state:"reported"}];d.effort={value:"high",source:"configured"};
+ delete d.recent; // This fixture intentionally exercises the exact legacy v2 detail.
  const agents=[{id:"opaque-row",title:d.identity.title.text,model:"gpt-6.1-sol",host:"agent-a",state:"thinking",startedAt:now-1000,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[],details:d,detailCoverage:"reported"}];
  const host={host:"agent-a",shown:1,total:1,truncated:false,observedAt:now,freshness:"live",states:{thinking:1},models:[{model:"gpt-6.1-sol",count:1}],resources:{state:"reported",sample:{sampledAt:now,cpuUtilization:0.25,cpuCount:8,availableMemoryBytes:1073741824,totalMemoryBytes:4294967296}}};
  const snapshot={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[host]};
  b.snapshot(snapshot);
  let html=b.elements.view!.innerHTML;
- assert.match(html,/task-label">Task/);assert.match(html,/Thinking/);
+ assert.match(b.elements.view!.querySelector(".card-status")!.textContent,/Thinking/);
+ assert.equal(b.elements.view!.querySelector(".card-effort"),null);
+ d.effort={value:"high",source:"reported"};b.snapshot(snapshot);
+ assert.match(b.elements.view!.querySelector(".card-effort")!.textContent,/high/);
+ d.effort={value:"high",source:"configured"};b.snapshot(snapshot);
+ assert.doesNotMatch(b.elements.view!.querySelector("header")!.textContent,/Thinking|high/);
  assert.match(html,/Actual &lt;script&gt;title&lt;\/script&gt;/);
  assert.match(html,/Latest &lt;img/);assert.doesNotMatch(html,/<script>|<img /);
+ b.openDetails("opaque-row");html=b.document.body.querySelector(".thread-drawer")!.innerHTML;
  assert.match(html,/data-copy-thread="mcp:real-application-thread-123456789"/);
  assert.match(html,/high \(configured\)/);assert.match(html,/go test -race/);
+ assert.match(html,/detail-freshness/);assert.match(html,/detail coverage reported/);b.closeDetails();
  b.click("agent-summary");html=b.elements.view!.innerHTML;
  assert.match(html,/Host overview/);assert.doesNotMatch(html,/Actual &lt;script&gt;|App thread|Latest &lt;img|go test -race/);
- b.click("fleet");html=b.elements.view!.innerHTML;assert.match(html,/CPU 25.0%/);assert.match(html,/RAM 3.0 \/ 4.0 GiB \(75.0% used\)/);
- b.click("overview");assert.match(b.elements.view!.innerHTML,/CPU 25.0%/);
+ b.click("fleet");html=b.elements.view!.innerHTML;assert.match(html,/25.0% · 8 cores/);assert.match(html,/3.0 \/ 4.0 GiB · 75.0% used/);
+ b.click("overview");assert.match(b.elements.view!.innerHTML,/25.0% · 8 cores/);
+});
+
+test("Auto maximizes readable card area for the current count and viewport",()=>{
+ const b=browser("https://board.example/?mode=agents"),now=Date.now();b.resize(3840,2160);
+ const rows=Array.from({length:48},(_,i)=>({id:"auto-"+i,title:"Auto task "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));
+ const snap=(n:number)=>({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:rows.slice(0,n),shown:n,total:n,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]});
+ for(const [n,cols,lines] of [[1,1,1],[2,2,1],[5,3,2],[6,3,2],[7,3,3],[9,3,3],[10,4,3],[12,4,3],[13,4,4],[16,4,4],[48,8,6]]){
+  b.snapshot(snap(n!));const html=b.elements.view!.innerHTML;
+  assert.match(html,new RegExp("Effective fit "+cols+" × "+lines+" ·"));
+  assert.equal(b.elements.view!.querySelector(".agrid")!.children.length,n);
+  assert.match(html,/Page 1 of 1/);
+ }
+ b.snapshot(snap(13));b.resize(1920,1080);assert.match(b.elements.view!.innerHTML,/Effective fit 5 × 3/);
+ b.grid("4x4");b.snapshot(snap(5));assert.match(b.elements.view!.innerHTML,/Effective fit 4 × 3/);
+ b.grid("auto");b.snapshot(snap(5));assert.match(b.elements.view!.innerHTML,/Effective fit 3 × 2/);
+ b.resize(390,600);assert.match(b.elements.view!.innerHTML,/Effective fit 1 × 1/);
 });
 
 test("explicit grids page every row, clamp on resize and SSE shrink, and survive history",()=>{
@@ -295,4 +328,105 @@ test("host cards keep independent ages, observed zero, missing counts and escape
  assert.match(html,/stale · source 100s ago/);assert.match(html,/disconnected/);
  assert.match(html,/NOT OBSERVED · thread count unknown/);
  assert.equal(browser(b.location.href).document.body.dataset.mode,"agent-summary");
+});
+
+test("Overview count follows the actual four-row budget with five observed rows",()=>{
+ const b=browser(),now=Date.now();
+ const agents=Array.from({length:5},(_,i)=>({id:"count-"+i,title:"Count fixture "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:5,total:5,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]});
+ const html=b.elements.view!.querySelector(".p-threads")!.innerHTML;
+ assert.equal((html.match(/Count fixture /g)||[]).length,4);
+ assert.match(html,/showing 4 of 5 observed threads/);
+ assert.equal((html.match(/showing/gi)||[]).length,1);
+});
+
+test("compact cards use current state, bounded previews, safe provider identity and a stable modal",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ const b=browser("https://board.example/?mode=agents&grid=4x3"),now=Date.now(),d:any=emptyDetail();
+ d.assistant={text:"Sanitized assistant preview ".repeat(30),state:"reported"};
+ d.commands=Array.from({length:3},(_,i)=>({text:"safe command "+i+" ".repeat(20),state:"reported"}));
+ delete d.recent; // Legacy path; later snapshots below exercise authoritative v3 recent.
+ const row={id:"one",title:"A meaningful task title ".repeat(6),host:"agent-a",model:"claude-opus-5-5",state:"completed",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:["Command running"],details:d,detailCoverage:"reported"};
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[row],shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+ for(const state of ["completed","failed","idle"]){
+  b.snapshot({...snap,agents:[{...row,state}]});b.resize(390,834);
+  const card=b.elements.view!.querySelector(".tile")!;
+  assert.match(card.innerHTML,new RegExp(state==="idle"?"Idle":state==="failed"?"Failed":"Completed"));
+  assert.match(card.innerHTML,/Last observed command · outcome unknown/);
+  assert.doesNotMatch(card.innerHTML,/Command running|Active command observed|App thread|Effort|Usage not reported/);
+  assert.equal((card.innerHTML.match(/class="activity-item"/g)||[]).length,3);
+  assert.match(card.querySelector("header")!.textContent,/A meaningful task title/);
+  assert.doesNotMatch(card.querySelector("header")!.textContent,/Task |Completed|Failed|Idle/);
+  assert.match(card.querySelector(".card-status")!.textContent,new RegExp(state==="idle"?"Idle":state==="failed"?"Failed":"Completed"));
+  assert.doesNotMatch(card.querySelector(".body")!.innerHTML,/card-model|card-effort|card-usage|card-fresh|data-thread-details/);
+  assert.match(card.querySelector(".card-fresh")!.getAttribute("title")!,/Activity live.*A source live/);
+  assert.match(card.innerHTML,/aria-label="Provider unknown"/);
+ }
+ const opener=b.elements.view!.querySelector('[data-thread-details="one"]')!;
+ opener.focus();b.refresh();assert.equal(b.document.activeElement,b.elements.view!.querySelector('[data-thread-details="one"]'));
+ b.snapshot(snap);assert.equal(b.document.activeElement,b.elements.view!.querySelector('[data-thread-details="one"]'));
+ b.openDetails("one");
+ const dialog=b.document.body.querySelector(".thread-drawer")!,close=dialog.querySelector("[data-close-details]")!;
+ assert.equal(dialog.open,true);assert.equal(b.document.activeElement,close);
+ b.refresh();b.snapshot({...snap,agents:[{...row,state:"failed",details:{...d,assistant:{text:null,state:"withheld"},commands:[]}}]});
+ assert.equal(b.document.activeElement,close);assert.equal(dialog.querySelector("[data-close-details]"),close);
+ assert.doesNotMatch(dialog.innerHTML,/Sanitized assistant preview/);
+ b.closeDetails();assert.equal(dialog.open,false);assert.equal(b.document.activeElement,b.elements.view!.querySelector('[data-thread-details="one"]'));
+ // Actual optional provider/recent metadata wins over legacy data and model names.
+ const recent=[{kind:"assistant",preview:{text:"Earlier actual message",state:"truncated"},at:now-10000,status:"unknown"},{kind:"command",preview:{text:"Observed completed command",state:"redacted"},at:now,status:"completed"},{kind:"command",preview:{text:null,state:"withheld"},at:now,status:"failed"}];
+ b.snapshot({...snap,agents:[{...row,details:{...d,provider:{instanceId:"custom-codex",driver:"codex"},recent}}]});
+ let html=b.elements.view!.innerHTML;
+ assert.match(html,/OpenAI Codex · custom-codex/);assert.doesNotMatch(html,/Claude ·/);
+ assert.match(html,/Earlier actual message/);assert.match(html,/Command · completed/);assert.match(html,/truncated/);assert.match(html,/redacted/);assert.doesNotMatch(html,/Sanitized assistant preview|safe command/);
+ b.openDetails("one");assert.match(dialog.innerHTML,/Earlier actual message/);assert.match(dialog.innerHTML,/Observed completed command/);b.closeDetails();
+ b.snapshot({...snap,agents:[{...row,details:{...d,provider:{instanceId:"custom-claude",driver:"claudeAgent"},recent:[]}}]});
+ html=b.elements.view!.innerHTML;assert.match(html,/Claude · custom-claude/);assert.doesNotMatch(html,/Earlier actual message|Sanitized assistant preview/);
+ b.snapshot({...snap,agents:[{...row,state:"working",detailObservedAt:now-90000,details:{...d,recent:[{kind:"command",preview:{text:"Old command",state:"reported"},at:now-90000,status:"running"}]}}]});
+ assert.doesNotMatch(b.elements.view!.innerHTML,/Active command observed/);
+ assert.match(b.elements.view!.innerHTML,/Last observed command/);
+ const css=readFileSync(new URL("../../src/mission-control/static/core.css",import.meta.url),"utf8");
+ assert.doesNotMatch(css,/\.dynamic-grid \.tile > \.body\s*\{[^}]*overflow:\s*(auto|scroll)/);
+ assert.match(css,/\.card-foot\s*\{[^}]*flex:0 0 54px/);
+ assert.match(css,/@container \(max-width:460px\).*card-usage/);
+});
+
+test("card metrics stay in the footer and visual updates follow real evidence only",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ for(const reduced of [false,true]){
+  const b=browser("https://board.example/?mode=agents",reduced),now=Date.now(),d:any=emptyDetail();
+  d.effort={value:"high",source:"reported"};
+  d.usage={...d.usage,total:12345,coverage:"observed",observedAt:now};
+  d.recent=[{kind:"assistant",preview:{text:"Real preview",state:"reported"},at:now,status:"unknown"}];
+  const row={id:"glance",title:"Actual task",host:"agent-a",model:"actual-model",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[],details:d,detailCoverage:"reported"};
+  const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[row],shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+  b.snapshot(snap);
+  const foot=b.elements.view!.querySelector(".card-foot")!;
+  assert.match(foot.textContent,/Working.*actual-model.*high.*12K tok/);
+  assert.doesNotMatch(b.elements.view!.querySelector(".tile")!.querySelector(".body")!.textContent,/actual-model|12K tok/);
+  assert.equal(b.animations.length,0);
+  b.refresh();b.snapshot(snap);assert.equal(b.animations.length,0);
+  b.snapshot({...snap,now:now+1,agents:[{...row,observedAt:now+1}]});
+  assert.equal(b.animations.length,reduced?0:1);
+  b.snapshot({...snap,now:now+1,agents:[{...row,observedAt:now+1,details:{...d,recent:[{...d.recent[0],preview:{text:"New real preview",state:"truncated"}}]}}]});
+  assert.equal(b.animations.length,reduced?0:2);
+  b.snapshot({...snap,agents:[{...row,state:"completed",detailObservedAt:now-120000,activityFreshness:"stale",details:{...d,effort:{value:null,source:null},usage:{coverage:"not-reported"},recent:[{kind:"command",preview:{text:"PRIVATE WITHHELD",state:"withheld"},at:now,status:"running"}]}}]});
+  const card=b.elements.view!.querySelector(".tile")!;
+  assert.match(card.querySelector(".card-status")!.textContent,/Completed/);
+  assert.match(card.querySelector(".card-fresh")!.textContent,/Activity stale/);
+  assert.doesNotMatch(card.innerHTML,/PRIVATE WITHHELD|Command · running|card-effort|card-usage|not reported/);
+  assert.equal(card.querySelector(".recent-activity")!.textContent,"Previews unavailable");
+ }
+});
+
+test("resource instruments preserve measured CPU zero, independent stale samples, units and accessibility",()=>{
+ const b=browser("https://board.example/?mode=fleet"),now=Date.now();
+ const hosts=["agent-a","agent-b","omarchy-pc","laptop"].map((host,i)=>({host,shown:i,total:i,truncated:false,observedAt:now,freshness:i===1?"stale":"live",states:{},models:[],resources:{state:i===2?"unavailable":"reported",sample:i===2?null:{sampledAt:now-(i===1?120000:0),cpuUtilization:i===0?0:null,cpuCount:8,availableMemoryBytes:1073741824,totalMemoryBytes:4294967296}}}));
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],shown:0,total:0,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:hosts});
+ for(const mode of ["fleet","agent-summary"]){
+  b.click(mode);const html=b.elements.view!.innerHTML;
+  assert.equal((html.match(/host-card/g)||[]).length,4);
+  assert.match(html,/aria-valuenow="0.00"/);assert.match(html,/0.0% · 8 cores/);
+  assert.match(html,/1.0 GiB available/);assert.match(html,/3.0 \/ 4.0 GiB/);
+  assert.match(html,/last known \/ stale/);assert.match(html,/Resource sample unavailable/);
+ }
 });

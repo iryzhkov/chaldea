@@ -5,7 +5,10 @@ export type ResourceSample = {sampledAt:number;cpuUtilization:number|null;cpuCou
 export type Resources = {state:"reported"|"unavailable"|"byte-budget";sample:ResourceSample|null};
 export type Usage = {input:number|null;output:number|null;cacheRead:number|null;cacheWrite:number|null;reasoning:number|null;total:number|null;turns:number;coverage:"observed"|"partial"|"not-reported";observedAt:number|null;rate:number|null;windowSeconds:60;scope:"main-agent observed turns"};
 export type Work = {active:number;queued:number;completed:number};
-export type Detail = {identity:{title:Preview;appThreadId:Preview};fieldCoverage:"full"|"identity-only";activity:"thinking"|"working"|null;assistant:Preview;commands:Preview[];commandsOmitted:number;effort:Effort;usage:Usage;context:{used:number;max:number|null}|null;work:{children:Work|null;delegates:Work|null;subagents:Work|null;monitors:number|null;background:number|null;durableWaits:null;coverage:"observed bounded roster"|"not-reported"}};
+export type ProviderIdentity = {instanceId:string;driver:string|null};
+export type Recent = {kind:"assistant"|"command";preview:Preview;at:number|null;status:"running"|"completed"|"failed"|"cancelled"|"unknown"};
+export const safeProviderId=(v:unknown):v is string=>typeof v==="string"&&/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(v)&&!/(?:bearer|password|secret|credential|api[_-]?key|token|sk-|gh[pousr]_)/i.test(v);
+export type Detail = {provider?:ProviderIdentity|null;recent?:Recent[];identity:{title:Preview;appThreadId:Preview};fieldCoverage:"full"|"identity-only";activity:"thinking"|"working"|null;assistant:Preview;commands:Preview[];commandsOmitted:number;effort:Effort;usage:Usage;context:{used:number;max:number|null}|null;work:{children:Work|null;delegates:Work|null;subagents:Work|null;monitors:number|null;background:number|null;durableWaits:null;coverage:"observed bounded roster"|"not-reported"}};
 export const integer=(n:unknown):n is number=>typeof n==="number"&&Number.isSafeInteger(n)&&n>=0;
 export function utf8(text:string,max:number):string {let result="";for(const c of text){if(Buffer.byteLength(result+c)>max)break;result+=c;}return result;}
 const normalize=(text:string)=>text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g," ");
@@ -51,9 +54,10 @@ export function effort(selection:unknown,source:Effort["source"]):Effort {
   return {value:null,source:"not-reported"};
 }
 export const emptyUsage=():Usage=>({input:null,output:null,cacheRead:null,cacheWrite:null,reasoning:null,total:null,turns:0,coverage:"not-reported",observedAt:null,rate:null,windowSeconds:60,scope:"main-agent observed turns"});
-export const emptyDetail=():Detail=>({identity:{title:{text:null,state:"not-reported"},appThreadId:{text:null,state:"not-reported"}},fieldCoverage:"full",activity:null,assistant:{text:null,state:"not-reported"},commands:[],commandsOmitted:0,effort:{value:null,source:"not-reported"},usage:emptyUsage(),context:null,work:{children:null,delegates:null,subagents:null,monitors:null,background:null,durableWaits:null,coverage:"not-reported"}});
+export const emptyDetail=():Detail=>({provider:null,recent:[],identity:{title:{text:null,state:"not-reported"},appThreadId:{text:null,state:"not-reported"}},fieldCoverage:"full",activity:null,assistant:{text:null,state:"not-reported"},commands:[],commandsOmitted:0,effort:{value:null,source:"not-reported"},usage:emptyUsage(),context:null,work:{children:null,delegates:null,subagents:null,monitors:null,background:null,durableWaits:null,coverage:"not-reported"}});
 export type TurnUsage = {usageScope:"main_agent";usageStatus:"complete"|"partial"|"unavailable";inputTokens?:number|undefined;outputTokens?:number|undefined;cachedInputTokens?:number|undefined;cacheCreationTokens?:number|undefined;reasoningTokens?:number|undefined;hasSubagents:boolean};
 export type DetailEvent =
+ | {kind:"recent-item";id:string;ordinal:number;type:Recent["kind"];text:string;at:number|null;status:Recent["status"]}
  | {kind:"reset"}
  | {kind:"clear-activity"}
  | {kind:"activity-state";id:string;type:"thinking"|"working";running:boolean}
@@ -64,13 +68,19 @@ export type DetailEvent =
 export class ThreadDetails {
   private value=emptyDetail();
   private assistantAt=0;
+  private recent=new Map<string,{ordinal:number;value:Recent}>();
   private commands=new Map<string,Preview>();
   private activeItems=new Map<string,"thinking"|"working">();
   private turns=new Map<string,{usage:TurnUsage;at:number}>();
   private partial=false;
   apply(e:DetailEvent):void {
-    if(e.kind==="reset"){this.commands.clear();this.activeItems.clear();this.value.work=emptyDetail().work;this.value.context=null;this.value.effort=emptyDetail().effort;}
-    if(e.kind==="clear-activity"){this.activeItems.clear();this.commands.clear();}
+    if(e.kind==="reset"){this.recent.clear();this.commands.clear();this.activeItems.clear();this.value.work=emptyDetail().work;this.value.context=null;this.value.effort=emptyDetail().effort;}
+    if(e.kind==="clear-activity"){this.activeItems.clear();this.commands.clear();for(const r of this.recent.values())if(r.value.status==="running")r.value.status="unknown";}
+    if(e.kind==="recent-item"&&integer(e.ordinal)){
+      this.recent.set(e.id,{ordinal:e.ordinal,value:{kind:e.type,preview:e.type==="assistant"?assistantPreview(e.text):commandPreview(e.text),at:e.at,status:e.status}});
+      const keep=[...this.recent].sort((a,b)=>b[1].ordinal-a[1].ordinal||b[0].localeCompare(a[0])).slice(0,3);
+      this.recent=new Map(keep);
+    }
     if(e.kind==="activity-state"){if(!e.running)this.activeItems.delete(e.id);else if(this.activeItems.has(e.id)||this.activeItems.size<64)this.activeItems.set(e.id,e.type);}
     if(e.kind==="assistant"&&e.at>=this.assistantAt){const preview=assistantPreview(e.text);if(preview.state!=="not-reported"){this.value.assistant=preview;this.assistantAt=e.at;}}
     if(e.kind==="command"){if(!e.running)this.commands.delete(e.id);else if(this.commands.has(e.id)||this.commands.size<32)this.commands.set(e.id,commandPreview(e.input));else this.partial=true;}
@@ -85,6 +95,7 @@ export class ThreadDetails {
   }
   snapshot(configured:unknown,now:number,connected:boolean):Detail {
     const result=structuredClone(this.value);result.activity=connected?([...this.activeItems.values()].includes("working")?"working":[...this.activeItems.values()].includes("thinking")?"thinking":null):null;
+    result.recent=[...this.recent.values()].map(r=>({...structuredClone(r.value),at:integer(r.value.at)&&r.value.at>0&&r.value.at<=now?r.value.at:null,status:!connected&&r.value.status==="running"?"unknown":r.value.status}));
     const values=[...this.turns.values()].filter(v=>v.usage.usageStatus!=="unavailable");
     if(result.effort.source!=="reported")result.effort=effort(configured,"configured");
     result.commands=connected?[...this.commands.values()].slice(0,3):[];

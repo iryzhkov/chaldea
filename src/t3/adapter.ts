@@ -265,6 +265,7 @@ export interface ShellSubscription {
   /** Called for every item in order; the next item waits for the promise. */
   readonly onEvent: (event: ShellEvent) => Promise<void> | void;
   readonly onResources?: (resources: Resources) => void;
+  readonly onProviderCatalog?: (providers: ReadonlyArray<{instanceId:string;driver:string}>) => void;
 }
 
 export function socketUrl(serverUrl: string): string {
@@ -546,7 +547,21 @@ export type MissionDetailEvent =
   | { kind: "usage"; turnId: string; output: number | null; at: number; baseline: boolean; startedAt?: number | null };
 export async function connectMissionThread(options: ConnectOptions, threadId: string,
   afterSequence: number | undefined, onEvent: (event: MissionDetailEvent) => void): Promise<void> {
-  const mainOwners=new Set<string>();
+  // Retain at most 128 owner IDs: item overflow cannot evict a running root.
+  const mainRoots=new Set<string>(),mainOwners=new Map<string,string>();
+  const rememberRoot=(root:string)=>{
+    mainRoots.delete(root);mainRoots.add(root);
+    if(mainRoots.size>64){
+      const oldest=mainRoots.values().next().value!;mainRoots.delete(oldest);
+      for(const [id,owner] of mainOwners)if(owner===oldest)mainOwners.delete(id);
+    }
+  };
+  const rememberOwner=(id:string,root:string)=>{
+    rememberRoot(root);
+    mainOwners.delete(id);
+    if(mainOwners.size>=64)mainOwners.delete(mainOwners.keys().next().value!);
+    mainOwners.set(id,root);
+  };
   const activeCommands=new Map<string,string|null>();
   const terminalRuns=new Set<string>();
   const nativeKey=(driver:string,instance:string,provider:string,task:string)=>JSON.stringify(["native",driver,instance,provider,task]);
@@ -572,8 +587,8 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       children:counts,delegates,subagents,monitors:tasks.length?monitors:null,background:tasks.length?background:null,
       durableWaits:null,coverage:"observed bounded roster"}});
   };
-  const provider=(p:OrchestrationV2ThreadProjection["providerThreads"][number])=>{
-    if(p.appThreadId!==threadId||p.ownerNodeId===null||!mainOwners.has(p.ownerNodeId))return;
+  const provider=(p:OrchestrationV2ThreadProjection["providerThreads"][number],snapshotOwner=false)=>{
+    if(p.appThreadId!==threadId||p.ownerNodeId===null||!(snapshotOwner||mainRoots.has(p.ownerNodeId)||providers.get(p.id)?.owner===p.ownerNodeId))return;
     if(!providers.has(p.id)&&providers.size>=16)return;
     providers.set(p.id,{owner:p.ownerNodeId,updatedAt:DateTime.toEpochMillis(p.updatedAt),reported:p.nativeMetadata?.modelSelection,
       context:p.contextUsage?{used:p.contextUsage.usedTokens,max:p.contextUsage.maxTokens??null}:null,
@@ -589,7 +604,23 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     // Normalized per-turn main-agent totals are independent of live context counters.
     if(providers.has(t.providerThreadId)&&t.turnTokenUsage)onEvent({kind:"turn-usage",id:t.id,usage:t.turnTokenUsage,at:t.completedAt?DateTime.toEpochMillis(t.completedAt):stamp});
   };
+  const node=(n:OrchestrationV2ThreadProjection["nodes"][number])=>{
+    if(n.threadId!==threadId)return;
+    if(n.kind==="root_turn"){rememberRoot(n.id);return;}
+    const rootKnown=mainRoots.has(n.rootNodeId);
+    if(["assistant_message","reasoning","tool_call"].includes(n.kind)&&rootKnown
+      &&(n.parentNodeId===null||n.parentNodeId===n.rootNodeId||mainOwners.get(n.parentNodeId)===n.rootNodeId)
+      &&(n.providerThreadId===null||providers.has(n.providerThreadId)))rememberOwner(n.id,n.rootNodeId);
+  };
   const activity=(r:OrchestrationV2ThreadProjection["turnItems"][number])=>{
+    // Preserve legacy capture even when bounded ownership evidence is unavailable.
+    if(r.threadId!==threadId)return;
+    const recentOwner=(r.nodeId!==null?(mainRoots.has(r.nodeId)||mainOwners.has(r.nodeId)):r.providerThreadId!=null&&providers.has(r.providerThreadId))
+      &&(r.providerThreadId==null||providers.has(r.providerThreadId));
+    if(recentOwner&&(r.type==="assistant_message"||r.type==="command_execution")){
+      const status=["running","completed","failed","cancelled"].includes(r.status)?r.status as "running"|"completed"|"failed"|"cancelled":"unknown";
+      onEvent({kind:"recent-item",id:r.id,ordinal:r.ordinal,type:r.type==="assistant_message"?"assistant":"command",text:r.type==="assistant_message"?r.text:r.input,at:DateTime.toEpochMillis(r.updatedAt),status:status==="running"&&r.runId&&terminalRuns.has(r.runId)?"unknown":status==="completed"&&r.type==="command_execution"&&(r.outputIndicatesFailure===true||r.exitCode!==undefined&&r.exitCode!==0)?"failed":status});
+    }
     if(["reasoning","command_execution","tool_call"].includes(r.type))onEvent({kind:"activity-state",id:r.id,type:r.type==="reasoning"?"thinking":"working",running:r.status==="running"&&!(r.runId&&terminalRuns.has(r.runId))});
     if(r.type==="command_execution"){
       const running=r.status==="running"&&!(r.runId&&terminalRuns.has(r.runId));
@@ -607,10 +638,14 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   } as never).pipe(Stream.runForEach(item => Effect.sync(() => {
     if(item.kind==="synchronized"){onEvent({kind:"synchronized"});return;}
     if(item.kind==="snapshot"){
-      providers.clear();children.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
+      providers.clear();children.clear();mainRoots.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
+      if(item.projection.thread.id!==threadId)return;
       for(const run of item.projection.runs.slice(-128))if(["completed","failed","cancelled","interrupted"].includes(run.status))terminalRuns.add(run.id);
-      for(const n of item.projection.nodes.filter(n=>n.kind==="root_turn").slice(-128))mainOwners.add(n.id);
-      for(const p of item.projection.providerThreads)provider(p);
+      for(const n of item.projection.nodes)if(n.kind==="root_turn")node(n);
+      // Provider creation can predate the retained owner window. Verify against
+      // the actual snapshot, without retaining all historical roots.
+      for(const p of item.projection.providerThreads)provider(p,item.projection.nodes.some(n=>n.id===p.ownerNodeId&&n.kind==="root_turn"&&n.threadId===threadId));
+      for(const n of item.projection.nodes)if(n.kind!=="root_turn")node(n);
       for(const c of item.projection.subagents)child(c);
       metadata();
       for(const t of item.projection.providerTurns.slice(-128))turn(t,DateTime.toEpochMillis(item.projection.updatedAt));
@@ -625,6 +660,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     sequence=item.sequence;
     if(item.kind==="event"){
       const e=item.event;
+      if(e.threadId!==threadId)return;
       if(e.type==="run.updated"&&["completed","failed","cancelled","interrupted"].includes(e.payload.status)){
         onEvent({kind:"clear-activity"});
         if(terminalRuns.size>=128)terminalRuns.delete(terminalRuns.values().next().value!);terminalRuns.add(e.payload.id);
@@ -633,7 +669,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       else if(e.type==="provider-turn.updated")turn(e.payload,DateTime.toEpochMillis(e.occurredAt));
       else if(e.type==="turn-item.updated")activity(e.payload);
       else if(e.type==="message.updated"&&e.payload.role==="assistant")onEvent({kind:"assistant",text:e.payload.text,at:DateTime.toEpochMillis(e.payload.updatedAt)});
-      else if(e.type==="node.updated"&&e.payload.kind==="root_turn"){if(mainOwners.size<128)mainOwners.add(e.payload.id);}
+      else if(e.type==="node.updated")node(e.payload);
       else if(e.type==="provider-thread.updated"){provider(e.payload);metadata();}
       else if(e.type==="subagent.updated"){child(e.payload);metadata();}
     }
@@ -658,7 +694,17 @@ export async function connectShell(options: ConnectOptions, subscription: ShellS
           }
         })),
       );
-      if(!subscription.onResources)return shell;
+      const catalog=subscription.onProviderCatalog?Effect.gen(function*(){
+        const publish=(providers:ReadonlyArray<{instanceId:string;driver:string}>)=>subscription.onProviderCatalog!(providers.slice(0,128).map(p=>({instanceId:p.instanceId,driver:p.driver})));
+        // The official subscription starts with its config snapshot; no separate getter/poll.
+        yield* client.subscribeServerConfig({}).pipe(Stream.runForEach(event=>Effect.sync(()=>{
+          if(event.type==="snapshot")publish(event.config.providers);
+          else if(event.type==="providerStatuses")publish(event.payload.providers);
+        })));
+        yield* Effect.never;
+      }).pipe(Effect.catchCause(()=>Effect.gen(function*(){subscription.onProviderCatalog!([]);yield* Effect.never;}))):Effect.never;
+      const shellAndCatalog=Effect.raceFirst(shell,catalog);
+      if(!subscription.onResources)return shellAndCatalog;
       const sample=Effect.gen(function*(){
         while(true){
           const resources=yield* client["server.getHostResources"]({}).pipe(
@@ -669,7 +715,7 @@ export async function connectShell(options: ConnectOptions, subscription: ShellS
           yield* Effect.sleep("5 seconds");
         }
       });
-      return Effect.raceFirst(shell,sample.pipe(Effect.catchCause(()=>Effect.gen(function*(){
+      return Effect.raceFirst(shellAndCatalog,sample.pipe(Effect.catchCause(()=>Effect.gen(function*(){
         yield* Effect.sync(()=>subscription.onResources!({state:"unavailable",sample:null})).pipe(Effect.catchCause(()=>Effect.void));
         yield* Effect.never;
       }))));

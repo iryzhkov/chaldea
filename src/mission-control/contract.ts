@@ -57,11 +57,11 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
       {qualified:false,output:null,rate:null,observedAt:null,coverage:"unknown"}};
   while(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){snapshot.agents.pop();snapshot.truncated=true;}
   // Fit base rows first. Optional metadata never removes another row.
-  const rich:RichSnapshot={v:2,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
+  const rich:RichSnapshot={v:3,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
   snapshot.rich=rich;
   if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
   else {
-    try{rich.resources=validateRich({v:2,resources:v.resources,details:[],omitted:0},new Set(),observedAt).resources;}
+    try{rich.resources=validateRich({v:3,resources:v.resources,details:[],omitted:0},new Set(),observedAt).resources;}
     catch{rich.resources={state:"unavailable",sample:null};}
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.resources={state:"byte-budget",sample:null};
     for(let i=0;i<snapshot.agents.length;i++){
@@ -69,8 +69,13 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
       const row={id:snapshot.agents[i]!.id,value:{identity:safe.identity,fieldCoverage:"identity-only" as const}};rich.details.push(row);rich.omitted--;
       if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES){rich.details.pop();rich.omitted++;}
     }
-    for(const row of rich.details){const i=snapshot.agents.findIndex(a=>a.id===row.id),identity=row.value;row.value=isolateDetail(v.agents[i]!.details,observedAt);
+    for(const row of rich.details){const i=snapshot.agents.findIndex(a=>a.id===row.id),identity=row.value;const detail=isolateDetail(v.agents[i]!.details,observedAt);row.value=detail.fieldCoverage==="full"?{...detail,recent:[]}:detail;
       if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)row.value=identity;
+    }
+    // Recent content is the last optional tier, after every base/identity/resource row.
+    for(const row of rich.details){if(row.value.fieldCoverage!=="full")continue;const i=snapshot.agents.findIndex(a=>a.id===row.id),detail=isolateDetail(v.agents[i]!.details,observedAt);if(detail.fieldCoverage!=="full")continue;
+      const full=row.value as import("./details.ts").Detail;full.recent=detail.recent??[];
+      while(full.recent.length&&Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)full.recent.pop();
     }
   }
   return validateHostSnapshot(snapshot);
