@@ -13,10 +13,10 @@ import { request } from "node:http";
 import { join } from "node:path";
 async function hostedRig(host="agent-a"){
   const identity={issuer:"chaldea:"+host,source:host+".mission-control",host,source_id:host+"--mission-control",profile:"mission-control-publisher",project:"chaldea"};
-  const x=await rig("service"),key=generateKeyPairSync("ed25519");
+  const x=await rig("service",host),key=generateKeyPairSync("ed25519");
   const publisher={issuer:identity.issuer,source:identity.source,host:identity.host,source_id:identity.source_id,profile:identity.profile,project:identity.project,mode:"service" as const,kinds:["agent_status" as const]};
   const reader={issuer:"chaldea:omarchy-normandy",source:"mission-control-reader",host:"omarchy-normandy",source_id:"omarchy-normandy--mission-control-reader",profile:"mission-control-reader",project:"chaldea",mode:"service" as const,kinds:["agent_status" as const],mission_control_read_sources:[identity.source_id]};
-  const bundle=structuredClone(x.bundle);bundle.sequence++;bundle.keys[0]!.issuer=identity.issuer;
+  const bundle=structuredClone(x.bundle);bundle.sequence++;
   bundle.keys[0]!.ceilings=[{audience:"akasha",profile:publisher.profile,project:publisher.project,source:publisher.source,grants:[{resource:publisher.source,actions:["append","read"]}]}];
   // Disposable key only. Append ceiling proves the server selector independently denies writes.
   bundle.keys.push({issuer:reader.issuer,kid:"reader",public_key:{kty:"OKP",crv:"Ed25519",x:key.publicKey.export({format:"jwk"}).x!},not_before:N-3600,issue_until:N+3600,verify_until:N+4410,
@@ -194,7 +194,7 @@ for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"])
     const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
     assert.equal(cache.gap,false);assert.equal(cache.snapshots[0]!.host,host);
     const wrong=payload();wrong.data.snapshot.host=host==="agent-a"?"agent-b":"agent-a";
-    assert.equal((await h.post(wrong,"mismatch")).status,400);
+    assert.equal((await h.post(wrong,"mismatch")).status,403);
     const laptop=payload();laptop.data.snapshot.host="laptop";assert.equal((await h.post(laptop,"unissued-laptop")).status,400);
     assert.throws(()=>new Authorization([{...h.publisher,issuer:"chaldea:laptop"}],h.x.trust,h.x.clock),/registry_host_mismatch/);
     assert.throws(()=>new Authorization([{...h.publisher,host:"laptop",issuer:"chaldea:laptop",source:"laptop.mission-control",source_id:"laptop--mission-control"}],h.x.trust,h.x.clock),/invalid_mission_control_publisher/);

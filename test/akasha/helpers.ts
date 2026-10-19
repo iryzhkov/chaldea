@@ -22,7 +22,7 @@ export const registration: Registration = {
   issuer: "chaldea:agent-a", source: "chaldea.daily-health.agent-a", host: "agent-a",
   source_id: "agent-a-daily-health", profile: "daily-health", project: "homelab", mode: "report", kinds: ["report", "feed_post"],
 };
-export async function rig(mode: "report" | "service" | "operator" = "report") {
+export async function rig(mode: "report" | "service" | "operator" = "report", host = registration.host) {
   const dir = scratch(), issuer = generateKeyPairSync("ed25519"), deployment = generateKeyPairSync("ed25519");
   const publicKey = (key: typeof issuer.publicKey) => ({ kty: "OKP" as const, crv: "Ed25519" as const, x: key.export({ format: "jwk" }).x! });
   let state = new AccessState(join(dir.path, "access.db"), { initialize: true });
@@ -30,7 +30,7 @@ export async function rig(mode: "report" | "service" | "operator" = "report") {
   let clock = new Clock(state, () => sample);
   const anchor = { kid: "deployment", public_key: publicKey(deployment.publicKey) };
   let trust = new TrustStore(state, clock, [anchor]);
-  const r = { ...registration, mode, ...(mode === "operator" ? { global_read: true } : {}) };
+  const r = { ...registration, host, issuer: "chaldea:" + host, mode, ...(mode === "operator" ? { global_read: true } : {}) };
   const bundle: TrustBundle = { v: 1, sequence: 1, published_at: N - 1, expires_at: N + TRUST_FRESH_SECONDS - 1,
     keys: [{ issuer: r.issuer, kid: "host-1", public_key: publicKey(issuer.publicKey),
       not_before: N - 3600, issue_until: N + 3600, verify_until: N + 4410,
