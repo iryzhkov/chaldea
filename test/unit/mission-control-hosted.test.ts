@@ -443,8 +443,9 @@ test("compact telemetry preserves source order when the newest activity timestam
  m.detail("private-thread",{kind:"recent-item",id:"newer",ordinal:2,type:"assistant",text:"Newest observation.",at:null,status:"completed"});
  const s=captureSnapshot(m,"agent-a",epoch,1)!;
  const detail=normalizeRich(s.rich,new Set(s.agents.map(a=>a.id)),s.observedAt).details[0]!.value as import("../../src/mission-control/details.ts").Detail;
- assert.deepEqual(detail.recent?.map(r=>r.preview.text),["Older observation.","Newest observation."]);
- assert.equal(detail.recent?.at(-1)?.at,null);
+ assert.deepEqual(detail.recent?.map(r=>r.preview.text),["Newest observation.","Older observation."]);
+ assert.deepEqual(detail.recent,m.snapshot().agents[0]!.details.recent);
+ assert.equal(detail.recent?.[0]?.at,null);
 });
 
 test("compact telemetry gives nine representative threads actual activity within the unchanged host budget",()=>{
@@ -521,7 +522,7 @@ test("compact telemetry capacity matrix preserves base, identities and freshness
   for(const row of expanded?.details??[]){
    if(row.value.fieldCoverage!=="full")continue;const d=row.value as import("../../src/mission-control/details.ts").Detail;
    assert.ok((d.recent?.length??0)<=3);assert.ok((d.recentOmitted??0)+(d.recent?.length??0)<=3);
-   assert.deepEqual(d.recent?.map(r=>r.at),d.recent?.map(r=>r.at).toSorted((a,b)=>Number(a)-Number(b)));
+   assert.deepEqual(d.recent?.map(r=>r.at),d.recent?.map(r=>r.at).toSorted((a,b)=>Number(b)-Number(a)));
   }
  }
 });

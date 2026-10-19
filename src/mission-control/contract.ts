@@ -77,14 +77,14 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     const preview=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).trimEnd(),state:"truncated"}:p;
     const command=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).split(" ").slice(0,-1).join(" "),state:"truncated"}:p;
     const activity=(d:Detail,tier:number):Detail=>({...d,assistant:preview(d.assistant),commands:d.commands.slice(0,1).map(command),
-      commandsOmitted:d.commandsOmitted+Math.max(0,d.commands.length-1),recent:(d.recent??[]).slice(-tier).map(r=>({...r,preview:r.kind==="command"?command(r.preview):preview(r.preview)})),
+      commandsOmitted:d.commandsOmitted+Math.max(0,d.commands.length-1),recent:(d.recent??[]).slice(0,tier).map(r=>({...r,preview:r.kind==="command"?command(r.preview):preview(r.preview)})),
       ...((d.recent??[]).length>tier?{recentOmitted:d.recent!.length-tier}:{})});
     for(const row of rich.details){
       const i=snapshot.agents.findIndex(a=>a.id===row.id),detail=isolateDetail(v.agents[i]!.details,observedAt);
       if(detail.fieldCoverage!=="full")continue;
       const full=detail as import("./details.ts").Detail;
-      // The source projection is newest-first; unknown timestamps do not change that order.
-      const recent=[...(full.recent??[])].reverse();
+      // Keep the source projection newest-first even when timestamps are unknown.
+      const recent=[...(full.recent??[])];
       candidates.set(row.id,{...full,recent});
       const identity=row.value;
       // Every thread gets its latest actual observation before older optional observations.
