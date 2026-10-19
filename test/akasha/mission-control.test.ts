@@ -73,6 +73,18 @@ test("real HTTP ingest/store/scoped reader/cache/web continue without a PC produ
     assert.equal(h.x.store.scalar("SELECT count(*) FROM events"),1);assert.equal(h.x.store.scalar("SELECT count(*) FROM feed_entries"),0);
     const first=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
     assert.equal(first.gap,false);assert.equal(first.snapshots[0]!.host,"agent-a");assert.equal(first.snapshots[0]!.tokens.output,null);
+    const originalEnvelope=JSON.parse(String(h.x.store.db.prepare("SELECT envelope FROM events").get()!.envelope));
+    const originalTime=first.snapshots[0]!.observedAt;
+    const replay=await refreshStatus(h.config,first,{token:async()=>h.readToken,now:()=>N*1000,fetch:async()=>new Response(JSON.stringify({events:[originalEnvelope],next_cursor:null}))});
+    assert.equal(replay.snapshots[0]!.sequence,1);assert.equal(replay.snapshots[0]!.observedAt,originalTime);
+    const badIdentity={...originalEnvelope,host:"agent-b"};
+    const rejected=await refreshStatus(h.config,first,{token:async()=>h.readToken,now:()=>N*1000,fetch:async()=>new Response(JSON.stringify({events:[badIdentity],next_cursor:null}))});
+    assert.equal(rejected.gap,true);assert.equal(rejected.snapshots[0]!.observedAt,originalTime);
+    const offline=await refreshStatus(h.config,first,{token:async()=>h.readToken,now:()=>(N+301)*1000,fetch:async u=>{
+      assert.equal(new URL(String(u)).searchParams.get("from"),new Date((N+181)*1000).toISOString());
+      return new Response(JSON.stringify({events:[],next_cursor:null}));
+    }});
+    assert.equal(offline.snapshots[0]!.observedAt,originalTime);
     h.x.sample={...h.x.sample,unixSeconds:N+35,monotonicSeconds:135};
     const update=payload();update.data.snapshot=sample(2,(N+35)*1000);update.data.snapshot.agents[0]!.state="waiting";
     assert.equal((await h.post(update,"status-2")).status,201);
@@ -107,6 +119,18 @@ test("scoped HTTP denies append, raw endpoints, foreign scope, expired tokens, r
   }finally{await h.close();}
 });
 
+test("backend five-second gate rejects early samples and admits the exact boundary",async()=>{
+  const h=await hostedRig();
+  try{
+    assert.equal((await h.post(payload())).status,201);
+    h.x.sample={...h.x.sample,unixSeconds:N+4,monotonicSeconds:104};
+    const next=payload();next.data.snapshot=sample(2,(N+4)*1000);
+    assert.equal((await h.post(next,"early-four")).status,429);
+    h.x.sample={...h.x.sample,unixSeconds:N+5,monotonicSeconds:105};
+    next.data.snapshot=sample(3,(N+5)*1000);
+    assert.equal((await h.post(next,"exact-five")).status,201);
+  }finally{await h.close();}
+});
 test("status admission compares millisecond sample time in the trusted clock's integer-second units",async()=>{
   const h=await hostedRig();
   try{

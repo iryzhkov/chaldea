@@ -555,7 +555,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       }
       const recent = [...item.projection.turnItems, ...item.projection.visibleTurnItems.map(row => row.item)]
         .filter(row => row.status === "running").toSorted((a,b) => b.ordinal - a.ordinal)[0];
-      if (recent) onEvent({ kind: "activity", tool: "toolName" in recent && typeof recent.toolName === "string" ? recent.toolName : null });
+      if (recent) onEvent({ kind: "activity", tool: recent.type === "command_execution" ? "command_execution" : "toolName" in recent && typeof recent.toolName === "string" ? recent.toolName : null });
       onEvent({ kind: "cursor", sequence: item.snapshotSequence }); return;
     }
     if (item.kind === "unknown-event") { onEvent({ kind: "cursor", sequence: item.sequence }); return; }
@@ -567,7 +567,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
           startedAt: turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : null,
           at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : DateTime.toEpochMillis(e.occurredAt), baseline: false });
       } else if (e.type === "turn-item.updated" && e.payload.status === "running") {
-        onEvent({ kind: "activity", tool: "toolName" in e.payload && typeof e.payload.toolName === "string" ? e.payload.toolName : null });
+        onEvent({ kind: "activity", tool: e.payload.type === "command_execution" ? "command_execution" : "toolName" in e.payload && typeof e.payload.toolName === "string" ? e.payload.toolName : null });
       }
       onEvent({ kind: "cursor", sequence: item.sequence });
     }

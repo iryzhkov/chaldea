@@ -5,6 +5,8 @@ export function projectClientSnapshot(snapshot, now, connected) {
   return { ...snapshot,
     source: { ...snapshot.source, observedAt: !snapshot.sampled && snapshot.source.state === "live" ? snapshot.now : snapshot.source.observedAt,
       state: lost && snapshot.source.state === "live" ? "disconnected" : snapshot.source.state },
+    ...(snapshot.hostSummary ? { hostSummary: snapshot.hostSummary.map(h => ({ ...h,
+      freshness: lost && h.freshness === "live" ? "disconnected" : h.freshness })) } : {}),
     agents: snapshot.agents.map(a => ({ ...a,
       detailObservedAt: !snapshot.sampled && a.activityFreshness === "live" ? snapshot.now : a.detailObservedAt,
       activityFreshness: lost && a.activityFreshness === "live" ? "disconnected" : a.activityFreshness,
@@ -40,8 +42,20 @@ script.onload = () => {
   R.tokens = () => sourcePanel("thero",snapshot?.tokens.coverage==="partial"?"Partial output · 60 s average":"Output rate · 60 s average",'<div class="stats">' + heroStat(snapshot?.tokens.rate == null ? "—" : snapshot.tokens.rate.toFixed(1),snapshot?.tokens.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg") + heroStat(snapshot?.tokens.output ?? "—",snapshot?.tokens.coverage==="partial"?"output lower bound":"observed output","since process start") + '</div>',"t3thread") + panel("models","Observation scope",missing(snapshot?.tokens.scope || "No usage data") + missing("Updated " + (age(snapshot?.tokens.observedAt) ?? "unknown") + "s ago · daily totals and model history unavailable"),"t3thread",age(snapshot?.tokens.observedAt),snapshot?.source.state === "live" ? undefined : "stale") + unavailable("hourly","Today by hour");
   R.quota=()=>quotas();
   for(const m of ["fleet","events","ops","lab"]) R[m]=()=>unavailable("summary",m + " unavailable");
+  const coverage = () => "Showing " + (snapshot?.shown ?? 0) + " of " + (snapshot?.total ?? "unknown") + " observed threads" + (snapshot?.truncated ? " · truncated / coverage incomplete" : "") + " · 48-row bound";
+  R["agent-summary"] = () => {
+    const hosts=snapshot?.hostSummary || [];
+    const rows=hosts.map(h=>{
+      const states=Object.entries(h.states).map(([state,count])=>esc(state)+": "+count).join(" · ");
+      const models=h.models.map(m=>esc(m.model)+": "+m.count).join(" · ");
+      return '<div class="item"><div class="l1"><span class="t t1">' + esc(h.host) + '</span></div><div class="l2">' +
+        (h.observedAt===null ? "NOT OBSERVED · thread count unknown" : esc(h.freshness) + " · source " + age(h.observedAt) + "s ago · shown " + h.shown + " / " + (h.total ?? "unknown") + (h.truncated?" · truncated":"")) +
+        '</div><div class="t1">' + states + '</div><div class="t1 muted">' + models + '</div></div>';
+    }).join("");
+    return sourcePanel("summary","Agent summary · " + coverage(),rows || missing("No observed host sources"));
+  };
   const originalAgents = R.agents;
-  R.agents = () => originalAgents().replace(/hosts awake[^<]*/g,(snapshot?.sampled?"Enrolled sources only · sampled":"PC source only · fleet presence not observed") + (snapshot?.truncated ? " · coverage incomplete" : ""));
+  R.agents = () => originalAgents().replace(/hosts awake[^<]*/g,esc(coverage()) + " · source coverage in Agent summary").replace('data-console="FLIGHT">Agents','data-console="FLIGHT">Live threads');
   document.addEventListener("mc:mode",e=>{mode=e.detail;});
   function render() {
     snapshot = projectClientSnapshot(receivedSnapshot, Date.now(), transportConnected);
@@ -49,8 +63,8 @@ script.onload = () => {
     window.MC.SOURCES.t3shell.label = sourceLabel;
     window.MC.SOURCES.t3thread.label = sourceLabel;
     if(snapshot) {
-      DATA.demo=snapshot.demo;
-      DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:age(a.detailObservedAt), age:null, run:age(a.startedAt), effort:"unknown", steps:a.steps.map(tool=>({tool})) }));
+      DATA.demo=snapshot.demo; DATA.agentSourceAge=age(snapshot.source.observedAt);
+      DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:"unknown", steps:a.steps.map(tool=>({tool})) }));
       DATA.agentPool=DATA.threads; DATA.sources=[];
     }
     window.MC.show(window.MC.MODES.includes(mode)?mode:"overview");

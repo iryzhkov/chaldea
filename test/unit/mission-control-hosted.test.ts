@@ -169,6 +169,67 @@ test("atomic group-readable cache survives offline reload, then expires and does
     now=now0+86400_001;assert.equal(m.snapshot().source.state,"nosource");assert.equal(m.snapshot().agents.length,0);
   }finally{d.close();}
 });
+test("collector yields a slow ordinary drain after durable ACKs and both lanes progress",async()=>{
+  const d=scratch(),file=join(d.path,"snapshot.json"),db=join(d.path,"sliced.db");
+  let now=now0,o=new Outbox(db);const ordinary:string[]=[],statuses:number[]=[];
+  try{
+    for(let i=0;i<7;i++)o.admit({key:"ordinary-"+i,source:"agent-a.toolfeedback",host:"agent-a",payload:{v:1,kind:"tool_call"}},"input",{generation:"fixture",dev:"0",ino:"1",offset:i+1,prefix:"",prefixLength:0,tail:""});
+    for(let seq=1;seq<=4;seq++){
+      writeFileSync(file,JSON.stringify(sample(seq,now)),{mode:0o600});
+      const start=now;let delivered=0,first=true;
+      await collect({outbox:o,host:"agent-a",spool:join(d.path,"absent"),missionControlSnapshotFile:file,now:()=>now,deliver:async e=>{
+        if(first){assert.equal(e.payload.kind,"agent_status");first=false;}
+        if(e.payload.kind==="agent_status")statuses.push((e.payload.data as any).snapshot.sequence);
+        else {ordinary.push(e.key);delivered++;now+=1100;}
+        return true;
+      }});
+      assert.ok(delivered>=1&&delivered<=2);assert.ok(now-start<=3100,"two-second slice plus one request");
+      assert.equal(o.cursor("input")!.offset,ordinary.length);
+      o.close();o=new Outbox(db);now+=5000;
+    }
+    assert.deepEqual(statuses,[1,2,3,4]);assert.deepEqual(ordinary,Array.from({length:7},(_,i)=>"ordinary-"+i));
+    assert.equal(o.next(),null);
+  }finally{o.close();d.close();}
+});
+test("collector admits latest at five seconds, never early",async()=>{
+  const d=scratch(),o=new Outbox(join(d.path,"cadence.db")),file=join(d.path,"sample");let now=now0,sent=0;
+  try{
+    for(const [seq,offset,expected] of [[1,0,1],[2,4999,1],[3,5000,2]]){
+      now=now0+offset!;writeFileSync(file,JSON.stringify(sample(seq,now)),{mode:0o600});
+      await collect({outbox:o,host:"agent-a",spool:join(d.path,"absent"),missionControlSnapshotFile:file,now:()=>now,deliver:async()=>{sent++;return true;}});
+      assert.equal(sent,expected);
+    }
+  }finally{o.close();d.close();}
+});
+test("summary retains fresh zero, missing and stale hosts with independent quiet activity age",()=>{
+  const d=scratch();let now=now0;
+  try{
+    const path=join(d.path,"summary"),cache=emptyCache(),zero=sample();zero.agents=[];zero.total=0;
+    mergeStatus(cache,zero,now);const busy=sample();busy.host="agent-b";mergeStatus(cache,busy,now);writeCache(path,cache);
+    const model=new CacheModel(path,()=>now);now+=65_000;
+    const next={...busy,sequence:2,observedAt:now};mergeStatus(cache,next,now);
+    const nextZero={...zero,sequence:2,observedAt:now};mergeStatus(cache,nextZero,now);writeCache(path,cache);model.reload();
+    const view=model.snapshot(),a=view.hostSummary.find(h=>h.host==="agent-a")!;
+    assert.equal(a.total,0);assert.equal(a.freshness,"live");assert.equal(a.observedAt,now);
+    assert.equal(view.hostSummary.find(h=>h.host==="omarchy-pc")!.total,null);
+    assert.equal(view.hostSummary.find(h=>h.host==="omarchy-pc")!.freshness,"nosource");
+    assert.deepEqual(view.hostSummary.find(h=>h.host==="agent-b")!.models,[{model:"gpt-6.1-sol",count:1}]);
+    assert.equal(view.agents[0]!.activityFreshness,"live");assert.equal(view.agents[0]!.detailObservedAt,now0);
+    now+=91_000;assert.equal(model.snapshot().hostSummary.find(h=>h.host==="agent-a")!.freshness,"stale");
+    assert.equal(model.snapshot().hostSummary.find(h=>h.host==="agent-a")!.observedAt,now0+65_000);
+  }finally{d.close();}
+});
+test("fixed activity normalization crosses old-shape capture without arbitrary text",()=>{
+  const m=live();for(const [input,expected] of [["mcp__huyang__read","read"],["functions.mcp__huyang__edit_apply","edit_apply"],["command_execution","Command running"]]){
+    m.detail("private-thread",{kind:"activity",tool:input!});
+    const s=captureSnapshot(m,"agent-a",epoch,1)!;assert.equal(s.agents[0]!.steps[0],expected);
+    assert.equal(validateHostSnapshot(s).schema,"mission-control.host.v1");
+  }
+  m.detail("private-thread",{kind:"activity",tool:"mcp__evil__read /private/token"});
+  const s=captureSnapshot(m,"agent-a",epoch,2)!;assert.ok(!JSON.stringify(s).includes("/private"));
+  s.agents[0]!.steps=["arbitrary"];assert.throws(()=>validateHostSnapshot(s));
+  assert.equal(validateHostSnapshot(sample()).agents[0]!.steps.length,0);
+});
 test("collector coalesces latest state behind one frozen retry, expires gaps, keeps ordinary backlog semantics",async()=>{
   const d=scratch(),outbox=new Outbox(join(d.path,"collector.db"));let now=now0;const seen:string[]=[];
   try{
@@ -231,6 +292,7 @@ test("reader binds pagination to one window, resets410 as a gap and fails closed
     return page===1?new Response(JSON.stringify({events:[],next_cursor:"cursor"})):page===2?new Response("",{status:410}):new Response(JSON.stringify({events:[],next_cursor:null}));
   }});
   assert.equal(result.gap,true);assert.equal(result.snapshots[0]!.observedAt,now0);
+  assert.equal(new URL(urls[0]!).searchParams.get("from"),new Date(now0+1000-120_000).toISOString());
   assert.equal(new URL(urls[0]!).searchParams.get("from"),new URL(urls[1]!).searchParams.get("from"));assert.equal(new URL(urls[2]!).searchParams.has("cursor"),false);
   for(const response of [new Response("",{status:302}),new Response(" ".repeat(2*1024**2+1)),new Response(JSON.stringify({events:[],next_cursor:"same"}))]){
     const next=await refreshStatus(config,old,{now:()=>now0+1000,token:async()=>"fixture",fetch:async()=>response.clone()});
