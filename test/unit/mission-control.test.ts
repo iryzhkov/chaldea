@@ -11,6 +11,25 @@ import type { ShellThread } from "../../src/t3/adapter.ts";
 import { emptyHeadroom, newProvider } from "../../src/quota/headroom.ts";
 const row=(id="private-thread-id"):ShellThread=>({id,title:"Implement canary",status:"running",providerInstanceId:"private-account",modelSelection:{instanceId:"private-account",model:"gpt-6.1-sol"},latestRunId:"private-run",activeRunId:"private-run",latestRunStartedAt:"2026-10-18T00:00:00Z",latestRunCompletedAt:null,lastErrorClass:null,usageLimitResetAt:null,limitRecovery:null,relationshipToParent:null,archived:false,deleted:false});
 const initialized=(now:()=>number=Date.now)=>{const m=new MissionModel(false,now);m.shell({kind:"snapshot",sequence:1,threads:[row()]});m.shell({kind:"synchronized"});m.detail("private-thread-id",{kind:"synchronized"});return m;};
+test("detail retention follows admitted rows during churn and immediate snapshot replacement",()=>{
+ const m=initialized(),retained=()=> (m as unknown as {detailStates:Map<string,unknown>}).detailStates.size;
+ let seq=2;
+ for(let i=0;i<192;i++){
+  const r=row("churn-"+i);m.shell({kind:"thread",sequence:seq++,thread:r});
+  m.detail(r.id,{kind:"assistant",text:"Public detail",at:Date.now()});
+  if(i%4===0)m.shell({kind:"removed",sequence:seq++,threadId:r.id});
+  else m.shell({kind:"thread",sequence:seq++,thread:{...r,...(i%4===1?{archived:true}:i%4===2?{deleted:true}:{settled:true})}});
+  assert.ok(retained()<=1,"removed detail must not accumulate");
+ }
+ const rows=Array.from({length:48},(_,i)=>row("retained-"+i));
+ m.shell({kind:"snapshot",sequence:seq++,threads:rows});
+ for(const r of rows)m.detail(r.id,{kind:"assistant",text:"Public detail",at:Date.now()});
+ assert.equal(retained(),48);
+ m.shell({kind:"snapshot",sequence:seq++,threads:[row("replacement")]});
+ assert.equal(retained(),0,"prune before synchronized");
+ m.shell({kind:"thread",sequence:seq++,thread:row("retained-0")});m.detail("retained-0",{kind:"synchronized"});
+ assert.equal(m.snapshot().agents.find(a=>a.details.identity.appThreadId.text==="retained-0")!.details.assistant.text,null);
+});
 test("allowlisted DTOs redact titles and ignore raw payloads; legitimate zero survives",()=>{
   const m=initialized(); const dirty={...row(),title:"bearer SECRET /home/igor/private",input:"RAW_INPUT_SECRET",output:"RAW_OUTPUT_SECRET",arguments:"RAW_ARGUMENT_SECRET"};
   m.shell({kind:"thread",sequence:2,thread:dirty});m.detail(dirty.id,{kind:"activity",tool:"UNKNOWN_SECRET"});
@@ -232,6 +251,34 @@ test("HTTP exposes only fixed read paths with security headers and same-origin c
     assert.equal((await get(port,"/?mode=agents")).status,200);
   }finally{await app.close();}
 });
+test("48 maximally escaped legitimate detail rows fit local HTTP and SSE publication",async()=>{
+ const now=Date.parse("2026-10-18T00:00:00Z"),m=new MissionModel(false,()=>now);
+ const rows=Array.from({length:48},(_,i)=>({...row(("thread:"+i+":").padEnd(256,".")),title:'"'.repeat(160)}));
+ m.shell({kind:"snapshot",sequence:1,threads:rows});m.shell({kind:"synchronized"});
+ const app=missionServer(m);await app.listen(0);
+ try{
+  for(const r of rows){
+   m.detail(r.id,{kind:"synchronized"});
+   m.detail(r.id,{kind:"assistant",text:'"\\\\'.repeat(192),at:now});
+   for(let i=0;i<3;i++)m.detail(r.id,{kind:"command",id:String(i),input:"chaldea "+Array(12).fill("--porcelain").join(" "),running:true});
+   m.detail(r.id,{kind:"metadata",reported:{options:{effort:"high"}},context:{used:Number.MAX_SAFE_INTEGER,max:Number.MAX_SAFE_INTEGER},work:{children:{active:2176,queued:2176,completed:2176},delegates:{active:2176,queued:2176,completed:2176},subagents:{active:2176,queued:2176,completed:2176},monitors:2176,background:2176,durableWaits:null,coverage:"observed bounded roster"}});
+   m.detail(r.id,{kind:"turn-usage",id:"turn",at:now,usage:{usageScope:"main_agent",usageStatus:"complete",inputTokens:4000000000000000,outputTokens:4000000000000000,cachedInputTokens:3000000000000000,cacheCreationTokens:1000000000000000,reasoningTokens:3000000000000000,hasSubagents:true}});
+  }
+  const snapshot=m.snapshot(),port=(app.server.address() as {port:number}).port;
+  const response=await get(port,"/api/snapshot"),body=JSON.parse(response.body);
+  const template=snapshot.agents.find(a=>a.details.fieldCoverage==="full")!.details;
+  const full={...snapshot,agents:snapshot.agents.map(a=>({...a,details:{...template,identity:a.details.identity}}))};
+  console.log("48-row local unbudgeted bytes="+Buffer.byteLength(JSON.stringify(full))+" published bytes="+Buffer.byteLength(response.body));
+  assert.ok(Buffer.byteLength(JSON.stringify(full))>128*1024);
+  assert.ok(snapshot.agents.some(a=>a.detailCoverage==="byte-budget"));
+  assert.equal(response.status,200);assert.equal(body.agents.length,48);assert.equal(body.total,48);
+  assert.ok(Buffer.byteLength(response.body)<=128*1024);
+  assert.ok(snapshot.agents.every(a=>Buffer.byteLength(a.details.identity.appThreadId.text!)===256));
+  assert.equal(full.agents.length,48);
+  // A real subscribed publisher was invoked by every detail update above.
+  m.changed();
+ }finally{await app.close();}
+});
 test("SSE client cap releases on disconnect and transports normalized snapshots only",async()=>{
   const m=initialized(),app=missionServer(m,1);await app.listen(0);const port=(app.server.address() as {port:number}).port;
   const opened=()=>new Promise<{req:ReturnType<typeof request>;body:string}>(resolve=>{
@@ -296,7 +343,10 @@ test("official detail events carry real metadata, deduplicate child roster and c
  let sequence=0;
  const event=(type:string,payload:unknown)=>({kind:"event",sequence:++sequence,event:{id:"event-"+sequence,threadId:"fixture-thread",occurredAt:stamp,type,payload}});
  const values=[
-  event("node.updated",node),event("provider-thread.updated",provider),event("subagent.updated",child),
+  event("node.updated",node),event("provider-thread.updated",{...provider,pendingBackgroundTasks:[...provider.pendingBackgroundTasks,{taskId:"scoped-native",kind:"subagent"}]}),event("subagent.updated",child),
+  event("provider-thread.updated",{...provider,id:"other-provider",updatedAt:"2026-10-17T23:59:59.000Z",nativeMetadata:{modelSelection:{instanceId:"private-provider",model:"gpt-6.1-sol",options:[{id:"reasoningEffort",value:"low"}]}},pendingBackgroundTasks:[{taskId:"scoped-native",kind:"subagent"}]}),
+  event("subagent.updated",{...child,id:"native-node",origin:"provider_native",providerThreadId:"provider",childThreadId:null,nativeTaskRef:{driver:"codex",nativeId:"scoped-native",strength:"strong"}}),
+  event("subagent.updated",{...child,id:"app-node",providerThreadId:"provider",childThreadId:null,nativeTaskRef:{driver:"codex",nativeId:"scoped-native",strength:"strong"}}),
   event("provider-turn.updated",turn),
   event("turn-item.updated",{...base,id:"command",type:"command_execution",status:"running",input:"go test -race ./...",output:"PRIVATE OUTPUT"}),
   event("turn-item.updated",{...base,id:"reasoning",type:"reasoning",status:"running",text:"HIDDEN REASONING",streaming:true}),
@@ -315,7 +365,7 @@ test("official detail events carry real metadata, deduplicate child roster and c
   const result=model.snapshot(),d=result.agents[0]!.details;
   assert.equal(d.effort.source,"reported");assert.equal(d.effort.value,"high");assert.equal(d.context!.used,500);
   assert.equal(d.usage.total,120);assert.equal(d.commands.length,0);assert.equal(d.assistant.text,"Latest public paragraph.");
-  assert.equal(result.agents[0]!.state,"thinking");assert.equal(d.work.children!.completed,1);assert.equal(d.work.children!.active,0);assert.equal(d.work.delegates!.completed,1);
+  assert.equal(result.agents[0]!.state,"thinking");assert.equal(d.work.children!.completed,1);assert.equal(d.work.children!.active,2);assert.equal(d.work.delegates!.active,1);assert.equal(d.work.subagents!.active,1);assert.equal(d.work.delegates!.completed,1);
   assert.equal(d.work.monitors,1);assert.equal(d.work.durableWaits,null);
   for(const forbidden of ["HIDDEN REASONING","PRIVATE OUTPUT","PRIVATE PROMPT","private-provider"])assert.equal(JSON.stringify(result).includes(forbidden),false);
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();http.close();}

@@ -12,6 +12,15 @@ function preview(raw:unknown,limit:number):void {
  check(p.text===null||!["withheld","not-reported"].includes(String(p.state)));
 }
 function idPreview(raw:unknown):void {const p=obj(raw);exact(p,["text","state"]);enums(p.state,["reported","truncated","withheld","not-reported"]);check(p.text===null?["withheld","not-reported"].includes(String(p.state)):typeof p.text==="string"&&Buffer.byteLength(p.text)<=256&&appThreadIdPreview(p.text).state!=="withheld"&&/^[A-Za-z0-9._:%/-]+$/.test(p.text));}
+/** Optional producer metadata can fail closed without freezing the base snapshot. */
+export function isolateDetail(value:Detail,at:number):WireDetail {
+ const identity={identity:value.identity,fieldCoverage:"identity-only" as const};
+ for(const candidate of [value.fieldCoverage==="identity-only"?identity:value,identity]){
+  try{return validateRich({v:2,resources:{state:"unavailable",sample:null},details:[{id:"row",value:candidate}],omitted:0},new Set(["row"]),at).details[0]!.value;}catch{}
+ }
+ const withheld={text:null,state:"withheld" as const};
+ return {identity:{title:withheld,appThreadId:withheld},fieldCoverage:"identity-only"};
+}
 export function validateRich(raw:unknown,ids:Set<string>,at:number):RichSnapshot {
  const r=obj(raw);exact(r,["v","resources","details","omitted"]);check(r.v===2&&integer(r.omitted)&&Array.isArray(r.details)&&r.details.length<=48);
  const resources=obj(r.resources);exact(resources,["state","sample"]);enums(resources.state,["reported","unavailable","byte-budget"]);

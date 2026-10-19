@@ -257,7 +257,7 @@ b, strong, .b { font-weight:600; }
 .agrid.c12 .tile .act { font-size:var(--t1); }
 .agrid.c12 .tile .tail div:nth-child(n+4) { display:none; }
 .agrid.c24 .tile .tail div:nth-child(n+2) { display:none; }
-.agrid.c24 .tile > header, .agrid.c48 .tile > header { display:none; }
+.agrid.c24 .tile > header, .agrid.c48 .tile > header { display:flex; }
 .tile .agrid-c24-only { display:none; }
 .agrid.c24 .tile .agrid-c24-only, .agrid.c48 .tile .agrid-c24-only { display:-webkit-box; }
 .agrid.c24 .tile .title, .agrid.c48 .tile .title { font-size:var(--t1); }

@@ -549,28 +549,41 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   const mainOwners=new Set<string>();
   const activeCommands=new Map<string,string|null>();
   const terminalRuns=new Set<string>();
-  const providers=new Map<string,{reported:unknown;context:Detail["context"];tasks:{id:string;child:string|null;kind:string}[]}>();
-  const children=new Map<string,{status:string;child:string|null;origin:string}>();
+  const nativeKey=(driver:string,instance:string,provider:string,task:string)=>JSON.stringify(["native",driver,instance,provider,task]);
+  const childKey=(id:string)=>JSON.stringify(["child",id]);
+  const providers=new Map<string,{owner:string;updatedAt:number;reported:unknown;context:Detail["context"];tasks:{keys:string[];kind:string}[]}>();
+  const children=new Map<string,{status:string;keys:string[];origin:string}>();
   const metadata=()=>{
-    const rows=[...providers.values()],latest=rows.at(-1),tasks=new Map(rows.flatMap(p=>p.tasks).map(t=>[t.child??t.id,t]));
+    const rows=[...providers.values()],latest=rows.toSorted((a,b)=>a.updatedAt-b.updatedAt).at(-1);
     const counts={active:0,queued:0,completed:0},delegates={...counts},subagents={...counts};
     const seen=new Set<string>();
-    for(const [id,c] of [...children].sort((a,b)=>Number(b[1].origin==="app_owned")-Number(a[1].origin==="app_owned"))){const key=c.child??id;if(seen.has(key))continue;seen.add(key);const state=c.status==="pending"?"queued":["running","waiting"].includes(c.status)?"active":c.status==="completed"?"completed":null;if(state){counts[state]++;(c.origin==="app_owned"?delegates:subagents)[state]++;}}
-    for(const [key,t] of tasks)if(t.kind==="subagent"&&!seen.has(key)){seen.add(key);counts.active++;subagents.active++;}
+    for(const c of [...children.values()].sort((a,b)=>Number(b.origin==="app_owned")-Number(a.origin==="app_owned"))){
+      const duplicate=c.keys.some(key=>seen.has(key));for(const key of c.keys)seen.add(key);if(duplicate)continue;
+      const state=c.status==="pending"?"queued":["running","waiting"].includes(c.status)?"active":c.status==="completed"?"completed":null;
+      if(state){counts[state]++;(c.origin==="app_owned"?delegates:subagents)[state]++;}
+    }
+    const tasks=rows.flatMap(p=>p.tasks),taskSeen=new Set<string>();let monitors=0,background=0;
+    for(const t of tasks){
+      const duplicate=t.keys.some(key=>taskSeen.has(key));for(const key of t.keys)taskSeen.add(key);if(duplicate)continue;
+      if(t.kind==="subagent"&&!t.keys.some(key=>seen.has(key))){for(const key of t.keys)seen.add(key);counts.active++;subagents.active++;}
+      if(t.kind==="monitor")monitors++;if(t.kind==="background_task")background++;
+    }
     onEvent({kind:"metadata",reported:latest?.reported,context:latest?.context??null,work:{
-      children:counts,delegates,subagents,monitors:tasks.size?[...tasks.values()].filter(t=>t.kind==="monitor").length:null,
-      background:tasks.size?[...tasks.values()].filter(t=>t.kind==="background_task").length:null,
+      children:counts,delegates,subagents,monitors:tasks.length?monitors:null,background:tasks.length?background:null,
       durableWaits:null,coverage:"observed bounded roster"}});
   };
   const provider=(p:OrchestrationV2ThreadProjection["providerThreads"][number])=>{
     if(p.appThreadId!==threadId||p.ownerNodeId===null||!mainOwners.has(p.ownerNodeId))return;
     if(!providers.has(p.id)&&providers.size>=16)return;
-    providers.delete(p.id);providers.set(p.id,{reported:p.nativeMetadata?.modelSelection,
+    providers.set(p.id,{owner:p.ownerNodeId,updatedAt:DateTime.toEpochMillis(p.updatedAt),reported:p.nativeMetadata?.modelSelection,
       context:p.contextUsage?{used:p.contextUsage.usedTokens,max:p.contextUsage.maxTokens??null}:null,
-      tasks:(p.pendingBackgroundTasks??[]).slice(0,128).map(t=>({id:p.id+"\0"+t.taskId,child:"childThreadId" in t?String(t.childThreadId):null,kind:t.kind}))});
+      tasks:(p.pendingBackgroundTasks??[]).slice(0,128).map(t=>({keys:[nativeKey(p.driver,p.providerInstanceId,p.id,t.taskId),...("childThreadId" in t&&t.childThreadId?[childKey(String(t.childThreadId))]:[])],kind:t.kind}))});
   };
   const child=(c:OrchestrationV2ThreadProjection["subagents"][number])=>{
-    if(children.has(c.id)||children.size<128)children.set(c.id,{status:c.status,child:c.childThreadId,origin:c.origin});
+    const scope=c.providerThreadId??[...providers].find(([,p])=>p.owner===c.parentNodeId)?.[0];
+    const ref=c.nativeTaskRef;
+    const keys=[...(c.childThreadId?[childKey(c.childThreadId)]:[]),...(scope&&ref?.nativeId&&ref.strength!=="none"?[nativeKey(ref.driver,c.providerInstanceId,scope,ref.nativeId)]:[])];
+    if(children.has(c.id)||children.size<128)children.set(c.id,{status:c.status,keys:keys.length?keys:[JSON.stringify(["node",c.id])],origin:c.origin});
   };
   const turn=(t:OrchestrationV2ThreadProjection["providerTurns"][number],stamp:number)=>{
     // Normalized per-turn main-agent totals are independent of live context counters.
@@ -651,12 +664,15 @@ export async function connectShell(options: ConnectOptions, subscription: ShellS
           const resources=yield* client["server.getHostResources"]({}).pipe(
             Effect.timeout("3 seconds"),
             Effect.map(sample=>({state:"reported" as const,sample})),
-            Effect.catch(()=>Effect.succeed({state:"unavailable" as const,sample:null})));
+            Effect.catchCause(()=>Effect.succeed({state:"unavailable" as const,sample:null})));
           subscription.onResources!(resources);
           yield* Effect.sleep("5 seconds");
         }
       });
-      return Effect.raceFirst(shell,sample);
+      return Effect.raceFirst(shell,sample.pipe(Effect.catchCause(()=>Effect.gen(function*(){
+        yield* Effect.sync(()=>subscription.onResources!({state:"unavailable",sample:null})).pipe(Effect.catchCause(()=>Effect.void));
+        yield* Effect.never;
+      }))));
     });
   } catch (error) {
     // Callback failures include switch RPC protocol/configuration failures.

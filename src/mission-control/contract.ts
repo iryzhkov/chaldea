@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { validateRich, type RichSnapshot } from "./detail-contract.ts";
+import { validateRich, isolateDetail, type RichSnapshot } from "./detail-contract.ts";
 import type { MissionModel } from "./model.ts";
 export const SNAPSHOT_SCHEMA = "mission-control.host.v1", SNAPSHOT_BYTES = 8192;
 export const HOSTS = ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"] as const;
@@ -61,13 +61,15 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
   snapshot.rich=rich;
   if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
   else {
-    rich.resources=v.resources;
+    try{rich.resources=validateRich({v:2,resources:v.resources,details:[],omitted:0},new Set(),observedAt).resources;}
+    catch{rich.resources={state:"unavailable",sample:null};}
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.resources={state:"byte-budget",sample:null};
     for(let i=0;i<snapshot.agents.length;i++){
-      const row={id:snapshot.agents[i]!.id,value:{identity:v.agents[i]!.details.identity,fieldCoverage:"identity-only" as const}};rich.details.push(row);rich.omitted--;
+      const safe=isolateDetail(v.agents[i]!.details,observedAt);
+      const row={id:snapshot.agents[i]!.id,value:{identity:safe.identity,fieldCoverage:"identity-only" as const}};rich.details.push(row);rich.omitted--;
       if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES){rich.details.pop();rich.omitted++;}
     }
-    for(const row of rich.details){const i=snapshot.agents.findIndex(a=>a.id===row.id),identity=row.value;row.value=v.agents[i]!.details;
+    for(const row of rich.details){const i=snapshot.agents.findIndex(a=>a.id===row.id),identity=row.value;row.value=isolateDetail(v.agents[i]!.details,observedAt);
       if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)row.value=identity;
     }
   }

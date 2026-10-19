@@ -158,17 +158,22 @@ test("a protocol failure inside the shell callback retains its fail-closed class
   }
 });
 
-for(const denied of [false,true])test("host resources share the shell connection; denial preserves thread capture, denied="+denied,async()=>{
+for(const denied of ["success","typed","die","decode"])test("host resources share the shell connection; denial preserves thread capture, denied="+denied,async()=>{
  const server=createServer(),wss=new WebSocketServer({server}),controller=new AbortController();
  const sample={sampledAt:1000,cpuUtilization:0.2,cpuCount:8,availableMemoryBytes:400,totalMemoryBytes:1000};
- let connections=0,synchronized=false,resources:any=null;
+ let connections=0,synchronized=false,resources:any=null,shellRequestId:string|null=null;
  const requests:string[]=[];
  const finish=()=>{if(synchronized&&resources)controller.abort();};
  wss.on("connection",socket=>{connections++;socket.on("message",data=>{
   const req=JSON.parse(String(data));if(req._tag==="Ping"){socket.send(JSON.stringify({_tag:"Pong"}));return;}if(req._tag!=="Request")return;
   requests.push(req.tag);
-  if(req.tag==="orchestration.subscribeShell")socket.send(JSON.stringify({_tag:"Chunk",requestId:req.id,values:[{kind:"synchronized"}]}));
-  else if(req.tag==="server.getHostResources")socket.send(JSON.stringify({_tag:"Exit",requestId:req.id,exit:denied?{_tag:"Failure",cause:[{_tag:"Fail",error:{_tag:"EnvironmentAuthorizationError",message:"fixture denied",requiredScope:"orchestration:read"}}]}:{_tag:"Success",value:sample}}));
+  if(req.tag==="orchestration.subscribeShell")shellRequestId=req.id;
+  else if(req.tag==="server.getHostResources"){
+   const exit=denied==="typed"?{_tag:"Failure",cause:[{_tag:"Fail",error:{_tag:"EnvironmentAuthorizationError",message:"fixture denied",requiredScope:"orchestration:read"}}]}:denied==="die"?{_tag:"Failure",cause:[{_tag:"Die",defect:{message:"unsupported RPC"}}]}:{_tag:"Success",value:denied==="decode"?{invalid:true}:sample};
+   socket.send(JSON.stringify({_tag:"Exit",requestId:req.id,exit}));
+   // The shell must still deliver after the failed optional sample.
+   setTimeout(()=>{if(shellRequestId)socket.send(JSON.stringify({_tag:"Chunk",requestId:shellRequestId,values:[{kind:"synchronized"}]}));},30);
+  }
  });});
  const timer=setTimeout(()=>controller.abort(),4000);
  try{
@@ -177,8 +182,8 @@ for(const denied of [false,true])test("host resources share the shell connection
    onEvent:e=>{if(e.kind==="synchronized"){synchronized=true;finish();}},
    onResources:r=>{resources=r;finish();}
   }));
-  assert.equal(connections,1);assert.equal(synchronized,true);assert.equal(resources.state,denied?"unavailable":"reported");
-  assert.deepEqual(resources.sample,denied?null:sample);
+  assert.equal(connections,1);assert.equal(synchronized,true);assert.equal(resources.state,denied==="success"?"reported":"unavailable");
+  assert.deepEqual(resources.sample,denied==="success"?sample:null);
   assert.deepEqual(new Set(requests),new Set(["orchestration.subscribeShell","server.getHostResources"]));
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
 });

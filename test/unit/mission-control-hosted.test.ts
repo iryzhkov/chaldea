@@ -348,6 +348,31 @@ test("rich capture crosses ordinary collector/cache with resources, privacy, usa
   assert.equal(denied.agents.length,1);assert.equal(denied.rich!.resources.state,"unavailable");
  }finally{d.close();}
 });
+test("optional privacy and malformed detail cannot freeze base capture",()=>{
+ let now=now0;const m=live(()=>now);
+ for(const text of ["Bearer\u200bXYZ","api\u001ckey","Bearer\u202eXYZ","api\tkey"]){
+  m.shell({kind:"thread",sequence:m.cursor()!+1,thread:{...row(),title:text}});
+  m.detail("private-thread",{kind:"assistant",text,at:now});
+  const s=captureSnapshot(m,"agent-a",epoch,1)!;validateHostSnapshot(s);
+  const d=s.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+  assert.equal(s.agents.length,1);assert.equal(d.identity.title.state,"withheld");assert.equal(d.assistant.state,"withheld");
+ }
+ m.shell({kind:"thread",sequence:m.cursor()!+1,thread:{...row(),title:"Safe title"}});
+ m.detail("private-thread",{kind:"command",id:"long",input:"git "+Array(12).fill("--porcelain").join(" "),running:true});
+ let s=captureSnapshot(m,"agent-a",epoch,2)!;validateHostSnapshot(s);
+ const d=s.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+ assert.equal(d.commands[0]!.state,"truncated");assert.ok(Buffer.byteLength(d.commands[0]!.text!)<=128);
+ m.detail("private-thread",{kind:"turn-usage",id:"bad-optional",at:now,usage:{usageScope:"main_agent",usageStatus:"complete",inputTokens:1,outputTokens:1,reasoningTokens:99,hasSubagents:false}});
+ s=captureSnapshot(m,"agent-a",epoch,3)!;validateHostSnapshot(s);
+ assert.equal(s.agents.length,1);assert.equal(s.rich!.details[0]!.value.fieldCoverage,"identity-only");
+ m.disconnected();now+=1000;
+ m.setResources({state:"reported",sample:{sampledAt:now,cpuUtilization:0.2,cpuCount:8,availableMemoryBytes:400,totalMemoryBytes:1000}});
+ s=captureSnapshot(m,"agent-a",epoch,4)!;validateHostSnapshot(s);
+ assert.equal(s.agents.length,1);assert.equal(s.rich!.resources.state,"unavailable");
+ const blank=live();blank.detail("private-thread",{kind:"assistant",text:"\u200b\u001c",at:now0});
+ const empty=captureSnapshot(blank,"agent-a",epoch,5)!;validateHostSnapshot(empty);
+ assert.equal((empty.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail).assistant.text,null);
+});
 test("rich detail byte budget preserves base rows and legacy validation",()=>{
  const rows=Array.from({length:48},(_,i)=>row("thread-"+i)),m=live(()=>now0,rows);
  for(const r of rows)m.detail(r.id,{kind:"assistant",text:"🧪 ".repeat(300),at:now0});

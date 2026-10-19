@@ -8,12 +8,16 @@ export type Work = {active:number;queued:number;completed:number};
 export type Detail = {identity:{title:Preview;appThreadId:Preview};fieldCoverage:"full"|"identity-only";activity:"thinking"|"working"|null;assistant:Preview;commands:Preview[];commandsOmitted:number;effort:Effort;usage:Usage;context:{used:number;max:number|null}|null;work:{children:Work|null;delegates:Work|null;subagents:Work|null;monitors:number|null;background:number|null;durableWaits:null;coverage:"observed bounded roster"|"not-reported"}};
 export const integer=(n:unknown):n is number=>typeof n==="number"&&Number.isSafeInteger(n)&&n>=0;
 export function utf8(text:string,max:number):string {let result="";for(const c of text){if(Buffer.byteLength(result+c)>max)break;result+=c;}return result;}
+const normalize=(text:string)=>text.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g," ");
 const suspicious=/(?:bearer\s|password|passwd|secret|credential|api[ _-]?key|access[ _-]?token|refresh[ _-]?token|sk-[\w-]+|gh[pousr]_[\w]+|-----BEGIN|[A-Za-z0-9_+\/-]{32,}={0,2}|[\w.+-]+@[\w.-]+|https?:\/\/[^\s]*[@?])/i;
 export function assistantPreview(value:unknown):Preview {
   if(typeof value!=="string"||!value.trim())return {text:null,state:"not-reported"};
   // Inspect the entire bounded source input before extracting the paragraph.
-  if(Buffer.byteLength(value)>65536||suspicious.test(value))return {text:null,state:"withheld"};
-  const paragraph=value.trim().split(/\n\s*\n/).filter(s=>s.trim()).at(-1)!.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g," ").trim();
+  if(Buffer.byteLength(value)>65536)return {text:null,state:"withheld"};
+  const normalized=normalize(value);
+  if(!normalized.trim())return {text:null,state:"not-reported"};
+  if(suspicious.test(normalized.replace(/[\t\n\r]/g," ")))return {text:null,state:"withheld"};
+  const paragraph=normalized.trim().split(/\n\s*\n/).filter(s=>s.trim()).at(-1)!.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g," ").trim();
   const text=utf8(paragraph,384);return {text,state:text===paragraph?"reported":"truncated"};
 }
 const commands=new Set(["git","go","npm","node","python","python3","pytest","rg","make","tsc","chaldea","jocasta","cargo"]);
@@ -25,12 +29,14 @@ export function commandPreview(value:unknown):Preview {
   const args=value.trim().split(/\s+/),name=args.shift()!;
   if(!commands.has(name))return {text:null,state:"withheld"};
   const shown=args.map(a=>safeArgs.has(a)?a:"…").filter((a,i,aAll)=>a!=="…"||aAll[i-1]!=="…").slice(0,12);
-  return {text:utf8([name,...shown].join(" "),128),state:args.some(a=>!safeArgs.has(a))?"redacted":"reported"};
+  let text=name,kept=0;
+  for(const arg of shown){if(Buffer.byteLength(text+" "+arg)>128)break;text+=" "+arg;kept++;}
+  return {text,state:kept<args.length?"truncated":args.some(a=>!safeArgs.has(a))?"redacted":"reported"};
 }
 export function titlePreview(value:unknown):Preview {
   if(typeof value!=="string"||!value.trim())return {text:null,state:"not-reported"};
-  if(suspicious.test(value)||/(?:\/|\\)[\w.~]/.test(value))return {text:null,state:"withheld"};
-  const clean=value.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/g," ").trim(),text=utf8(clean,160);
+  if(suspicious.test(normalize(value).replace(/[\t\n\r]/g," "))||/(?:\/|\\)[\w.~]/.test(value))return {text:null,state:"withheld"};
+  const clean=normalize(value).replace(/[\t\n\r]/g," ").trim(),text=utf8(clean,160);
   return {text,state:text.length<clean.length?"truncated":clean===value?"reported":"redacted"};
 }
 export function appThreadIdPreview(value:unknown):Preview {

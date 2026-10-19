@@ -1,6 +1,7 @@
 // Browser DTOs are constructed here. Raw source objects never cross this interface.
 import type { ShellEvent, ShellThread, MissionDetailEvent } from "../t3/adapter.ts";
-import { ThreadDetails, aggregateDetails, validResources, titlePreview, appThreadIdPreview, type Resources } from "./details.ts";
+import { ThreadDetails, aggregateDetails, validResources, titlePreview, appThreadIdPreview, type Resources, emptyDetail } from "./details.ts";
+import { isolateDetail } from "./detail-contract.ts";
 import type { HeadroomState, Metric } from "../quota/headroom.ts";
 export const MAX_AGENTS = 48, MAX_TURNS = 512, MAX_SAMPLES = 4096;
 const tools = new Set(["read","search","navigate","edit_apply","change_plan","verify_run","chaldea exec","t3_thread_read","t3_thread_list","jocasta","watch_pull_request","html_preview","delegate_task","chaldea_decision_prepare"]);
@@ -79,9 +80,11 @@ export class MissionModel {
       const selected = rows.toSorted((a,b) => (a.latestRunStartedAt ?? "").localeCompare(b.latestRunStartedAt ?? "") || a.id.localeCompare(b.id)).slice(0, MAX_AGENTS);
       const previous = this.threads; this.threads = new Map();
       for (const row of selected) this.threads.set(row.id, { connected: false, detailObserved: null, steps: [], ...previous.get(row.id), row, observed: now });
+      for (const id of this.detailStates.keys()) if (!this.threads.has(id)) this.detailStates.delete(id);
     } else if (event.kind === "thread") {
       const row = event.thread;
       if (row.archived || row.deleted || row.settled) {
+        this.detailStates.delete(row.id);
         if (this.threads.delete(row.id)) this.total = Math.max(0, this.total - 1);
         else if (this.total > this.threads.size) this.coverageExact = false;
       }
@@ -94,6 +97,7 @@ export class MissionModel {
         }
       }
     } else if (event.kind === "removed") {
+      this.detailStates.delete(event.threadId);
       if (this.threads.delete(event.threadId)) this.total = Math.max(0, this.total - 1);
       else if (this.total > this.threads.size) this.coverageExact = false;
     }
@@ -167,7 +171,7 @@ export class MissionModel {
         unlimited: p.credits.value?.unlimited ?? null, manualResets: count(p.manualResets.value?.availableCount) ? p.manualResets.value.availableCount : null });
     }
     const agents = [...this.threads.values()].map((t,i) => {
-      const details={...(this.detailStates.get(t.row.id)??new ThreadDetails()).snapshot(t.row.modelSelection,now,t.connected&&this.connected),identity:{title:titlePreview(t.row.title),appThreadId:appThreadIdPreview(t.row.id)}};
+      const details={...emptyDetail(),...isolateDetail({...(this.detailStates.get(t.row.id)??new ThreadDetails()).snapshot(t.row.modelSelection,now,t.connected&&this.connected),identity:{title:titlePreview(t.row.title),appThreadId:appThreadIdPreview(t.row.id)}},now)};
       return ({
       id: "agent-" + i, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
       host: "omarchy-pc", state:threadState(t.row,details),
@@ -178,7 +182,7 @@ export class MissionModel {
       details,
     });});
     const usageConnected = agents.length > 0 && [...this.threads.values()].every(t => t.connected);
-    return { version: 1, demo: this.demo, now, source: { state: freshness(this.connected, this.observed, 30_000, 300_000), observedAt: this.observed },
+    const result={ version: 1, demo: this.demo, now, source: { state: freshness(this.connected, this.observed, 30_000, 300_000), observedAt: this.observed },
       hostSummary: [{...summarizeHost("omarchy-pc",agents,this.coverageExact?this.total:null,!this.coverageExact||this.total>agents.length,this.observed,freshness(this.connected,this.observed,30_000,300_000),this.observed===null?null:this.connected),resources:this.resources,details:aggregateDetails(agents.map(a=>a.details),agents.length)}] as HostSummary[],
       resources:this.resources,
       agents, shown: agents.length, total: this.coverageExact ? this.total : null, truncated: !this.coverageExact || this.total > agents.length,
@@ -188,5 +192,12 @@ export class MissionModel {
         scope: this.accountingPartial ? "Partial accounting: known lower bound after bounded counter eviction. Uncertain returning counters establish new baselines. Daily reconciliation unavailable." : "Observed deltas since this process started; 48-thread cap. Daily reconciliation unavailable." },
       quota: { state: this.quotaError ? "error" : this.quota === null ? "unknown" : "cached", accounts },
       unavailable: ["Events","Ops","Lab","host health","exec slots","cost","daily totals"] };
+    // Keep every admitted base row; shed optional detail in reverse display order.
+    for(const a of [...agents].reverse()){
+      if(Buffer.byteLength(JSON.stringify(result))<=128*1024)break;
+      a.details={...emptyDetail(),identity:a.details.identity,fieldCoverage:"identity-only"};
+      a.detailCoverage="byte-budget";
+    }
+    return result;
   }
 }
