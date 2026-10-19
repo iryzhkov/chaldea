@@ -24,6 +24,26 @@ function live(clock=()=>now0,rows=[row()]){const m=new MissionModel(false,clock)
 const sample=(sequence=1,now=now0)=>{const s=captureSnapshot(live(()=>now),"agent-a",epoch,sequence)!;delete s.rich;return s;};
 
 
+test("operations validates source check time at response receipt and still rejects future data",async()=>{
+  const {refreshOperations}=await import("../../src/mission-control/reader.ts");
+  const {emptyOperations}=await import("../../src/mission-control/contract.ts");
+  const config:import("../../src/mission-control/reader.ts").ReaderConfig={url:"https://akasha.example",tokenHelper:"/helper",source:"mission-control-reader",host:"omarchy-normandy",profile:"mission-control-reader",project:"chaldea",allowedSourceIds:["agent-a--mission-control"],cacheFile:"/cache",refreshMs:5000,operationsEnabled:true};
+  let clock=now0;
+  const fetchPage=(extra:number):typeof fetch=>(async()=>{
+    clock=now0+1000;
+    const page=emptyOperations();
+    page.events={...page.events,state:"cached",checkedAt:clock+extra};
+    page.ops.dailyHealth={...page.ops.dailyHealth,state:"cached",checkedAt:clock+extra};
+    return new Response(JSON.stringify(page));
+  }) as typeof fetch;
+  const received=await refreshOperations(config,emptyCache(),{now:()=>clock,token:async()=>"unused",fetch:fetchPage(0)});
+  assert.equal(received.events.state,"cached");assert.equal(received.events.checkedAt,now0+1000);
+  assert.equal(received.ops.dailyHealth.state,"cached");
+  clock=now0;
+  const future=await refreshOperations(config,emptyCache(),{now:()=>clock,token:async()=>"unused",fetch:fetchPage(1000)});
+  assert.equal(future.events.state,"error");assert.equal(future.ops.dailyHealth.state,"error");
+});
+
 for(const existingSlot of [false,true])test("R1 full4096page status admission cannot starve100 protected ordinary deliveries, existingSlot="+existingSlot,async()=>{
   const d=scratch(),o=new Outbox(join(d.path,"full.db"));
   try{

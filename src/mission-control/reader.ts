@@ -61,9 +61,10 @@ export async function refreshOperations(c:ReaderConfig,previous:StatusCache,depe
       const url=new URL("/api/v1/events",c.url);url.searchParams.set("mission_control_operations",kind);url.searchParams.set("window","48h");url.searchParams.set("limit","16");
       const response=await(dependencies.fetch??fetch)(url,{redirect:"error",headers:{authorization:"Bearer "+token},signal:AbortSignal.timeout(5000)});
       if(!response.ok){await response.body?.cancel();throw new Error("operations_unavailable");}
-      const page=validateOperations(await responseJson(response,64*1024),now);
+      const raw=await responseJson(response,64*1024),receivedNow=(dependencies.now??Date.now)();
+      const page=validateOperations(raw,receivedNow);
       const selected=kind==="job_finished"?page.events:page.ops.dailyHealth;
-      if(selected.state!=="cached"||selected.checkedAt===null||now-selected.checkedAt>60_000)throw new Error("invalid_operation_check");
+      if(selected.state!=="cached"||selected.checkedAt===null||receivedNow-selected.checkedAt>60_000)throw new Error("invalid_operation_check");
       if(kind==="job_finished")next.events=page.events;else next.ops.dailyHealth=page.ops.dailyHealth;
     }catch{if(kind==="job_finished"){next.events.state="error";next.events.checkedAt=now;}else{next.ops.dailyHealth.state="error";next.ops.dailyHealth.checkedAt=now;}}
   }));
