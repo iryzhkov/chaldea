@@ -1,0 +1,124 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { newProvider } from "../../src/quota/headroom.ts";
+import type { Metric, ProviderHeadroom, Window } from "../../src/quota/headroom.ts";
+import { classifyCapacity, DEFAULT_CAPACITY } from "../../src/quota/capacity.ts";
+import { recommend } from "../../src/route/policy.ts";
+import type { RouteInput } from "../../src/route/types.ts";
+import { catalog, now, iso } from "../fixtures/route/catalog.ts";
+import { liveCodex } from "../fixtures/route/live-policy.ts";
+
+// Sanitized shape of the 2026-10-19 omarchy-pc cache: included weekly quota exhausted,
+// ordinaryUsageAllowed=false, about 59k fresh credits, spend control not reached,
+// an asserted HOME binding and an account hash. No native account ID is used.
+const metric = <T>(value: T, at = now): Metric<T> => ({ value, observedAt: iso(at), state: "fresh", error: null, source: "codex-app-server" });
+const weekly = (remaining: number, timeLeft = .4): Window => ({ id: "primary", kind: "weekly", usedPercent: 100 - remaining,
+  remainingPercent: remaining, windowDurationMins: 10080, resetsAt: iso(now + timeLeft * 7 * 86400000) });
+const session = (remaining: number): Window => ({ id: "5h", kind: "session", usedPercent: 100 - remaining,
+  remainingPercent: remaining, windowDurationMins: 300, resetsAt: iso(now + 3600000) });
+function fundedCodex(): ProviderHeadroom {
+  const p = liveCodex();
+  p.accountKey = "a".repeat(64);
+  p.binding = "asserted";
+  p.credits = metric({ balance: "59012.25", hasCredits: true, unlimited: false });
+  p.included = metric([weekly(0)]);
+  p.ordinaryUsageAllowed = metric(false);
+  p.spendControlReached = metric(false);
+  return p;
+}
+/** Claude weekly quota trending to run out before its reset: 30% left with 40% of the week left. */
+function pacedClaude(): ProviderHeadroom {
+  const p = newProvider("claudeAgent", "claudeAgent");
+  p.accountKey = "b".repeat(64);
+  p.included = { ...metric([weekly(30)]), source: "t3" };
+  p.burnHistory = [{ observedAt: iso(now - 3600000), windows: [{ ...weekly(31), remainingPercent: 31, usedPercent: 69 }] }];
+  return p;
+}
+function route(codex: ProviderHeadroom, input: RouteInput, stops: { codex?: boolean; claudeAgent?: boolean } = {}) {
+  const rows = [codex, pacedClaude()];
+  const capacity = Object.fromEntries(rows.map(p => [p.alias, classifyCapacity(p, stops[p.alias as "codex"] ?? false, now)]));
+  const quota = Object.fromEntries(rows.map(p => [p.alias, { observedAt: p.included.observedAt,
+    windows: p.included.value ?? [], activeStop: stops[p.alias as "codex"] ?? false }]));
+  return recommend(input, { catalog, now, quota, analytics: null, capacity });
+}
+
+test("observed funded Codex: exhausted included quota and ordinary denial still classify credits as unlimited", () => {
+  const c = classifyCapacity(fundedCodex(), false, now);
+  assert.equal(c.class, "unlimited");
+  assert.equal(c.creditFunded, true);
+  assert.equal(c.burnTargetPerHour, null);
+  assert.match(c.reasons.join("; "), /credit-funded lane/);
+  assert.equal(classifyCapacity(pacedClaude(), false, now).class, "paced");
+  const expiring = fundedCodex(); expiring.creditExpiresAt = iso(now + 3600000);
+  assert.equal(classifyCapacity(expiring, false, now).class, "use-it");
+  const included = fundedCodex(); included.ordinaryUsageAllowed = metric(true);
+  assert.equal(classifyCapacity(included, false, now).creditFunded, true, "funding does not depend on the included lane");
+});
+
+test("funded Codex outranks paced Claude for builder and general; review separation still applies", () => {
+  for (const [role, effort] of [["builder", "high"], ["general", "medium"]] as const) {
+    const r = route(fundedCodex(), { role });
+    assert.equal(r.providerInstanceId, "codex", role);
+    assert.equal(r.model, "gpt-6.1-sol", role);
+    assert.deepEqual(r.options, { reasoningEffort: effort }, role);
+    assert.equal(r.alternatives[0]?.providerInstanceId, "claudeAgent", role);
+  }
+  const codexAuthor = route(fundedCodex(), { role: "builder", authorProvider: "codex" });
+  assert.equal(codexAuthor.providerInstanceId, "claudeAgent");
+  assert.equal(codexAuthor.model, "claude-opus-5-5");
+  const claudeAuthor = route(fundedCodex(), { role: "builder", authorProvider: "claudeAgent" });
+  assert.equal(claudeAuthor.providerInstanceId, "codex");
+  assert.equal(claudeAuthor.model, "gpt-6.1-sol");
+  // Bans and the catalog effort/model floor still apply to the funded provider.
+  assert.equal(recommend({ role: "builder" }, { catalog, now, analytics: null, config: { bans: ["*sonnet*", "gpt-6.1-sol"] },
+    quota: {}, capacity: { codex: classifyCapacity(fundedCodex(), false, now) } }).providerInstanceId, "claudeAgent");
+});
+
+test("unproven credit funding fails closed while the included lane is denied", () => {
+  const cases: Array<[string, (p: ProviderHeadroom) => void]> = [
+    ["spend control reached", p => { p.spendControlReached = metric(true); }],
+    ["spend control unknown", p => { p.spendControlReached = newProvider("codex", "codex").spendControlReached; }],
+    ["spend control errored", p => { p.spendControlReached = { ...p.spendControlReached, state: "error", error: "read_failed" }; }],
+    ["spend control stale", p => { p.spendControlReached = metric(false, now - DEFAULT_CAPACITY.maxAgeMs); }],
+    ["credits stale", p => { p.credits = metric(p.credits.value!, now - DEFAULT_CAPACITY.maxAgeMs); }],
+    ["credits expired", p => { p.creditExpiresAt = iso(now); }],
+    ["credits missing", p => { p.credits = newProvider("codex", "codex").credits; }],
+    ["zero wallet", p => { p.credits = metric({ balance: "0", hasCredits: false, unlimited: false }); }],
+    ["zero balance flagged available", p => { p.credits = metric({ balance: "0", hasCredits: true, unlimited: false }); }],
+    ["unknown balance", p => { p.credits = { ...metric({ balance: null, hasCredits: true, unlimited: false }), state: "unknown" }; }],
+    ["no account binding", p => { delete p.accountKey; }],
+  ];
+  for (const [name, change] of cases) {
+    const p = fundedCodex(); change(p);
+    const c = classifyCapacity(p, false, now);
+    assert.equal(c.class, "tight", name);
+    assert.equal(c.creditFunded, undefined, name);
+    assert.match(c.reasons.join("; "), /ordinary included usage not allowed/, name);
+    assert.equal(route(p, { role: "builder" }).providerInstanceId, "claudeAgent", name);
+    assert.equal(route(p, { role: "general" }).providerInstanceId, "claudeAgent", name);
+  }
+  // With the included lane open, a reached spend control means credits add nothing; exhausted quota stays tight.
+  const p = fundedCodex(); p.ordinaryUsageAllowed = metric(true); p.spendControlReached = metric(true);
+  const c = classifyCapacity(p, false, now);
+  assert.equal(c.class, "tight"); assert.match(c.reasons.join("; "), /spend control reached/);
+});
+
+test("active usage stops stay stopped; included short-window gates do not gate the proven paid lane", () => {
+  assert.equal(classifyCapacity(fundedCodex(), true, now).class, "stopped");
+  assert.equal(route(fundedCodex(), { role: "builder" }, { codex: true }).providerInstanceId, "claudeAgent");
+  assert.throws(() => route(fundedCodex(), { role: "builder", authorProvider: "claudeAgent" }, { codex: true }), /No eligible/);
+  for (const left of [0, 5]) {
+    const funded = fundedCodex(); funded.included = metric([weekly(0), session(left)]);
+    const c = classifyCapacity(funded, false, now);
+    assert.equal(c.class, "unlimited", String(left)); assert.equal(c.creditFunded, true);
+    const r = route(funded, { role: "builder" });
+    assert.equal(r.providerInstanceId, "codex", String(left));
+    assert.match(r.reasons.join("; "), /included short window .* does not gate the credit-funded lane/);
+    assert.equal(route(funded, { role: "builder" }, { codex: true }).providerInstanceId, "claudeAgent");
+    // Without proven funding the short included gate still excludes Codex, as before.
+    const advisory = fundedCodex(); advisory.included = funded.included;
+    advisory.ordinaryUsageAllowed = metric(true); advisory.spendControlReached = newProvider("codex", "codex").spendControlReached;
+    assert.equal(classifyCapacity(advisory, false, now).class, left === 0 ? "stopped" : "tight");
+    assert.equal(route(advisory, { role: "builder" }).providerInstanceId, "claudeAgent");
+  }
+});
