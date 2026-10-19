@@ -4,7 +4,7 @@
   const Q = new URLSearchParams(location.search);
   const MODES = ['overview','agents','agent-summary','fleet','tokens','quota','events','ops','lab'];
   const MORE = new Set(['ops','lab']);
-  const LABEL = { overview:'Overview', agents:'Live threads', 'agent-summary':'Agent summary', fleet:'Fleet', tokens:'Tokens', quota:'Quota', events:'Events', ops:'Ops', lab:'Lab' };
+  const LABEL = { overview:'Overview', agents:'Live threads', 'agent-summary':'Host overview', fleet:'Fleet', tokens:'Tokens', quota:'Quota', events:'Events', ops:'Ops', lab:'Lab' };
   const DWELL = { overview:30, agents:20, 'agent-summary':20, fleet:20, tokens:20, quota:20, events:20, ops:15, lab:15 };
   const CONSOLE = { kpi:'FLIGHT', inbox:'FD', threads:'CAPCOM', hosts:'EECOM', quota:'FAO', events:'PAO', summary:'FLIGHT', config:'EECOM', rollouts:'BOOSTER', trust:'INCO', timers:'BOOSTER', expiring:'FAO', thero:'EECOM', models:'GNC', hourly:'FIDO', acct:'FAO', ecount:'PAO', timeline:'PAO', einbox:'FD', waits:'FD', incidents:'SURGEON', prs:'GUIDO', backups:'EECOM', health:'SURGEON', tasks:'CAPCOM', routing:'GNC', board:'RETRO', eval:'GNC', huyang:'GUIDO', audit:'FLIGHT' };
   const GLYPH = { working:'●', 'waiting-igor':'◆', 'waiting-ci':'◐', failed:'✕', idle:'○', merge:'⑂', deploy:'▲', alert:'!', canary:'◐', decision:'?', 'use-it':'▲', unlimited:'∞', paced:'●', tight:'◆', stopped:'✕', unknown:'?', ok:'●', warn:'◆', fail:'✕', up:'●', down:'✕', late:'◆', none:'—' };
@@ -78,7 +78,7 @@
   };
   const compact = n => n >= 1e6 ? (n/1e6).toFixed(1) + 'M' : n >= 1e3 ? (n/1e3).toFixed(n >= 1e4 ? 0 : 1) + 'K' : String(n);
   const sev = (pct, w = 80, f = 95) => pct == null ? 'nosrc' : pct >= f ? 'fail' : pct >= w ? 'warn' : '';
-  const FRESH_WORD = { live:'observed', stale:'stale', lost:'no data', nosource:'no source', asleep:'asleep', unsupported:'not applicable' };
+  const FRESH_WORD = { disconnected:'disconnected', live:'observed', stale:'stale', lost:'no data', nosource:'no source', asleep:'asleep', unsupported:'not applicable' };
   const panel = (area, title, body, kind, age, explicit, extra = '') => { const f = freshOf(kind, age, explicit);
     const chip = f === 'live' ? ago(age) : f === 'stale' ? 'stale ' + ago(age) : f === 'lost' ? 'no data ' + ago(age) : FRESH_WORD[f];
     const note = f === 'stale' ? `<div class="lastknown">Last observed ${ago(age)} ago · values are last known · source ${SOURCES[kind].label}</div>` : f === 'lost' ? `<div class="lastknown">No data for ${ago(age)} · last known values · source ${SOURCES[kind].label}</div>` : '';
@@ -142,14 +142,26 @@
       + panel('hosts', 'Hosts · exec slots', hosts, 'exec', 4) + panel('quota', 'Quota', quota, 'quota', 252) + panel('events', 'Latest events', events, 'feed', 48);
   };
 
-  // Agents: count-based density. Tiers 1 / 4 / 12 / 24 / 48, page beyond 48 (8 per page in portrait).
+  // Live thread density follows the available CSS viewport and a bounded URL preference.
   const agentSet = () => { const n = DATA.demo ? parseInt(Q.get('agents'), 10) : 0; if (!n) return DATA.threads; const pool = DATA.agentPool; return Array.from({ length: Math.max(1, Math.min(480, n)) }, (_, i) => ({ ...pool[i % pool.length], id: 'a' + i, title: pool[i % pool.length].title + (i >= pool.length ? ' (' + (Math.floor(i / pool.length) + 1) + ')' : '') })); };
-  const tierOf = n => n <= 1 ? 1 : n <= 4 ? 4 : n <= 12 ? 12 : n <= 24 ? 24 : 48;
+  const GRID_CHOICES = ['auto','2x2','3x3','4x3','5x3','6x4','8x6'];
+  const gridPreference = () => { const v = new URLSearchParams(location.search).get('grid'); return GRID_CHOICES.includes(v) ? v : 'auto'; };
+  const gridFit = () => {
+    const rect = view.getBoundingClientRect(), summary = view.querySelector('.p-summary');
+    const width = Math.min(rect.width || innerWidth, innerWidth);
+    const height = Math.min(rect.height || innerHeight, innerHeight - Math.max(0, rect.top));
+    const room = Math.max(0, height - (summary?.getBoundingClientRect().height || 160) - 12);
+    const maxCols = Math.max(1, Math.min(8, Math.floor((width + 12) / 312)));
+    const maxRows = Math.max(1, Math.min(6, Math.floor((room + 12) / 242)));
+    const pref = gridPreference(), requested = pref === 'auto' ? [maxCols,maxRows] : pref.split('x').map(Number);
+    const cols = Math.min(requested[0], maxCols), rows = Math.min(requested[1], maxRows);
+    return { pref, cols, rows, per: Math.min(48, cols * rows), maxCols, maxRows };
+  };
   let agentPage = 0;
   R.agents = () => {
     const incoming = agentSet(); const all = !DATA.demo ? incoming : display.source('agents', incoming.length === display.count('agents', incoming.length, performance.now()) ? incoming : null) || incoming;
-    const per = portrait() ? 8 : 48; const pages = Math.max(1, Math.ceil(all.length / per)); agentPage = Math.min(agentPage, pages - 1);
-    const shown = all.slice(agentPage * per, agentPage * per + per); const tier = tierOf(all.length);
+    const fit = gridFit(), per = fit.per; const pages = Math.max(1, Math.ceil(all.length / per)); agentPage = Math.min(agentPage, pages - 1);
+    const shown = all.slice(agentPage * per, agentPage * per + per);
     const count = k => all.filter(a => a.state === k).length;
     const summary = `<div class="agents-summary"><span class="t">${all.length} agent${all.length === 1 ? '' : 's'}</span>${st('working', count('working') + ' working')}${st('waiting-igor', count('waiting-igor') + ' waiting for Igor')}${st('waiting-ci', count('waiting-ci') + ' waiting for CI')}${count('failed') ? st('failed', count('failed') + ' failed') : ''}${count('idle') ? st('idle', count('idle') + ' idle') : ''}<span class="muted t1">hosts awake ${DATA.hosts.filter(h => h.up).length} of ${DATA.hosts.length} · laptop not observed</span>${pages > 1 ? `<span class="pg">${agentPage * per + 1}–${agentPage * per + shown.length} of ${all.length} · page ${agentPage + 1}/${pages}</span>` : ''}</div>`;
     const step = item => { const s = safeStep(item); return `<span class="tool">${esc(s.tool)}</span><span class="tgt ell">${esc(s.target)}</span><span class="el num">${esc(s.age)}</span>`; };
@@ -158,7 +170,8 @@
       <div class="act ell">${step(steps[0])}</div>
       ${window.MC?.UI.agentDetail ? window.MC.UI.agentDetail(a) : ""}<div class="tail">${steps.slice(1).map(x => `<div class="ell">${step(x)}</div>`).join('')}</div>
       <div class="meta"><span class="host-name">${esc(a.host)}</span><span class="num">run ${dur(a.run)}</span><span class="model">${esc(a.model)} · ${esc(a.effortx || a.effort || 'high')}</span><span class="observed num">activity ${ago(a.observed)} ago · source ${ago(a.sourceObserved ?? a.observed)} ago</span></div></div></section>`; }).join('');
-    return `<section class="panel p-summary"><header><h2 data-console="FLIGHT">Agents</h2><span class="fresh">${ago(DATA.demo ? 1 : DATA.agentSourceAge)}</span></header><div class="body">${summary}</div></section><div class="agrid c${tier}">${tiles}</div>`;
+    const controls = `<div class="grid-controls"><label>Thread grid <select data-thread-grid aria-label="Thread grid">${GRID_CHOICES.map(v => `<option value="${v}" ${v === fit.pref ? 'selected' : ''}>${v === 'auto' ? 'Auto' : v.replace('x',' × ')}${v !== 'auto' && (Number(v.split('x')[0]) > fit.maxCols || Number(v.split('x')[1]) > fit.maxRows) ? ' (fit limited)' : ''}</option>`).join('')}</select></label><span>Effective fit ${fit.cols} × ${fit.rows} · ${per} per page</span><button data-thread-page="-1" aria-label="Previous thread page" ${agentPage === 0 ? 'disabled' : ''}>Previous</button><span role="status">Page ${agentPage + 1} of ${pages}</span><button data-thread-page="1" aria-label="Next thread page" ${agentPage === pages - 1 ? 'disabled' : ''}>Next</button></div>`;
+    return `<section class="panel p-summary"><header><h2 data-console="FLIGHT">Agents</h2><span class="fresh">${ago(DATA.demo ? 1 : DATA.agentSourceAge)}</span></header><div class="body">${controls}${summary}</div></section><div class="agrid dynamic-grid" style="grid-template-columns:repeat(${fit.cols},minmax(0,1fr));grid-template-rows:repeat(${fit.rows},minmax(230px,1fr))">${tiles}</div>`;
   };
 
   R.fleet = () => {
@@ -253,14 +266,15 @@
   const hold = () => { holdUntil = performance.now() + 10 * 60e3; };
   tabs.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; select(b.dataset.m); });
   pick.addEventListener('change', () => { select(pick.value); });
-  document.addEventListener('keydown', e => { const i = parseInt(e.key, 10); if (i >= 1 && i <= MODES.length) { select(MODES[i - 1]); } if (e.key === 'ArrowRight' && cur === 'agents') { agentPage++; show('agents'); hold(); } if (e.key === 'ArrowLeft' && cur === 'agents') { agentPage = Math.max(0, agentPage - 1); show('agents'); hold(); } });
+  document.addEventListener('keydown', e => { if (e.target.matches?.('input,select,textarea')) return; const i = parseInt(e.key, 10); if (i >= 1 && i <= MODES.length) { select(MODES[i - 1]); } if (e.key === 'ArrowRight' && cur === 'agents') { agentPage++; show('agents'); hold(); } if (e.key === 'ArrowLeft' && cur === 'agents') { agentPage = Math.max(0, agentPage - 1); show('agents'); hold(); } });
   function show(m, navigate = false) {
     if (!MODES.includes(m)) m = 'overview';
     if (navigate && m !== modeFromURL()) {
       const url = new URL(location.href); url.searchParams.set('mode', m);
       history.pushState(null, '', url.href);
     }
-    cur = m; t0 = performance.now(); view.className = m === 'agent-summary' ? 'agents' : m; view.innerHTML = R[m]();
+    cur = m; t0 = performance.now(); view.className = m === 'agent-summary' ? 'host-overview' : m; view.innerHTML = R[m]();
+    if (m === 'agents') view.innerHTML = R[m]();
     for (const b of tabs.children) {
       const selected = b.dataset.m === m;
       b.classList.toggle('on', selected);
@@ -270,6 +284,19 @@
     pick.value = m; document.body.dataset.mode = m;
     document.dispatchEvent(new CustomEvent('mc:mode', { detail: m }));
   }
+  document.addEventListener('change', e => {
+    if (!e.target.matches?.('[data-thread-grid]')) return;
+    const value = e.target.value;
+    if (!GRID_CHOICES.includes(value)) return;
+    const url = new URL(location.href); url.searchParams.set('grid', value);
+    if (url.href !== location.href) history.pushState(null, '', url.href);
+    agentPage = 0; show(cur); hold();
+  });
+  document.addEventListener('click', e => {
+    const button = e.target.closest?.('[data-thread-page]');
+    if (!button || button.disabled || !button.dataset.threadPage) return;
+    agentPage = Math.max(0, agentPage + Number(button.dataset.threadPage)); show('agents'); hold();
+  });
   addEventListener('popstate', () => show(modeFromURL()));
   function urgent() { const dec = decisionsSorted(), inc = incidents(); $('#urgent').innerHTML = `${dec.length ? st('decision', dec.length + ' for Igor · ' + dur(dec[0].left)) : ''}${inc.length ? st('alert', inc.length + ' incident' + (inc.length === 1 ? '' : 's')) : ''}`; }
   function globalFresh() { const s = DATA.sources; const stale = s.filter(x => freshOf(x.kind, x.age, x.state) === 'stale').length, lost = s.filter(x => freshOf(x.kind, x.age, x.state) === 'lost').length, unavailable = s.filter(x => ['nosource', 'unsupported'].includes(freshOf(x.kind, x.age, x.state))).length, asleep = s.filter(x => x.state === 'asleep').length;

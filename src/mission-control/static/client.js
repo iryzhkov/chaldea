@@ -64,18 +64,19 @@ script.onload = () => {
   const coverage = () => "Showing " + (snapshot?.shown ?? 0) + " of " + (snapshot?.total ?? "unknown") + " observed threads" + (snapshot?.truncated ? " · truncated / coverage incomplete" : "") + " · 48-row bound";
   R["agent-summary"] = () => {
     const hosts=snapshot?.hostSummary || [];
-    const rows=hosts.map(h=>{
-      const states=Object.entries(h.states).map(([state,count])=>esc(state)+": "+count).join(" · ");
-      const models=h.models.map(m=>esc(m.model)+": "+m.count+" · "+esc(usage(m.usage))).join("<br>");
-      return '<div class="item"><div class="l1"><span class="t t1">' + esc(h.host) + '</span></div><div class="l2">' +
-        (h.observedAt===null ? "NOT OBSERVED · thread count unknown" : esc(h.freshness) + " · source " + age(h.observedAt) + "s ago · shown " + h.shown + " / " + (h.total ?? "unknown") + (h.truncated?" · truncated":"")) +
-        '</div><div class="t1">' + states + '</div><div class="t1 muted">' + models + '</div><div>'+esc(usage(h.details?.usage))+'</div><div>'+resources(h)+'</div>'+(snapshot?.agents||[]).filter(a=>a.host===h.host).map(a=>'<div class="item"><span class="task-label">Agent '+st(a.state,a.state)+'</span><h3>'+esc(a.title)+'</h3><div>'+esc(a.model)+'</div>'+detailBody(a)+'</div>').join('')+'</div>';
+    const cards=hosts.map(h=>{
+      const states=Object.entries(h.states).map(([state,count])=>esc(state)+": "+esc(count)).join(" · ");
+      const models=h.models.map(m=>esc(m.model)+": "+esc(m.count)+" · "+esc(usage(m.usage))).join("<br>");
+      const observed=h.observedAt!=null, sourceAge=age(h.observedAt);
+      const freshness=!observed?"nosource":h.freshness==="live"&&sourceAge>90?"stale":h.freshness;
+      const status=!observed?"NOT OBSERVED · thread count unknown":(freshness==="live"?"observed":esc(freshness))+" · source "+sourceAge+"s ago · shown "+h.shown+" / "+(h.total??"unknown")+(h.truncated?" · truncated":"");
+      return panel("host",h.host,'<div>'+status+'</div><div>'+states+'</div><div class="muted">'+models+'</div><div>'+esc(usage(h.details?.usage))+'</div><div>'+resources(h)+'</div>',"host",sourceAge,freshness,"host-card");
     }).join("");
-    return sourcePanel("summary","Agent summary · " + coverage(),rows || missing("No observed host sources"));
+    return '<div class="host-coverage">'+esc("Host overview · "+coverage())+'</div>'+ (cards || missing("No observed host sources"));
   };
   UI.agentDetail=detailBody;
   const originalAgents=R.agents;
-  R.agents=()=>originalAgents().replace(/hosts awake[^<]*/g,esc(coverage())+" · source coverage in Agent summary").replace('data-console="FLIGHT">Agents','data-console="FLIGHT">Live threads');
+  R.agents=()=>originalAgents().replace(/hosts awake[^<]*/g,esc(coverage())+" · source coverage in Host overview").replace('data-console="FLIGHT">Agents','data-console="FLIGHT">Live threads');
   document.addEventListener("click",e=>{
     const button=e.target.closest?.("[data-copy-thread]");if(button)navigator.clipboard?.writeText(button.dataset.copyThread).catch(()=>{});
   });

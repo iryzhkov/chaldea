@@ -365,8 +365,6 @@ b, strong, .b { font-weight:600; }
   .kpi-deadline { flex-wrap:wrap; gap:0.15em 0.8em; }
   .kpi-deadline .t { flex:1 1 70%; }
   .kpi-deadline .t1 { flex:1 1 100%; }
-  #view.agents .agrid { grid-template-columns: repeat(2, minmax(0,1fr)) !important; grid-template-rows: repeat(4, minmax(0,1fr)) !important; }
-  #view.agents .agrid:is(.c1,.c4) { grid-template-rows:repeat(2,minmax(0,1fr)) !important; }
   .agrid.c12 .tile .tail div:nth-child(n+3) { display:none; }
   .tile .act { font-size:var(--t1); }
   #view.fleet { grid-template-columns: repeat(2, minmax(0,1fr)); grid-template-rows: minmax(0,1.3fr) minmax(0,1fr) minmax(0,1fr); grid-template-areas: "config config" "rollouts trust" "timers expiring"; }
@@ -399,3 +397,17 @@ b, strong, .b { font-weight:600; }
 .thread-id { font-size:var(--t1); overflow-wrap:anywhere; }
 .thread-id button { margin-left:.5em; font:inherit; color:inherit; background:transparent; border:1px solid var(--line); cursor:pointer; }
 .agrid.c24 .tile h2.title, .agrid.c48 .tile h2.title { font-size:var(--t1); }
+
+/* Fit uses CSS viewport space; overflow remains reachable at small sizes and browser zoom. */
+#view.agents { --t1:clamp(14px,1vw,18px); --t2:clamp(16px,1.25vw,24px); --pad:12px; --gap:12px; overflow:auto; }
+#view.agents .p-summary { overflow:visible; }
+#view.agents .p-summary > .body { overflow:visible; }
+.grid-controls { display:flex; align-items:center; flex-wrap:wrap; gap:.5em; font-size:var(--t1); }
+.grid-controls :is(select,button) { font:inherit; color:var(--ink); background:var(--dim); border:1px solid var(--frame); padding:.35em; max-width:100%; }
+.grid-controls button:disabled { opacity:.5; }
+.dynamic-grid .tile > header { flex-wrap:wrap; }
+.dynamic-grid .tile > .body { overflow:auto; }
+.dynamic-grid .tile .meta span { white-space:normal; overflow-wrap:anywhere; }
+#view.host-overview { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr)); grid-auto-rows:max-content; align-content:start; overflow:auto; }
+.host-coverage { grid-column:1 / -1; overflow-wrap:anywhere; }
+.host-card > .body { overflow-wrap:anywhere; }

@@ -6,6 +6,7 @@ import { runInNewContext } from "node:vm";
 // Execute both shipped scripts against the small DOM/history seam they use.
 // Rendering remains real; no copied navigation implementation.
 function browser(href = "https://board.example/?palette=mocr-1969", reduced = false) {
+  let width=3840,height=1800;
   class Element extends EventTarget {
     dataset: Record<string, string> = {};
     style: Record<string, string> = {};
@@ -25,7 +26,9 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     setAttribute(name: string, value: string) { this.attrs[name] = value; }
     getAttribute(name: string) { return this.attrs[name] ?? null; }
     removeAttribute(name: string) { delete this.attrs[name]; }
-    closest() { return this; }
+    closest(selector: string) { if (selector === "[data-copy-thread]") return null; return selector === "[data-thread-page]" && !this.dataset.threadPage ? null : this; }
+    matches(selector: string) { return selector === "[data-thread-grid]" && this.attrs["data-thread-grid"] !== undefined; }
+    getBoundingClientRect() { return {width,height,top:0}; }
     append(el: Element) { this.children.push(el); }
     set innerHTML(html: string) {
       this.html = html;
@@ -65,7 +68,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   const intervals: (() => void)[] = []; let frame = () => {};
   const context: any = {
     document, location, history, URL, URLSearchParams, Date, performance, CustomEvent,
-    innerWidth: 1280, matchMedia: (q: string) => ({ matches: q.includes("reduced-motion") && reduced }),
+    innerWidth: width, innerHeight:height, matchMedia: (q: string) => ({ matches: q.includes("reduced-motion") && reduced }),
     requestAnimationFrame: (fn: () => void) => { frame = fn; },
     setInterval: (fn: () => void) => { intervals.push(fn); },
     addEventListener: window.addEventListener.bind(window),
@@ -84,6 +87,9 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   };
   const travel = (delta: number) => { index += delta; location.href = entries[index]!; window.dispatchEvent(new Event("popstate")); };
   return { elements, location, entries, click, travel, frame: () => frame(),
+    resize: (w:number,h:number) => {width=w;height=h;context.innerWidth=w;context.innerHeight=h;window.dispatchEvent(new Event("resize"));},
+    grid: (value:string) => { const el=new Element();el.attrs["data-thread-grid"]="";el.value=value;const e=new Event("change");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    page: (delta:number) => {const el=new Element();el.dataset.threadPage=String(delta);const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document };
 }
 
@@ -128,7 +134,7 @@ test("two agent views preserve old URLs, update immediately and disclose bounded
   assert.match(b.elements.view!.innerHTML,/truncated/);assert.match(b.elements.view!.innerHTML,/activity 1m ago · source 0s ago/);
   const history=b.entries.length;b.click("agent-summary");assert.equal(b.entries.length,history+1);
   assert.equal(b.location.searchParams.get("mode"),"agent-summary");
-  assert.match(b.elements.view!.innerHTML,/Agent summary/);assert.match(b.elements.view!.innerHTML,/shown 0 \/ 0/);
+  assert.match(b.elements.view!.innerHTML,/Host overview/);assert.match(b.elements.view!.innerHTML,/shown 0 \/ 0/);
   assert.match(b.elements.view!.innerHTML,/NOT OBSERVED · thread count unknown/);
   assert.match(b.elements.view!.innerHTML,/gpt-6.1-sol: 48/);assert.doesNotMatch(b.elements.view!.innerHTML,/panel tile/);
   b.snapshot({...snapshot,shown:47,agents:agents.slice(0,47)});assert.equal(b.entries.length,history+1);
@@ -169,7 +175,50 @@ test("cards render sanitized title, compact real app ID, top state, effort and r
  assert.match(html,/data-copy-thread="mcp:real-application-thread-123456789"/);
  assert.match(html,/high \(configured\)/);assert.match(html,/go test -race/);
  b.click("agent-summary");html=b.elements.view!.innerHTML;
- assert.match(html,/task-label">Agent/);assert.match(html,/Actual &lt;script&gt;/);assert.match(html,/App thread/);
+ assert.match(html,/Host overview/);assert.doesNotMatch(html,/Actual &lt;script&gt;|App thread|Latest &lt;img|go test -race/);
  b.click("fleet");html=b.elements.view!.innerHTML;assert.match(html,/CPU 25.0%/);assert.match(html,/RAM 3.0 \/ 4.0 GiB \(75.0% used\)/);
  b.click("overview");assert.match(b.elements.view!.innerHTML,/CPU 25.0%/);
+});
+
+test("explicit grids page every row, clamp on resize and SSE shrink, and survive history",()=>{
+ const b=browser("https://board.example/?mode=agents#board"),now=Date.now();
+ const agents=Array.from({length:48},(_,i)=>({id:"row-"+i,title:"Distinct task "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));
+ const snapshot={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:48,total:48,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+ b.snapshot(snapshot);
+ for(const [grid,capacity] of [["3x3",9],["4x3",12],["5x3",15]] as const){
+   b.grid(grid); assert.equal(b.location.searchParams.get("grid"),grid);
+   assert.equal((b.elements.view!.innerHTML.match(/panel tile/g)||[]).length,capacity);
+   const seen=new Set<number>();
+   for(let page=0;page<Math.ceil(48/capacity);page++){
+     for(const m of b.elements.view!.innerHTML.matchAll(/Distinct task (\d+)/g))seen.add(Number(m[1]));
+     b.page(1);
+   }
+   assert.equal(seen.size,48);assert.match(b.elements.view!.innerHTML,/Distinct task 47/);
+ }
+ b.resize(640,900);assert.match(b.elements.view!.innerHTML,/Effective fit 2 × 3/);
+ b.resize(320,600);assert.match(b.elements.view!.innerHTML,/Effective fit 1 × 1/);
+ b.snapshot({...snapshot,agents:agents.slice(0,2),shown:2,total:2});
+ assert.match(b.elements.view!.innerHTML,/Page 2 of 2/);
+ b.page(-1);assert.match(b.elements.view!.innerHTML,/Distinct task 0/);
+ b.grid("3x3");b.grid("4x3");const count=b.entries.length;b.refresh();assert.equal(b.entries.length,count);
+ b.travel(-1);assert.equal(b.location.searchParams.get("grid"),"3x3");
+ b.travel(1);assert.equal(b.location.searchParams.get("grid"),"4x3");
+ const reload=browser(b.location.href);assert.match(reload.elements.view!.innerHTML,/Effective fit 4 × 3/);
+ b.grid("evil");assert.equal(b.location.searchParams.get("grid"),"4x3");
+ assert.equal(b.location.hash,"#board");
+ b.resize(3840,1800);b.grid("auto");b.snapshot(snapshot);
+ assert.equal((b.elements.view!.innerHTML.match(/panel tile/g)||[]).length,48);
+});
+test("host cards keep independent ages, observed zero, missing counts and escaped metadata",()=>{
+ const b=browser("https://board.example/?mode=agent-summary"),now=Date.now();
+ const host=(name:string,observedAt:number|null,freshness:string,total:number|null)=>({host:name,shown:0,total,truncated:false,observedAt,freshness,states:{},models:[]});
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],shown:0,total:0,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},
+ hostSummary:[host("fresh <script>",now,"live",0),host("old",now-100000,"live",0),host("absent",null,"nosource",null),host("offline",now,"disconnected",0)]});
+ const html=b.elements.view!.innerHTML;
+ assert.equal((html.match(/host-card/g)||[]).length,4);
+ assert.match(html,/fresh &lt;script&gt;/);assert.doesNotMatch(html,/<script>|undefined/);
+ assert.match(html,/observed · source 0s ago · shown 0 \/ 0/);
+ assert.match(html,/stale · source 100s ago/);assert.match(html,/disconnected/);
+ assert.match(html,/NOT OBSERVED · thread count unknown/);
+ assert.equal(browser(b.location.href).document.body.dataset.mode,"agent-summary");
 });
