@@ -3,6 +3,7 @@ import { dirname,isAbsolute } from "node:path";
 import { readTrustedFile, readJson, onlyKeys } from "../config/files.ts";
 import { strictJson } from "../access/token.ts";
 import { atomicWrite } from "../fs/atomic.ts";
+import { aggregateDetails,emptyDetail } from "./details.ts";
 import { MissionModel,summarizeHost } from "./model.ts";
 import { HOSTS,validateHostSnapshot, object, exact, type HostSnapshot } from "./contract.ts";
 export const CACHE_BYTES=512*1024, CACHE_AGE=86400_000;
@@ -37,7 +38,7 @@ export function mergeStatus(cache:StatusCache,raw:HostSnapshot,now=Date.now()):b
     } else cache.gap=true;
     cache.snapshots[i]=s;
   }else {if(cache.snapshots.length===4)throw new Error("source_limit");cache.snapshots.push(s);}
-  while(cache.snapshots.reduce((n,v)=>n+v.agents.length,0)>48){const largest=cache.snapshots.toSorted((a,b)=>b.agents.length-a.agents.length||a.host.localeCompare(b.host))[0]!;largest.agents.pop();largest.truncated=true;}
+  while(cache.snapshots.reduce((n,v)=>n+v.agents.length,0)>48){const largest=cache.snapshots.toSorted((a,b)=>b.agents.length-a.agents.length||a.host.localeCompare(b.host))[0]!;const removed=largest.agents.pop();largest.truncated=true;if(largest.rich){largest.rich.details=largest.rich.details.filter(d=>d.id!==removed?.id);largest.rich.omitted=largest.agents.length-largest.rich.details.length;}}
   return true;
 }
 export class CacheModel {
@@ -65,13 +66,15 @@ export class CacheModel {
     const now=this.now(),base=new MissionModel(false,this.now).snapshot();
     const snapshots=this.cache.snapshots.filter(s=>s.observedAt<=now&&now-s.observedAt<=CACHE_AGE);
     const freshness=(connected:boolean,at:number|null,stale=90_000,lost=600_000)=>at===null?"nosource":now-at>lost?"lost":now-at>stale?"stale":connected?"live":"disconnected";
-    base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
-      freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:s.connected&&a.connected&&this.warmSources.has(s.host)&&freshness(s.connected,s.observedAt)==="live"?"live":freshness(false,a.detailObservedAt,60_000,600_000),steps:[...a.steps]}))).slice(0,48);
+    base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:s.rich?.details.find(d=>d.id===a.id)?.value.identity.title.text??"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
+      freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:s.connected&&a.connected&&this.warmSources.has(s.host)&&freshness(s.connected,s.observedAt)==="live"?"live":freshness(false,a.detailObservedAt,60_000,600_000),steps:[...a.steps],details:{...emptyDetail(),...s.rich?.details.find(d=>d.id===a.id)?.value},detailCoverage:s.rich?(s.rich.details.some(d=>d.id===a.id)?"reported":"byte-budget"):"legacy"}))).slice(0,48);
     base.hostSummary=HOSTS.map(host=>{
       const s=snapshots.find(s=>s.host===host);
       if(!s)return summarizeHost(host,[],null,false,null,"nosource",null);
       const state=freshness(s.connected,s.observedAt);
-      return summarizeHost(host,s.agents,s.total,s.truncated,s.observedAt,state==="live"&&!this.warmSources.has(host)?"cached":state,s.connected);
+      const summary=summarizeHost(host,s.agents,s.total,s.truncated,s.observedAt,state==="live"&&!this.warmSources.has(host)?"cached":state,s.connected);
+      summary.models=summary.models.map(m=>({...m,usage:aggregateDetails(s.agents.filter(a=>a.model===m.model).flatMap(a=>s.rich?.details.filter(d=>d.id===a.id).map(d=>({...emptyDetail(),...d.value}))??[]),m.count).usage}));
+      return {...summary,resources:s.rich?.resources??{state:"unavailable" as const,sample:null},details:aggregateDetails(s.rich?.details.map(d=>({...emptyDetail(),...d.value}))??[],s.agents.length)};
     });
     base.shown=base.agents.length;base.total=snapshots.length&&snapshots.every(s=>s.total!==null)?snapshots.reduce((n,s)=>n+s.total!,0):null;
     base.truncated=this.cache.gap||snapshots.some(s=>s.truncated)||snapshots.reduce((n,s)=>n+s.agents.length,0)>48;

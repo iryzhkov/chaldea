@@ -257,7 +257,7 @@ b, strong, .b { font-weight:600; }
 .agrid.c12 .tile .act { font-size:var(--t1); }
 .agrid.c12 .tile .tail div:nth-child(n+4) { display:none; }
 .agrid.c24 .tile .tail div:nth-child(n+2) { display:none; }
-.agrid.c24 .tile > header, .agrid.c48 .tile > header { display:none; }
+.agrid.c24 .tile > header, .agrid.c48 .tile > header { display:flex; }
 .tile .agrid-c24-only { display:none; }
 .agrid.c24 .tile .agrid-c24-only, .agrid.c48 .tile .agrid-c24-only { display:-webkit-box; }
 .agrid.c24 .tile .title, .agrid.c48 .tile .title { font-size:var(--t1); }
@@ -389,3 +389,13 @@ b, strong, .b { font-weight:600; }
   #view.quota { grid-template-columns:minmax(0,1fr); grid-auto-rows:max-content; grid-template-rows:none; overflow-y:auto; }
 }
 @media (prefers-reduced-motion: reduce) { * { animation:none !important; transition:none !important; } }
+
+/* Keep live card identity and state visible at every density. Detail scroll stays within its card. */
+.agrid .tile > header { display:flex; align-items:center; gap:.5em; }
+.tile .task-label { font-size:var(--t1); display:flex; gap:.5em; align-items:center; }
+.tile h2.title { margin:0; height:auto; min-height:1.2em; font-size:var(--t2); overflow-wrap:anywhere; }
+.tile .agent-detail { overflow:auto; max-height:16em; min-height:2em; font-size:var(--t1); overflow-wrap:anywhere; }
+.tile .agent-detail .facts { display:block; }
+.thread-id { font-size:var(--t1); overflow-wrap:anywhere; }
+.thread-id button { margin-left:.5em; font:inherit; color:inherit; background:transparent; border:1px solid var(--line); cursor:pointer; }
+.agrid.c24 .tile h2.title, .agrid.c48 .tile h2.title { font-size:var(--t1); }

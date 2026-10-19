@@ -144,10 +144,32 @@ test("two agent views preserve old URLs, update immediately and disclose bounded
 });
 test("unavailable modes replace previous content without invented data", () => {
   const b = browser();
-  for (const mode of ["fleet", "events", "ops", "lab"]) {
+  for (const mode of ["events", "ops", "lab"]) {
     b.click(mode); assert.equal(b.elements.view!.className, mode);
     assert.match(b.elements.view!.innerHTML, /Unavailable · no authorized source/);
     assert.equal((b.elements.view!.innerHTML.match(/<section/g) ?? []).length, 1);
     assert.equal(browser(b.location.href).elements.view!.className, mode);
   }
+});
+
+test("cards render sanitized title, compact real app ID, top state, effort and resources without HTML injection",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ const b=browser("https://board.example/?mode=agents"),now=Date.now(),d=emptyDetail();
+ d.identity={title:{text:"Actual <script>title</script>",state:"reported"},appThreadId:{text:"mcp:real-application-thread-123456789",state:"reported"}};
+ d.assistant={text:"Latest <img src=x onerror=alert(1)> paragraph",state:"reported"};
+ d.commands=[{text:"go test -race ./...",state:"reported"}];d.effort={value:"high",source:"configured"};
+ const agents=[{id:"opaque-row",title:d.identity.title.text,model:"gpt-6.1-sol",host:"agent-a",state:"thinking",startedAt:now-1000,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[],details:d,detailCoverage:"reported"}];
+ const host={host:"agent-a",shown:1,total:1,truncated:false,observedAt:now,freshness:"live",states:{thinking:1},models:[{model:"gpt-6.1-sol",count:1}],resources:{state:"reported",sample:{sampledAt:now,cpuUtilization:0.25,cpuCount:8,availableMemoryBytes:1073741824,totalMemoryBytes:4294967296}}};
+ const snapshot={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:1,total:1,truncated:false,tokens:{rate:null,output:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[host]};
+ b.snapshot(snapshot);
+ let html=b.elements.view!.innerHTML;
+ assert.match(html,/task-label">Task/);assert.match(html,/Thinking/);
+ assert.match(html,/Actual &lt;script&gt;title&lt;\/script&gt;/);
+ assert.match(html,/Latest &lt;img/);assert.doesNotMatch(html,/<script>|<img /);
+ assert.match(html,/data-copy-thread="mcp:real-application-thread-123456789"/);
+ assert.match(html,/high \(configured\)/);assert.match(html,/go test -race/);
+ b.click("agent-summary");html=b.elements.view!.innerHTML;
+ assert.match(html,/task-label">Agent/);assert.match(html,/Actual &lt;script&gt;/);assert.match(html,/App thread/);
+ b.click("fleet");html=b.elements.view!.innerHTML;assert.match(html,/CPU 25.0%/);assert.match(html,/RAM 3.0 \/ 4.0 GiB \(75.0% used\)/);
+ b.click("overview");assert.match(b.elements.view!.innerHTML,/CPU 25.0%/);
 });

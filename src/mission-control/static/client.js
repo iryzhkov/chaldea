@@ -37,25 +37,48 @@ script.onload = () => {
     const quotaObserved=s?.quota.accounts.map(a=>a.observedAt).filter(Number.isFinite) || [];
     const kpi = '<div class="stats hero-row">' + [["—","needs Igor"],["—","open incidents"],[s?agents.filter(a=>a.state==="working").length:"—","working"],[s?agents.filter(a=>a.state==="waiting-igor").length:"—","waiting"],["—","exec slots"],["—","queued jobs"],[s?.tokens.rate == null ? "—" : s.tokens.rate.toFixed(1),s?.tokens.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg"],["—","shipped today"]].map(x=>heroStat(...x)).join("") + '</div>';
     const rows=budget(agents,4,a=>'<div class="item"><div class="l1"><span class="t two t1">' + esc(a.title) + '</span></div><div class="l2">' + st(a.state,a.state) + ' · ' + esc(a.model) + ' · ' + esc(a.host) + '</div><div class="t1 muted">' + esc(a.steps[0] || "Activity unavailable") + '</div></div>',"threads");
-    return sourcePanel("kpi",(s?.sampled?"Enrolled sources · sampled · ":"PC canary · ") + (live?"connected":"last known") + (s?.tokens.coverage==="partial"?" · partial tokens":""),kpi) + unavailable("inbox","Decision inbox") + sourcePanel("threads","Threads · showing " + agents.length + " of " + (s?.total ?? "unknown") + (s?.truncated ? " · coverage incomplete" : ""),rows || missing("No observed threads")) + unavailable("hosts","Hosts · exec slots") + panel("quota","Quota",s?.quota.accounts.length ? budget(s.quota.accounts,2,a=>'<div class="item">' + esc(a.label) + ' · ' + esc(a.state) + ' · ' + (a.used==null?"usage unknown":a.used+"% used") + '</div>',"accounts") : missing("No cached quota"),"quota",quotaObserved.length ? age(Math.max(...quotaObserved)) : null) + unavailable("events","Latest events");
+    return sourcePanel("kpi",(s?.sampled?"Enrolled sources · sampled · ":"PC canary · ") + (live?"connected":"last known") + (s?.tokens.coverage==="partial"?" · partial tokens":""),kpi) + unavailable("inbox","Decision inbox") + sourcePanel("threads","Threads · showing " + agents.length + " of " + (s?.total ?? "unknown") + (s?.truncated ? " · coverage incomplete" : ""),rows || missing("No observed threads")) + sourcePanel("hosts","Hosts · resources",fleetBody(),"host") + panel("quota","Quota",s?.quota.accounts.length ? budget(s.quota.accounts,2,a=>'<div class="item">' + esc(a.label) + ' · ' + esc(a.state) + ' · ' + (a.used==null?"usage unknown":a.used+"% used") + '</div>',"accounts") : missing("No cached quota"),"quota",quotaObserved.length ? age(Math.max(...quotaObserved)) : null) + unavailable("events","Latest events");
   };
   R.tokens = () => sourcePanel("thero",snapshot?.tokens.coverage==="partial"?"Partial output · 60 s average":"Output rate · 60 s average",'<div class="stats">' + heroStat(snapshot?.tokens.rate == null ? "—" : snapshot.tokens.rate.toFixed(1),snapshot?.tokens.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg") + heroStat(snapshot?.tokens.output ?? "—",snapshot?.tokens.coverage==="partial"?"output lower bound":"observed output","since process start") + '</div>',"t3thread") + panel("models","Observation scope",missing(snapshot?.tokens.scope || "No usage data") + missing("Updated " + (age(snapshot?.tokens.observedAt) ?? "unknown") + "s ago · daily totals and model history unavailable"),"t3thread",age(snapshot?.tokens.observedAt),snapshot?.source.state === "live" ? undefined : "stale") + unavailable("hourly","Today by hour");
   R.quota=()=>quotas();
-  for(const m of ["fleet","events","ops","lab"]) R[m]=()=>unavailable("summary",m + " unavailable");
+  for(const m of ["events","ops","lab"]) R[m]=()=>unavailable("summary",m + " unavailable");
+  const resources = h => {
+    const r=h.resources?.sample;
+    if(!r)return esc(h.host) + (h.resources?.state==="byte-budget"?" · resources withheld · host byte budget":" · resources not reported");
+    const used=Math.max(0,r.totalMemoryBytes-r.availableMemoryBytes),gib=n=>(n/1073741824).toFixed(1);
+    return esc(h.host)+" · CPU "+(r.cpuUtilization===null?"not reported":(r.cpuUtilization*100).toFixed(1)+"%")+" · "+r.cpuCount+" CPUs · RAM "+gib(used)+" / "+gib(r.totalMemoryBytes)+" GiB ("+(r.totalMemoryBytes?(used/r.totalMemoryBytes*100).toFixed(1):"unknown")+"% used) · sample "+age(r.sampledAt)+"s ago";
+  };
+  const fleetBody = () => (snapshot?.hostSummary||[]).map(h=>'<div class="item">'+resources(h)+'</div>').join("") || missing("No host observations");
+  R.fleet=()=>sourcePanel("summary","Fleet CPU and RAM",fleetBody(),"host");
+  const usage = u => !u||u.coverage==="not-reported"?"Usage not reported":("Input "+(u.input??"?")+" · output "+(u.output??"?")+" · observed total "+(u.total??"?")+" · cache read "+(u.cacheRead??"?")+" / write "+(u.cacheWrite??"?")+" · reasoning "+(u.reasoning??"?")+" (subsets) · "+u.coverage+" / "+u.turns+" observed main-agent turns · usage "+age(u.observedAt)+"s ago · generation rate not reported");
+  const detailBody = a => {
+    const d=a.details;if(!d||a.detailCoverage&&a.detailCoverage!=="reported")return missing(a.detailCoverage==="byte-budget"?"Detail withheld · host byte budget":"Detail not reported · older producer or host byte budget");
+    const p=d.assistant,effort=d.effort.value?d.effort.value+" ("+d.effort.source+")":"not reported";
+    const commands=a.activityFreshness==="live"?d.commands:[],w=d.work,c=w.children;
+    const identity=d.identity,id=identity?.appThreadId;
+    const identityBody=id?.text?'<div class="thread-id">App thread <code title="'+esc(id.text)+'">'+esc(id.text.length>26?id.text.slice(0,26)+"…":id.text)+'</code> · '+esc(id.state)+(id.state==="reported"?'<button type="button" data-copy-thread="'+esc(id.text)+'">Copy ID</button>':' · full ID unavailable')+'</div>':missing("App thread ID "+(id?.state??"not reported"));
+    if(d.fieldCoverage==="identity-only")return identityBody+missing("Other detail withheld · host byte budget");
+    const countWork=c=>c?c.active+" active / "+c.queued+" queued / "+c.completed+" completed observed":"not reported";
+    return '<div class="agent-detail">'+identityBody+'<div class="facts"><div>Effort '+esc(effort)+'</div><div>Assistant: '+esc(p.text??p.state)+' · '+esc(p.state)+'</div><div>Commands: '+(commands.length?commands.map(p=>esc(p.text??p.state)+" ("+esc(p.state)+")").join(" · "):"not reported / no active observation")+(d.commandsOmitted?" · "+d.commandsOmitted+" omitted":"")+'</div><div>'+esc(usage(d.usage))+'</div><div>Context '+(d.context?d.context.used+" / "+(d.context.max??"?"):"not reported")+'</div><div>Children '+(c?c.active+" active / "+c.queued+" queued / "+c.completed+" completed observed":"not reported")+' · delegates '+esc(countWork(w.delegates))+' · native subagents '+esc(countWork(w.subagents))+' · monitors '+(w.monitors??"not reported")+' · background '+(w.background??"not reported")+' · durable waits unavailable · '+esc(w.coverage)+'</div></div></div>';
+  };
   const coverage = () => "Showing " + (snapshot?.shown ?? 0) + " of " + (snapshot?.total ?? "unknown") + " observed threads" + (snapshot?.truncated ? " · truncated / coverage incomplete" : "") + " · 48-row bound";
   R["agent-summary"] = () => {
     const hosts=snapshot?.hostSummary || [];
     const rows=hosts.map(h=>{
       const states=Object.entries(h.states).map(([state,count])=>esc(state)+": "+count).join(" · ");
-      const models=h.models.map(m=>esc(m.model)+": "+m.count).join(" · ");
+      const models=h.models.map(m=>esc(m.model)+": "+m.count+" · "+esc(usage(m.usage))).join("<br>");
       return '<div class="item"><div class="l1"><span class="t t1">' + esc(h.host) + '</span></div><div class="l2">' +
         (h.observedAt===null ? "NOT OBSERVED · thread count unknown" : esc(h.freshness) + " · source " + age(h.observedAt) + "s ago · shown " + h.shown + " / " + (h.total ?? "unknown") + (h.truncated?" · truncated":"")) +
-        '</div><div class="t1">' + states + '</div><div class="t1 muted">' + models + '</div></div>';
+        '</div><div class="t1">' + states + '</div><div class="t1 muted">' + models + '</div><div>'+esc(usage(h.details?.usage))+'</div><div>'+resources(h)+'</div>'+(snapshot?.agents||[]).filter(a=>a.host===h.host).map(a=>'<div class="item"><span class="task-label">Agent '+st(a.state,a.state)+'</span><h3>'+esc(a.title)+'</h3><div>'+esc(a.model)+'</div>'+detailBody(a)+'</div>').join('')+'</div>';
     }).join("");
     return sourcePanel("summary","Agent summary · " + coverage(),rows || missing("No observed host sources"));
   };
-  const originalAgents = R.agents;
-  R.agents = () => originalAgents().replace(/hosts awake[^<]*/g,esc(coverage()) + " · source coverage in Agent summary").replace('data-console="FLIGHT">Agents','data-console="FLIGHT">Live threads');
+  UI.agentDetail=detailBody;
+  const originalAgents=R.agents;
+  R.agents=()=>originalAgents().replace(/hosts awake[^<]*/g,esc(coverage())+" · source coverage in Agent summary").replace('data-console="FLIGHT">Agents','data-console="FLIGHT">Live threads');
+  document.addEventListener("click",e=>{
+    const button=e.target.closest?.("[data-copy-thread]");if(button)navigator.clipboard?.writeText(button.dataset.copyThread).catch(()=>{});
+  });
   document.addEventListener("mc:mode",e=>{mode=e.detail;});
   function render() {
     snapshot = projectClientSnapshot(receivedSnapshot, Date.now(), transportConnected);
@@ -64,7 +87,7 @@ script.onload = () => {
     window.MC.SOURCES.t3thread.label = sourceLabel;
     if(snapshot) {
       DATA.demo=snapshot.demo; DATA.agentSourceAge=age(snapshot.source.observedAt);
-      DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:"unknown", steps:a.steps.map(tool=>({tool})) }));
+      DATA.threads=snapshot.agents.map(a=>({ ...a, state:a.state, observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
       DATA.agentPool=DATA.threads; DATA.sources=[];
     }
     window.MC.show(window.MC.MODES.includes(mode)?mode:"overview");

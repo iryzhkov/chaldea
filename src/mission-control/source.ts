@@ -53,7 +53,7 @@ export async function runSource(model: MissionModel, resolve: () => Omit<Connect
       try {
         const options = { ...resolve(), signal };
         if (options.serverUrl !== endpoint) { endpoint = options.serverUrl; cursors.clear(); shellCursor = undefined; }
-        await source.shell(options, { ...(shellCursor === undefined ? {} : { afterSequence: shellCursor }),
+        await source.shell(options, { onResources:resources=>model.setResources(resources), ...(shellCursor === undefined ? {} : { afterSequence: shellCursor }),
           onEvent(event) { if (event.kind !== "synchronized") shellCursor = event.sequence; model.shell(event); if (event.kind === "synchronized" || event.kind === "thread" || event.kind === "removed" || event.kind === "snapshot") reconcile(options); } });
       } catch (error) {
         if (error instanceof AuthenticationError || error instanceof ProtocolIncompatibleError) { model.disconnected(); return; }
