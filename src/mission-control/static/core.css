@@ -444,6 +444,7 @@ b, strong, .b { font-weight:600; }
 .host-card .metric .v { white-space:normal; text-align:right; }
 .host-status,.resource-note,.host-work { font-size:var(--t1); }
 .host-coverage { grid-column:1 / -1; font-size:var(--t2); }
+.p-hosts > .body { overflow-y:auto; }
 .p-hosts .host-card { margin-bottom:12px; }
 .p-hosts .host-card > .body { padding:8px; }
 @media (max-width:600px) {
