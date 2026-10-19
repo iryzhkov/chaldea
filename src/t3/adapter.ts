@@ -4,6 +4,7 @@
 // client, the WebSocket handshake, protocol gating and the mapping of shell
 // stream items to the small domain type the quota observer consumes. The rest
 // of Chaldea sees `connectShell` and the types below, nothing else.
+import type { DetailEvent, Detail, Resources } from "../mission-control/details.ts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -44,6 +45,7 @@ export interface ShellThread {
   readonly modelSelection?: ModelChoice;
   readonly settled?: boolean;
   readonly pendingRequest?: boolean;
+  readonly pendingRequestKind?: string;
   readonly latestRunId: string | null;
   readonly activeRunId: string | null;
   readonly latestRunStartedAt: string | null;
@@ -262,6 +264,7 @@ export interface ShellSubscription {
   readonly afterSequence?: number;
   /** Called for every item in order; the next item waits for the promise. */
   readonly onEvent: (event: ShellEvent) => Promise<void> | void;
+  readonly onResources?: (resources: Resources) => void;
 }
 
 export function socketUrl(serverUrl: string): string {
@@ -368,6 +371,7 @@ export function toShellThread(thread: OrchestrationV2ThreadShell): ShellThread {
     modelSelection: thread.modelSelection,
     settled: thread.settledOverride === "settled",
     pendingRequest: thread.pendingRuntimeRequest !== null,
+    ...(thread.pendingRuntimeRequest?{pendingRequestKind:thread.pendingRuntimeRequest.kind}:{}),
     latestRunId: thread.latestRunId,
     activeRunId: thread.activeRunId,
     latestRunStartedAt: isoOrNull(thread.latestRunStartedAt),
@@ -533,52 +537,102 @@ export async function setAutoResumeLimitedThreads(options: ConnectOptions, enabl
  * ends the stream; rejects with one of the error classes above otherwise.
  */
 
-/** Narrow read-only detail stream for Mission Control. Never exports raw items. */
+/** Narrow read-only detail stream for Mission Control. Raw content is sanitized by its model before export. */
 export type MissionDetailEvent =
+  | DetailEvent
   | { kind: "synchronized" }
   | { kind: "cursor"; sequence: number }
   | { kind: "activity"; tool: string | null }
   | { kind: "usage"; turnId: string; output: number | null; at: number; baseline: boolean; startedAt?: number | null };
 export async function connectMissionThread(options: ConnectOptions, threadId: string,
   afterSequence: number | undefined, onEvent: (event: MissionDetailEvent) => void): Promise<void> {
+  const mainOwners=new Set<string>();
+  const activeCommands=new Map<string,string|null>();
+  const terminalRuns=new Set<string>();
+  const providers=new Map<string,{reported:unknown;context:Detail["context"];tasks:{id:string;child:string|null;kind:string}[]}>();
+  const children=new Map<string,{status:string;child:string|null;origin:string}>();
+  const metadata=()=>{
+    const rows=[...providers.values()],latest=rows.at(-1),tasks=new Map(rows.flatMap(p=>p.tasks).map(t=>[t.child??t.id,t]));
+    const counts={active:0,queued:0,completed:0},delegates={...counts},subagents={...counts};
+    const seen=new Set<string>();
+    for(const [id,c] of [...children].sort((a,b)=>Number(b[1].origin==="app_owned")-Number(a[1].origin==="app_owned"))){const key=c.child??id;if(seen.has(key))continue;seen.add(key);const state=c.status==="pending"?"queued":["running","waiting"].includes(c.status)?"active":c.status==="completed"?"completed":null;if(state){counts[state]++;(c.origin==="app_owned"?delegates:subagents)[state]++;}}
+    for(const [key,t] of tasks)if(t.kind==="subagent"&&!seen.has(key)){seen.add(key);counts.active++;subagents.active++;}
+    onEvent({kind:"metadata",reported:latest?.reported,context:latest?.context??null,work:{
+      children:counts,delegates,subagents,monitors:tasks.size?[...tasks.values()].filter(t=>t.kind==="monitor").length:null,
+      background:tasks.size?[...tasks.values()].filter(t=>t.kind==="background_task").length:null,
+      durableWaits:null,coverage:"observed bounded roster"}});
+  };
+  const provider=(p:OrchestrationV2ThreadProjection["providerThreads"][number])=>{
+    if(p.appThreadId!==threadId||p.ownerNodeId===null||!mainOwners.has(p.ownerNodeId))return;
+    if(!providers.has(p.id)&&providers.size>=16)return;
+    providers.delete(p.id);providers.set(p.id,{reported:p.nativeMetadata?.modelSelection,
+      context:p.contextUsage?{used:p.contextUsage.usedTokens,max:p.contextUsage.maxTokens??null}:null,
+      tasks:(p.pendingBackgroundTasks??[]).slice(0,128).map(t=>({id:p.id+"\0"+t.taskId,child:"childThreadId" in t?String(t.childThreadId):null,kind:t.kind}))});
+  };
+  const child=(c:OrchestrationV2ThreadProjection["subagents"][number])=>{
+    if(children.has(c.id)||children.size<128)children.set(c.id,{status:c.status,child:c.childThreadId,origin:c.origin});
+  };
+  const turn=(t:OrchestrationV2ThreadProjection["providerTurns"][number],stamp:number)=>{
+    // Normalized per-turn main-agent totals are independent of live context counters.
+    if(providers.has(t.providerThreadId)&&t.turnTokenUsage)onEvent({kind:"turn-usage",id:t.id,usage:t.turnTokenUsage,at:t.completedAt?DateTime.toEpochMillis(t.completedAt):stamp});
+  };
+  const activity=(r:OrchestrationV2ThreadProjection["turnItems"][number])=>{
+    if(["reasoning","command_execution","tool_call"].includes(r.type))onEvent({kind:"activity-state",id:r.id,type:r.type==="reasoning"?"thinking":"working",running:r.status==="running"&&!(r.runId&&terminalRuns.has(r.runId))});
+    if(r.type==="command_execution"){
+      const running=r.status==="running"&&!(r.runId&&terminalRuns.has(r.runId));
+      if(running&&(activeCommands.has(r.id)||activeCommands.size<32))activeCommands.set(r.id,r.runId);else if(!running)activeCommands.delete(r.id);
+      onEvent({kind:"command",id:r.id,input:r.input,running});
+    }
+    if(r.type==="assistant_message")onEvent({kind:"assistant",text:r.text,at:DateTime.toEpochMillis(r.updatedAt)});
+    if(r.status==="running")onEvent({kind:"activity",tool:r.type==="command_execution"?"command_execution":"toolName" in r&&typeof r.toolName==="string"?r.toolName:null});
+  };
+  let sequence=afterSequence;
   await withClient(options, client => client["orchestration.subscribeThread"]({
-    threadId, ...(afterSequence === undefined ? {} : { afterSequence }),
+    // Each reconnect rebuilds bounded active state; stable usage IDs deduplicate in the model.
+    threadId,
     requestCompletionMarker: true, acceptBoundedSnapshot: true, acceptCompactTurnItems: true,
   } as never).pipe(Stream.runForEach(item => Effect.sync(() => {
-    if (item.kind === "synchronized") { onEvent({ kind: "synchronized" }); return; }
-    if (item.kind === "snapshot") {
-      const turns = item.projection.providerTurns.toSorted((a, b) => b.ordinal - a.ordinal);
-      for (const turn of turns.filter((turn, i) => i === 0 || turn.status === "running").slice(0, 8)) {
-        onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
-          startedAt: turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : null,
-          at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : 0, baseline: true });
-      }
-      const recent = [...item.projection.turnItems, ...item.projection.visibleTurnItems.map(row => row.item)]
-        .filter(row => row.status === "running").toSorted((a,b) => b.ordinal - a.ordinal)[0];
-      if (recent) onEvent({ kind: "activity", tool: recent.type === "command_execution" ? "command_execution" : "toolName" in recent && typeof recent.toolName === "string" ? recent.toolName : null });
-      onEvent({ kind: "cursor", sequence: item.snapshotSequence }); return;
+    if(item.kind==="synchronized"){onEvent({kind:"synchronized"});return;}
+    if(item.kind==="snapshot"){
+      providers.clear();children.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
+      for(const run of item.projection.runs.slice(-128))if(["completed","failed","cancelled","interrupted"].includes(run.status))terminalRuns.add(run.id);
+      for(const n of item.projection.nodes.filter(n=>n.kind==="root_turn").slice(-128))mainOwners.add(n.id);
+      for(const p of item.projection.providerThreads)provider(p);
+      for(const c of item.projection.subagents)child(c);
+      metadata();
+      for(const t of item.projection.providerTurns.slice(-128))turn(t,DateTime.toEpochMillis(item.projection.updatedAt));
+      // Iterate oldest first; model deduplicates assistant updates by source timestamp.
+      const items=new Map([...item.projection.turnItems,...item.projection.visibleTurnItems.map(r=>r.item)].map(r=>[r.id,r]));
+      for(const r of [...items.values()].toSorted((a,b)=>a.ordinal-b.ordinal))activity(r as OrchestrationV2ThreadProjection["turnItems"][number]);
+      const assistant=item.projection.messages.filter(m=>m.role==="assistant"&&m.text.trim()).toSorted((a,b)=>DateTime.toEpochMillis(a.updatedAt)-DateTime.toEpochMillis(b.updatedAt)).at(-1);
+      if(assistant)onEvent({kind:"assistant",text:assistant.text,at:DateTime.toEpochMillis(assistant.updatedAt)});
+      sequence=item.snapshotSequence;onEvent({kind:"cursor",sequence});return;
     }
-    if (item.kind === "unknown-event") { onEvent({ kind: "cursor", sequence: item.sequence }); return; }
-    if (item.kind === "event") {
-      const e = item.event;
-      if (e.type === "provider-turn.updated") {
-        const turn = e.payload;
-        onEvent({ kind: "usage", turnId: turn.id, output: turn.tokenUsage?.outputTokens ?? null,
-          startedAt: turn.startedAt ? DateTime.toEpochMillis(turn.startedAt) : null,
-          at: turn.tokenUsage?.updatedAt ? Date.parse(turn.tokenUsage.updatedAt) : DateTime.toEpochMillis(e.occurredAt), baseline: false });
-      } else if (e.type === "turn-item.updated" && e.payload.status === "running") {
-        onEvent({ kind: "activity", tool: e.payload.type === "command_execution" ? "command_execution" : "toolName" in e.payload && typeof e.payload.toolName === "string" ? e.payload.toolName : null });
+    if(sequence!==undefined&&item.sequence<=sequence)return;
+    sequence=item.sequence;
+    if(item.kind==="event"){
+      const e=item.event;
+      if(e.type==="run.updated"&&["completed","failed","cancelled","interrupted"].includes(e.payload.status)){
+        onEvent({kind:"clear-activity"});
+        if(terminalRuns.size>=128)terminalRuns.delete(terminalRuns.values().next().value!);terminalRuns.add(e.payload.id);
+        for(const [id,run] of activeCommands)if(run===e.payload.id){activeCommands.delete(id);onEvent({kind:"command",id,input:"",running:false});onEvent({kind:"activity-state",id,type:"working",running:false});}
       }
-      onEvent({ kind: "cursor", sequence: item.sequence });
+      else if(e.type==="provider-turn.updated")turn(e.payload,DateTime.toEpochMillis(e.occurredAt));
+      else if(e.type==="turn-item.updated")activity(e.payload);
+      else if(e.type==="message.updated"&&e.payload.role==="assistant")onEvent({kind:"assistant",text:e.payload.text,at:DateTime.toEpochMillis(e.payload.updatedAt)});
+      else if(e.type==="node.updated"&&e.payload.kind==="root_turn"){if(mainOwners.size<128)mainOwners.add(e.payload.id);}
+      else if(e.type==="provider-thread.updated"){provider(e.payload);metadata();}
+      else if(e.type==="subagent.updated"){child(e.payload);metadata();}
     }
+    onEvent({kind:"cursor",sequence:item.sequence});
   }))));
 }
 
 export async function connectShell(options: ConnectOptions, subscription: ShellSubscription): Promise<void> {
   let callbackError: unknown;
   try {
-    await withClient(options, (client) =>
-      client["orchestration.subscribeShell"]({
+    await withClient(options, (client) => {
+      const shell=client["orchestration.subscribeShell"]({
         ...(subscription.afterSequence === undefined ? {} : { afterSequence: subscription.afterSequence }),
         requestCompletionMarker: true,
       }).pipe(
@@ -590,8 +644,20 @@ export async function connectShell(options: ConnectOptions, subscription: ShellS
             throw error;
           }
         })),
-      ),
-    );
+      );
+      if(!subscription.onResources)return shell;
+      const sample=Effect.gen(function*(){
+        while(true){
+          const resources=yield* client["server.getHostResources"]({}).pipe(
+            Effect.timeout("3 seconds"),
+            Effect.map(sample=>({state:"reported" as const,sample})),
+            Effect.catch(()=>Effect.succeed({state:"unavailable" as const,sample:null})));
+          subscription.onResources!(resources);
+          yield* Effect.sleep("5 seconds");
+        }
+      });
+      return Effect.raceFirst(shell,sample);
+    });
   } catch (error) {
     // Callback failures include switch RPC protocol/configuration failures.
     // Preserve their classification across Effect's callback defect boundary.

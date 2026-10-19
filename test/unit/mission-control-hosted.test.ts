@@ -18,7 +18,8 @@ const now0=Date.parse("2026-10-18T19:00:00Z"),epoch="a".repeat(32);
 function scratch(){const root=process.env.CHALDEA_TEST_SCRATCH!;assert.ok(root&&!root.startsWith("/tmp"));const path=mkdtempSync(join(root,"mc-"));return{path,close:()=>rmSync(path,{recursive:true,force:true})};}
 const row=(id="private-thread"):ShellThread=>({id,title:"PRIVATE arbitrary task /home/igor/key",status:"running",providerInstanceId:"SECRET account alias",modelSelection:{instanceId:"SECRET",model:"gpt-6.1-sol"},latestRunId:"private-run",activeRunId:"private-run",latestRunStartedAt:new Date(now0-1000).toISOString(),latestRunCompletedAt:null,lastErrorClass:null,usageLimitResetAt:null,limitRecovery:null,relationshipToParent:null,archived:false,deleted:false});
 function live(clock=()=>now0,rows=[row()]){const m=new MissionModel(false,clock);m.shell({kind:"snapshot",sequence:1,threads:rows});m.shell({kind:"synchronized"});for(const r of rows)m.detail(r.id,{kind:"synchronized"});return m;}
-const sample=(sequence=1,now=now0)=>captureSnapshot(live(()=>now),"agent-a",epoch,sequence)!;
+// Mutation-heavy fixtures exercise legacy v1 compatibility.
+const sample=(sequence=1,now=now0)=>{const s=captureSnapshot(live(()=>now),"agent-a",epoch,sequence)!;delete s.rich;return s;};
 
 
 for(const existingSlot of [false,true])test("R1 full4096page status admission cannot starve100 protected ordinary deliveries, existingSlot="+existingSlot,async()=>{
@@ -113,7 +114,7 @@ test("capture samples quiet live state, preserves activity age and private metad
   let now=now0;const m=live(()=>now);m.detail("private-thread",{kind:"activity",tool:"read"});
   let s=captureSnapshot(m,"agent-a",epoch,1)!;
   assert.equal(s.tokens.qualified,false);assert.equal(s.tokens.output,null);assert.equal(s.agents[0]!.steps[0],"read");
-  for(const secret of ["PRIVATE","/home/igor","SECRET","private-run","private-thread"])assert.equal(JSON.stringify(s).includes(secret),false);
+  for(const secret of ["PRIVATE","/home/igor","SECRET","private-run"])assert.equal(JSON.stringify(s).includes(secret),false);
   now+=60_000;s=captureSnapshot(m,"agent-a",epoch,2)!;
   assert.equal(s.observedAt,now);assert.equal(s.agents[0]!.detailObservedAt,now0);assert.equal(s.agents[0]!.observedAt,now0);
   m.disconnected();const stopped=captureSnapshot(m,"agent-a",epoch,3)!;now+=60_000;
@@ -213,7 +214,7 @@ test("summary retains fresh zero, missing and stale hosts with independent quiet
     assert.equal(a.total,0);assert.equal(a.freshness,"live");assert.equal(a.observedAt,now);
     assert.equal(view.hostSummary.find(h=>h.host==="omarchy-pc")!.total,null);
     assert.equal(view.hostSummary.find(h=>h.host==="omarchy-pc")!.freshness,"nosource");
-    assert.deepEqual(view.hostSummary.find(h=>h.host==="agent-b")!.models,[{model:"gpt-6.1-sol",count:1}]);
+    assert.deepEqual(view.hostSummary.find(h=>h.host==="agent-b")!.models.map(({model,count})=>({model,count})),[{model:"gpt-6.1-sol",count:1}]);
     assert.equal(view.agents[0]!.activityFreshness,"live");assert.equal(view.agents[0]!.detailObservedAt,now0);
     now+=91_000;assert.equal(model.snapshot().hostSummary.find(h=>h.host==="agent-a")!.freshness,"stale");
     assert.equal(model.snapshot().hostSummary.find(h=>h.host==="agent-a")!.observedAt,now0+65_000);
@@ -314,4 +315,47 @@ test("hosted HTTP is independent of T3, enforces fixed proxy origin and keeps li
     assert.equal((await get("/rpc")).status,404);assert.match((await get("/")).headers["content-security-policy"],/frame-ancestors 'none'/);
     now+=601_000;const stale=await get("/api/snapshot");assert.equal(JSON.parse(stale.body).source.state,"lost");assert.equal((await get("/healthz")).status,200);assert.equal((await get("/readyz")).status,503);
   }finally{await server.close();d.close();}
+});
+
+test("rich capture crosses ordinary collector/cache with resources, privacy, usage and exact identities",async()=>{
+ const d=scratch(),m=live();
+ try{
+  m.setResources({state:"reported",sample:{sampledAt:now0,cpuUtilization:0.25,cpuCount:12,availableMemoryBytes:400,totalMemoryBytes:1000}});
+  m.detail("private-thread",{kind:"assistant",text:"Earlier paragraph\n\nThe tests passed <script>alert(1)</script>.",at:now0});
+  m.detail("private-thread",{kind:"command",id:"private-command",input:"go test -race ./...",running:true});
+  m.detail("private-thread",{kind:"turn-usage",id:"private-turn",at:now0,usage:{usageScope:"main_agent",usageStatus:"complete",inputTokens:100,outputTokens:20,cachedInputTokens:30,cacheCreationTokens:10,reasoningTokens:5,hasSubagents:true}});
+  const rich=captureSnapshot(m,"agent-a",epoch,1)!;validateHostSnapshot(rich);
+  assert.equal(rich.rich!.resources.sample!.cpuUtilization,0.25);
+  const detail=rich.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail;
+  assert.equal(detail.commands[0]!.text,"go test -race ./...");assert.equal(detail.usage.total,120);assert.equal(detail.usage.rate,null);
+  assert.equal(detail.assistant.text,"The tests passed <script>alert(1)</script>.");
+  assert.equal(JSON.stringify(rich).includes("private-turn"),false);
+  const forged=structuredClone(rich);((forged.rich!.details[0]!.value as import("../../src/mission-control/details.ts").Detail).usage as any).arbitrary=1;assert.throws(()=>validateHostSnapshot(forged));
+  const wrong=structuredClone(rich);wrong.rich!.details[0]!.id="0".repeat(16);assert.throws(()=>validateHostSnapshot(wrong));
+  const file=join(d.path,"rich.json");writeFileSync(file,JSON.stringify(rich),{mode:0o600});
+  const outbox=new Outbox(join(d.path,"rich.db"));
+  try{
+   let delivered:any;
+   await collect({outbox,host:"agent-a",spool:join(d.path,"absent"),missionControlSnapshotFile:file,now:()=>now0,deliver:async e=>{delivered=e;return true;}});
+   assert.deepEqual(delivered.payload.data.snapshot,rich);
+  }finally{outbox.close();}
+  const cache=emptyCache();mergeStatus(cache,rich,now0);const cachePath=join(d.path,"cache");writeCache(cachePath,cache);
+  const model=new CacheModel(cachePath,()=>now0),view=model.snapshot();
+  assert.equal(view.hostSummary.find(h=>h.host==="agent-a")!.resources!.sample!.totalMemoryBytes,1000);
+  assert.equal(view.agents[0]!.details.usage.total,120);
+  assert.equal(view.hostSummary.find(h=>h.host==="agent-a")!.details!.usage.total,120);
+  m.setResources({state:"unavailable",sample:null});const denied=captureSnapshot(m,"agent-a",epoch,2)!;
+  assert.equal(denied.agents.length,1);assert.equal(denied.rich!.resources.state,"unavailable");
+ }finally{d.close();}
+});
+test("rich detail byte budget preserves base rows and legacy validation",()=>{
+ const rows=Array.from({length:48},(_,i)=>row("thread-"+i)),m=live(()=>now0,rows);
+ for(const r of rows)m.detail(r.id,{kind:"assistant",text:"🧪 ".repeat(300),at:now0});
+ const s=captureSnapshot(m,"agent-a",epoch,1)!;
+ assert.ok(Buffer.byteLength(JSON.stringify(s))<=8192);assert.equal(s.total,48);
+ const base=structuredClone(s);delete base.rich;validateHostSnapshot(base);
+ assert.equal(s.agents.length,base.agents.length);
+ if(s.rich){assert.equal(s.rich.details.length+s.rich.omitted,s.agents.length);assert.ok(s.rich.omitted>0);}
+ const c=emptyCache();mergeStatus(c,s,now0);const second={...structuredClone(s),host:"agent-b"};mergeStatus(c,second,now0);
+ for(const value of c.snapshots)validateHostSnapshot(value);
 });

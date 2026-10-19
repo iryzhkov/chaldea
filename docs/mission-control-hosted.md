@@ -15,14 +15,49 @@ Live threads keeps the existing density tiers and portrait paging within the
 48-row bound. Its source age and activity age are independent; a quiet connected
 thread remains live while its source is fresh.
 
-The v1 shape, identity and strict privacy validation stay unchanged. The closed
-tool enum adds only `Command running`; known finite MCP tool names normalize to
-existing labels before capture. Command input, output and arbitrary tool names
-never become labels, and targets stay blank. Old snapshots remain valid. Old
-installed validators reject the new enum until upgraded: stage H Akasha and N
-reader/web before any upgraded capture emits it. H's five-second admission gate
-must also precede faster collectors. New qualified client/host assets and ROOT's
-review, CI and deployment packet are still required. No live change is made here.
+The optional strict `rich.v2` field set carries official whole-host CPU/RAM and
+bounded agent details through the same capture → ordinary collector → Akasha →
+restricted reader/cache → API/SSE path. Legacy v1 snapshots remain valid. Old
+validators reject the extension and new state enums: upgrade H's host validator
+and N's reader/web first, then compatible ordinary collectors, and capture
+producers last. Source-only acceptance is not live qualification. Preserve all
+older immutable releases and rollback state; roll producers back before older
+validators. No new grants, identity, publisher or data store are needed.
+
+Base rows fit the unchanged 8 KiB budget first. Resources and sanitized actual
+titles/app thread IDs follow, then full details when they fit. IDs in base rows
+remain epoch-local opaque keys; displayed app IDs are labelled, bounded to 256
+UTF-8 bytes, and copyable only when complete. Titles are bounded to 160 bytes,
+assistant paragraphs to 384, and up to three active command summaries to 128
+bytes each. Missing/identity-only detail, omitted commands, withheld sensitive
+content and truncation remain explicit. HTML uses escaped text. Provider
+conversation IDs, prompts, reasoning text and arbitrary tool outputs stay private.
+
+Effort is either provider-reported, explicitly configured, or not reported.
+Thinking requires a running reasoning item, never elapsed silence. Terminal
+command/run updates and bounded reconnect snapshots clear active commands.
+Existing density tiers and portrait paging are retained; state sits beside Task
+or Agent and the sanitized title is the main heading.
+
+Usage uses normalized main-agent turn totals, replaced by stable internal turn
+identity across reconnects. At most eight observed turns per shown thread are
+retained; eviction marks coverage partial. Input + output is the observed total.
+Cache reads/writes are input subsets and reasoning is an output subset. Context
+occupancy is separate. Live context counters do not qualify a generation rate:
+rate stays null/not reported, as do daily totals and cost. Host/model aggregates
+cover observed main-agent turns only and disclose missing rows. Child provider
+turns are excluded from parent usage. Delegate/native child rosters deduplicate
+actual child IDs, distinguish active/queued/completed observations, and remain
+bounded; parent work rosters are not additive. Empty unsupported native
+background rosters and unavailable Chaldea durable waits stay unknown.
+
+Host resources use only `server.getHostResources` on the existing shell
+connection, one request at a time, a three-second timeout and five-second delay.
+Denial or lack of support leaves threads working and resources unavailable.
+CPU utilization is a 0–1 fraction, displayed as percent. Used RAM is
+max(0, total − available); resource sample age is independent of thread age.
+Other hosts remain not reported until their existing read permissions and
+natural publication are qualified.
 
 Storage caps are unchanged. Payload TTL is one hour, receipts one day; ordinary
 maintenance runs at startup and hourly, so expired payloads may remain on disk

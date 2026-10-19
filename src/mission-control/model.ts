@@ -1,5 +1,6 @@
 // Browser DTOs are constructed here. Raw source objects never cross this interface.
 import type { ShellEvent, ShellThread, MissionDetailEvent } from "../t3/adapter.ts";
+import { ThreadDetails, aggregateDetails, validResources, titlePreview, appThreadIdPreview, type Resources } from "./details.ts";
 import type { HeadroomState, Metric } from "../quota/headroom.ts";
 export const MAX_AGENTS = 48, MAX_TURNS = 512, MAX_SAMPLES = 4096;
 const tools = new Set(["read","search","navigate","edit_apply","change_plan","verify_run","chaldea exec","t3_thread_read","t3_thread_list","jocasta","watch_pull_request","html_preview","delegate_task","chaldea_decision_prepare"]);
@@ -8,7 +9,7 @@ for(const tool of tools)for(const prefix of ["","mcp__huyang__","mcp__t3_code__"
 toolAliases.set("command_execution","Command running");
 toolAliases.set("Command running","Command running");
 export const fixedTool = (value:unknown):string => typeof value==="string" ? toolAliases.get(value) ?? "Activity unavailable" : "Activity unavailable";
-export interface HostSummary {host:string;shown:number;total:number|null;truncated:boolean;observedAt:number|null;freshness:string;connected:boolean|null;states:Record<string,number>;models:{model:string;count:number}[]}
+export interface HostSummary {host:string;shown:number;total:number|null;truncated:boolean;observedAt:number|null;freshness:string;connected:boolean|null;states:Record<string,number>;models:{model:string;count:number;usage?:import("./details.ts").Usage}[];resources?:Resources;details?:ReturnType<typeof aggregateDetails>}
 export function summarizeHost(host:string,agents:{state:string;model:string}[],total:number|null,truncated:boolean,observedAt:number|null,freshness:string,connected:boolean|null):HostSummary {
   const states:Record<string,number>={},models=new Map<string,number>();
   for(const a of agents){states[a.state]=(states[a.state]??0)+1;models.set(a.model,(models.get(a.model)??0)+1);}
@@ -23,7 +24,26 @@ export function safeLabel(value: unknown, fallback = "Task"): string {
 const at = (s: string | null | undefined): number | null => s && Number.isFinite(Date.parse(s)) ? Date.parse(s) : null;
 const count = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 type Thread = { row: ShellThread; observed: number; connected: boolean; detailObserved: number | null; steps: string[] };
+function threadState(row:ShellThread,details:import("./details.ts").Detail):string {
+  if(row.pendingRequest){
+    if(!row.pendingRequestKind||row.pendingRequestKind==="user_input")return "waiting-igor";
+    return ["command","file-read","file-change","mcp-elicitation","permission"].includes(row.pendingRequestKind)?"waiting-approval":"waiting";
+  }
+  if(["failed","interrupted"].includes(row.status))return "failed";
+  if(row.status==="cancelled")return "cancelled";
+  if(row.status==="waiting"){
+    if(details.work.children&&details.work.children.active>0)return "waiting-children";
+    if(details.work.monitors&&details.work.monitors>0)return "waiting-monitor";
+    return "waiting";
+  }
+  if(["pending","queued","preparing"].includes(row.status))return "queued";
+  if(row.activeRunId)return details.activity==="thinking"?"thinking":"working";
+  return row.status==="completed"?"completed":"idle";
+}
 export class MissionModel {
+  private detailStates = new Map<string,ThreadDetails>();
+  private resources:Resources={state:"unavailable",sample:null};
+  setResources(resources:Resources):void {this.resources=resources.state==="reported"&&validResources(resources.sample)&&resources.sample.sampledAt<=this.now()?resources:{state:"unavailable",sample:null};this.changed();}
   private threads = new Map<string, Thread>();
   private turns = new Map<string, { output: number; at: number; live: boolean; fence: number }>();
   private evictedThrough: number | null = null;
@@ -49,7 +69,8 @@ export class MissionModel {
   ids(): string[] { return [...this.threads.keys()]; }
   shell(event: ShellEvent): void {
     const now = this.now();
-    if (event.kind === "synchronized") { this.connected = true; this.observed = now; this.changed(); return; }
+    if (event.kind === "synchronized") { this.connected = true; for(const id of this.detailStates.keys())if(!this.threads.has(id))this.detailStates.delete(id);
+    this.observed = now; this.changed(); return; }
     if (event.kind !== "snapshot" && this.sequence !== undefined && event.sequence <= this.sequence) return;
     this.sequence = event.sequence;
     if (event.kind === "snapshot") {
@@ -83,6 +104,9 @@ export class MissionModel {
   detail(id: string, event: MissionDetailEvent): void {
     const t = this.threads.get(id); if (!t) return;
     const now = this.now(); t.detailObserved = now;
+    let details=this.detailStates.get(id);if(!details){details=new ThreadDetails();this.detailStates.set(id,details);}
+    if((event.kind==="turn-usage"||event.kind==="assistant")&&(!Number.isSafeInteger(event.at)||event.at>now))return;
+    if(["reset","clear-activity","assistant","command","metadata","turn-usage","activity-state"].includes(event.kind)){details.apply(event as import("./details.ts").DetailEvent);this.changed();return;}
     if (event.kind === "synchronized") t.connected = true;
     if (event.kind === "activity") {
       const label = fixedTool(event.tool);
@@ -142,22 +166,27 @@ export class MissionModel {
         creditState: p.credits.state, resetState: p.manualResets.state,
         unlimited: p.credits.value?.unlimited ?? null, manualResets: count(p.manualResets.value?.availableCount) ? p.manualResets.value.availableCount : null });
     }
-    const agents = [...this.threads.values()].map((t,i) => ({
+    const agents = [...this.threads.values()].map((t,i) => {
+      const details={...(this.detailStates.get(t.row.id)??new ThreadDetails()).snapshot(t.row.modelSelection,now,t.connected&&this.connected),identity:{title:titlePreview(t.row.title),appThreadId:appThreadIdPreview(t.row.id)}};
+      return ({
       id: "agent-" + i, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
-      host: "omarchy-pc", state: t.row.pendingRequest ? "waiting-igor" : ["failed","interrupted"].includes(t.row.status) ? "failed" : t.row.status === "waiting" ? "waiting" : t.row.activeRunId ? "working" : "idle",
+      host: "omarchy-pc", state:threadState(t.row,details),
       startedAt: at(t.row.latestRunStartedAt), observedAt: t.observed, detailObservedAt: t.detailObserved,
       freshness: freshness(this.connected, this.observed, 30_000, 300_000),
       activityFreshness: freshness(t.connected, t.detailObserved, 60_000, 600_000), steps: [...t.steps],
-    }));
+      detailCoverage:"reported" as string,
+      details,
+    });});
     const usageConnected = agents.length > 0 && [...this.threads.values()].every(t => t.connected);
     return { version: 1, demo: this.demo, now, source: { state: freshness(this.connected, this.observed, 30_000, 300_000), observedAt: this.observed },
-      hostSummary: [summarizeHost("omarchy-pc",agents,this.coverageExact?this.total:null,!this.coverageExact||this.total>agents.length,this.observed,freshness(this.connected,this.observed,30_000,300_000),this.observed===null?null:this.connected)],
+      hostSummary: [{...summarizeHost("omarchy-pc",agents,this.coverageExact?this.total:null,!this.coverageExact||this.total>agents.length,this.observed,freshness(this.connected,this.observed,30_000,300_000),this.observed===null?null:this.connected),resources:this.resources,details:aggregateDetails(agents.map(a=>a.details),agents.length)}] as HostSummary[],
+      resources:this.resources,
       agents, shown: agents.length, total: this.coverageExact ? this.total : null, truncated: !this.coverageExact || this.total > agents.length,
       tokens: { rate: this.usageObserved === null || !usageConnected ? null : this.samples.filter(s => now - s.at <= 60_000).reduce((s,v) => s + v.output, 0) / 60,
         output: this.usageObserved === null ? null : this.output, observedAt: this.usageObserved,
         coverage: this.accountingPartial ? "partial" : "observed",
         scope: this.accountingPartial ? "Partial accounting: known lower bound after bounded counter eviction. Uncertain returning counters establish new baselines. Daily reconciliation unavailable." : "Observed deltas since this process started; 48-thread cap. Daily reconciliation unavailable." },
       quota: { state: this.quotaError ? "error" : this.quota === null ? "unknown" : "cached", accounts },
-      unavailable: ["Fleet","Events","Ops","Lab","host health","exec slots","cost","daily totals"] };
+      unavailable: ["Events","Ops","Lab","host health","exec slots","cost","daily totals"] };
   }
 }

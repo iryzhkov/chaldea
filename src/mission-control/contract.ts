@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
+import { validateRich, type RichSnapshot } from "./detail-contract.ts";
 import type { MissionModel } from "./model.ts";
 export const SNAPSHOT_SCHEMA = "mission-control.host.v1", SNAPSHOT_BYTES = 8192;
 export const HOSTS = ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"] as const;
 export const MODELS = ["gpt-6.1-sol","gpt-6-sol","gpt-6-astra","gpt-6-luna","gpt-5.6-sol","claude-opus-5-5","claude-haiku-4-5","unknown"] as const;
 export const TOOLS = ["read","search","navigate","edit_apply","change_plan","verify_run","Command running"] as const;
-const STATES = ["working","waiting","waiting-igor","idle","failed"] as const;
+const STATES = ["thinking","working","waiting","waiting-igor","waiting-approval","waiting-children","waiting-monitor","queued","completed","cancelled","idle","failed"] as const;
 export interface HostSnapshot {
+  rich?:RichSnapshot;
   schema: typeof SNAPSHOT_SCHEMA; host: string; epoch: string; sequence: number; observedAt: number; connected: boolean;
   total: number|null; truncated: boolean;
   agents: {id:string;model:string;state:string;startedAt:number|null;observedAt:number;detailObservedAt:number|null;connected:boolean;steps:string[]}[];
@@ -17,7 +19,7 @@ export function exact(v:Record<string,unknown>,keys:readonly string[]):void {che
 const count=(v:unknown):v is number=>typeof v==="number"&&Number.isSafeInteger(v)&&v>=0;
 const time=(v:unknown):v is number=>count(v)&&v>0&&v<=8_640_000_000_000_000;
 export function validateHostSnapshot(raw:unknown):HostSnapshot {
-  const s=object(raw);exact(s,["schema","host","epoch","sequence","observedAt","connected","total","truncated","agents","tokens"]);
+  const s=object(raw);exact(s,["schema","host","epoch","sequence","observedAt","connected","total","truncated","agents","tokens",...(Object.hasOwn(s,"rich")?["rich"]:[])]);
   check(s.schema===SNAPSHOT_SCHEMA&&HOSTS.includes(s.host as typeof HOSTS[number])&&typeof s.epoch==="string"&&/^[a-f0-9]{32}$/.test(s.epoch));
   check(count(s.sequence)&&s.sequence>0&&time(s.observedAt)&&typeof s.connected==="boolean"&&typeof s.truncated==="boolean");
   check(Array.isArray(s.agents)&&s.agents.length<=48&&(s.total===null||count(s.total)&&s.total>=s.agents.length));
@@ -29,6 +31,12 @@ export function validateHostSnapshot(raw:unknown):HostSnapshot {
     check(time(a.observedAt)&&a.observedAt<=s.observedAt&&(a.startedAt===null||time(a.startedAt)&&a.startedAt<=s.observedAt)&&(a.detailObservedAt===null||time(a.detailObservedAt)&&a.detailObservedAt<=s.observedAt));
     check(Array.isArray(a.steps)&&a.steps.length<=6&&a.steps.every(t=>TOOLS.includes(t as typeof TOOLS[number])));
   }
+  if(Object.hasOwn(s,"rich")){
+    const rich=validateRich(s.rich,ids,Number(s.observedAt));
+    for(const row of rich.details){const app=row.value.identity.appThreadId;
+      if(app.state==="reported"&&app.text!==null)check(createHash("sha256").update(String(s.epoch)+"\0"+app.text).digest("hex").slice(0,16)===row.id);
+    }
+  }
   const t=object(s.tokens);exact(t,["qualified","output","rate","observedAt","coverage"]);
   check(typeof t.qualified==="boolean"&&["unknown","observed","partial"].includes(t.coverage as string));
   check(t.output===null||count(t.output));check(t.rate===null||typeof t.rate==="number"&&Number.isFinite(t.rate)&&t.rate>=0&&t.rate<=Number.MAX_SAFE_INTEGER);
@@ -38,7 +46,7 @@ export function validateHostSnapshot(raw:unknown):HostSnapshot {
   check(Buffer.byteLength(JSON.stringify(s))<=SNAPSHOT_BYTES);
   return structuredClone(s) as unknown as HostSnapshot;
 }
-/** Export only fixed labels and epoch-local opaque identities, never source titles. */
+/** Base rows keep opaque identities; approved bounded titles/app IDs use the optional detail budget. */
 export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequence:number,qualified=false):HostSnapshot|null {
   const v=model.snapshot();if(v.source.observedAt===null)return null;
   const observedAt=Math.max(v.source.state==="live"?v.now:v.source.observedAt,...v.agents.map(a=>Math.max(a.observedAt,a.detailObservedAt??0)),v.tokens.observedAt??0);
@@ -48,6 +56,21 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     tokens:qualified?{qualified:true,output:v.tokens.output,rate:v.tokens.rate,observedAt:v.tokens.observedAt,coverage:v.tokens.coverage as "observed"|"partial"}:
       {qualified:false,output:null,rate:null,observedAt:null,coverage:"unknown"}};
   while(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){snapshot.agents.pop();snapshot.truncated=true;}
+  // Fit base rows first. Optional metadata never removes another row.
+  const rich:RichSnapshot={v:2,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
+  snapshot.rich=rich;
+  if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
+  else {
+    rich.resources=v.resources;
+    if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.resources={state:"byte-budget",sample:null};
+    for(let i=0;i<snapshot.agents.length;i++){
+      const row={id:snapshot.agents[i]!.id,value:{identity:v.agents[i]!.details.identity,fieldCoverage:"identity-only" as const}};rich.details.push(row);rich.omitted--;
+      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES){rich.details.pop();rich.omitted++;}
+    }
+    for(const row of rich.details){const i=snapshot.agents.findIndex(a=>a.id===row.id),identity=row.value;row.value=v.agents[i]!.details;
+      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)row.value=identity;
+    }
+  }
   return validateHostSnapshot(snapshot);
 }
 export function statusIdentity(e:{host:string;source:string;issuer:string;profile:string;project:string;source_id?:string},snapshot:HostSnapshot):boolean {

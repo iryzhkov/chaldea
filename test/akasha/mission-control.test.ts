@@ -1,6 +1,6 @@
 import test from "node:test";
 import { once } from "node:events";
-import { generateKeyPairSync } from "node:crypto";
+import { createHash,generateKeyPairSync } from "node:crypto";
 import { CompactSign } from "jose";
 import { project, event } from "./helpers.ts";
 import { Ingress } from "../../src/akasha/ingress.ts";
@@ -249,4 +249,34 @@ test("reader selector validates coherent registry and produces only approved sna
     const q=scopeSql({...reader,global:false,missionControlSources:reader.mission_control_read_sources} as any);
     assert.match(q.sql,/source_id/);assert.match(q.sql,/snapshot/);assert.ok(q.params.includes("agent_status"));
   } finally{x.close();}
+});
+
+test("rich v2 fields cross authenticated H store and restricted reader to API/SSE; legacy v1 remains valid",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ const h=await hostedRig();
+ try{
+  const p:any=payload(),d=emptyDetail();
+  d.identity={title:{text:"Useful actual title",state:"reported"},appThreadId:{text:"mcp:actual-app-thread",state:"reported"}};
+  d.assistant={text:"A public assistant paragraph.",state:"reported"};d.effort={value:"high",source:"configured"};
+  d.commands=[{text:"go test -race ./...",state:"reported"}];
+  const opaque=createHash("sha256").update(p.data.snapshot.epoch+"\0"+d.identity.appThreadId.text).digest("hex").slice(0,16);p.data.snapshot.agents[0].id=opaque;
+  p.data.snapshot.rich={v:2,resources:{state:"reported",sample:{sampledAt:N*1000,cpuUtilization:0.4,cpuCount:12,availableMemoryBytes:200,totalMemoryBytes:800}},details:[{id:opaque,value:d}],omitted:0};
+  assert.equal((await h.post(p)).status,201);
+  const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
+  assert.deepEqual(cache.snapshots[0]!.rich,p.data.snapshot.rich);writeCache(h.config.cacheFile,cache);
+  const web=missionServer(new CacheModel(h.config.cacheFile,()=>N*1000));await web.listen(0);
+  try{
+   const port=(web.server.address()as{port:number}).port;
+   const response=await fetch("http://127.0.0.1:"+port+"/api/snapshot"),body:any=await response.json();
+   assert.equal(body.agents[0].title,"Useful actual title");
+   assert.equal(body.agents[0].details.identity.appThreadId.text,"mcp:actual-app-thread");
+   const stream=await fetch("http://127.0.0.1:"+port+"/api/events"),reader=stream.body!.getReader();
+   let bytes="";for(let i=0;i<4&&!bytes.includes("Useful actual title");i++){const next=await reader.read();bytes+=new TextDecoder().decode(next.value);}
+   assert.match(bytes,/Useful actual title/);await reader.cancel();
+  }finally{await web.close();}
+  const malformed=structuredClone(p);malformed.data.snapshot.rich.details[0].value.identity.providerConversationId="forbidden";
+  assert.equal((await h.post(malformed,"extra-id")).status,400);
+  const wrong=structuredClone(p);wrong.data.snapshot.host="agent-b";assert.equal((await h.post(wrong,"wrong-host")).status,403);
+  assert.equal(normalize(payload(),identity,false).kind,"agent_status");
+ }finally{await h.close();}
 });
