@@ -88,7 +88,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
       w.remainingPercent <= 100 && (w.resetsAt === null || Date.parse(w.resetsAt) > data.now)) : [];
     const advice = windowPolicy(windows, data.now, config.minimumRemaining, config.paceMargin);
     reasons.push(...advice.reasons.map(reason => p.providerInstanceId + " " + reason));
-    if (advice.gate) { reasons.push(p.providerInstanceId + ": short window " + advice.gate + ", avoid until reset"); continue; }
+    // Short windows gate included usage only. The classifier sets creditFunded solely for fresh,
+    // account-bound credits with spend control not reached; active stops were excluded above.
+    if (advice.gate && capacity?.creditFunded) reasons.push(p.providerInstanceId + ": included short window " + advice.gate + " does not gate the credit-funded lane");
+    else if (advice.gate) { reasons.push(p.providerInstanceId + ": short window " + advice.gate + ", avoid until reset"); continue; }
     if ((!capacity || capacity.reserveWeeks === 0 && !["unlimited", "use-it"].includes(capacity.class)) &&
         advice.pacing && advice.pacing.remainingPercent / 100 < config.minimumRemaining) {
       reasons.push(`${p.providerInstanceId}: under ${config.minimumRemaining * 100}% remaining, avoid`); continue;

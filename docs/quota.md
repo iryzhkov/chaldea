@@ -366,7 +366,11 @@ Codex aggregate credits come from a separate short-lived **installed** Codex
 app-server. They are credits, not dollars or a purchased-only ledger, and are never
 summed across aliases/buckets. The wallet's decimal string, hasCredits/unlimited
 flags, manual-reset count, ordinaryUsageAllowed and spendControlReached each retain
-their own successful observation time. The only account RPC is
+their own successful observation time. A read whose account ID differs from the
+retained one (changed, newly known or missing) clears these app-server fields and the
+cached account credit expiry first,
+so an omitted field never carries over from another account; T3-sourced windows and
+reset inventory are kept. The only account RPC is
 `account/rateLimits/read`, with `excludeResetCreditDetails:true` and
 `supportsLunaReserve:false`, after initialize/initialized. No model thread or turn,
 purchase, reset redemption, login change or explicit credential refresh is requested.
@@ -480,11 +484,15 @@ restarts replay durable delivery intents through the existing poster path.
 Legacy feed attempts retain their existing at-most-once semantics; scoped Akasha
 delivery retains its receipt/retry behavior. Status does not post feed records.
 
-Routing receives these three lanes as read-only inputs. Credit-funded admission
-and automatic reset redemption are always disabled in this design. Inventory
+Routing receives these three lanes as read-only inputs. Automatic provider
+switching never uses the credit-funded lane, so `creditFunded.admissionAllowed`
+stays false, and automatic reset redemption is always disabled. Inventory
 cannot admit a provider switch; a fresh ordinary-usage denial blocks the included
-lane, while spend controls remain separate in the credit-funded lane. A future paid-routing policy would need an explicit budget, adequate
-**fresh** balance, spend-control checks and actual provider acceptance. Existing
+lane, while spend controls remain separate in the credit-funded lane. FATE route
+recommendations do consider that lane: fresh account-bound credits with fresh
+`spendControlReached: false` classify as credit-funded unlimited capacity (see
+[route](route.md#capacity-and-preference)). Chaldea still spends, buys and
+redeems nothing; the provider's own usage stop always wins. Existing
 usage-limit stop/resume behavior remains in place.
 
 The fake Codex stdio fixture verifies the exact allowlisted request sequence,

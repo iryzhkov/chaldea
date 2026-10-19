@@ -146,6 +146,17 @@ export function applyCodex(row: ProviderHeadroom, raw: unknown, at: string): voi
   const result = object(raw);
   if (!result) throw new BalanceReadError("protocol");
   const key = accountKey(result.accountId);
+  // App-server metrics belong to the login that reported them. Fields this response omits are
+  // otherwise retained, so a changed, newly known or lost identity starts from clean metrics.
+  // T3-sourced windows and reset inventory belong to the T3 instance and are kept.
+  if (key !== row.accountKey) {
+    const clean = newProvider(row.alias, row.driver);
+    row.credits = clean.credits; row.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
+    row.spendControlReached = clean.spendControlReached; row.plan = clean.plan;
+    if (row.manualResets.source === "codex-app-server") row.manualResets = clean.manualResets;
+    // The cached credit expiry was looked up for the previous account's capacity key.
+    delete row.creditExpiresAt;
+  }
   if (key) row.accountKey = key; else delete row.accountKey;
   const map = object(result.rateLimitsByLimitId);
   const buckets = map ? Object.values(map).map(object).filter(b => b !== null) : [object(result.rateLimits)].filter(b => b !== null);
@@ -174,7 +185,9 @@ export function failCodex(row: ProviderHeadroom, error: string): void {
   if (row.manualResets.source === "codex-app-server") row.manualResets = { ...row.manualResets, state: "error", error };
 }
 
-/** Public, identity-free lanes: reporting inputs only; paid admission stays false without a future policy. */
+/** Public, identity-free lanes: reporting inputs only. admissionAllowed describes automatic provider
+ * switching, which admits only the included lane and stays false. FATE recommendations judge the
+ * credit-funded lane separately through the capacity classifier (`creditFunded`). */
 export function routingLanes(row: ProviderHeadroom, nowMs: number) {
   return {
     ...(row.binding ? { binding: row.binding } : {}),
