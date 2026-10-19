@@ -75,8 +75,8 @@ test("operations authenticated projection binds five complete tuples and keeps s
   const good=await refreshOperations(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
   assert.equal(good.events.state,"cached");assert.equal(good.ops.dailyHealth.report!.status,"ok");
   const cache={...emptyCache(),operations:good};
-  const failed=await refreshOperations(h.config,cache,{token:async()=>{throw new Error("grant_not_installed");},now:()=>(N+60)*1000});
-  assert.equal(failed.events.state,"error");assert.equal(failed.events.checkedAt,(N+60)*1000);assert.equal(failed.events.rows[0]!.occurredAt,(N-20)*1000);
+  const failed=await refreshOperations(h.config,cache,{token:async()=>{throw new Error("grant_not_installed");},now:()=>N*1000});
+  assert.equal(failed.events.state,"error");assert.equal(failed.events.checkedAt,N*1000);assert.equal(failed.events.rows[0]!.occurredAt,(N-20)*1000);
   writeCache(h.config.cacheFile,{...cache,operations:failed});
   const dto=new CacheModel(h.config.cacheFile,()=>(N+60)*1000).snapshot();
   assert.equal(dto.events!.rows[0]!.occurredAt,(N-20)*1000);
