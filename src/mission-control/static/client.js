@@ -20,7 +20,7 @@ script.onload = () => {
   const { R, UI } = window.MC, { panel, heroStat, gauge, st, budget } = UI;
   const esc = v => String(v ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const missing = text => '<div class="muted">' + esc(text) + '</div>';
-  let snapshot = null, receivedSnapshot = null, transportConnected = false, mode = new URLSearchParams(location.search).get("mode") || "overview";
+  let snapshot = null, receivedSnapshot = null, transportConnected = false, mode = window.MC.modeFromURL();
   const age = at => at == null ? null : Math.max(0,Math.floor((Date.now()-at)/1000));
   const sourcePanel = (area,title,body,kind="t3shell") => panel(area,title,body,kind,age(snapshot?.source.observedAt),snapshot?.source.state === "live" ? "live" : snapshot?.source.state === "nosource" ? "nosource" : age(snapshot?.source.observedAt)>(snapshot?.sampled?600:300) ? "lost" : "stale");
   const unavailable = (area,title) => panel(area,title,missing("Unavailable · no authorized source"),"host",null,"nosource");

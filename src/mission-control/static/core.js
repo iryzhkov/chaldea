@@ -249,11 +249,29 @@
   let cur = pinned || seq[0], t0 = performance.now(), holdUntil = 0;
   tabs.innerHTML = MODES.map(m => `<button data-m="${m}">${LABEL[m]}<span class="bar"><i></i></span></button>`).join('');
   pick.innerHTML = MODES.map(m => `<option value="${m}">${LABEL[m]}</option>`).join('');
+  const modeFromURL = () => { const m = new URLSearchParams(location.search).get('mode'); return MODES.includes(m) ? m : 'overview'; };
+  const select = m => { show(m, true); hold(); };
   const hold = () => { holdUntil = performance.now() + 10 * 60e3; };
-  tabs.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; show(b.dataset.m); hold(); });
-  pick.addEventListener('change', () => { show(pick.value); hold(); });
-  document.addEventListener('keydown', e => { const i = parseInt(e.key, 10); if (i >= 1 && i <= MODES.length) { show(MODES[i - 1]); hold(); } if (e.key === 'ArrowRight' && cur === 'agents') { agentPage++; show('agents'); hold(); } if (e.key === 'ArrowLeft' && cur === 'agents') { agentPage = Math.max(0, agentPage - 1); show('agents'); hold(); } });
-  function show(m) { cur = m; t0 = performance.now(); view.className = m; view.innerHTML = R[m](); for (const b of tabs.children) b.classList.toggle('on', b.dataset.m === m); pick.value = m; document.body.dataset.mode = m; document.dispatchEvent(new CustomEvent('mc:mode', { detail: m })); }
+  tabs.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; select(b.dataset.m); });
+  pick.addEventListener('change', () => { select(pick.value); });
+  document.addEventListener('keydown', e => { const i = parseInt(e.key, 10); if (i >= 1 && i <= MODES.length) { select(MODES[i - 1]); } if (e.key === 'ArrowRight' && cur === 'agents') { agentPage++; show('agents'); hold(); } if (e.key === 'ArrowLeft' && cur === 'agents') { agentPage = Math.max(0, agentPage - 1); show('agents'); hold(); } });
+  function show(m, navigate = false) {
+    if (!MODES.includes(m)) m = 'overview';
+    if (navigate && m !== modeFromURL()) {
+      const url = new URL(location.href); url.searchParams.set('mode', m);
+      history.pushState(null, '', url.href);
+    }
+    cur = m; t0 = performance.now(); view.className = m; view.innerHTML = R[m]();
+    for (const b of tabs.children) {
+      const selected = b.dataset.m === m;
+      b.classList.toggle('on', selected);
+      b.querySelector('.bar i').style.width = selected && !cycle ? '100%' : '0%';
+      if (selected) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+    }
+    pick.value = m; document.body.dataset.mode = m;
+    document.dispatchEvent(new CustomEvent('mc:mode', { detail: m }));
+  }
+  addEventListener('popstate', () => show(modeFromURL()));
   function urgent() { const dec = decisionsSorted(), inc = incidents(); $('#urgent').innerHTML = `${dec.length ? st('decision', dec.length + ' for Igor · ' + dur(dec[0].left)) : ''}${inc.length ? st('alert', inc.length + ' incident' + (inc.length === 1 ? '' : 's')) : ''}`; }
   function globalFresh() { const s = DATA.sources; const stale = s.filter(x => freshOf(x.kind, x.age, x.state) === 'stale').length, lost = s.filter(x => freshOf(x.kind, x.age, x.state) === 'lost').length, unavailable = s.filter(x => ['nosource', 'unsupported'].includes(freshOf(x.kind, x.age, x.state))).length, asleep = s.filter(x => x.state === 'asleep').length;
     $('#globalfresh').innerHTML = `${st('ok', 'feed')}<span class="muted">${[[stale, 'stale'], [lost, 'lost'], [unavailable, 'n/a'], [asleep, 'asleep']].filter(x => x[0]).map(x => x[0] + ' ' + x[1]).join(' · ') || 'all sources live'}</span>`; if (DATA.demo && !$('#top .demo')) $('#top .brand').insertAdjacentHTML('beforeend', ' <span class="demo">DEMO DATA</span>'); }
@@ -272,5 +290,5 @@
   // ---------- display care: pixel shift unless reduced motion ----------
   const board = $('#board'); const shifts = [[0,0],[3,1],[1,3],[-2,2],[-3,-1],[-1,-3],[2,-2],[3,3]]; let si = 0;
   if (!reduceMotion && !still) setInterval(() => { si = (si + 1) % shifts.length; board.style.transform = `translate(${shifts[si][0]}px, ${shifts[si][1]}px)`; }, 60e3);
-  window.MC = { show, DATA, P, dir, paletteKey, MODES, SOURCES, safeStep, createDisplayState, R, UI: { panel, heroStat, gauge, st, budget } };
+  window.MC = { show, modeFromURL, DATA, P, dir, paletteKey, MODES, SOURCES, safeStep, createDisplayState, R, UI: { panel, heroStat, gauge, st, budget } };
 })();
