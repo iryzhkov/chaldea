@@ -70,7 +70,6 @@ export class CacheModel {
     const publicDetail=(s:(typeof snapshots)[number],id:string)=>{
       const detail={...emptyDetail(),...s.rich?.details.find(d=>d.id===id)?.value};
       if(s.rich?.v===2){delete detail.provider;delete detail.recent;}
-      else if(s.rich?.v===4&&detail.recent?.length===0)delete detail.recent;
       return detail;
     };
     base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:s.rich?.details.find(d=>d.id===a.id)?.value.identity.title.text??"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,

@@ -83,7 +83,8 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
       const i=snapshot.agents.findIndex(a=>a.id===row.id),detail=isolateDetail(v.agents[i]!.details,observedAt);
       if(detail.fieldCoverage!=="full")continue;
       const full=detail as import("./details.ts").Detail;
-      const recent=[...(full.recent??[])].sort((a,b)=>(a.at??0)-(b.at??0));
+      // The source projection is newest-first; unknown timestamps do not change that order.
+      const recent=[...(full.recent??[])].reverse();
       candidates.set(row.id,{...full,recent});
       const identity=row.value;
       // Every thread gets its latest actual observation before older optional observations.
