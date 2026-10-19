@@ -106,6 +106,7 @@ export class CacheModel {
       return {host,state:s?.quota?.state??(retained?"byte-budget":"unknown"),observedAt:q?.observedAt??null,omitted:s?.quota?.omitted??q?.omitted??0,accounts:q?quotaAccounts(q,now):[]};
     });
     base.quota.state=base.quota.hosts.some(q=>q.state==="error")?"error":base.quota.hosts.some(q=>q.state==="cached"||q.accounts.length)?"cached":"unknown";
+    base.unavailable=base.unavailable.filter(x=>x!=="Events"&&x!=="Ops");
     const operations=this.cache.operations??emptyOperations();
     base.events=structuredClone(operations.events);base.ops=structuredClone(operations.ops);
     base.events.rows=base.events.rows.filter(r=>now-r.occurredAt<=48*3600_000);

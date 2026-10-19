@@ -6,9 +6,10 @@ import { helperToken } from "../events/publisher.ts";
 import { validateEnvelope } from "../akasha/schema.ts";
 import { validateHostSnapshot,statusIdentity,validateOperations,emptyOperations } from "./contract.ts";
 import { emptyCache,loadCache,mergeStatus,writeCache,type StatusCache } from "./cache.ts";
-export interface ReaderConfig {url:string;tokenHelper:string;source:"mission-control-reader";host:"omarchy-normandy";profile:"mission-control-reader";project:"chaldea";allowedSourceIds:string[];cacheFile:string;refreshMs:5000}
+export interface ReaderConfig {url:string;tokenHelper:string;source:"mission-control-reader";host:"omarchy-normandy";profile:"mission-control-reader";project:"chaldea";allowedSourceIds:string[];cacheFile:string;refreshMs:5000;operationsEnabled?:boolean}
 export function readerConfig(path:string):ReaderConfig {
-  const c=readJson(path,false,strictJson);onlyKeys(c,["url","tokenHelper","source","host","profile","project","allowedSourceIds","cacheFile","refreshMs"]);
+  const c=readJson(path,false,strictJson);onlyKeys(c,["url","tokenHelper","source","host","profile","project","allowedSourceIds","cacheFile","refreshMs","operationsEnabled"]);
+  if(c.operationsEnabled!==undefined&&typeof c.operationsEnabled!=="boolean")throw new Error("invalid_reader_config");
   const u=new URL(String(c.url)),ids=c.allowedSourceIds;
   if(u.protocol!=="https:"||u.username||u.password||u.search||u.hash||u.pathname!=="/"||c.source!=="mission-control-reader"||c.host!=="omarchy-normandy"||c.profile!=="mission-control-reader"||c.project!=="chaldea"||c.refreshMs!==5000||!isAbsolute(String(c.tokenHelper))||!isAbsolute(String(c.cacheFile))||!Array.isArray(ids)||!ids.length||ids.length>4||new Set(ids).size!==ids.length||!ids.every(s=>typeof s==="string"&&/^(agent-a|agent-b|omarchy-pc|omarchy-macbook-air-igor)--mission-control$/.test(s)))throw new Error("invalid_reader_config");
   return c as unknown as ReaderConfig;
@@ -73,7 +74,7 @@ export async function runReader(c:ReaderConfig,signal:AbortSignal):Promise<void>
   let operationRead:Promise<void>|undefined,nextOperation=0;
   while(!signal.aborted){
     const refreshed=await refreshStatus(c,cache);if(cache.operations)refreshed.operations=cache.operations;cache=refreshed;
-    if(!operationRead&&Date.now()>=nextOperation){
+    if(c.operationsEnabled===true&&!operationRead&&Date.now()>=nextOperation){
       nextOperation=Date.now()+60_000;
       operationRead=refreshOperations(c,cache).then(operations=>{cache.operations=operations;}).finally(()=>{operationRead=undefined;});
     }

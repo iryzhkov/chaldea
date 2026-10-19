@@ -23,7 +23,7 @@ async function hostedRig(host="agent-a",operations=false){
   // Disposable key only. Append ceiling proves the server selector independently denies writes.
   bundle.keys.push({issuer:reader.issuer,kid:"reader",public_key:{kty:"OKP",crv:"Ed25519",x:key.publicKey.export({format:"jwk"}).x!},not_before:N-3600,issue_until:N+3600,verify_until:N+4410,
     ceilings:[{audience:"akasha",profile:reader.profile,project:reader.project,source:reader.source,grants:[{resource:reader.source,actions:["read","append"]}]}]});
-  const producers=OPERATIONS_PAIRS.map(p=>({...p,mode:"service" as const,kinds:[p.kind as "job_finished"|"report"]}));
+  const producers=OPERATIONS_PAIRS.map(({kind,...p})=>({...p,mode:"service" as const,kinds:[kind as "job_finished"|"report"]}));
   if(operations){
     Object.assign(reader,{mission_control_operations_read:true,kinds:["agent_status","job_finished","report"]});
     for(const p of producers.filter(p=>p.host===host))bundle.keys[0]!.ceilings.push({audience:"akasha",profile:p.profile,project:p.project,source:p.source,grants:[{resource:p.source,actions:["append"]}]});
@@ -48,6 +48,11 @@ async function hostedRig(host="agent-a",operations=false){
 test("operations authenticated projection binds five complete tuples and keeps status-only clients compatible",async()=>{
  const h=await hostedRig("agent-a",true),path="/api/v1/events?mission_control_operations=job_finished&window=48h&limit=16";
  try{
+  for(const change of [{mission_control_operations_read:false},{global_read:true},{kinds:["agent_status","job_finished","tool_call"]},{mission_control_read_sources:Array(5).fill("agent-a--mission-control")}]){
+   const registry=h.auth.registry.map(r=>r.profile==="mission-control-reader"?{...r,...change}:r);
+   assert.throws(()=>new Authorization(registry as any,h.x.trust,h.x.clock));
+  }
+  assert.throws(()=>new Authorization(h.auth.registry.filter(r=>r.source_id!=="agent-a-daily-health") as any,h.x.trust,h.x.clock),/missing_operations_pair/);
   const append=async(kind:"job_finished"|"report",data:unknown,key:string)=>{
    const p=OPERATIONS_PAIRS.find(p=>p.host==="agent-a"&&p.kind===kind)!;
    const token=await h.x.token({source:p.source,host:p.host,sub:p.profile,project:p.project,grants:[{resource:p.source,actions:["append"]}]});

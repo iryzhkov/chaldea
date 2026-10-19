@@ -457,6 +457,8 @@ test("hosted quota uses private observer custody, per-host age and closed compac
   assert.equal(s.quota!.accounts.length,2);assert.equal(s.quota!.accounts[0]![3],0);
   assert.doesNotMatch(JSON.stringify(s.quota),/PRIVATE|accountKey|private|aaaaaaaa/);
   assert.equal(s.quota!.accounts[0]![11],now0-200_000);
+  const many=live();many.setQuota({...head,providers:Array.from({length:6},(_,i)=>({...head.providers[0]!,accountKey:i.toString(16).padStart(64,"0")}))});
+  const capped=captureSnapshot(many,"agent-a",epoch,1)!.quota!;assert.equal(capped.accounts.length,4);assert.equal(capped.omitted,2);
   const cache=emptyCache();mergeStatus(cache,s,now0);
   const next=sample(2,now0+1000);next.quota={state:"byte-budget",observedAt:now0-100_000,omitted:2,accounts:[]};mergeStatus(cache,next,now0+1000);
   const file=join(dir.path,"cache");writeCache(file,cache);
@@ -471,8 +473,8 @@ test("hosted quota uses private observer custody, per-host age and closed compac
   for(const r of rows)nine.detail(r.id,{kind:"recent-item",id:"actual",ordinal:1,type:"assistant",text:'界 🧪 " \\ '.repeat(100),at:now0,status:"completed"});
   const wire=captureSnapshot(nine,"agent-a",epoch,1)!;
   const expanded=normalizeRich(wire.rich,new Set(wire.agents.map(a=>a.id)),wire.observedAt);
-  console.log("QUOTA_CAPACITY "+JSON.stringify({bytes:Buffer.byteLength(JSON.stringify(wire)),quotaBytes:Buffer.byteLength(JSON.stringify(wire.quota)),rows:wire.agents.length,useful:expanded.details.filter(d=>d.value.recent?.some(r=>r.preview.text)).length}));
-  assert.equal(wire.quota!.accounts.length,2);assert.equal(wire.agents.length,9);assert.equal(expanded.details.filter(d=>d.value.recent?.some(r=>r.preview.text)).length,9);assert.ok(Buffer.byteLength(JSON.stringify(wire))<=8192);
+  console.log("QUOTA_CAPACITY "+JSON.stringify({bytes:Buffer.byteLength(JSON.stringify(wire)),quotaBytes:Buffer.byteLength(JSON.stringify(wire.quota)),rows:wire.agents.length,useful:expanded.details.filter(d=>d.value.fieldCoverage!=="identity-only"&&d.value.recent?.some(r=>r.preview.text)).length}));
+  assert.equal(wire.quota!.accounts.length,2);assert.equal(wire.agents.length,9);assert.equal(expanded.details.filter(d=>d.value.fieldCoverage!=="identity-only"&&d.value.recent?.some(r=>r.preview.text)).length,9);assert.ok(Buffer.byteLength(JSON.stringify(wire))<=8192);
   for(const mutate of [(x:any)=>x.quota.accountKey="PRIVATE",(x:any)=>x.quota.accounts[0][0]="private@example.com",(x:any)=>x.quota.accounts[0][2]=now0+1]){const bad=structuredClone(s);mutate(bad);assert.throws(()=>validateHostSnapshot(bad));}
  }finally{dir.close();}
 });
