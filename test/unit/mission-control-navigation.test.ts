@@ -192,12 +192,12 @@ test("two agent views preserve old URLs, update immediately and disclose bounded
   }
   assert.equal(b.context.MC.safeStep({tool:"Command running",target:"/private/key"}).target,"");
 });
-test("unavailable modes replace previous content without invented data", () => {
-  const b = browser();
-  for (const mode of ["events", "ops", "lab"]) {
+test("observed pages replace previous content with honest empty states and preserve URLs", () => {
+  const b = browser(), empty = {events:/No changed or failed timer runs observed in 48h/,ops:/No report in 48h/,lab:/No observed threads/};
+  for (const mode of ["events", "ops", "lab"] as const) {
     b.click(mode); assert.equal(b.elements.view!.className, mode);
-    assert.match(b.elements.view!.innerHTML, /Unavailable · no authorized source/);
-    assert.equal((b.elements.view!.innerHTML.match(/<section/g) ?? []).length, 1);
+    assert.match(b.elements.view!.innerHTML, empty[mode]);
+    assert.doesNotMatch(b.elements.view!.innerHTML, /undefined|NaN|all sources live/);
     assert.equal(browser(b.location.href).elements.view!.className, mode);
   }
 });
@@ -429,4 +429,84 @@ test("resource instruments preserve measured CPU zero, independent stale samples
   assert.match(html,/1.0 GiB available/);assert.match(html,/3.0 \/ 4.0 GiB/);
   assert.match(html,/last known \/ stale/);assert.match(html,/Resource sample unavailable/);
  }
+});
+
+test("hosted quota keeps observing hosts separate, source ages and known zero",()=>{
+ const b=browser("https://board.example/?mode=quota"),now=Date.now();
+ const account={label:"Codex account 1",state:"cached",observedAt:now-4000000,used:0,resetsAt:now+3600000,duration:300,credits:"0",creditState:"cached",resetState:"unknown",unlimited:false,manualResets:0};
+ const hosts=[{host:"agent-a",state:"cached",observedAt:now-4000000,omitted:2,accounts:[account]},{host:"agent-b",state:"cached",observedAt:now,omitted:0,accounts:[{...account,observedAt:now}]},{host:"laptop",state:"byte-budget",observedAt:null,omitted:0,accounts:[]},{host:"omarchy-pc",state:"error",observedAt:null,omitted:0,accounts:[]}];
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{rate:null,coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]};
+ b.snapshot(snap);let html=b.elements.view!.innerHTML;
+ assert.equal((html.match(/class="quota-account"/g)||[]).length,2);
+ assert.match(html,/Observed by agent-a/);assert.match(html,/Observed by agent-b/);
+ assert.match(html,/same account may appear on multiple hosts/);
+ assert.match(html,/0% used · 100% headroom/);assert.match(html,/aria-valuenow="0.00"/);
+ assert.match(html,/Credits remaining 0/);assert.match(html,/0 manual resets available/);
+ assert.match(html,/data-fresh="stale"/);assert.match(html,/quota source 1h ago/);
+ assert.match(html,/Quota withheld · host byte budget/);assert.match(html,/Quota source error/);
+ assert.match(html,/2 account rows omitted/);assert.doesNotMatch(html,/undefined|NaN|financial|quality score/);
+ b.snapshot({...snap,quota:{state:"cached",accounts:[account]}});html=b.elements.view!.innerHTML;
+ assert.match(html,/Codex account 1/);assert.doesNotMatch(html,/Observed by/);
+});
+
+test("Events uses actual maintenance occurrence order, coverage and safe labels",()=>{
+ const b=browser("https://board.example/?mode=events"),now=Date.now();
+ const event=(host:string,job:string,status:string,occurredAt:number,receivedAt:number)=>({host,job,status,occurredAt,receivedAt,severity:status==="failed"?"fail":"info",title:"PRIVATE RAW TITLE",body:"PRIVATE RAW BODY",id:"PRIVATE ID"});
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{rate:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[],events:{state:"cached",checkedAt:now,windowHours:48,rows:[event("older","chaldea-fleet-pull","changed",now-20000,now),event("newest <img>","chaldea-retention","failed",now-10000,now-20000)],truncated:true}};
+ b.snapshot(snap);let html=b.elements.view!.innerHTML;
+ assert.ok(html.indexOf("newest &lt;img&gt;")<html.indexOf("older"));
+ assert.match(html,/Fleet pull/);assert.match(html,/Retention/);assert.match(html,/Occurred <time/);assert.match(html,/received <time/);
+ assert.match(html,/48h window/);assert.match(html,/truncated; more runs may be omitted/);
+ assert.doesNotMatch(html,/PRIVATE|<img>|exec jobs|healthy|idle/);
+ b.snapshot({...snap,events:{...snap.events,rows:[],truncated:false}});html=b.elements.view!.innerHTML;
+ assert.match(html,/No changed or failed timer runs observed in 48h/);
+ b.snapshot({...snap,events:{...snap.events,state:"error",rows:[]}});assert.match(b.elements.view!.innerHTML,/source error/);
+ b.snapshot({...snap,events:undefined});html=b.elements.view!.innerHTML;assert.match(html,/unknown · last checked unknown/);assert.doesNotMatch(html,/undefined|NaN/);
+});
+
+test("Ops distinguishes last checked, report occurrence, missing report and host resources",()=>{
+ const b=browser("https://board.example/?mode=ops"),now=Date.now();
+ const hostSummary=[{host:"agent-a",observedAt:now-120000,freshness:"stale",shown:0,total:0,states:{},models:[],resources:{state:"reported",sample:{sampledAt:now-120000,cpuUtilization:.96,cpuCount:8,totalMemoryBytes:4294967296,availableMemoryBytes:0}}}];
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{rate:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary,events:{state:"cached",checkedAt:now,windowHours:48,rows:[],truncated:false},ops:{dailyHealth:{state:"cached",checkedAt:now,report:null}}};
+ b.snapshot(snap);let html=b.elements.view!.innerHTML;
+ assert.match(html,/No report in 48h/);assert.match(html,/last checked 0s ago/);
+ assert.match(html,/CPU 96.0%/);assert.match(html,/RAM 4.0 \/ 4.0 GiB/);assert.match(html,/last known \/ stale/);
+ assert.match(html,/aria-valuenow="100.00"/);assert.doesNotMatch(html,/healthy|free slots/);
+ b.snapshot({...snap,ops:{dailyHealth:{state:"error",checkedAt:now,report:{status:"warning <script>",occurredAt:now-3600000,receivedAt:now-3000000,checks:[{name:"Disk <img>",status:"failed"}],omitted:3}}}});
+ html=b.elements.view!.innerHTML;assert.match(html,/source error/);assert.match(html,/Report occurred <time/);
+ assert.match(html,/warning &lt;script&gt;/);assert.match(html,/Disk &lt;img&gt;/);assert.match(html,/3 checks omitted/);
+ assert.doesNotMatch(html,/<script>|<img>|No report in 48h/);
+});
+
+test("Lab groups only observed provider/model/reported effort/activity within each host",()=>{
+ const b=browser("https://board.example/?mode=lab"),now=Date.now();
+ const row=(host:string,driver:string,instanceId:string,state="working",source="reported")=>({id:host+instanceId+source,host,title:"Observed",model:"claude-model",state,observedAt:now,detailObservedAt:now,activityFreshness:"live",steps:[],detailCoverage:"reported",details:{provider:{driver,instanceId},effort:{value:"high",source}}});
+ const agents=[row("agent-a","codex","custom"),row("agent-a","codex","custom"),row("agent-b","custom-driver","custom <img>","completed","configured"),{...row("agent-b","",""),details:undefined}];
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,tokens:{rate:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]});
+ const html=b.elements.view!.innerHTML;
+ assert.match(html,/Observed thread set/);assert.match(html,/agent-a · 2 observed threads/);assert.match(html,/agent-b · 2 observed threads/);
+ assert.match(html,/OpenAI Codex · custom/);assert.doesNotMatch(html,/Claude · custom/);
+ assert.match(html,/custom-driver · custom &lt;img&gt;/);assert.match(html,/Provider unknown/);
+ assert.match(html,/reported effort high/);assert.match(html,/completed · reported effort unknown/);
+ assert.match(html,/AA quality scores disabled \/ unqualified/);assert.match(html,/Exec slots unknown/);
+ assert.doesNotMatch(html,/<img>|benchmark|recommendation|available catalog|undefined/);
+});
+
+test("Overview renders four compact resource summaries without full host-card stacks",()=>{
+ const b=browser(),now=Date.now();b.resize(1280,800);
+ const hostSummary=["agent-a","agent-b","omarchy-pc","laptop"].map(host=>({host,observedAt:now,freshness:"live",shown:0,total:0,states:{},models:[],resources:{state:"reported",sample:{sampledAt:now,cpuUtilization:0,cpuCount:8,totalMemoryBytes:4294967296,availableMemoryBytes:1073741824}}}));
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{rate:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary});
+ assert.equal(b.elements.view!.getAttribute("tabindex"),"0");
+ assert.equal(b.elements.view!.getAttribute("aria-label"),"Mission Control page");
+ const html=b.elements.view!.querySelector(".p-hosts")!.innerHTML;
+ assert.equal((html.match(/class="host-glance"/g)||[]).length,4);
+ assert.equal((html.match(/role="meter"/g)||[]).length,8);
+ assert.match(html,/CPU 0.0%/);assert.match(html,/RAM 3.0 \/ 4.0 GiB/);
+ assert.doesNotMatch(html,/host-card|thread count|NOT OBSERVED/);
+ const kpi=b.elements.view!.querySelector(".p-kpi")!.innerHTML;
+ assert.equal((kpi.match(/class="stat /g)||[]).length,3);
+ assert.match(kpi,/not connected/);
+ const css=readFileSync(new URL("../../src/mission-control/static/core.css",import.meta.url),"utf8");
+ assert.match(css,/#view.overview \{ grid-template-columns:minmax\(0,1.25fr\) minmax\(300px,1fr\)/);
+ assert.match(css,/@media \(max-width:650px\)/);
 });
