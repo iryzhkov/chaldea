@@ -229,11 +229,20 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         assert.equal((await rpc(6,"chaldea_wait_cancel",{id:w.id})).delivery,"suppressed");
         const compact=await rpc(90,"chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+60000)},responseMode:"compact"});
         assert.equal(compact.threadId,parent);assert.equal(compact.lifecycle,"waiting");
-        const selected=await rpc(91,"chaldea_wait_list",{threadId:parent,responseMode:"compact"});
-        assert.ok(selected.waits.some((item:{id:string})=>item.id===compact.id));
-        const closed=await rpc(92,"chaldea_wait_closeout",{threadId:parent,waitIds:[compact.id],responseMode:"compact"});
-        assert.equal(closed.results[0].result.cancelOutcome,"suppressed");
-        assert.equal(closed.results[0].result.wakeMayStillArrive,false);
+        try{
+          let selected=await rpc(91,"chaldea_wait_list",{threadId:parent,responseMode:"compact"});
+          let found=selected.waits.some((item:{id:string})=>item.id===compact.id);
+          // Retained terminal rows and random IDs can place this wait on a later page.
+          for(let page=0;!found&&selected.nextCursor&&page<8;page++){
+            selected=await rpc(100+page,"chaldea_wait_list",{threadId:parent,cursor:selected.nextCursor,responseMode:"compact"});
+            found=selected.waits.some((item:{id:string})=>item.id===compact.id);
+          }
+          assert.ok(found,"registered wait must appear in the bounded fixture history");
+        }finally{
+          const closed=await rpc(92,"chaldea_wait_closeout",{threadId:parent,waitIds:[compact.id],responseMode:"compact"});
+          assert.equal(closed.results[0].result.cancelOutcome,"suppressed");
+          assert.equal(closed.results[0].result.wakeMayStillArrive,false);
+        }
         assert.equal((await rpc(7,"chaldea_decision_status",{id:row.id})).id,row.id);
         const answered=await runCli(["decision","answer",row.id,"--answer","Run","--config",configPath],dir.path);
         assert.equal(answered.code,0,answered.stderr);
