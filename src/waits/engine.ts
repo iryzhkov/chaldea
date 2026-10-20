@@ -7,17 +7,21 @@ import { NativeDecisions, questionSchema } from "../decisions/native.ts";
 import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
 import type { WaitInput, NativeDecisionInput, AnswerSource } from "./types.ts";
+import { SessionLifecycle, RESULT_GRACE_MS, type SessionOptions, type SessionStatus, type IssueDecision } from "../session/lifecycle.ts";
 
 export interface EngineOptions {
   // Test seam for abrupt process termination at durable/ambiguous boundaries.
   boundary?: (name: string, item: string) => void;
   report?: (event: string) => void;
+  /** Fixed-preset sessions; absent means disabled and existing behavior is unchanged. */
+  sessions?: SessionOptions;
 }
 export class WaitEngine {
   readonly store: WakeStore;
   readonly t3: WaitT3;
   private options: EngineOptions;
   private native: NativeDecisions;
+  private sessions: SessionLifecycle;
   private clock = new Deadlines();
   private snapshots = new Map<string,WaitSnapshot|null>();
   private cursors = new Map<string,number>();
@@ -60,8 +64,20 @@ export class WaitEngine {
     }
   }
   constructor(store: WakeStore, t3: WaitT3, options: EngineOptions = {}) { this.store=store; this.t3=t3; this.options=options;
-    this.native=new NativeDecisions(store,options.boundary); }
+    this.native=new NativeDecisions(store,options.boundary);
+    this.sessions=new SessionLifecycle(store,t3,options.sessions ?? {policy:()=>null},{poke:()=>this.poke(),
+      fault:error=>{ if (error instanceof CheckpointBlockedError) this.backoffStorage(); else this.failStorage(); },
+      boundary:options.boundary,report:options.report}); }
   start(): void { this.poke(); }
+  async startSession(value: unknown): Promise<SessionStatus> {
+    if (this.fatal) throw new Error("Watcher needs attention");
+    return this.sessions.start(value);
+  }
+  sessionStatus(id: string): SessionStatus { return this.sessions.status(id); }
+  cancelSession(id: string): SessionStatus { const status=this.sessions.cancel(id); this.poke(); return status; }
+  reconcileSession(id: string): Promise<SessionStatus> { return this.sessions.reconcileNow(id); }
+  /** Internal gate for a future preset-bound helper; deliberately not reachable over IPC. */
+  authorizeIssue(preset: string, audience: string, now?: number): IssueDecision { return this.sessions.authorizeIssue(preset,audience,now); }
   trackedNative(parent:string):ReturnType<WakeStore["nativeTracking"]>{
     if(this.fatal)throw new Error("Watcher needs attention");
     try{return this.store.nativeTracking(parent);}
@@ -163,6 +179,7 @@ export class WaitEngine {
             this.store.orphan(item.id,!p || p.deleted ? "parent_deleted" : "parent_inactive"); continue;
           }
         }
+        if(item.kind==="session")continue; // Reconciled below, including slots held after the outcome.
         if(item.kind==="native"){
           const snapshot=this.snapshots.get(item.parent);
           if(snapshot)this.native.reconcile(item,snapshot,now);
@@ -188,8 +205,9 @@ export class WaitEngine {
         if (outcome) { this.store.resolve(item.id,outcome,cursor,now); this.options.boundary?.("resolved",item.id); }
         else if (cursor !== undefined && cursor > item.cursor) this.store.cursor(item.id,cursor);
       }
+      this.sessions.reconcileAll(now,id => this.snapshots.has(id) ? this.snapshots.get(id) ?? null : undefined);
       this.store.maintain(now);
-      const needed=new Set<string>();
+      const needed=new Set<string>(this.sessions.observed());
       for (const i of this.store.outstanding()) {
         needed.add(i.parent);
         const input=JSON.parse(i.input) as WaitInput;
@@ -222,7 +240,9 @@ export class WaitEngine {
           }
           continue;
         }
-        times.push(i.deadline);
+        // A session still active past its deadline is reading a timely result; its retries
+        // poke the pump, and the grace end is the next wake, so an overdue deadline never spins.
+        times.push(i.kind === "session" && i.deadline <= now ? i.deadline + RESULT_GRACE_MS : i.deadline);
         const input=JSON.parse(i.input) as WaitInput;
         if (input.condition?.kind === "time") times.push(Date.parse(input.condition.at));
       }
@@ -234,7 +254,7 @@ export class WaitEngine {
         if (d.expires !== null) times.push(d.expires);
       }
       // Tombstone expiry also has a single next deadline, without model involvement.
-      const terminal = this.store.db.prepare("SELECT min(terminal) AS t FROM items WHERE state<>'parked' AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked','uncertain'))").get() as {t:number|null};
+      const terminal = this.store.db.prepare("SELECT min(terminal) AS t FROM items WHERE state<>'parked' AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked','uncertain')) AND id NOT IN (SELECT item FROM sessions WHERE occupancy='held')").get() as {t:number|null};
       if (terminal.t !== null) times.push(terminal.t + 42*86_400_000 + 1);
       this.clock.arm(times.length ? Math.max(now+1,Math.min(...times)) : undefined,() => this.poke(),
         () => { this.options.report?.("calendar_timer_retry"); });
@@ -289,7 +309,7 @@ export class WaitEngine {
     }
   }
   async stop(): Promise<void> {
-    this.stopped=true; this.clock.clear();clearTimeout(this.storageRetry);
+    this.stopped=true; this.clock.clear();clearTimeout(this.storageRetry);this.sessions.stop();
     for (const e of this.observers.values()) {e.abort.abort();clearTimeout(e.retry);}
     // Service shutdown waits for requests (each has a bounded timeout) before closing SQLite.
     while (this.inflight.size) await new Promise(r => setTimeout(r,10));

@@ -29,7 +29,14 @@ export const WAIT_TOOLS=[
   {name:"chaldea_decision_answer",description:"Answer a fallback inbox question from another local thread, recorded as an agent answer (mcp:<thread>), never as human consent. Your own asking thread cannot answer. Igor uses the page or CLI.",inputSchema:schema({id:str,answer:str,answeringThreadId:identity.threadId},["id","answer","answeringThreadId"])},
   {name:"chaldea_decision_status",description:"Read native policy/binding or fallback answer/default, state, deadline and delivery status. Native answers are submitted in T3, never through chaldea_decision_answer.",inputSchema:schema({id:str},["id"])},
 ];
-export async function runMcp(socket:string):Promise<void>{
+/** Listed only when the waits config names a session policy; the service still re-checks it. */
+export const SESSION_TOOLS=[
+  {name:"chaldea_session_start",description:"Start one operator-configured fixed preset as a separate visible thread on this T3, then end your turn: the result arrives as one Chaldea wake. You choose only the preset; explicit limits, models, prompts and grants are refused. threadId is only where the wake goes, never authority. Reuse the same requestId and arguments after uncertainty; the service never relaunches an uncertain start.",
+    inputSchema:schema({...identity,preset:{...str,description:"Configured preset name"}},["threadId","requestId","preset"])},
+  {name:"chaldea_session_status",description:"Read a session's launch, outcome and exact stored result text. Read it when the wake says result_in_status.",inputSchema:schema({id:str},["id"])},
+];
+export async function runMcp(socket:string,sessions=false):Promise<void>{
+  const tools=()=>[...WAIT_TOOLS,...(sessions?SESSION_TOOLS:[]),...messageTools()];
   let buffer="";let chain=Promise.resolve();
   const reply=(id:unknown,result:unknown,error?:unknown)=>process.stdout.write(JSON.stringify(error?
     {jsonrpc:"2.0",id,error}:{jsonrpc:"2.0",id,result})+"\n");
@@ -41,10 +48,10 @@ export async function runMcp(socket:string):Promise<void>{
     try{
       if(r.method==="initialize"){reply(id,{protocolVersion:"2024-11-05",capabilities:{tools:{}},serverInfo:{name:"chaldea",version:"0.1.0"}});return;}
       if(r.method==="ping"){reply(id,{});return;}
-      if(r.method==="tools/list"){reply(id,{tools:[...WAIT_TOOLS,...messageTools()]});return;}
+      if(r.method==="tools/list"){reply(id,{tools:tools()});return;}
       if(r.method==="tools/call"){
         const p=r.params as {name:string;arguments?:unknown};
-        if(![...WAIT_TOOLS,...messageTools()].some(t=>t.name===p?.name))throw new Error("Unknown tool");
+        if(!tools().some(t=>t.name===p?.name))throw new Error("Unknown tool");
         try{
           const result=p.name==="chaldea_route" ? await route(p.arguments??{}) :
             p.name==="chaldea_message_send" ? await message("send",p.arguments??{}) :
