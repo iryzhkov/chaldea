@@ -12,6 +12,7 @@ import { withClient } from "../../src/t3/adapter.ts";
 import { startWaitService, callService } from "../../src/waits/service.ts";
 import { WakeStore, type Item } from "../../src/wake/store.ts";
 import type { WaitConfig } from "../../src/waits/config.ts";
+import type { CompactWait } from "../../src/waits/presentation.ts";
 
 const skip=t3Version()==="t3 v0.1.0"?false:"Needs pinned disposable T3 0.1.0";
 if(skip&&process.env.CHALDEA_REQUIRE_E2E==="1")throw new Error(skip);
@@ -74,7 +75,41 @@ test("eight waits share one durable T3 message across crashes before send and af
         assert.notEqual(a.id,b.id);assert.match(a.request_key,/^\d{13}:[a-f0-9-]+$/);
         const retry=await callService(config.socket,"chaldea_wait",JSON.parse(a.input)) as Item;
         assert.equal(retry.id,a.id);
-        service.engine.cancel(a.id);service.engine.cancel(b.id);
+        const compact=await callService(config.socket,"chaldea_wait",{...input,responseMode:"compact"}) as CompactWait;
+        assert.match(compact.requestId,/^\d{13}:[a-f0-9-]+$/);
+        assert.equal(compact.threadId,parent);assert.equal(compact.lifecycle,"waiting");
+        assert.ok(!("input" in compact));
+        const same=await callService(config.socket,"chaldea_wait",{...input,requestId:compact.requestId,responseMode:"compact"}) as CompactWait;
+        assert.equal(same.waitId,compact.waitId);
+        const status=await callService(config.socket,"chaldea_wait_status",{id:compact.waitId,responseMode:"compact"}) as CompactWait;
+        assert.equal(status.requestId,compact.requestId);assert.equal(status.description,compact.description);
+        const verbose=await callService(config.socket,"chaldea_wait_status",{id:compact.waitId,responseMode:"verbose"}) as Item;
+        assert.equal(verbose.request_key,compact.requestId);assert.equal(JSON.parse(verbose.input).deadline,compact.deadline);
+        await assert.rejects(callService(config.socket,"chaldea_wait_list",{}),/threadId/);
+        await assert.rejects(callService(config.socket,"chaldea_wait_closeout",{waitIds:[a.id]}),/threadId/);
+        const before=service.store.get(a.id);
+        const cross=await callService(config.socket,"chaldea_wait_closeout",{threadId:"explicit-other-parent",waitIds:[a.id],responseMode:"compact"}) as {results:unknown[]};
+        assert.deepEqual(cross.results,[{id:a.id,error:"wait_not_found_for_thread"}]);
+        assert.deepEqual(service.store.get(a.id),before);
+        const listed:string[]=[];let cursor:string|null=null;
+        do{
+          const page=await callService(config.socket,"chaldea_wait_list",{threadId:parent,responseMode:"compact",...(cursor?{cursor}:{})}) as {
+            threadId:string;waits:CompactWait[];nextCursor:string|null;
+          };
+          assert.equal(page.threadId,parent);
+          assert.ok(page.waits.every(row=>row.threadId===parent));
+          listed.push(...page.waits.map(row=>row.waitId));cursor=page.nextCursor;
+        }while(cursor);
+        assert.ok(listed.includes(a.id)&&listed.includes(b.id)&&listed.includes(compact.waitId));
+        const closeout=await callService(config.socket,"chaldea_wait_closeout",{
+          threadId:parent,waitIds:[a.id],responseMode:"compact",
+        }) as {results:Array<{id:string;result:CompactWait}>};
+        assert.equal(closeout.results[0]!.result.cancelOutcome,"suppressed");
+        assert.equal(closeout.results[0]!.result.wakeMayStillArrive,false);
+        const cancelled=await callService(config.socket,"chaldea_wait_cancel",{id:compact.waitId,responseMode:"compact"}) as CompactWait;
+        assert.equal(cancelled.cancelOutcome,"suppressed");assert.equal(cancelled.wakeMayStillArrive,false);
+        const legacyCancel=await callService(config.socket,"chaldea_wait_cancel",{id:b.id}) as {item:Item;delivery:string};
+        assert.equal(legacyCancel.item.id,b.id);assert.equal(legacyCancel.delivery,"suppressed");
         await service.stop();service=undefined;
         service=await startWaitService(config);
         assert.deepEqual(service.store.dispatchable(),[]);

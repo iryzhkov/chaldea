@@ -291,6 +291,93 @@ pending delivery may still be suppressed. A claimed send returns
 claims to retract an accepted T3 message. An orphan or rejected delivery needs
 operator attention; do not edit IDs to force a retry.
 
+
+## Compact output and selected-thread closeout
+
+Wait registration, status and cancellation accept `responseMode:"compact"`.
+Omission or `responseMode:"verbose"` retains the legacy response, including the
+complete persisted item. The CLI accepts `--compact` and `--verbose`.
+
+Compact wait objects contain `id`, `waitId`, `threadId`, `requestId`,
+`description`, `condition`, `deadline`, stored `state`, derived `lifecycle`,
+`deliveryDisposition`, `disposition` and `wakeMayStillArrive`.
+A thread condition includes its pinned run. The generated request key is always
+returned as `requestId`. Compact cancellation also includes `cancelOutcome`,
+using the existing cancellation vocabulary, including `suppressed`,
+`cancelled`, `orphaned`, `uncertain_in_flight` and `already_delivered`.
+
+The lifecycle is `waiting`, `ready`, `delivering`, `delivered`, `cancelled`,
+`orphaned` or `needs_attention`. These labels derive from the persisted item
+and wake outbox. An attempted wake whose receipt is unknown remains uncertain,
+including when its parent becomes orphaned. `wakeMayStillArrive:true` also
+covers a wake already accepted by T3, because it may still be queued there.
+Cancellation cannot retract it. An unattempted orphan has a suppressed wake
+and reports false. A parked wait reports true because it can still resolve.
+Use verbose status for complete stored input, outcome and delivery evidence.
+
+The private service adds these operator methods:
+
+- `chaldea_wait_list({threadId,limit?,cursor?,responseMode?})` returns
+  `{threadId,waits,nextCursor}`. Every page contains only waits for the explicitly
+  selected parent. The default and maximum page size is eight; the minimum is one.
+  Pass the returned `nextCursor` as `cursor` until it is null.
+- `chaldea_wait_closeout({threadId,waitIds,responseMode?})` returns
+  `{threadId,results}`. Select one to eight unique wait IDs. Each result is
+  `{id,result}`, where result is the normal cancellation response in the selected
+  mode, or `{id,error:"wait_not_found_for_thread"}`. Unknown IDs and another
+  parent's IDs return the same refusal without modifying either item.
+
+These calls select an explicit thread under the existing private same-UID socket
+boundary. The selected thread is not authenticated as the caller's own thread.
+MCP stdio supplies no trusted caller identity. Nothing infers a thread from cwd,
+provider IDs, environment variables or an identity adapter. Any MCP integration
+must require explicit `threadId` in its tool schemas.
+
+Listing includes retained terminal history and is ordered by wait ID. Pages are
+bounded observations, not one frozen snapshot across calls. Closeout checks and
+cancels the selected rows in one writer transaction, with individual outcomes for
+already claimed or delivered wakes. It never cancels all threads, decisions,
+native questions or sessions. Invalid selection refuses the whole request before
+writing. A storage failure rolls back the whole selected set.
+
+```sh
+chaldea wait time --after 30s --thread "$thread_id" --compact
+chaldea wait status "$wait_id" --compact
+chaldea wait list --thread "$thread_id" --compact
+chaldea wait closeout --thread "$thread_id" --wait-id "$wait_id" --compact
+```
+
+## Retry receipts
+
+A caller can supply `--receipt PATH` when registering a CLI wait. The CLI
+generates or accepts the durable request key, normalizes the absolute condition
+and deadline, then exclusively creates an owner-only mode-0600 JSON receipt.
+It syncs the file and its directory before its first service request. Choose a
+path in an existing private scratch directory. An existing path is refused.
+If receipt creation fails, no transport begins.
+
+After an ambiguous transport failure, use `chaldea wait retry PATH`. Replay
+uses exactly the stored normalized request and key. It does not recalculate
+relative time or the default deadline. Retry accepts only the receipt path,
+`--config` and the response-mode flags, so argument overrides cannot silently
+change intent. Receipt reads refuse symlinks, extra hard links, non-owner files,
+non-0600 modes and invalid normalized requests. Receipts contain wait context,
+so keep their parent directory private. The operator owns their retention.
+
+```sh
+chaldea wait time --after 30s --thread "$thread_id" --compact \
+  --receipt "$scratch/recheck-wait.json"
+# Use after an ambiguous failure, including a lost registration response:
+chaldea wait retry "$scratch/recheck-wait.json" --compact
+```
+
+The service's existing replay age, pruning fence and changed-payload refusals
+still apply. Same key and same normalized input return the original wait.
+Equivalent waits with different keys are intentional distinct waits.
+A receipt is optional; no extra service store, polling loop or background retry
+worker is introduced. Native children and native PR watching remain the
+completion paths for those workflows.
+
 ## Fallback answer page
 
 The answer page uses HTTP Basic login `chaldea` and a private answer token as the

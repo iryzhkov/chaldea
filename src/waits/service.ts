@@ -9,10 +9,29 @@ import { createWaitT3 } from "../t3/waits.ts";
 import { discoverServerUrl } from "../t3/adapter.ts";
 import { loadConfig, privateFile, type WaitConfig } from "./config.ts";
 import { boundedLog } from "./log.ts";
-import { object, text, waitDescription, type WaitInput } from "./types.ts";
+import { object, text } from "./types.ts";
 import { loadSessionPolicy } from "../session/policy.ts";
 import { createSessionT3 } from "../session/t3.ts";
 import { CredentialRefusal } from "../session/credential.ts";
+import { formatWaitResponse, formatWaitCancellation, waitResponseMode } from "./presentation.ts";
+
+/** The thread is explicitly selected by a same-UID operator, never inferred. */
+export function listSelectedThreadWaits(store: WakeStore, value: unknown) {
+  const input=object(value),threadId=text(input.threadId,"threadId");
+  const mode=waitResponseMode(input.responseMode);
+  const page=store.listWaits(threadId,input.limit === undefined ? 8 : input.limit as number,
+    input.cursor === undefined ? "" : text(input.cursor,"cursor"));
+  const deliveries=store.waitDeliveries(threadId,page.items.map(item=>item.id));
+  return {threadId,waits:page.items.map(item=>formatWaitResponse(item,deliveries,mode)),nextCursor:page.nextCursor};
+}
+export function closeoutSelectedThreadWaits(store: WakeStore, value: unknown) {
+  const input=object(value),threadId=text(input.threadId,"threadId");
+  const mode=waitResponseMode(input.responseMode);
+  const results=store.closeoutWaits(threadId,input.waitIds as string[]);
+  const deliveries=store.waitDeliveries(threadId,results.map(row=>row.id));
+  return {threadId,results:results.map(row=>"error" in row ? row
+    : {id:row.id,result:formatWaitCancellation(row,deliveries,mode)})};
+}
 
 export async function body(req: IncomingMessage, limit=8192): Promise<string> {
   const parts:Buffer[]=[];let n=0;
@@ -61,12 +80,16 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
         send(res,200,headers);return;
       }
       let result:unknown;
+      const mode=typeof v.method === "string" && ["chaldea_wait","chaldea_wait_status","chaldea_wait_cancel"].includes(v.method)
+        ? waitResponseMode(input.responseMode) : "verbose";
       switch(v.method){
         case "chaldea_wait":result=await engine.register("wait",input);break;
         case "chaldea_decision_ask":result=await engine.register("decision",input);break;
         case "chaldea_decision_prepare":result=await engine.registerNative(input);break;
         case "chaldea_decision_track":result=await engine.registerNative(input,true);break;
-        case "chaldea_wait_cancel":result=engine.cancel(text(input.id,"id"));break;
+        case "chaldea_wait_cancel":result=formatWaitCancellation(engine.cancel(text(input.id,"id")),engine.store.deliveries(),mode);break;
+        case "chaldea_wait_list":result=listSelectedThreadWaits(engine.store,input);break;
+        case "chaldea_wait_closeout":result=closeoutSelectedThreadWaits(engine.store,input);engine.poke();break;
         case "chaldea_decision_answer":result=await engine.answerFromThread(text(input.id,"id"),text(input.answer,"answer",256),text(input.answeringThreadId,"answeringThreadId"));break;
         case "chaldea_decision_answer_cli":result=engine.answer(text(input.id,"id"),text(input.answer,"answer",256),"cli");break;
         case "chaldea_wait_status":case "chaldea_decision_status":result=engine.store.get(text(input.id,"id"));break;
@@ -77,7 +100,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       }
       if (result && typeof result === "object" && "kind" in result && "id" in result) {
         const item=result as import("../wake/store.ts").Item;
-        result={...item,...(item.kind === "wait" ? {waitId:item.id,description:waitDescription(JSON.parse(item.input) as WaitInput,item.target_run)} : {questionId:item.id}),
+        result=item.kind === "wait" ? formatWaitResponse(item,engine.store.deliveries(),mode) : {...item,questionId:item.id,
           ...(item.kind === "native" ? {native:{runtimeRequestId:engine.store.native(item.id).request_id,preparationExpiresAt:engine.store.native(item.id).bind_until}} : {}),
           delivery:engine.store.deliveries().filter(d=>d.item===item.id).map(d=>({channel:d.channel,state:d.state,disposition:d.disposition,attempts:d.attempts,nextAt:d.next_at}))};
       }
@@ -165,10 +188,11 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
 /** The service answered with a refusal; its message is the service's own error text. */
 export class ServiceRefusal extends Error { constructor(message:string){super(message);this.name="ServiceRefusal";} }
 export function callService(socket:string,method:string,input:unknown,timeout=15_000):Promise<unknown>{
+  const responseCap=["chaldea_wait_list","chaldea_wait_closeout"].includes(method) ? 131072 : 16384;
   return new Promise((resolve,reject)=>{
     // Do not reuse a keep-alive Unix connection across watcher replacement.
     const req=request({socketPath:socket,path:"/rpc",method:"POST",agent:false,headers:{"Content-Type":"application/json"},timeout},res=>{
-      let data="";res.setEncoding("utf8");res.on("data",s=>{data+=s;if(Buffer.byteLength(data)>16384)req.destroy(new Error("IPC response exceeds cap"));});
+      let data="";res.setEncoding("utf8");res.on("data",s=>{data+=s;if(Buffer.byteLength(data)>responseCap)req.destroy(new Error("IPC response exceeds cap"));});
       res.on("end",()=>{try{const value=JSON.parse(data);res.statusCode===200?resolve(value):reject(new ServiceRefusal(typeof value?.error==="string"?value.error:"Service refused"));}catch(e){reject(e);}});
     });
     req.on("timeout",()=>req.destroy(new Error("IPC timed out")));req.on("error",reject);
