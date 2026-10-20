@@ -432,4 +432,3 @@ test("CLI persists a private normalized generated-key receipt before transport a
     assert.equal(sends,2);
   }finally{dir.remove();}
 });
-
