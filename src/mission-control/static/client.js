@@ -112,7 +112,7 @@ script.onload = () => {
       +(distributions||panel("routing","Thread observations",missing("No observed threads"),"t3thread",null,"nosource"));
   };
   const hostList = () => snapshot?.hostSummary || [];
-  const hostFreshness = h => h.observedAt == null ? "nosource" : h.freshness === "live" && age(h.observedAt)>90 ? "stale" : h.freshness;
+  const hostFreshness = h => h.observedAt == null ? "nosource" : h.freshness === "live" && snapshot?.sampled && age(h.observedAt)>90 ? "stale" : h.freshness;
   const resourceMeter = (label,pct,value) => UI.stacked(esc(label),pct,esc(value),pct == null ? "nosrc" : pct>=95?"fail":pct>=80?"warn":"")
     .replace('<div class="meter', '<div role="meter" aria-label="'+esc(label+" "+value)+'" aria-valuemin="0" aria-valuemax="100"'+(pct==null?' aria-valuetext="Unavailable"':' aria-valuenow="'+pct.toFixed(2)+'"')+' class="meter');
   const resources = h => {

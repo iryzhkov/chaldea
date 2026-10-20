@@ -134,6 +134,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
     page: (delta:number) => {const el=elements.view!.querySelector(`[data-thread-page="${delta}"]`)!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     openDetails: (id:string) => {const el=elements.view!.querySelector('[data-thread-details="'+encodeURIComponent(id)+'"]')!;el.focus();const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     closeDetails: () => {const el=document.body.querySelector("[data-close-details]")!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
+    disconnect: () => (eventSource as any).onerror(),
     refresh: () => intervals.forEach(fn => fn()), snapshot: (data:unknown) => {const e=new Event("snapshot");Object.assign(e,{data:JSON.stringify(data)});eventSource.dispatchEvent(e);}, context, window, document, animations };
 }
 
@@ -605,4 +606,24 @@ test("sparse v4 fallback shares display selection and stable change evidence",as
  assert.equal(stamp(actual),stamp({...actual,assistant:{text:"Hidden fallback change",state:"reported"}}));
  assert.equal(display({...withheld,assistant:{text:null,state:"withheld"}}),"Previews unavailable");
  assert.equal(display(decoded,"byte-budget"),"Previews unavailable");
+});
+
+test("quiet connected local streams remain live while sampled age and transport loss invalidate",()=>{
+ const b=browser("https://board.example/?mode=agents"),now=Date.now(),old=now-120000;
+ const agents=["completed","working"].map(state=>({id:state,title:state,host:"agent-a",model:"sol",state,observedAt:old,detailObservedAt:old,activityFreshness:"live",freshness:"live",steps:[]}));
+ const host={host:"agent-a",observedAt:old,freshness:"live",shown:2,total:2,states:{},models:[]};
+ const snap={version:1,demo:false,sampled:false,now,source:{state:"live",observedAt:old},agents,tokens:{coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[host]};
+ const card=(id:string)=>b.elements.view!.querySelector('[data-thread-card="'+id+'"]')!;
+ b.snapshot(snap);
+ assert.equal(card("completed").getAttribute("data-fresh"),"cached");
+ assert.equal(card("working").getAttribute("data-fresh"),"live");
+ for(const id of ["completed","working"])assert.match(card(id).querySelector(".card-fresh")!.getAttribute("title")!,/source live · 2m ago/);
+ b.snapshot({...snap,sampled:true});
+ for(const id of ["completed","working"]){assert.equal(card(id).getAttribute("data-fresh"),"stale");assert.match(card(id).textContent,/Source stale/);}
+ b.snapshot(snap);b.disconnect();
+ for(const id of ["completed","working"]){assert.equal(card(id).getAttribute("data-fresh"),"stale");assert.match(card(id).textContent,/Source disconnected/);}
+ b.snapshot(snap);assert.equal(card("working").getAttribute("data-fresh"),"live");
+ b.context.Date=class extends Date{static override now(){return now+31000;}};
+ b.refresh();
+ for(const id of ["completed","working"])assert.match(card(id).textContent,/Source disconnected/);
 });

@@ -183,8 +183,7 @@
     const step = item => { const s = safeStep(item); return `<span class="tool">${esc(s.tool)}</span><span class="tgt ell">${esc(s.target)}</span><span class="el num">${esc(s.age)}</span>`; };
     const tiles = shown.map(a => {
       const activityFresh = a.activityFreshness === 'live' && a.observed != null && a.observed <= 60 ? 'live' : a.activityFreshness === 'nosource' ? 'nosource' : 'stale';
-      const sourceState = a.sourceFreshness || a.freshness;
-      const sourceFresh = sourceState === 'live' ? a.sourceObserved == null ? 'unknown' : a.sourceObserved <= 90 ? 'live' : 'stale' : sourceState || 'unknown';
+      const sourceFresh = a.sourceFreshness || a.freshness || 'unknown';
       const completed = a.state === 'completed';
       const freshness = sourceFresh !== 'live' ? sourceFresh === 'nosource' || sourceFresh === 'unknown' ? 'nosource' : 'stale' : completed ? 'cached' : activityFresh;
       const host = ({'agent-a':'A','agent-b':'B','omarchy-pc':'PC','laptop':'L'})[a.host] || a.host;
