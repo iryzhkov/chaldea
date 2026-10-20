@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtempSync,mkdirSync,writeFileSync,readFileSync,statSync,rmSync } from "node:fs";
 import { join } from "node:path";
@@ -625,21 +626,55 @@ test("completion evidence crosses v5 rich transport and hosted reload without re
   assert.equal(unknown.agents[0]!.completedAt,null);assert.equal(projectClientSnapshot(unknown,now,true).threadAgents.length,1);
  }
 });
-test("active work is admitted before terminal history at the model cap and completion tables survive bounded cache trimming",()=>{
- const rows=Array.from({length:48},(_,i)=>({...row("done-"+i),status:"completed",activeRunId:null,latestRunStartedAt:new Date(now0-1000).toISOString(),latestRunCompletedAt:new Date(now0).toISOString()}));
- const active={...row("active"),latestRunStartedAt:new Date(now0).toISOString()};
- const m=live(()=>now0,[...rows,active]);
- assert.ok(m.ids().includes(active.id));assert.equal(m.snapshot().total,49);assert.equal(m.snapshot().truncated,true);
- const full=live(()=>now0,rows);
- full.shell({kind:"thread",sequence:2,thread:active});assert.ok(full.ids().includes(active.id));assert.equal(full.snapshot().total,null);
- const cache=emptyCache();
- for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"]){
-  const snapshot=captureSnapshot(live(()=>now0,rows),host,epoch,1)!;
-  assert.ok(Buffer.byteLength(JSON.stringify(snapshot))<=8192);
-  assert.equal(snapshot.rich!.completionTimes!.length,snapshot.agents.length);
-  mergeStatus(cache,snapshot,now0);
+test("active admission and resumption survive pressured capture with aligned opaque identities",()=>{
+ const rows=Array.from({length:48},(_,i)=>({...row("done-"+i),status:"completed",activeRunId:null,latestRunStartedAt:new Date(now0-1000-i).toISOString(),latestRunCompletedAt:new Date(now0).toISOString()}));
+ const full=live(()=>now0,rows),active={...row("active"),latestRunStartedAt:new Date(now0).toISOString()};
+ full.shell({kind:"thread",sequence:2,thread:active});
+ const resumed=rows.find(r=>r.id===full.ids().at(-2))!;
+ full.shell({kind:"thread",sequence:3,thread:{...resumed,status:"running",activeRunId:"resumed"}});
+ for(let i=0;i<10;i++)full.shell({kind:"thread",sequence:4+i,thread:{...active,id:"new-active-"+i}});
+ const activeIds=full.ids().slice(0,12);
+ assert.equal(full.snapshot().total,null);assert.equal(full.ids().length,48);
+ assert.ok(activeIds.includes(active.id));assert.ok(activeIds.includes(resumed.id));
+ // Exercise the byte cap with the maximum bounded tool history on every row.
+ for(const id of full.ids())for(const tool of ["read","search","navigate","edit_apply","change_plan","verify_run"])full.detail(id,{kind:"activity",tool});
+ const view=full.snapshot(),captured=captureSnapshot(full,"agent-a",epoch,1)!;
+ assert.ok(captured.agents.length<48);assert.equal(captured.truncated,true);
+ assert.ok(Buffer.byteLength(JSON.stringify(captured))<=8192);
+ for(const [i,a] of captured.agents.entries()){
+  assert.equal(a.id,createHash("sha256").update(epoch+"\0"+full.ids()[i]).digest("hex").slice(0,16));
+  assert.equal(a.state,view.agents[i]!.state);assert.equal(a.startedAt,view.agents[i]!.startedAt);
  }
- for(const snapshot of cache.snapshots){validateHostSnapshot(snapshot);assert.equal(snapshot.rich!.completionTimes!.length,snapshot.agents.length);}
+ for(const id of activeIds){
+  const opaque=createHash("sha256").update(epoch+"\0"+id).digest("hex").slice(0,16);
+  assert.equal(captured.agents.find(a=>a.id===opaque)?.state,"working");
+ }
+});
+test("optional completion evidence preserves base coverage and remains bounded through cache trimming",async()=>{
+ const {projectClientSnapshot}=await import("../../src/mission-control/static/client.js" as string);
+ for(const count of [44,48]){
+  const rows=Array.from({length:count},(_,i)=>({...row("done-"+i),status:"completed",activeRunId:null,latestRunCompletedAt:new Date(now0).toISOString()}));
+  const without=captureSnapshot(live(()=>now0,rows.map(r=>({...r,latestRunCompletedAt:null}))),"agent-a",epoch,1)!;
+  const withTimes=captureSnapshot(live(()=>now0,rows),"agent-a",epoch,1)!;
+  assert.deepEqual(withTimes.agents,without.agents);assert.equal(withTimes.total,without.total);assert.equal(withTimes.truncated,without.truncated);
+  assert.ok(Buffer.byteLength(JSON.stringify(withTimes))<=8192);
+  const times=withTimes.rich?.completionTimes??[];
+  assert.ok(times.length<withTimes.agents.length,"completion metadata yields before base rows");
+  const d=scratch();try{
+   const local=emptyCache();mergeStatus(local,withTimes,now0);const path=join(d.path,"partial-completion-cache");writeCache(path,local);
+   const hosted=new CacheModel(path,()=>now0+60_000).snapshot(),unknown=hosted.agents.filter(a=>a.completedAt===null);
+   assert.equal(unknown.length,withTimes.agents.length-times.length);
+   assert.equal(projectClientSnapshot(hosted,now0+60_000,true).threadAgents.length,unknown.length);
+  }finally{d.close();}
+  const cache=emptyCache();
+  for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"])mergeStatus(cache,{...withTimes,host},now0);
+  for(const snapshot of cache.snapshots){
+   validateHostSnapshot(snapshot);
+   for(const [id,time] of snapshot.rich?.completionTimes??[]){
+    assert.equal(snapshot.agents.find(a=>a.id===id)?.state,"completed");assert.equal(time,now0);
+   }
+  }
+ }
 });
 
 test("a completion timestamp beyond its source receipt remains unknown as the local clock advances",()=>{

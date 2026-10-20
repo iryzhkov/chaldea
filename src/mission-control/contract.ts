@@ -68,16 +68,17 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
   while(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){snapshot.agents.pop();snapshot.truncated=true;}
   // v5 adds actual completion times through the existing rich schema seam.
   // Older v1/v2/v3/v4 producers remain readable; older readers reject v5.
-  const completionTimes:[string,number][]=snapshot.agents.flatMap((a,i)=>v.agents[i]!.completedAt===null?[]:[[a.id,v.agents[i]!.completedAt!] as [string,number]]);
-  const rich:RichSnapshot={v:completionTimes.length?5:4,...(completionTimes.length?{completionTimes}:{}),resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
+  const rich:RichSnapshot={v:4,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
   snapshot.rich=rich;
-  // Completion evidence precedes optional detail. Never silently drop it for a retained row.
-  while(rich.v===5&&Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){
-    const removed=snapshot.agents.pop()!;snapshot.truncated=true;
-    rich.completionTimes=rich.completionTimes!.filter(([id])=>id!==removed.id);rich.omitted=snapshot.agents.length;
-  }
   if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
   else {
+    // Completion evidence uses spare bytes only. Missing entries remain explicitly unknown.
+    for(const [i,a] of snapshot.agents.entries()){
+      const completedAt=v.agents[i]!.completedAt;if(completedAt===null)continue;
+      rich.v=5;(rich.completionTimes??=[]).push([a.id,completedAt]);
+      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.completionTimes.pop();
+      if(!rich.completionTimes.length){delete rich.completionTimes;rich.v=4;}
+    }
     try{rich.resources=validateRich({v:3,resources:v.resources,details:[],omitted:0},new Set(),observedAt).resources;}
     catch{rich.resources={state:"unavailable",sample:null};}
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.resources={state:"byte-budget",sample:null};

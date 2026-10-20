@@ -688,7 +688,7 @@ test("provider summaries consistently select newest actual usage without merging
  const account=(label:string,used:number,observedAt:number|null,duration=300)=>({label,used,observedAt,state:"cached",duration,resetsAt:start+3600000,credits:"99",creditState:"cached",manualResets:9,resetState:"cached"});
  const hosts=[
   {host:"agent-b",state:"cached",observedAt:start,omitted:0,accounts:[account("codex account 1",10,start-2000),account("claudeAgent account 2",20,start-1000)]},
-  {host:"agent-a",state:"cached",observedAt:start,omitted:0,accounts:[account("codex account 3",80,start-1000,10080),account("codex account 4",90,null),account("claudeAgent account 1",70,start-3000)]}
+  {host:"agent-a",state:"cached",observedAt:start,omitted:0,accounts:[account("codex account 3",80,start-1000,10080),account("codex account 4",90,null),{...account("codex account 5",0,start),used:null,state:"unsupported"},account("claudeAgent account 1",70,start-3000)]}
  ];
  const snap={version:1,demo:false,sampled:true,now:start,source:{state:"live",observedAt:start},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]};
  b.snapshot(snap);
@@ -699,9 +699,9 @@ test("provider summaries consistently select newest actual usage without merging
  assert.match(codexBody.querySelector(".source-meta")!.textContent,/Newest usage observation · agent-a · 1s ago/);
  assert.match(claudeBody.querySelector(".source-meta")!.textContent,/Newest usage observation · agent-b · 1s ago/);
  assert.match(codex.textContent,/80% used · 20% headroom/);assert.match(claude.textContent,/20% used · 80% headroom/);
- assert.equal(codex.querySelectorAll(".quota-account").length,3);assert.equal(claude.querySelectorAll(".quota-account").length,2);
+ assert.equal(codex.querySelectorAll(".quota-account").length,4);assert.equal(claude.querySelectorAll(".quota-account").length,2);
  assert.match(codex.textContent,/10080 min window/);assert.match(codex.textContent,/90% used/);
- assert.match(codex.textContent,/metric times unknown/);assert.match(codex.textContent,/Values are not combined/);
+ assert.match(codex.textContent,/credit\/manual reset times not shown/);assert.match(codex.textContent,/Values are not combined/);
  clock.now+=60_000;b.snapshot({...snap,now:clock.now,quota:{...snap.quota,hosts:hosts.slice().reverse().map(h=>({...h,observedAt:clock.now}))}});
  assert.match(b.elements.view!.querySelector(".quota-provider")!.textContent,/agent-a · 1m ago/);
  b.click("overview");const overview=b.elements.view!.querySelector(".p-quota")!;
@@ -711,4 +711,31 @@ test("provider summaries consistently select newest actual usage without merging
  b.click("quota");
  b.snapshot({...snap,quota:{...snap.quota,hosts:hosts.map(h=>({...h,accounts:h.accounts.filter(a=>a.label.startsWith("codex"))}))}});
  assert.match(b.elements.view!.querySelectorAll(".quota-provider")[1]!.textContent,/Claude.*Usage unknown/);
+});
+
+test("local quota retains all 32 separate readings and provider errors across Quota and Overview",()=>{
+ const start=Date.parse("2026-10-20T00:00:00Z"),b=browser("https://board.example/?mode=quota",false,{now:start});
+ const accounts=Array.from({length:32},(_,i)=>({label:(i===31?"claudeAgent":"codex")+" account "+(i+1),used:i,observedAt:start-1000-i,state:"cached",duration:300,resetsAt:null,credits:null,manualResets:null}));
+ const snap={version:1,demo:false,now:start,source:{state:"live",observedAt:start},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts},hostSummary:[]};
+ b.snapshot({...snap,quota:{state:"cached",accounts:[...accounts.slice(0,4),accounts[31]]}});
+ assert.match(b.elements.view!.querySelectorAll(".quota-provider").find(c=>c.textContent.includes("Claude"))!.textContent,/31% used/);
+ b.snapshot(snap);
+ assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,32);
+ const claude=b.elements.view!.querySelectorAll(".quota-provider").find(c=>c.textContent.includes("Claude"))!;
+ assert.match(claude.textContent,/31% used/);assert.match(claude.textContent,/1 separate readings/);
+ assert.match(b.elements.view!.textContent,/31 separate readings/);
+ b.click("overview");
+ assert.equal(b.elements.view!.querySelector(".p-quota")!.querySelectorAll(".quota-account").length,32);
+ assert.match(b.elements.view!.querySelector(".p-quota")!.textContent,/31% used/);
+ for(const mode of ["quota","overview"]){
+  b.click(mode);b.snapshot({...snap,quota:{state:"error",accounts:[]}});
+  assert.match(b.elements.view!.textContent,/Quota source error/);
+ }
+});
+test("hosted quota groups retain all 16 bounded hosts and enforce four readings per host",()=>{
+ const start=Date.parse("2026-10-20T00:00:00Z"),b=browser("https://board.example/?mode=quota",false,{now:start});
+ const hosts=Array.from({length:16},(_,h)=>({host:"host-"+h,state:"cached",observedAt:start,omitted:1,accounts:Array.from({length:5},(_,i)=>({label:(i===3?"claudeAgent":"codex")+" account "+i,used:i,observedAt:start-h,state:"cached"}))}));
+ b.snapshot({version:1,demo:false,sampled:true,now:start,source:{state:"live",observedAt:start},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]});
+ assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,64);
+ assert.match(b.elements.view!.textContent,/host-15/);assert.match(b.elements.view!.textContent,/account rows omitted by source/);
 });

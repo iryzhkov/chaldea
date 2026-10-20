@@ -113,6 +113,8 @@ export class MissionModel {
       if (this.threads.delete(event.threadId)) this.total = Math.max(0, this.total - 1);
       else if (this.total > this.threads.size) this.coverageExact = false;
     }
+    // Keep both public projections in the same active-first map order, including resumed rows.
+    this.threads = new Map([...this.threads].toSorted(([,a],[,b])=>Number(activeThread(b.row))-Number(activeThread(a.row))));
     this.observed = now; this.changed();
   }
   disconnected(): void { this.providerCatalog.clear(); if (this.connected) this.observed = this.now(); this.connected = false; for (const t of this.threads.values()) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
