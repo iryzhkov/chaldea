@@ -412,7 +412,7 @@ b, strong, .b { font-weight:600; }
 .host-coverage { grid-column:1 / -1; overflow-wrap:anywhere; }
 .host-card > .body { overflow-wrap:anywhere; }
 
-/* Fixed 230px budget: two-line title, up to three real previews, fixed state strip. */
+/* Minimum 230px budget: two-line title, up to three real previews, wrapping state strip. */
 .dynamic-grid .tile { min-width:0; min-height:230px; container-type:inline-size; }
 .dynamic-grid .tile > header { flex-wrap:nowrap; padding:6px 8px; height:52px; font-size:14px; }
 .provider-mark { margin-left:auto; border:1px solid var(--ink-3); border-radius:50%; width:20px; height:20px; text-align:center; flex:none; font:14px/18px var(--font-num); color:var(--ink-2); }
@@ -423,13 +423,14 @@ b, strong, .b { font-weight:600; }
 .activity-kind { color:var(--ink-2); flex:none; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; line-height:17px; }
 .activity-preview { min-width:0; min-height:17px; display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; overflow-wrap:anywhere; }
 .activity-empty { color:var(--ink-2); }
-.card-foot { flex:0 0 54px; display:grid; grid-template-rows:20px 20px; gap:3px; padding:5px 8px; border-top:1px solid var(--line); background:var(--dim); font-size:14px; line-height:18px; min-width:0; }
-.card-status,.card-access { display:flex; align-items:center; gap:8px; min-width:0; }
+.card-foot { flex:0 0 auto; min-height:54px; display:grid; grid-template-rows:auto auto; gap:3px; padding:5px 8px; border-top:1px solid var(--line); background:var(--dim); font-size:14px; line-height:18px; min-width:0; }
+.card-status,.card-access { display:flex; align-items:center; flex-wrap:wrap; gap:3px 8px; min-width:0; }
+.card-status > * { max-width:100%; white-space:normal; overflow-wrap:anywhere; }
 .card-status .st { flex:none; font-weight:600; color:var(--accent); }
 .tile:is(.completed,.idle,.cancelled) .card-status .st { color:var(--ink-2); }
 .tile.failed .card-status .st { color:var(--fail); }
 .tile[data-fresh]:not([data-fresh="live"]):not([data-fresh="cached"]) .card-status .st { color:var(--stale); }
-.card-model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-2); }
+.card-model { flex:0 1 auto; min-width:0; white-space:normal; overflow-wrap:anywhere; color:var(--ink-2); }
 .card-effort,.card-usage { flex:none; color:var(--ink-2); }
 .card-effort { font-size:12px; }
 .card-usage { margin-left:auto; }
@@ -530,6 +531,15 @@ b, strong, .b { font-weight:600; }
 #view.overview .p-threads .activity-preview { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
 .detail-link { color:var(--ink-2); font-size:var(--t1); overflow-wrap:anywhere; }
 @media (max-width:650px) {
+  #view:is(.events,.tokens) { grid-template-columns:minmax(0,1fr); grid-template-rows:none; grid-auto-rows:max-content; align-content:start; overflow:auto; }
+  #view.events { grid-template-areas:"ecount" "timeline"; }
+  #view.tokens { grid-template-areas:"thero" "models"; }
+  #view:is(.events,.tokens) > .panel { min-height:max-content; }
+  #view:is(.events,.tokens) > .panel > .body { flex:none; overflow:visible; }
+  #view.events .p-ecount > .body { flex-direction:column; align-items:stretch; }
+  #view.events .source-meta { white-space:normal; overflow-wrap:anywhere; }
+  #view.tokens .stats { grid-auto-flow:row; grid-template-columns:minmax(0,1fr); }
+  #view.tokens .stat .l { display:block; height:auto; white-space:normal; overflow:visible; overflow-wrap:anywhere; }
   #view.overview .p-hosts > .body { grid-template-columns:minmax(0,1fr); }
   #view.agents .agents-summary { gap:6px; }
   #view.agents .agents-summary > .t, #view.agents [data-grid-fit] { display:none; }

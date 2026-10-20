@@ -253,6 +253,40 @@ test("Auto maximizes readable card area for the current count and viewport",()=>
  b.resize(390,600);assert.match(b.elements.view!.innerHTML,/Effective fit 1 × 1/);
 });
 
+test("Auto widens sparse pages while capacity, stable rows and manual columns stay fixed",()=>{
+ const b=browser("https://board.example/?mode=agents"),now=Date.now();b.resize(1280,800);
+ const agents=Array.from({length:17},(_,i)=>({id:"endcap-"+i,title:"Endcap "+i,model:"claude-opus-5-5",host:"agent-a",state:"waiting-children",observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[],detailCoverage:"reported",details:{effort:{value:"high",source:"configured"}}}));
+ const snap=(n:number)=>({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:agents.slice(0,n),shown:n,total:n,truncated:false,tokens:{coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]});
+ const view=b.elements.view!,columns=()=>view.querySelector(".dynamic-grid")!.getAttribute("style");
+ const ids=()=>view.querySelectorAll(".tile").map(e=>e.getAttribute("data-thread-card"));
+ for(const n of [9,10,17]){
+  b.grid("auto");b.snapshot(snap(n));
+  const pages=Math.ceil(n/8),seen:string[]=[];
+  for(let page=0;page<pages;page++){
+   const visible=Math.min(8,n-page*8);
+   assert.match(view.textContent,new RegExp("Page "+(page+1)+" of "+pages));
+   assert.match(view.textContent,/Effective fit 4 × 2 · 8 per page/);
+   assert.match(columns()!,new RegExp("grid-template-columns:repeat\\("+Math.min(4,visible)+","));
+   assert.deepEqual(ids(),agents.slice(page*8,Math.min(n,page*8+8)).map(a=>a.id));
+   seen.push(...ids() as string[]);
+   for(const card of view.querySelectorAll(".tile")){
+    assert.equal(card.querySelector(".card-model")!.textContent,"claude-opus-5-5");
+    assert.match(card.querySelector(".card-status")!.textContent,/Waiting for children/);
+    assert.equal(card.querySelector(".card-effort")!.textContent,"high configured");
+   }
+   b.page(1);
+  }
+  assert.equal(new Set(seen).size,n);
+  assert.equal(view.querySelector('[data-thread-page="1"]')!.getAttribute("aria-disabled"),"true");
+  b.page(-1);assert.match(columns()!,/grid-template-columns:repeat\(4,/);
+ }
+ b.grid("4x3");b.snapshot(snap(10));b.page(1);
+ assert.deepEqual(ids(),["endcap-8","endcap-9"]);
+ assert.match(columns()!,/grid-template-columns:repeat\(4,/);
+ assert.equal(b.location.searchParams.get("grid"),"4x3");
+ assert.match(view.textContent,/Page 2 of 2/);
+});
+
 test("explicit grids page every row, clamp on resize and SSE shrink, and survive history",()=>{
  const b=browser("https://board.example/?mode=agents#board"),now=Date.now();
  const agents=Array.from({length:48},(_,i)=>({id:"row-"+i,title:"Distinct task "+i,model:"sol",host:"agent-a",state:"working",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[]}));
@@ -391,7 +425,9 @@ test("compact cards use current state, bounded previews, safe provider identity 
  assert.match(b.elements.view!.innerHTML,/Last observed command/);
  const css=readFileSync(new URL("../../src/mission-control/static/core.css",import.meta.url),"utf8");
  assert.doesNotMatch(css,/\.dynamic-grid \.tile > \.body\s*\{[^}]*overflow:\s*(auto|scroll)/);
- assert.match(css,/\.card-foot\s*\{[^}]*flex:0 0 54px/);
+ const card=b.elements.view!.querySelector(".tile")!;
+ assert.ok(card.querySelector(".card-foot")!.contains(card.querySelector(".card-status")));
+ assert.ok(card.querySelector(".card-foot")!.contains(card.querySelector("[data-thread-details]")));
  assert.match(css,/@container \(max-width:460px\).*card-usage/);
 });
 
