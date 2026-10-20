@@ -144,6 +144,12 @@
 
   // Live thread density follows the available CSS viewport and a bounded URL preference.
   const agentSet = () => { const n = DATA.demo ? parseInt(Q.get('agents'), 10) : 0; if (!n) return DATA.threads; const pool = DATA.agentPool; return Array.from({ length: Math.max(1, Math.min(480, n)) }, (_, i) => ({ ...pool[i % pool.length], id: 'a' + i, title: pool[i % pool.length].title + (i >= pool.length ? ' (' + (Math.floor(i / pool.length) + 1) + ')' : '') })); };
+  // Activity priority is independent of incoming producer order and applies before paging.
+  const orderThreads = rows => {
+    const active = a => /^(thinking|working|waiting(?:-|$)|queued$)/.test(a.state);
+    const at = a => [a.activityObservedAt,a.detailObservedAt,a.observedAt].find(Number.isFinite) ?? 0;
+    return rows.slice().sort((a,b) => Number(active(b))-Number(active(a)) || at(b)-at(a) || String(a.id).localeCompare(String(b.id),'en',{numeric:true}));
+  };
   const GRID_CHOICES = ['auto','2x2','3x2','3x3','4x3','4x4','5x3','6x4','8x6'];
   const gridPreference = () => { const v = new URLSearchParams(location.search).get('grid'); return GRID_CHOICES.includes(v) ? v : 'auto'; };
   const gridFit = count => {
@@ -169,19 +175,21 @@
   };
   let agentPage = 0;
   R.agents = () => {
-    const incoming = agentSet(); const all = !DATA.demo ? incoming : display.source('agents', incoming.length === display.count('agents', incoming.length, performance.now()) ? incoming : null) || incoming;
+    const incoming = agentSet(); const all = orderThreads(!DATA.demo ? incoming : display.source('agents', incoming.length === display.count('agents', incoming.length, performance.now()) ? incoming : null) || incoming);
     const fit = gridFit(all.length), per = fit.per; const pages = Math.max(1, Math.ceil(all.length / per)); agentPage = Math.min(agentPage, pages - 1);
     const shown = all.slice(agentPage * per, agentPage * per + per);
     const count = k => all.filter(a => a.state === k).length;
     const summary = `<div class="agents-summary"><span class="t">${all.length} agent${all.length === 1 ? '' : 's'}</span>${st('working', count('working') + ' working')}${st('waiting-igor', count('waiting-igor') + ' waiting for Igor')}${st('waiting-ci', count('waiting-ci') + ' waiting for CI')}${count('failed') ? st('failed', count('failed') + ' failed') : ''}${count('idle') ? st('idle', count('idle') + ' idle') : ''}<span class="muted t1">${esc(window.MC?.UI.threadCoverage ? window.MC.UI.threadCoverage(shown.length, all.length, agentPage * per) : all.length + " observed threads")}</span></div>`;
     const step = item => { const s = safeStep(item); return `<span class="tool">${esc(s.tool)}</span><span class="tgt ell">${esc(s.target)}</span><span class="el num">${esc(s.age)}</span>`; };
     const tiles = shown.map(a => {
-      const freshness = a.activityFreshness === 'live' && a.observed != null && a.observed <= 60 ? 'live' : a.activityFreshness === 'nosource' ? 'nosource' : 'stale';
-      const sourceFresh = a.freshness === 'live' ? a.sourceObserved == null ? 'unknown' : a.sourceObserved <= 90 ? 'live' : 'stale' : a.freshness || 'unknown';
+      const activityFresh = a.activityFreshness === 'live' && a.observed != null && a.observed <= 60 ? 'live' : a.activityFreshness === 'nosource' ? 'nosource' : 'stale';
+      const sourceFresh = a.sourceFreshness || a.freshness || 'unknown';
+      const completed = a.state === 'completed';
+      const freshness = sourceFresh !== 'live' ? sourceFresh === 'nosource' || sourceFresh === 'unknown' ? 'nosource' : 'stale' : completed ? 'cached' : activityFresh;
       const host = ({'agent-a':'A','agent-b':'B','omarchy-pc':'PC','laptop':'L'})[a.host] || a.host;
       const stamp = window.MC?.UI.agentChangeStamp ? window.MC.UI.agentChangeStamp(a) : JSON.stringify([a.observedAt, a.activityObservedAt, a.state, a.title]);
-      const freshnessNote = `Activity ${freshness} · ${a.observed == null ? 'age unknown' : ago(a.observed) + ' ago'}; ${host} source ${sourceFresh} · ${a.sourceObserved == null ? 'age unknown' : ago(a.sourceObserved) + ' ago'}`;
-      const freshLabel = freshness !== 'live' ? 'Activity ' + freshness : sourceFresh !== 'live' ? 'Source ' + sourceFresh : 'Updated ' + ago(a.observed) + ' ago';
+      const freshnessNote = `Activity ${activityFresh} · ${a.observed == null ? 'age unknown' : ago(a.observed) + ' ago'}; ${host} source ${sourceFresh} · ${a.sourceObserved == null ? 'age unknown' : ago(a.sourceObserved) + ' ago'}`;
+      const freshLabel = sourceFresh !== 'live' ? 'Source ' + sourceFresh : completed ? 'Completed · last activity ' + (a.observed == null ? 'unknown' : ago(a.observed) + ' ago') : activityFresh !== 'live' ? 'Activity ' + activityFresh : 'Updated ' + ago(a.observed) + ' ago';
       return `<section class="panel tile ${esc(a.state)}" data-fresh="${freshness}" data-thread-card="${encodeURIComponent(a.id)}" data-change-stamp="${esc(stamp)}"><header><h2 class="title two">${esc(a.title)}</h2>${window.MC?.UI.providerMark ? window.MC.UI.providerMark(a) : '<span class="provider-mark" role="img" aria-label="Provider unknown">?</span>'}</header><div class="body">
       ${window.MC?.UI.agentActivity ? window.MC.UI.agentActivity(a) : '<div class="muted">Activity unavailable</div>'}
       </div><footer class="card-foot"><div class="card-status">${st(a.state, STATE_LABEL[a.state] || a.state)}${window.MC?.UI.agentMetrics ? window.MC.UI.agentMetrics(a) : ''}</div><div class="card-access"><span class="card-fresh" title="${esc(freshnessNote)}" aria-label="${esc(freshnessNote)}">${esc(freshLabel)}</span><button type="button" data-thread-details="${encodeURIComponent(a.id)}" aria-label="Details for ${esc(a.title)}" aria-haspopup="dialog">Details</button></div></footer></section>`;
@@ -372,5 +380,5 @@
   // ---------- display care: pixel shift unless reduced motion ----------
   const board = $('#board'); const shifts = [[0,0],[3,1],[1,3],[-2,2],[-3,-1],[-1,-3],[2,-2],[3,3]]; let si = 0;
   if (!reduceMotion && !still) setInterval(() => { si = (si + 1) % shifts.length; board.style.transform = `translate(${shifts[si][0]}px, ${shifts[si][1]}px)`; }, 60e3);
-  window.MC = { show, modeFromURL, DATA, P, dir, paletteKey, MODES, SOURCES, safeStep, createDisplayState, R, UI: { panel, heroStat, gauge, st, budget, stacked, meter } };
+  window.MC = { show, modeFromURL, DATA, P, dir, paletteKey, MODES, SOURCES, safeStep, orderThreads, createDisplayState, R, UI: { panel, heroStat, gauge, st, budget, stacked, meter } };
 })();
