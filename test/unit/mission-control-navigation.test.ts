@@ -563,13 +563,13 @@ test("token unknown timestamps and unqualified coverage cannot imply freshness",
  const b=browser("https://board.example/?mode=tokens"),now=Date.now();
  const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{rate:null,output:null,coverage:"unknown",observedAt:null},quota:{state:"unknown",accounts:[]},hostSummary:[]};
  b.snapshot(snap);
- assert.match(b.elements.view!.textContent,/Update time unknown/);
+ assert.match(b.elements.view!.textContent,/oldest usage unknown/);
  assert.doesNotMatch(b.elements.view!.textContent,/unknowns ago/);
  assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"nosource");
  b.snapshot({...snap,tokens:{...snap.tokens,observedAt:now}});
  assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"nosource");
  b.snapshot({...snap,tokens:{...snap.tokens,coverage:"partial",observedAt:now}});
- assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"cached");
+ assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"nosource","legacy process freshness cannot qualify transported usage");
 });
 
 test("Overview quota summary bounds four accounts per host and links all observations",()=>{
@@ -626,4 +626,25 @@ test("quiet connected local streams remain live while sampled age and transport 
  b.context.Date=class extends Date{static override now(){return now+31000;}};
  b.refresh();
  for(const id of ["completed","working"])assert.match(card(id).textContent,/Source disconnected/);
+});
+
+test("Tokens uses retained transported detail usage with subsets, zeros, partial coverage and replacement",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts");
+ const b=browser("https://board.example/?mode=tokens"),now=Date.now();
+ const d=emptyDetail();d.usage={...d.usage,input:100,output:20,total:120,cacheRead:30,cacheWrite:0,reasoning:5,turns:1,coverage:"observed",observedAt:now};
+ const row={id:"usage",host:"agent-a",title:"Observed task",model:"known",state:"working",steps:[],freshness:"live",startedAt:now,observedAt:now,detailObservedAt:now,activityFreshness:"live",details:d,detailCoverage:"reported"};
+ const snap={version:1,now,demo:false,source:{state:"live",observedAt:now},agents:[row],shown:1,total:1,truncated:false,hostSummary:[{host:"agent-a",details:{usage:d.usage}}],tokens:{output:987654321,rate:987654321,coverage:"observed",observedAt:now},quota:{state:"unknown",accounts:[]}};
+ b.snapshot(snap);
+ let text=b.elements.view!.textContent;
+ assert.match(text,/Retained OBSERVED main-agent contributions/);
+ assert.match(text,/120/);assert.match(text,/cache write.*input subset/);assert.match(text,/reasoning.*output subset/);
+ assert.match(text,/1 usable turns \/ 1 usable threads/);assert.match(text,/eight turns per thread.*48 shown threads/);
+ assert.match(text,/0.*cache write/);assert.doesNotMatch(text,/987654321|since process start|60 s average/);
+ b.snapshot({...snap,agents:[row,row]});assert.match(b.elements.view!.textContent,/1 usable turns \/ 1 usable threads/);
+ b.snapshot({...snap,total:2,agents:[row,{...row,id:"missing",detailCoverage:"byte-budget",details:undefined}]});
+ text=b.elements.view!.textContent;assert.match(text,/Partial coverage/);assert.match(text,/1 shown threads missing usable usage/);assert.match(text,/1 \/ 2 threads report this field/);
+ b.snapshot({...snap,source:{state:"stale",observedAt:now},agents:[{...row,activityFreshness:"stale",details:{...d,usage:{...d.usage,input:0,output:0,total:0,cacheRead:null,reasoning:null}}}]});
+ text=b.elements.view!.textContent;assert.match(text,/source stale/);assert.match(text,/0 \/ 1 threads report this field/);assert.doesNotMatch(text,/120/);
+ b.snapshot({...snap,agents:[{...row,details:{...d,fieldCoverage:"identity-only"}}]});
+ text=b.elements.view!.textContent;assert.match(text,/0 usable turns \/ 0 usable threads/);assert.match(text,/Generation rate, p95, daily totals and model history unavailable/);
 });

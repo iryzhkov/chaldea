@@ -40,12 +40,29 @@ Existing density tiers and portrait paging are retained; state sits beside Task
 or Agent and the sanitized title is the main heading.
 
 Usage uses normalized main-agent turn totals, replaced by stable internal turn
-identity across reconnects. At most eight observed turns per shown thread are
+identity across reconnects. Snapshot replacement clears the retained usage window,
+including removed turns. Missing normalized turns make coverage partial.
+A separate usage-only proof requires an exact app/provider-thread association,
+a same-thread self-rooted root_turn node, reciprocal provider/turn/node/run IDs,
+and matching run-attempt relationships when present. Missing, ambiguous or
+contradictory tuples are excluded. A nullable provider owner is accepted only
+through this proof; a contradictory non-null owner is rejected. The existing
+provider metadata, activity ownership and child-roster admission guard is intact.
+Proof storage is bounded to 16 providers, 64 roots, 128 runs, 128 attempts and
+eight pending/observed turns per thread. Only relationship fields and normalized
+usage are retained. Event ordering can defer qualification; later contradictory
+updates withdraw contributions, and reconnect snapshots replace the proof window.
+No history database or additional RPC is used. At most eight observed turns per shown thread are
 retained; eviction marks coverage partial. Input + output is the observed total.
 Cache reads/writes are input subsets and reasoning is an output subset. Context
 occupancy is separate. Live context counters do not qualify a generation rate:
 rate stays null/not reported, as do daily totals and cost. Host/model aggregates
-cover observed main-agent turns only and disclose missing rows. Child provider
+cover observed main-agent turns only and disclose missing rows. The Tokens page
+uses unique transported agent details, at most 48 shown threads, and does not add
+overlapping host summaries. Each field names its contributing thread count;
+zero is known and absence is unknown. Source freshness and retained coverage are
+shown separately. Generation rate, p95, daily totals and model history remain
+unavailable. Child provider
 turns are excluded from parent usage. Delegate/native child rosters deduplicate
 actual child IDs, distinguish active/queued/completed observations, and remain
 bounded; parent work rosters are not additive. Empty unsupported native

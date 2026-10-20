@@ -80,10 +80,27 @@ script.onload = () => {
       +panel("events","Latest maintenance changes / failures",eventCoverage()+eventBody(2),"akasha",age(s?.events?.checkedAt),eventFresh());
   };
   R.tokens = () => {
-    const tokens=snapshot?.tokens,at=tokens?.observedAt,qualified=Number.isFinite(at)&&tokens?.coverage!=="unknown"&&tokens?.coverage!=null;
-    const fresh=qualified?(snapshot?.source.state==="live"&&age(at)<=90?"cached":"stale"):"nosource";
-    return panel("thero",tokens?.coverage==="partial"?"Partial output · 60 s average":"Output rate · 60 s average",'<div class="stats">'+heroStat(tokens?.rate==null?"—":tokens.rate.toFixed(1),tokens?.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg")+heroStat(tokens?.output??"—",tokens?.coverage==="partial"?"output lower bound":"observed output","since process start")+'</div>',"t3thread",qualified?age(at):null,fresh)
-      +panel("models","Observation scope",missing(tokens?.scope||"No usage data")+missing((Number.isFinite(at)?"Updated "+age(at)+"s ago":"Update time unknown")+" · daily totals and model history unavailable"),"t3thread",qualified?age(at):null,fresh)+unavailable("hourly","Today by hour");
+    // Cards and host summaries overlap. Count only unique transported cards.
+    const rows=[...new Map((snapshot?.agents||[]).map(a=>[a.id,a])).values()].slice(0,48);
+    const count=n=>Number.isSafeInteger(n)&&n>=0;
+    const usages=rows.map(a=>a.details && (!a.detailCoverage||a.detailCoverage==="reported") && a.details.fieldCoverage!=="identity-only"?a.details.usage:null);
+    const usable=usages.filter(u=>u&&u.turns>0&&u.coverage!=="not-reported"&&["input","output","total"].some(k=>count(u[k])));
+    const times=usable.map(u=>u.observedAt).filter(count),at=times.length===usable.length&&times.length?Math.min(...times):null;
+    const fresh=at==null?"nosource":snapshot?.source?.state==="live"&&rows.every(a=>a.activityFreshness==="live")?"live":"stale";
+    const metric=(key,label)=>{
+      const contributors=usable.filter(u=>count(u[key])),n=contributors.reduce((sum,u)=>sum+u[key],0);
+      return heroStat(contributors.length&&count(n)?n:"—",label,contributors.length+" / "+rows.length+" threads report this field");
+    };
+    const turns=usable.reduce((sum,u)=>sum+u.turns,0),missingThreads=rows.length-usable.length;
+    const partial=missingThreads>0||snapshot?.truncated||snapshot?.total!==rows.length||usable.some(u=>u.coverage!=="observed");
+    const scope=(partial?"Partial coverage":"Observed coverage")+" · "+turns+" usable turns / "+usable.length+" usable threads · "+missingThreads+" shown threads missing usable usage"
+      +" · shown "+rows.length+" / "+(snapshot?.total??"unknown")+" threads · source "+(snapshot?.source?.state||"unknown")
+      +" · oldest usage "+(at==null?"unknown":age(at)+"s ago");
+    return panel("thero","Retained OBSERVED main-agent contributions",'<div class="stats">'+metric("input","input")+metric("output","output")+metric("total","input + output")+'</div>',"t3thread",at==null?null:age(at),fresh)
+      +panel("models","Subsets and coverage",'<div class="stats">'+metric("cacheRead","cache read · input subset")+metric("cacheWrite","cache write · input subset")+metric("reasoning","reasoning · output subset")+'</div>'
+        +missing(scope)+missing("Cache reads and writes are included in input; reasoning is included in output.")
+        +missing("Retention: up to eight turns per thread, at most 48 shown threads. Missing fields remain unknown. These are retained observations, not lifetime, daily or process totals.")
+        +missing("Generation rate, p95, daily totals and model history unavailable."),"t3thread",at==null?null:age(at),fresh);
   };
   R.quota=()=>quotas();
   R.events=()=>panel("ecount","Maintenance observations",eventCoverage(),"akasha",age(snapshot?.events?.checkedAt),eventFresh())
