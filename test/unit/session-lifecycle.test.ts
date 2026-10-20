@@ -307,6 +307,30 @@ test("a surviving reporter keeps its preset quarantined after deadline and cance
   } finally { await f.close(); }
 });
 
+test("restart completes rejected and mismatched launch crash residues without relaunching", async () => {
+  for (const launch of ["rejected", "mismatch"] as const) {
+    const f = fixture("launch-residue-" + launch);
+    try {
+      f.t3.mode = "lost_absent";
+      const a = await start(f);
+      assert.equal(a.launch, "uncertain");
+      // Emulate death after persisting the launch answer but before finishSession.
+      assert.equal(f.store.sessionLaunch(a.sessionId, ["uncertain"], launch, "crash residue"), true);
+      await f.restart();
+      await until(() => f.engine.sessionStatus(a.sessionId).state === "resolved");
+      const status = f.engine.sessionStatus(a.sessionId);
+      assert.equal((status.outcome as { reason: string }).reason,
+        launch === "rejected" ? "launch_rejected" : "launch_identity_mismatch");
+      assert.equal(status.result, null);
+      await until(() => wake(f, a.sessionId)[0]?.state === "sent");
+      assert.equal(wake(f, a.sessionId).length, 1);
+      assert.equal(f.t3.launches.length, 1);
+      if (launch === "rejected") await until(() => f.engine.sessionStatus(a.sessionId).occupancy === "released");
+      else assert.equal(status.occupancy, "held");
+    } finally { await f.close(); }
+  }
+});
+
 test("failed, rejected, deleted and child-only outcomes carry no misleading success", async () => {
   const f = fixture("outcomes");
   try {

@@ -183,8 +183,12 @@ export class SessionLifecycle {
       if (overdue) this.store.finishSession(id, { reason: launch === "accepted" ? "deadline" : "launch_uncertain" }, null, now);
       return; // Not this preset's thread: never evidence that it stopped.
     }
-    if (launch === "mismatch") return; // Quarantined until an operator repairs it.
+    if (launch === "mismatch") {
+      if (active) this.store.finishSession(id, { reason: "launch_identity_mismatch" }, null, now);
+      return; // Quarantined until an operator repairs it.
+    }
     if (launch === "rejected") {
+      if (active) this.store.finishSession(id, { reason: "launch_rejected", ...(s.launch_detail ? { detail: s.launch_detail } : {}) }, null, now);
       if (gone) this.store.releaseSession(id, "launch_rejected", now);
       return;
     }
