@@ -141,7 +141,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
   eligible.sort((x, y) => {
     const rank = (c: typeof x) => {
-      if (!c.scopeKnown) return data.capacity ? 2 : null;
+      if (!c.scopeKnown && !data.capacity?.[c.providerInstanceId]?.creditFunded) return data.capacity ? 2 : null;
       const kind = data.capacity?.[c.providerInstanceId]?.class;
       return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
     };

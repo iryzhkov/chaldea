@@ -160,6 +160,12 @@ test("common short and weekly reset conflicts preserve independently proven loca
       const result = await route({ role: "builder" }, f.options);
       assert.equal(result.providerInstanceId, "codex");
       assert.equal(result.diagnostics!.quota["codex:gpt-6.1-sol"]!.scopedKnown, false);
+      const codexOnly = f.options.catalog;
+      f.options.catalog = async () => catalog.filter(p => ["codex", "claudeAgent"].includes(p.providerInstanceId))
+        .map(p => p.providerInstanceId === "codex" ? { ...p, accountKey } : p);
+      const competing = await route({ role: "builder" }, f.options);
+      assert.equal(competing.providerInstanceId, "codex", "proven funded priority survives unknown included scope");
+      f.options.catalog = codexOnly;
 
       const unproven = structuredClone(local);
       unproven.spendControlReached = newProvider("codex", "codex").spendControlReached;
