@@ -116,7 +116,20 @@ export class SessionLifecycle {
   private later(phase: Phase, id: string): void {
     const k = phase + ":" + id, n = this.attempts.get(k) ?? 0, delay = backoff(n);
     this.attempts.set(k, n + 1); this.notBefore.set(k, Date.now() + delay);
-    const timer = setTimeout(() => { this.timers.delete(timer); if (!this.stopped) this.hooks.poke(); }, delay);
+    let timer: NodeJS.Timeout;
+    const fire = () => {
+      this.timers.delete(timer);
+      if (this.stopped) return;
+      const remaining = this.notBefore.get(k)! - Date.now();
+      if (remaining > 0) {
+        // Relative timers can wake before the wall-clock eligibility check.
+        timer = setTimeout(fire, remaining);
+        this.timers.add(timer);
+        return;
+      }
+      this.hooks.poke();
+    };
+    timer = setTimeout(fire, delay);
     this.timers.add(timer);
   }
   /** One dispatch per committed intent. A thrown or lost answer becomes uncertain and is never resent. */

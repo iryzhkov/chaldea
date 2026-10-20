@@ -481,6 +481,102 @@ test("launch retries and ambiguous result reads have separate budgets", async ()
   } finally { await f.close(); }
 });
 
+function retryClock(t: import("node:test").TestContext) {
+  type Timer = { callback: () => void; delay: number };
+  const pending = new Set<Timer>();
+  let wall = Date.now(), scheduled = 0;
+  t.mock.method(Date, "now", () => wall);
+  t.mock.method(Math, "random", () => 0);
+  t.mock.method(globalThis, "setTimeout", (callback: () => void, delay = 1) => {
+    const timer = { callback, delay };
+    pending.add(timer); scheduled++;
+    return timer as unknown as NodeJS.Timeout;
+  });
+  t.mock.method(globalThis, "clearTimeout", (timer: unknown) => pending.delete(timer as Timer));
+  return {
+    pending,
+    get scheduled() { return scheduled; },
+    async deliver(early = false) {
+      assert.equal(pending.size, 1, "one pending retry wake");
+      const timer = [...pending][0]!;
+      pending.delete(timer);
+      wall += timer.delay - (early ? 1 : 0);
+      timer.callback();
+      // Drain the real lifecycle's promises independently of timer delivery and wall time.
+      await new Promise<void>(resolve => setImmediate(resolve));
+    },
+  };
+}
+
+for (const phase of ["launch", "read"] as const) {
+  test(`early ${phase} retry wakes rearm without spending either retry budget`, async t => {
+    const clock = retryClock(t), f = fixture("early-" + phase);
+    let reads = 0;
+    const advance = async (early: boolean) => {
+      const before = [f.t3.launches.length, reads], scheduled = clock.scheduled;
+      await clock.deliver(early);
+      if (early) {
+        assert.deepEqual([f.t3.launches.length, reads], before, "no premature RPC or read");
+        assert.equal(clock.pending.size, 1, "early retry retains one replacement wake");
+        assert.equal([...clock.pending][0]!.delay, 1, "replacement waits only the remaining millisecond");
+        assert.equal(clock.scheduled, scheduled + 1, "exactly one replacement timer");
+        await clock.deliver();
+      }
+    };
+    try {
+      f.t3.mode = "offline";
+      const s = await start(f);
+      assert.equal(s.launch, "intent");
+      for (let retry = 1; retry <= 3; retry++) {
+        if (retry === 3) f.t3.mode = "accept";
+        await advance(phase === "launch" && retry === 2);
+        assert.equal(f.t3.launches.length, retry + 1);
+      }
+      assert.equal(f.engine.sessionStatus(s.sessionId).launch, "accepted");
+      assert.equal(clock.pending.size, 0);
+      // One cancelled start-call timeout, three launch retries, and possibly one rearm.
+      assert.equal(clock.scheduled, 4 + (phase === "launch" ? 1 : 0));
+      const launchTimers = clock.scheduled;
+      const read = f.t3.sessions.result;
+      f.t3.sessions.result = async (threadId, runId) =>
+        ++reads <= 3 ? { kind: "ambiguous", detail: "two final messages" } : read(threadId, runId);
+      f.t3.say(s.threadId, "report after retries");
+      complete(f, s.threadId);
+      await new Promise<void>(resolve => setImmediate(resolve));
+      assert.equal(reads, 1);
+      for (let retry = 1; retry <= 3; retry++) {
+        await advance(phase === "read" && retry === 2);
+        assert.equal(reads, retry + 1);
+      }
+      assert.equal(clock.scheduled - launchTimers, 3 + (phase === "read" ? 1 : 0));
+      const done = f.engine.sessionStatus(s.sessionId);
+      assert.equal(done.launch, "accepted"); assert.equal(done.state, "resolved");
+      assert.equal((done.outcome as { reason: string }).reason, "succeeded");
+      assert.equal(done.resultState, "stored"); assert.equal(done.result, "report after retries");
+      assert.equal(f.t3.launches.length, 4); assert.equal(reads, 4);
+      assert.equal(clock.pending.size, 0);
+    } finally { await f.close(); }
+    assert.equal(clock.pending.size, 0, "closing leaves no retry timers");
+  });
+
+  test(`stopping cancels an early ${phase} retry's replacement wake`, async t => {
+    const clock = retryClock(t), f = fixture("early-stop-" + phase);
+    try {
+      f.t3.mode = phase === "launch" ? "offline" : "accept";
+      const s = await start(f);
+      if (phase === "read") {
+        f.t3.sessions.result = async () => ({ kind: "ambiguous", detail: "two final messages" });
+        complete(f, s.threadId);
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      await clock.deliver(true);
+      assert.equal(clock.pending.size, 1, "replacement exists before shutdown");
+      assert.equal([...clock.pending][0]!.delay, 1);
+    } finally { await f.close(); }
+    assert.equal(clock.pending.size, 0, "shutdown cancels the tracked replacement");
+  });
+}
+
 test("result bounds: exact bytes, pointer-only wake within 4096, oversize and invalid store nothing", async () => {
   const f = fixture("sizes");
   try {
