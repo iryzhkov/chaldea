@@ -752,6 +752,17 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
         const n=projection.nodes.find(n=>n.id===t.nodeId);
         return n?.threadId===threadId&&n.kind==="root_turn"&&!owned.includes(t);
       }))usagePartial=true;
+      // Retain already-observed contradictions even when their turns are not selected.
+      // Missing forward evidence stays pending; only fully linked rejected roots poison.
+      for(const t of projection.providerTurns){
+        if(owned.includes(t))continue;
+        const n=projection.nodes.find(n=>n.id===t.nodeId),p=projection.providerThreads.find(p=>p.id===t.providerThreadId);
+        if(n?.threadId===threadId&&n.kind==="root_turn"&&n.parentNodeId===null&&n.rootNodeId===n.id
+          &&n.providerThreadId===t.providerThreadId&&p?.appThreadId===threadId){
+          if(!makeUsageRoom(usageTurnProofs,t.id,128))break;
+          usageTurnProofs.set(t.id,null);
+        }
+      }
       const selected=owned.slice(-8);
       for(const t of selected){
         const p=projection.providerThreads.find(p=>p.id===t.providerThreadId)!;

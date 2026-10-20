@@ -227,7 +227,7 @@ test("detail adapter uses only official read subscription and omits unknown raw 
   try{
     const port=(http.address() as {port:number}).port;
     const done=connectMissionThread({serverUrl:"http://127.0.0.1:"+port,token:"DISPOSABLE_FIXTURE",signal:controller.signal},"fixture-thread",7,event=>{seen.push(event);if(event.kind==="synchronized")controller.abort();});
-    await assert.rejects(done);assert.deepEqual(seen,[{kind:"cursor",sequence:8},{kind:"turn-usage",id:"fixture-turn",usage:{usageScope:"main_agent",usageStatus:"unavailable",hasSubagents:false},at:Date.parse("2026-10-18T18:00:00.000Z")},{kind:"cursor",sequence:9},{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
+    await assert.rejects(done);assert.deepEqual(seen,[{kind:"cursor",sequence:8},{kind:"turn-usage",id:"fixture-turn",usage:{usageScope:"main_agent",usageStatus:"unavailable",hasSubagents:false},at:Date.parse("2026-10-18T18:00:00.000Z"),partial:false},{kind:"cursor",sequence:9},{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
   }finally{wss.close();http.close();}
 });
 

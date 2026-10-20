@@ -403,6 +403,7 @@ for(const scenario of ["qualified-crowding","same-provider-root-pointer","same-p
  const snapshot=()=>({kind:"snapshot",snapshotSequence:++sequence,projection:structuredClone(projection)});
  let values:unknown[]=[snapshot()];
  if(scenario==="reorder")values=[...turns.map(t=>event("provider-turn.updated",t)),...runs.map(r=>event("run.updated",r)),event("provider-thread.updated",provider),...nodes.map(n=>event("node.updated",n))];
+ if(scenario==="same-provider-root-pointer"||scenario==="same-provider-attempt-pointer")values.push(event("provider-turn.updated",turns[0]),event("node.updated",nodes[0]));
  if(scenario==="replay")values.push(snapshot(),event("provider-turn.updated",turns[0]),event("provider-turn.updated",turns[0]));
  if(scenario==="correction"){values.push(event("provider-turn.updated",{...turns[0],turnTokenUsage:{...turns[0]!.turnTokenUsage,inputTokens:0,outputTokens:0,cachedInputTokens:0,cacheCreationTokens:0,reasoningTokens:0}}));expected=5*120;}
  if(scenario==="withdraw"){values.push(event("run.updated",{...runs[0],threadId:"foreign"}));expected=5*120;expectedTurns=5;}
