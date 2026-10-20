@@ -677,6 +677,20 @@ test("optional completion evidence preserves base coverage and remains bounded t
  }
 });
 
+test("completion evidence yields to resource and identity coverage under byte pressure",()=>{
+ const identities=(s:ReturnType<typeof captureSnapshot>)=>s!.rich?normalizeRich(s!.rich,new Set(s!.agents.map(a=>a.id)),s!.observedAt).details.map(d=>[d.id,d.value.identity]):[];
+ for(let count=12;count<=44;count++){
+  const rows=Array.from({length:count},(_,i)=>({...row("budget-"+i),title:"Resource priority task "+i,status:"completed",activeRunId:null}));
+  const models=[null,new Date(now0).toISOString()].map(latestRunCompletedAt=>live(()=>now0,rows.map(r=>({...r,latestRunCompletedAt}))));
+  for(const m of models)m.setResources({state:"reported",sample:{sampledAt:now0,cpuUtilization:0.25,cpuCount:12,availableMemoryBytes:400,totalMemoryBytes:1000}});
+  const [without,withTimes]=models.map(m=>captureSnapshot(m,"agent-a",epoch,1)!);
+  assert.deepEqual(withTimes!.agents,without!.agents,"completion metadata cannot remove base rows");
+  assert.deepEqual(withTimes!.rich?.resources,without!.rich?.resources,"completion metadata cannot displace resources");
+  assert.deepEqual(identities(withTimes!),identities(without!),"completion metadata cannot displace useful identities");
+  assert.ok(Buffer.byteLength(JSON.stringify(withTimes))<=8192);
+ }
+});
+
 test("a completion timestamp beyond its source receipt remains unknown as the local clock advances",()=>{
  let now=now0;
  const m=live(()=>now,[{...row(),status:"completed",activeRunId:null,latestRunCompletedAt:new Date(now0+1).toISOString()}]);

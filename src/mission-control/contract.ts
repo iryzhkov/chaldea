@@ -72,13 +72,6 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
   snapshot.rich=rich;
   if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
   else {
-    // Completion evidence uses spare bytes only. Missing entries remain explicitly unknown.
-    for(const [i,a] of snapshot.agents.entries()){
-      const completedAt=v.agents[i]!.completedAt;if(completedAt===null)continue;
-      rich.v=5;(rich.completionTimes??=[]).push([a.id,completedAt]);
-      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.completionTimes.pop();
-      if(!rich.completionTimes.length){delete rich.completionTimes;rich.v=4;}
-    }
     try{rich.resources=validateRich({v:3,resources:v.resources,details:[],omitted:0},new Set(),observedAt).resources;}
     catch{rich.resources={state:"unavailable",sample:null};}
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.resources={state:"byte-budget",sample:null};
@@ -91,6 +84,13 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     try{snapshot.quota=quotaProjection(v.quota,observedAt,model.quotaTimes());}catch{snapshot.quota={state:"error",observedAt:null,omitted:0,accounts:[]};}
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)snapshot.quota={state:"byte-budget",observedAt:snapshot.quota.observedAt,omitted:snapshot.quota.accounts.length+snapshot.quota.omitted,accounts:[]};
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.quota;
+    // Completion evidence yields to resources, identities and quota. Missing entries remain unknown.
+    for(const [i,a] of snapshot.agents.entries()){
+      const completedAt=v.agents[i]!.completedAt;if(completedAt===null)continue;
+      rich.v=5;(rich.completionTimes??=[]).push([a.id,completedAt]);
+      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.completionTimes.pop();
+      if(!rich.completionTimes.length){delete rich.completionTimes;rich.v=4;}
+    }
     const candidates=new Map<string,Detail>();
     const preview=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).trimEnd(),state:"truncated"}:p;
     const command=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).split(" ").slice(0,-1).join(" "),state:"truncated"}:p;
