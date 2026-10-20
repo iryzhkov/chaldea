@@ -24,13 +24,13 @@ producers last. Source-only acceptance is not live qualification. Preserve all
 older immutable releases and rollback state; roll producers back before older
 validators. No new grants, identity, publisher or data store are needed.
 
-Base rows fit the unchanged 8 KiB budget first.
-Optional rich v5 completion evidence uses only spare bytes; omitted times stay
-unknown and never evict base rows. Expiry uses actual completion time, not receipt
-or page-open time. Upgrade H's validator and N's reader/web before enabling v5
-capture or publishing a new capture artifact. Older producer snapshots remain
-readable; roll producers back before reverting consumers. Resources and sanitized actual
-titles/app thread IDs follow, then full details when they fit. IDs in base rows
+Base rows fit the unchanged 8 KiB budget first, followed by resources,
+sanitized actual titles/app thread IDs and quota. Optional rich v5 completion
+evidence uses only remaining bytes; omitted times stay unknown and never evict
+base rows. Expiry uses actual completion time, not receipt or page-open time.
+Publish qualified artifacts, then upgrade H's validator and N's reader/web
+before enabling v5 captures. Older producer snapshots remain readable; roll
+producers back before reverting consumers. Full details use the remaining budget. IDs in base rows
 remain epoch-local opaque keys; displayed app IDs are labelled, bounded to 256
 UTF-8 bytes, and copyable only when complete. Titles are bounded to 160 bytes,
 assistant paragraphs to 384, and up to three active command summaries to 128

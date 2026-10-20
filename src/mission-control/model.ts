@@ -24,7 +24,7 @@ export function safeLabel(value: unknown, fallback = "Task"): string {
 }
 const at = (s: string | null | undefined): number | null => s && Number.isFinite(Date.parse(s)) ? Date.parse(s) : null;
 const count = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
-type Thread = { row: ShellThread; observed: number; connected: boolean; detailObserved: number | null; steps: string[] };
+type Thread = { localId: string; row: ShellThread; observed: number; connected: boolean; detailObserved: number | null; steps: string[] };
 function threadState(row:ShellThread,details:import("./details.ts").Detail):string {
   if(row.pendingRequest){
     if(!row.pendingRequestKind||row.pendingRequestKind==="user_input")return "waiting-igor";
@@ -53,6 +53,7 @@ export class MissionModel {
   private resources:Resources={state:"unavailable",sample:null};
   setResources(resources:Resources):void {this.resources=resources.state==="reported"&&validResources(resources.sample)&&resources.sample.sampledAt<=this.now()?resources:{state:"unavailable",sample:null};this.changed();}
   private threads = new Map<string, Thread>();
+  private nextLocalId = 0;
   private turns = new Map<string, { output: number; at: number; live: boolean; fence: number }>();
   private evictedThrough: number | null = null;
   private accountingPartial = false;
@@ -86,7 +87,7 @@ export class MissionModel {
       this.total = rows.length; this.coverageExact = true;
       const selected = rows.toSorted((a,b) => Number(activeThread(b))-Number(activeThread(a)) || (a.latestRunStartedAt ?? "").localeCompare(b.latestRunStartedAt ?? "") || a.id.localeCompare(b.id)).slice(0, MAX_AGENTS);
       const previous = this.threads; this.threads = new Map();
-      for (const row of selected) this.threads.set(row.id, { connected: false, detailObserved: null, steps: [], ...previous.get(row.id), row, observed: now });
+      for (const row of selected) this.threads.set(row.id, { localId: previous.get(row.id)?.localId ?? "agent-" + this.nextLocalId++, connected: false, detailObserved: null, steps: [], ...previous.get(row.id), row, observed: now });
       for (const id of this.detailStates.keys()) if (!this.threads.has(id)) this.detailStates.delete(id);
     } else if (event.kind === "thread") {
       const row = event.thread;
@@ -104,7 +105,7 @@ export class MissionModel {
           if(victim!==undefined){this.threads.delete(victim);this.detailStates.delete(victim);}
         }
         if (this.threads.size < MAX_AGENTS) {
-          this.threads.set(row.id, { row, observed: now, connected: false, detailObserved: null, steps: [] });
+          this.threads.set(row.id, { localId: "agent-" + this.nextLocalId++, row, observed: now, connected: false, detailObserved: null, steps: [] });
           if (this.coverageExact) this.total++;
         }
       }
@@ -187,13 +188,13 @@ export class MissionModel {
         creditState: p.credits.state, resetState: p.manualResets.state,
         unlimited: p.credits.value?.unlimited ?? null, manualResets: count(p.manualResets.value?.availableCount) ? p.manualResets.value.availableCount : null });
     }
-    const agents = [...this.threads.values()].map((t,i) => {
+    const agents = [...this.threads.values()].map(t => {
       const instance=t.row.modelSelection?.instanceId??t.row.providerInstanceId;
       const provider=safeProviderId(instance)&&instance===t.row.providerInstanceId?{instanceId:instance,driver:this.providerCatalog.get(instance)??null}:null;
       const details={...emptyDetail(),...isolateDetail({...(this.detailStates.get(t.row.id)??new ThreadDetails()).snapshot(t.row.modelSelection,now,t.connected&&this.connected),provider,identity:{title:titlePreview(t.row.title),appThreadId:appThreadIdPreview(t.row.id)}},now)};
       const state=threadState(t.row,details),completedAt=at(t.row.latestRunCompletedAt);
       return ({
-      id: "agent-" + i, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
+      id: t.localId, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
       host: "omarchy-pc", state,
       startedAt: at(t.row.latestRunStartedAt),
       // Only the owning run's actual completion is authoritative. Unknown time stays unknown.
