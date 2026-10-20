@@ -1,3 +1,4 @@
+import { RouteError } from "./errors.ts";
 import { MODEL_MAP } from "./scores.ts";
 export type Provider = string;
 export type Role = "builder" | "critical-review" | "bulk-read" | "general";
@@ -12,12 +13,13 @@ export interface CatalogProvider {
     id: string; type: string; options?: ReadonlyArray<{ id: string }>
   }> | null }>;
 }
-export interface QuotaWindow { kind: string; remainingPercent: number; windowDurationMins: number | null; resetsAt: string | null }
+export interface QuotaWindow { id?: string; kind: string; remainingPercent: number; windowDurationMins: number | null; resetsAt: string | null }
 export interface Quota {
   observedAt: string | null;
   windows: ReadonlyArray<QuotaWindow>;
   activeStop: boolean;
   operatorEstimate?: boolean;
+  incomplete?: boolean;
 }
 export interface ModelStats {
   turns: number; completionRate: number; failedRate: number; interruptedRate: number; minutesPerTurn: number | null;
@@ -31,7 +33,14 @@ export interface Analytics {
 export interface Target { accountKey?: string; providerInstanceId: string; model: string; options: Record<string, Effort> }
 export type ProviderPick = (Target & { eligible: true; reasons: string[] }) |
   { eligible: false; model: null; options: null; reasons: string[] };
+export interface RouteDiagnostics {
+  quality_source: "fixed_policy" | "AA";
+  fleet?: { readiness: "absent" | "disabled" | "ready" | "empty" | "unavailable"; freshAccounts: number };
+  quota: Record<string, { accountKey: string | null; bindingSource: string; source: string; ageSeconds: number | null;
+    freshness: "fresh" | "stale" | "unknown"; bindingWindow: string | null; scopedKnown: boolean; conflicts?: string[] }>;
+}
 export interface RouteResult extends Target {
+  diagnostics?: RouteDiagnostics;
   byProvider: Record<Provider, ProviderPick>;
   alternatives: Target[];
   reasons: string[];
@@ -67,13 +76,13 @@ export const PAIRS = {
 } as const;
 export const MODEL_NAMES: Record<string, string> = Object.fromEntries(MODEL_MAP.map(m => [m.analytics, m.model]));
 export function routeInput(value: unknown): RouteInput {
-  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("route input must be an object");
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new RouteError("usage", "route input must be an object");
   const v = value as Record<string, unknown>;
   if (Object.keys(v).some(k => !["role", "authorProvider", "effortOverride"].includes(k)) ||
       typeof v.role !== "string" || !Object.hasOwn(PAIRS, v.role) ||
       v.authorProvider !== undefined && (typeof v.authorProvider !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(v.authorProvider)) ||
       v.effortOverride !== undefined && !["low", "medium", "high", "xhigh"].includes(String(v.effortOverride))) {
-    throw new Error("Invalid route role, authorProvider or effortOverride");
+    throw new RouteError("usage", "Invalid route role, authorProvider or effortOverride");
   }
   return v as unknown as RouteInput;
 }

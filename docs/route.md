@@ -1,5 +1,10 @@
 # Native delegation routing
 
+CLI defaults to a bounded compact projection. Use `--explain` or `--legacy-full`
+for the full result described below. The [route and quota contracts](quota-routing-contracts.md)
+describe scoped Claude windows, conservative fleet conflicts, typed errors and
+the `review-pair` command and callable API.
+
 Call `chaldea route --role builder` or MCP `chaldea_route` before T3's
 `delegate_task`. Pass the returned `providerInstanceId`, `model` and `options`
 as the delegate target, then launch through T3. Children stay in their parent

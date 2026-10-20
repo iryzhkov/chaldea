@@ -36,8 +36,11 @@ export function validateSnapshot(raw: unknown): CapacitySnapshot {
     const id = a.provider + ":" + a.accountKey;
     if (seen.has(id)) throw new Error("duplicate_capacity_account");
     seen.add(id);
+    const windowIds = new Set<string>();
     for (const rawWindow of a.windows) {
       const w = obj(rawWindow);
+      if (windowIds.has(w.id)) throw new Error("duplicate_capacity_window");
+      windowIds.add(w.id);
       fields(w, ["id", "kind", "usedPercent", "remainingPercent", "windowDurationMins", "resetsAt"]);
       if (!["session", "weekly", "monthly", "other"].includes(w.kind) || !/^[a-zA-Z0-9_.:/-]{1,100}$/.test(w.id) ||
           !Number.isFinite(w.usedPercent) || w.usedPercent < 0 || w.usedPercent > 100 ||

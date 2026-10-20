@@ -2,12 +2,18 @@ import { parseArgs } from "node:util";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "./config.ts";
 import { requestTime } from "./types.ts";
+import { saveWaitReceipt, readWaitReceipt } from "./retry.ts";
 import { callService, runWaitService, ServiceRefusal } from "./service.ts";
 export const WAIT_USAGE=`chaldea waits serve [--config PATH]
 chaldea wait time --at RFC3339 --thread ID [--request-id EPOCH:KEY] [--description TEXT] [--deadline RFC3339]
 chaldea wait time --after 30s --thread ID [--request-id EPOCH:KEY] [--description TEXT]
 chaldea wait thread --target ID [--run ID] --thread ID [--request-id EPOCH:KEY] [--description TEXT]
-chaldea wait status|cancel ID
+chaldea wait status|cancel ID [--compact|--verbose]
+chaldea wait list --thread ID [--limit 1-8] [--cursor ID] [--compact|--verbose]
+chaldea wait closeout --thread ID --wait-id ID [--wait-id ID ...] [--compact|--verbose]
+chaldea wait retry RECEIPT [--compact|--verbose]
+Wait registration accepts --compact|--verbose and --receipt PATH.
+List/closeout select an explicit thread under the same-UID operator boundary.
 chaldea decision prepare --thread ID --dependent-action TEXT --default-action skip|defer
   --deadline RFC3339 --request-id EPOCH:KEY
 chaldea decision track --thread ID --runtime-request ID --dependent-action TEXT
@@ -46,11 +52,13 @@ export async function sessionCli(args:ReadonlyArray<string>):Promise<number>{
   if(typeof header!=="string"||!BEARER.test(header))return refuse("invalid_response");
   process.stdout.write(JSON.stringify({Authorization:header})+"\n");return 0;
 }
-export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
+export async function waitsCli(argv:ReadonlyArray<string>, transport:typeof callService=callService):Promise<number>{
   const [group,...args]=argv;
   if(group==="session")return sessionCli(args);
   const {values:v,positionals:p}=parseArgs({args,allowPositionals:true,options:{
     config:{type:"string"},thread:{type:"string"},"request-id":{type:"string"},deadline:{type:"string"},
+    compact:{type:"boolean"},verbose:{type:"boolean"},receipt:{type:"string"},
+    "wait-id":{type:"string",multiple:true},limit:{type:"string"},cursor:{type:"string"},
     description:{type:"string"},at:{type:"string"},after:{type:"string"},target:{type:"string"},run:{type:"string"},
     question:{type:"string"},option:{type:"string",multiple:true},"dependent-action":{type:"string"},
     "runtime-request":{type:"string"},"default-action":{type:"string"},answer:{type:"string"},help:{type:"boolean",short:"h"},
@@ -58,9 +66,24 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
   if(v.help){process.stdout.write(WAIT_USAGE);return 0;}
   if(group==="waits"&&p[0]==="serve"){await runWaitService(v.config);return 0;}
   if(group==="mcp"){const {runMcp}=await import("../mcp.ts");const c=loadConfig(v.config);await runMcp(c.socket,c.sessionPolicy!==undefined);return 0;}
+  if(v.compact&&v.verbose)throw new Error("Choose --compact or --verbose");
+  const registration=group==="wait"&&["time","thread"].includes(p[0]??"");
+  if(v.receipt!==undefined&&!registration)throw new Error("--receipt requires wait registration; use wait retry PATH to replay");
+  if((v.compact||v.verbose)&&group!=="wait")throw new Error("Response mode requires wait");
   const config=loadConfig(v.config);let method:string;let input:unknown;
-  const requestId=v["request-id"]??Date.now()+":"+randomUUID();
-  if(group==="wait"&&["time","thread"].includes(p[0]??"")){
+  const requestId=v["request-id"]??(group==="wait"&&p[0]==="retry" ? "" : Date.now()+":"+randomUUID());
+  if(group==="wait"&&p[0]==="retry"){
+    const allowed=new Set(["config","compact","verbose"]);
+    if(p.length!==2||Object.keys(v).some(key=>!allowed.has(key)))throw new Error("Retry accepts only a receipt path, config and response mode");
+    const receipt=readWaitReceipt(p[1]!);method=receipt.method;input=receipt.input;
+  }else if(group==="wait"&&p[0]==="list"){
+    if(!v.thread)throw new Error("--thread required for selected-thread list");
+    method="chaldea_wait_list";input={threadId:v.thread,...(v.limit===undefined?{}:{limit:Number(v.limit)}),...(v.cursor===undefined?{}:{cursor:v.cursor})};
+  }else if(group==="wait"&&p[0]==="closeout"){
+    if(!v.thread)throw new Error("--thread required for selected-thread closeout");
+    if(!v["wait-id"]?.length)throw new Error("--wait-id required for selected-thread closeout");
+    method="chaldea_wait_closeout";input={threadId:v.thread,waitIds:v["wait-id"]};
+  }else if(registration){
     let condition:unknown;
     if(p[0]==="time"){
       if(Boolean(v.at)===Boolean(v.after))throw new Error("Specify exactly one of --at or --after");
@@ -87,6 +110,8 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
   else if(p[0]==="status"&&(group==="wait"||group==="decision")){method=group==="wait"?"chaldea_wait_status":"chaldea_decision_status";input={id:p[1]};}
   else if(group==="wait"&&p[0]==="cancel"){method="chaldea_wait_cancel";input={id:p[1]};}
   else throw new Error(WAIT_USAGE);
-  const result=await callService(config.socket,method,input);
+  if(v.receipt!==undefined)input=saveWaitReceipt(v.receipt,input).input;
+  if(group==="wait"&&(v.compact||v.verbose))input={...input as Record<string,unknown>,responseMode:v.compact?"compact":"verbose"};
+  const result=await transport(config.socket,method,input);
   process.stdout.write(JSON.stringify(result)+"\n");return 0;
 }

@@ -202,7 +202,9 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
       child.stdin.write(JSON.stringify({jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"chaldea_decision_ask",arguments:q}})+"\n");
       try{
         await until("MCP ask",async()=>lines().some(r=>r.id===3));
-        assert.equal(lines().find(r=>r.id===2).result.tools.length,9);
+        assert.equal(lines().find(r=>r.id===2).result.tools.length,12);
+        for(const name of ["chaldea_route_review_pair","chaldea_wait_list","chaldea_wait_closeout"])
+          assert.ok(lines().find(r=>r.id===2).result.tools.some((tool:{name:string})=>tool.name===name));
         assert.ok(lines().find(r=>r.id===2).result.tools.some((tool:{name:string})=>tool.name==="chaldea_route"));
         const result=lines().find(r=>r.id===3).result;
         assert.equal(result.isError,undefined,err);
@@ -225,6 +227,22 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
         const status=await rpc(5,"chaldea_wait_status",{id:w.id});
         assert.equal(status.id,w.id);assert.equal(status.description,w.description);
         assert.equal((await rpc(6,"chaldea_wait_cancel",{id:w.id})).delivery,"suppressed");
+        const compact=await rpc(90,"chaldea_wait",{...waitTime(),condition:{kind:"time",at:iso(Date.now()+60000)},responseMode:"compact"});
+        assert.equal(compact.threadId,parent);assert.equal(compact.lifecycle,"waiting");
+        try{
+          let selected=await rpc(91,"chaldea_wait_list",{threadId:parent,responseMode:"compact"});
+          let found=selected.waits.some((item:{id:string})=>item.id===compact.id);
+          // Retained terminal rows and random IDs can place this wait on a later page.
+          for(let page=0;!found&&selected.nextCursor&&page<8;page++){
+            selected=await rpc(100+page,"chaldea_wait_list",{threadId:parent,cursor:selected.nextCursor,responseMode:"compact"});
+            found=selected.waits.some((item:{id:string})=>item.id===compact.id);
+          }
+          assert.ok(found,"registered wait must appear in the bounded fixture history");
+        }finally{
+          const closed=await rpc(92,"chaldea_wait_closeout",{threadId:parent,waitIds:[compact.id],responseMode:"compact"});
+          assert.equal(closed.results[0].result.cancelOutcome,"suppressed");
+          assert.equal(closed.results[0].result.wakeMayStillArrive,false);
+        }
         assert.equal((await rpc(7,"chaldea_decision_status",{id:row.id})).id,row.id);
         const answered=await runCli(["decision","answer",row.id,"--answer","Run","--config",configPath],dir.path);
         assert.equal(answered.code,0,answered.stderr);

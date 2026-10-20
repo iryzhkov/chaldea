@@ -6,7 +6,7 @@ import { ownDatabase } from "./owner.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { MAX_AGE, validate, waitDescription, type WaitInput, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
+import { MAX_AGE, validate, waitDescription, text, type WaitInput, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
 import { SessionRefusal } from "../session/policy.ts";
 import { sessionWake, type SessionOutcome } from "../session/result.ts";
 
@@ -301,17 +301,51 @@ export class WakeStore {
     this.transaction(() => this.db.prepare("UPDATE items SET cursor=max(cursor,?) WHERE id=?").run(sequence,id));
   }
   cancel(id: string, now = Date.now()): {item: Item; delivery: string} {
-    return this.transaction(() => {
-      const row = this.get(id);
-      if (row.kind !== "wait") throw new Error("Only waits can be cancelled");
-      if (row.state === "cancelled" || row.state === "orphaned") return {item:row,delivery:row.state};
-      const wake = this.deliveries().find(d => d.item === id && d.channel === "wake");
-      if (wake?.state === "pending" && wake.attempts > 0) return {item:row,delivery:"uncertain_in_flight"};
-      if (wake?.state === "sending" || wake?.state === "sent") return {item:row,delivery:wake.state === "sending" ? "uncertain_in_flight" : "already_delivered"};
-      this.db.prepare("UPDATE items SET state='cancelled',disposition='manual',terminal=? WHERE id=?").run(now,id);
-      this.db.prepare("UPDATE outbox SET state='suppressed' WHERE item=? AND state IN ('pending','blocked')").run(id);
-      return {item:this.get(id),delivery:"suppressed"};
-    });
+    return this.transaction(() => this.cancelLocked(this.get(id),now));
+  }
+  private cancelLocked(row: Item, now: number): {item: Item; delivery: string} {
+    const id=row.id,parent=row.parent;
+    if (row.kind !== "wait") throw new Error("Only waits can be cancelled");
+    if (row.state === "cancelled" || row.state === "orphaned") return {item:row,delivery:row.state};
+    const wake = this.db.prepare(`SELECT o.* FROM outbox o JOIN items i ON i.id=o.item
+      WHERE i.parent=? AND i.id=? AND o.channel='wake'`).get(parent,id) as Delivery|undefined;
+    if (wake?.state === "pending" && wake.attempts > 0) return {item:row,delivery:"uncertain_in_flight"};
+    if (wake?.state === "sending" || wake?.state === "sent") return {item:row,delivery:wake.state === "sending" ? "uncertain_in_flight" : "already_delivered"};
+    this.db.prepare("UPDATE items SET state='cancelled',disposition='manual',terminal=? WHERE id=? AND parent=?").run(now,id,parent);
+    this.db.prepare(`UPDATE outbox SET state='suppressed' WHERE item=? AND state IN ('pending','blocked')
+      AND item IN (SELECT id FROM items WHERE parent=?)`).run(id,parent);
+    const item=this.db.prepare("SELECT * FROM items WHERE parent=? AND id=?").get(parent,id) as unknown as Item;
+    return {item,delivery:"suppressed"};
+  }
+  /** Explicit same-UID operator selection, never authenticated caller identity.
+   * Keyset pages are bounded and every SQL query includes the selected parent. */
+  listWaits(parent: string, limit = 8, after = ""): {items:Item[];nextCursor:string|null} {
+    text(parent,"threadId");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 8) throw new Error("Invalid limit (1-8)");
+    if (typeof after !== "string" || Buffer.byteLength(after)>256) throw new Error("Invalid cursor");
+    const rows=this.db.prepare("SELECT * FROM items WHERE kind='wait' AND parent=? AND id>? ORDER BY id LIMIT ?")
+      .all(parent,after,limit+1) as unknown as Item[];
+    return {items:rows.slice(0,limit),nextCursor:rows.length>limit ? rows[limit-1]!.id : null};
+  }
+  waitDeliveries(parent: string, ids: readonly string[]): Delivery[] {
+    text(parent,"threadId");
+    if (ids.length>8) throw new Error("At most 8 waitIds");
+    return ids.flatMap(id => this.db.prepare(`SELECT o.* FROM outbox o JOIN items i ON i.id=o.item
+      WHERE i.kind='wait' AND i.parent=? AND i.id=?`).all(parent,text(id,"waitId")) as unknown as Delivery[]);
+  }
+  /** One writer transaction arbitrates each selected row against claim/receipt.
+   * Unknown and cross-parent IDs share a refusal and never mutate either parent. */
+  closeoutWaits(parent: string, ids: readonly string[], now = Date.now()): Array<
+    {id:string;item:Item;delivery:string} | {id:string;error:"wait_not_found_for_thread"}
+  > {
+    text(parent,"threadId");
+    if (!Array.isArray(ids) || ids.length<1 || ids.length>8 || new Set(ids).size!==ids.length)
+      throw new Error("Provide 1-8 unique waitIds");
+    for (const id of ids) text(id,"waitId");
+    return this.transaction(() => ids.map(id => {
+      const row=this.db.prepare("SELECT * FROM items WHERE kind='wait' AND parent=? AND id=?").get(parent,id) as Item|undefined;
+      return row ? {id,...this.cancelLocked(row,now)} : {id,error:"wait_not_found_for_thread" as const};
+    }));
   }
   orphan(id: string, reason: string, now = Date.now()): void {
     this.transaction(() => {

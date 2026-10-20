@@ -1,4 +1,5 @@
-import { windowPolicy } from "../quota/window-policy.ts";
+import { RouteError } from "./errors.ts";
+import { modelWindowPolicy } from "../quota/window-policy.ts";
 import type { Capacity } from "../quota/capacity.ts";
 import { banned, compareScores, emptyHistory, inProbation, roleKey, scoreFor, targetEligible, trialAvailable } from "./targets.ts";
 import type { RoutingHistory } from "./targets.ts";
@@ -23,6 +24,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   const config = { ...DEFAULT_POLICY, ...data.config };
   const reasons: string[] = [];
   const ages: Record<string, number | null> = {};
+  const diagnostics: NonNullable<RouteResult["diagnostics"]> = { quality_source: "fixed_policy", quota: {} };
   const effort = input.effortOverride ?? (input.role === "builder" ? "high" : "medium");
   const pair = PAIRS[input.role];
   const history = data.history ?? emptyHistory();
@@ -41,9 +43,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     : overrideFallback ? "AA has no role anchors at requested effort; use fixed role pairs with Sonnet removed"
     : "AA unavailable; no last good snapshot; use fixed role pairs with Sonnet removed");
   if (scores?.unmapped.length) reasons.push("AA models unmapped, held: " + scores.unmapped.join(", "));
+  diagnostics.quality_source = scores && !pin ? "AA" : "fixed_policy";
   const policyReasons = [...reasons];
   const providerReasons = new Map<Provider, string[]>();
-  const candidates: Array<Target & { driver: Provider; pace: number | null }> = [];
+  const candidates: Array<Target & { driver: Provider; pace: number | null; scopeKnown: boolean }> = [];
   for (const p of [...data.catalog].sort((a, b) => a.providerInstanceId.localeCompare(b.providerInstanceId))) {
     const scoped = providerReasons.get(p.driverKind) ?? [];
     providerReasons.set(p.driverKind, scoped);
@@ -86,19 +89,24 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     const fresh = age !== null && age * 1000 < (q?.operatorEstimate ? 7 * 86_400_000 : config.quotaMaxAgeMs);
     const windows = fresh ? (q?.windows ?? []).filter(w => Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 &&
       w.remainingPercent <= 100 && (w.resetsAt === null || Date.parse(w.resetsAt) > data.now)) : [];
-    const advice = windowPolicy(windows, data.now, config.minimumRemaining, config.paceMargin);
+    const advice = modelWindowPolicy(windows, p.driverKind === "claudeAgent" ? model : "", data.now, config.minimumRemaining, config.paceMargin);
+    diagnostics.quota[p.providerInstanceId + ":" + model] = { accountKey: p.accountKey ?? null,
+      bindingSource: p.accountKey ? "catalog" : "unbound", source: q?.operatorEstimate ? "operator_estimate" : "observation",
+      ageSeconds: age, freshness: fresh ? "fresh" : age === null ? "unknown" : "stale",
+      bindingWindow: advice.binding?.id ?? advice.binding?.kind ?? null, scopedKnown: advice.scopeKnown && !q?.incomplete };
     reasons.push(...advice.reasons.map(reason => p.providerInstanceId + " " + reason));
     // Short windows gate included usage only. The classifier sets creditFunded solely for fresh,
     // account-bound credits with spend control not reached; active stops were excluded above.
     if (advice.gate && capacity?.creditFunded) reasons.push(p.providerInstanceId + ": included short window " + advice.gate + " does not gate the credit-funded lane");
     else if (advice.gate) { reasons.push(p.providerInstanceId + ": short window " + advice.gate + ", avoid until reset"); continue; }
     if ((!capacity || capacity.reserveWeeks === 0 && !["unlimited", "use-it"].includes(capacity.class)) &&
-        advice.pacing && advice.pacing.remainingPercent / 100 < config.minimumRemaining) {
+        advice.limit) {
       reasons.push(`${p.providerInstanceId}: under ${config.minimumRemaining * 100}% remaining, avoid`); continue;
     }
-    const pace = advice.pace;
+    if (advice.scopedLimit) { reasons.push(model + ": seven_day_fable under minimum remaining, avoid"); continue; }
+    const pace = q?.incomplete ? null : advice.pace;
     if (!advice.pacing) reasons.push(`${p.providerInstanceId}: quota pacing unknown${p.driverKind === "codex" ? ", not assumed unlimited" : ""}${age !== null && age * 1000 >= config.quotaMaxAgeMs ? " (stale cache)" : ""}`);
-    candidates.push({ ...(p.accountKey ? { accountKey: p.accountKey } : {}), providerInstanceId: p.providerInstanceId, model, options: { [option]: effort }, driver: p.driverKind, pace });
+    candidates.push({ ...(p.accountKey ? { accountKey: p.accountKey } : {}), providerInstanceId: p.providerInstanceId, model, options: { [option]: effort }, driver: p.driverKind, pace, scopeKnown: advice.scopeKnown && !q?.incomplete });
     }
     scoped.push(...reasons.slice(start));
   }
@@ -132,11 +140,12 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   const hasPace = pacedClaude.length > 0;
   reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
   eligible.sort((x, y) => {
-    const rank = (id: string) => {
-      const kind = data.capacity?.[id]?.class;
+    const rank = (c: typeof x) => {
+      if (!c.scopeKnown && !data.capacity?.[c.providerInstanceId]?.creditFunded) return data.capacity ? 2 : null;
+      const kind = data.capacity?.[c.providerInstanceId]?.class;
       return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
     };
-    const xr = rank(x.providerInstanceId), yr = rank(y.providerInstanceId);
+    const xr = rank(x), yr = rank(y);
     if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
     const underPaced = (c: typeof x) => c.driver === "claudeAgent" && c.pace !== null && c.pace >= config.paceMargin;
     if (underPaced(x) !== underPaced(y)) return Number(underPaced(y)) - Number(underPaced(x));
@@ -163,7 +172,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     return x.providerInstanceId.localeCompare(y.providerInstanceId);
   });
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
-  if (!eligible[0]) throw new Error("No eligible routing candidate: " + reasons.join("; "));
+  if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target");
   if (input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
@@ -175,7 +184,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     }
     return !held;
   });
-  if (!eligible[0]) throw new Error("No settled candidate while probation share is exhausted");
+  if (!eligible[0]) throw new RouteError("no_candidate", "No settled candidate while probation share is exhausted");
   const byProvider: RouteResult["byProvider"] = Object.fromEntries([...providerReasons].map(([driver, details]) => {
     const best = eligible.find(c => c.driver === driver);
     return [driver, best ? { ...target(best), eligible: true, reasons: [...new Set([...policyReasons, ...details]),
@@ -187,6 +196,6 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     reasons.push("Role top pick " + topPick.model + ": AA intelligence " + s.intelligence + ", coding " + s.coding +
       ", 3:1 input/output price $" + ((3 * s.inputPrice + s.outputPrice) / 4) + "/M; " + input.role + " objective after quota policy");
   }
-  return { ...target(eligible[0]!), topPick, byProvider, alternatives: eligible.slice(1).map(target), reasons,
+  return { ...target(eligible[0]!), diagnostics, topPick, byProvider, alternatives: eligible.slice(1).map(target), reasons,
     dataAges: { quota: ages, slopalytics: analyticsAge, slopalyticsWindow: windowAge, artificialAnalysis: scoreAge } };
 }

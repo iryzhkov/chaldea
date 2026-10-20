@@ -4,6 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { openDb, tx } from "../store/sqlite.ts";
 import { publish } from "../events/publisher.ts";
 import type { Publication, PublisherOptions } from "../events/publisher.ts";
+import { recommendReviewPair, reviewPairInput, type ReviewPairInput, type ReviewPairResult } from "./pair.ts";
 import { recommend } from "./policy.ts";
 import type { PolicyData } from "./policy.ts";
 import { emptyHistory, inProbation, roleKey } from "./targets.ts";
@@ -96,6 +97,50 @@ export class RouteState {
       result.reasons.push("Route-change announcement deferred: event storage unavailable or at capacity");
     }
     return result;
+  }
+  reviewPair(value: ReviewPairInput, data: PolicyData): ReviewPairResult {
+    const input = reviewPairInput(value);
+    return tx(this.db, () => {
+      const histories = new Map<string, RoutingHistory>();
+      const historyFor = (request: RouteInput) => {
+        const key = roleKey(request.role, request.authorProvider, request.effortOverride);
+        if (!histories.has(key)) {
+          const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
+          const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
+          for (const p of data.catalog) for (const m of p.models) {
+            history.seen[m.id] ??= data.now;
+            history.allocations[m.id] ??= { calls: 0, trials: 0 };
+          }
+          histories.set(key, history);
+        }
+        return histories.get(key)!;
+      };
+      const result = recommendReviewPair(input, data, historyFor);
+      const config = { ...DEFAULT_POLICY, ...data.config };
+      const slots = new Map<string, { request: RouteInput; models: string[] }>();
+      for (const [target, role, main] of [[result.main, input.mainRole ?? "builder", true],
+        [result.peer, input.peerRole ?? "builder", false]] as const) {
+        if (!target) continue;
+        const driver = data.catalog.find(p => p.providerInstanceId === target.providerInstanceId)!.driverKind;
+        const request: RouteInput = { role, effortOverride: Object.values(target.options)[0]!,
+          ...(main && driver !== input.authorProvider ? { authorProvider: input.authorProvider } : {}) };
+        const key = roleKey(role, request.authorProvider, request.effortOverride);
+        const slot = slots.get(key) ?? { request, models: [] };
+        slot.models.push(target.model); slots.set(key, slot);
+      }
+      for (const [key, slot] of slots) {
+        const history = historyFor(slot.request);
+        for (const [model, allocation] of Object.entries(history.allocations)) {
+          if (inProbation(model, slot.request.role, history, config, data.now)) {
+            allocation.calls += slot.models.length;
+            allocation.trials += slot.models.filter(m => m === model).length;
+          }
+        }
+        this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
+          .run(key, JSON.stringify(history));
+      }
+      return result;
+    });
   }
   async flush(options: PublisherOptions = {}): Promise<void> {
     for (let n = 0; n < 100; n++) {

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { join } from "node:path";
 import { hostname, homedir } from "node:os";
 import { tokenSource, type ClaudeTokenSource } from "../route/claude-usage.ts";
@@ -71,18 +72,56 @@ export function capacitySnapshot(host: string, providers: readonly ProviderHeadr
       resets: usable(p.manualResets) && p.manualResets.value ? { availableCount: p.manualResets.value.availableCount, nextExpiresAt: p.manualResets.value.nextExpiresAt } : null,
       ...(p.creditExpiresAt ? { creditExpiresAt: p.creditExpiresAt } : {}), activeStop: stops.has(p.alias) };
     const id = capacityKey(a.provider, a.accountKey), prior = accounts.get(id);
-    if (!prior || Date.parse(a.observedAt) > Date.parse(prior.observedAt)) accounts.set(id, a);
+    if (!prior || Date.parse(a.observedAt) > Date.parse(prior.observedAt)) accounts.set(id, { ...a, activeStop: a.activeStop || !!prior?.activeStop });
+    else if (Date.parse(a.observedAt) === Date.parse(prior.observedAt)) {
+      const merged = reconcile(prior, a);
+      // Version 1 has no conflict field. A missing common window makes all included
+      // evidence unknown; keep that empty intersection through later same-time aliases.
+      if (merged.conflicts.some(c => c.includes("reset epoch") && !/^seven_day_/.test(c))) merged.account.windows = [];
+      accounts.set(id, merged.account);
+    } else if (a.activeStop) accounts.set(id, { ...prior, activeStop: true });
   }
   return validateSnapshot({ version: 1, host, generatedAt: new Date(now).toISOString(), accounts: [...accounts.values()].slice(0, 32) });
 }
-export function mergeSnapshots(snapshots: readonly CapacitySnapshot[], now: number): Map<string, AccountSnapshot & { host: string; ageSeconds: number }> {
-  const result = new Map<string, AccountSnapshot & { host: string; ageSeconds: number }>();
+export type MergedAccount = AccountSnapshot & { host: string; ageSeconds: number; conflicts: string[] };
+/** Same-time observations are intersected, never added. Different reset epochs cannot
+ * establish a full allowance. Conflict metadata is local advice, not a wire change. */
+function reconcile(a: AccountSnapshot, b: AccountSnapshot): { account: AccountSnapshot; conflicts: string[] } {
+  const conflicts: string[] = [];
+  const windows: AccountSnapshot["windows"] = [];
+  const ids = new Set([...a.windows, ...b.windows].map(w => w.id));
+  for (const id of ids) {
+    const x = a.windows.find(w => w.id === id), y = b.windows.find(w => w.id === id);
+    if (!x || !y || (x.resetsAt === null || y.resetsAt === null ? x.resetsAt !== y.resetsAt : Date.parse(x.resetsAt) !== Date.parse(y.resetsAt)) ||
+        x.kind !== y.kind || x.windowDurationMins !== y.windowDurationMins) {
+      conflicts.push(id + ": missing or conflicting reset epoch"); continue;
+    }
+    if (x.remainingPercent !== y.remainingPercent) conflicts.push(id + ": utilization conflict; minimum retained");
+    const remainingPercent = Math.min(x.remainingPercent, y.remainingPercent);
+    windows.push({ ...x, remainingPercent, usedPercent: 100 - remainingPercent });
+  }
+  const same = isDeepStrictEqual;
+  if (!same(a.credits, b.credits)) conflicts.push("credits conflict; unknown");
+  if (!same(a.resets, b.resets)) conflicts.push("resets conflict; unknown");
+  return { account: { ...a, windows, maxAgeMs: Math.min(a.maxAgeMs, b.maxAgeMs),
+    credits: same(a.credits, b.credits) ? a.credits : null,
+    resets: same(a.resets, b.resets) ? a.resets : null,
+    activeStop: a.activeStop || b.activeStop,
+    ...(a.creditExpiresAt === b.creditExpiresAt ? {} : { credits: null }) }, conflicts };
+}
+export function mergeSnapshots(snapshots: readonly CapacitySnapshot[], now: number): Map<string, MergedAccount> {
+  const result = new Map<string, MergedAccount>();
   for (const s of snapshots) for (const a of validateSnapshot(s).accounts) {
     const age = now - Date.parse(a.observedAt);
     if (age < 0 || age >= a.maxAgeMs || Date.parse(s.generatedAt) > now) continue;
     const id = capacityKey(a.provider, a.accountKey), prior = result.get(id);
-    if (!prior || Date.parse(a.observedAt) > Date.parse(prior.observedAt) ||
-        a.observedAt === prior.observedAt && s.host < prior.host) result.set(id, { ...a, host: s.host, ageSeconds: Math.floor(age / 1000) });
+    if (!prior || Date.parse(a.observedAt) > Date.parse(prior.observedAt)) {
+      result.set(id, { ...a, host: s.host, ageSeconds: Math.floor(age / 1000), conflicts: [] });
+    } else if (Date.parse(a.observedAt) === Date.parse(prior.observedAt)) {
+      const merged = reconcile(prior, a);
+      result.set(id, { ...merged.account, host: s.host < prior.host ? s.host : prior.host,
+        ageSeconds: prior.ageSeconds, conflicts: [...new Set([...prior.conflicts, ...merged.conflicts])] });
+    }
   }
   return result;
 }
@@ -106,9 +145,11 @@ export async function publishSnapshot(config: FleetConfig, snapshot: CapacitySna
     return true;
   });
 }
-export async function readSnapshots(config: FleetConfig, now: number, fetcher: typeof fetch = fetch,
-  tokenReader: typeof helperToken = helperToken): Promise<CapacitySnapshot[]> {
-  if (!config.enabled) return [];
+export interface FleetRead { snapshots: CapacitySnapshot[]; readiness: "absent" | "disabled" | "ready" | "empty" | "unavailable"; }
+export async function readSnapshotsDetailed(config: FleetConfig | undefined, now: number, fetcher: typeof fetch = fetch,
+  tokenReader: typeof helperToken = helperToken): Promise<FleetRead> {
+  if (!config) return { snapshots: [], readiness: "absent" };
+  if (!config.enabled) return { snapshots: [], readiness: "disabled" };
   try {
     const token = await tokenReader(config.tokenHelper, { key: "", source: "quota", host: config.host,
       payload: { kind: "quota_headroom_snapshot" } }, "read");
@@ -128,10 +169,14 @@ export async function readSnapshots(config: FleetConfig, now: number, fetcher: t
           if (s.host === event.host) snapshots.push(s);
         } catch { /* Older headroom records and malformed snapshots are not capacity. */ }
       }
-      if (response.next_cursor === null) return snapshots;
+      if (response.next_cursor === null) return { snapshots, readiness: snapshots.length ? "ready" : "empty" };
       if (typeof response.next_cursor !== "string" || response.next_cursor.length > 1024) throw new Error();
       url.searchParams.set("cursor", response.next_cursor);
     }
   } catch { /* Missing helper, stale store and transport failure all keep local routing. */ }
-  return [];
+  return { snapshots: [], readiness: "unavailable" };
+}
+export async function readSnapshots(config: FleetConfig, now: number, fetcher: typeof fetch = fetch,
+  tokenReader: typeof helperToken = helperToken): Promise<CapacitySnapshot[]> {
+  return (await readSnapshotsDetailed(config, now, fetcher, tokenReader)).snapshots;
 }
