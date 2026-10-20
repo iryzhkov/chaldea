@@ -37,39 +37,73 @@ script.onload = () => {
   const agoText = at => age(at) == null ? "unknown" : age(at)<60 ? age(at)+"s ago" : age(at)<3600 ? Math.floor(age(at)/60)+"m ago" : Math.floor(age(at)/3600)+"h ago";
   const timestamp = at => Number.isFinite(at) ? '<time datetime="'+new Date(at).toISOString()+'">'+esc(new Date(at).toISOString().replace("T"," ").slice(0,19)+" UTC")+'</time>' : "unknown";
   const quotaHosts = () => snapshot?.quota?.hosts;
-  const quotaFresh = (state,at) => state==="error" ? "error" : at==null ? "nosource" : age(at)>5400 ? "lost" : age(at)>1800 ? "stale" : "cached";
-  const quotaRows = h => h.accounts.slice(0,4).map(a=>{
-    const used=Number.isFinite(a.used)?a.used:null;
-    return '<div class="quota-account" data-fresh="'+esc(quotaFresh(a.state,a.observedAt))+'"><strong>'+esc(a.label)+'</strong><span class="source-meta">'+esc(a.state)+' · usage observed '+esc(agoText(a.observedAt))+'</span>'
-      +(used==null?missing(a.state==="unsupported"?"Quota not applicable":"Usage unknown"):resourceMeter(a.label+" used",used,used+"% used · "+Number((100-used).toFixed(2))+"% headroom"))
-      +'<div class="source-meta">'+(a.duration==null?"":esc(a.duration)+" min window · ")+(a.resetsAt==null?"Reset unknown":"Reset "+timestamp(a.resetsAt))+'</div>'
-      +((a.unlimited===true||a.credits!=null||a.manualResets!=null)?'<div class="source-meta">'+[a.unlimited===true?"Credits unlimited":a.credits!=null?"Credits remaining "+esc(a.credits):"",a.manualResets!=null?esc(a.manualResets)+" manual resets available":""].filter(Boolean).join(" · ")+' · credit/manual reset times not shown</div>':"")+'</div>';
-  }).join("") || missing(h.state==="byte-budget"?"Quota withheld · host byte budget":h.state==="error"?"Quota source error · no quota data":"No quota data observed");
-  // Group presentation by provider, never by an inferred shared account identity.
+  const quotaFresh = (state,at) => state==="error" ? "error" : state==="unsupported" ? "unsupported" : at==null ? "nosource" : age(at)>5400 ? "lost" : age(at)>1800 ? "stale" : "cached";
+  const windowLabels={five_hour:"5 hour",seven_day:"7 day",seven_day_fable:"7 day · Fable",primary:"Primary",secondary:"Secondary",session:"Session",weekly:"Weekly",monthly:"Monthly"};
+  const windowRows = a => Array.isArray(a.windows)?a.windows.map(w=>({...w,state:a.state})):
+    [{id:"legacy",label:"Included window · name unavailable",used:a.used,resetsAt:a.resetsAt,duration:a.duration,observedAt:a.observedAt,state:a.state}];
+  const quotaWindow = (w,label) => '<div class="quota-window" data-fresh="'+esc(quotaFresh(w.state,w.observedAt))+'"><strong>'+esc(label)+'</strong>'
+    +(Number.isFinite(w.used)?resourceMeter(label+" used",w.used,w.used+"% used · "+Number((100-w.used).toFixed(2))+"% headroom"):missing(w.state==="unsupported"?"Quota not applicable":"Usage unknown"))
+    +'<div class="source-meta">'+esc(quotaFresh(w.state,w.observedAt))+' · usage observed '+esc(agoText(w.observedAt))+(w.duration==null?"":" · "+esc(w.duration)+" min window")+(w.resetsAt==null?" · reset unknown":" · reset "+timestamp(w.resetsAt))+'</div></div>';
+  const quotaCredits = a => '<div class="quota-capacity source-meta">'+[
+    a.unlimited===true?"Credits unlimited":a.credits!=null?"Credits remaining "+esc(a.credits):"Credits unknown",
+    esc(quotaFresh(a.creditState,a.creditObservedAt))+" · observed "+esc(agoText(a.creditObservedAt)),
+    a.manualResets!=null?esc(a.manualResets)+" manual resets available":"Manual resets unknown",
+    esc(quotaFresh(a.resetState,a.resetObservedAt))+" · observed "+esc(agoText(a.resetObservedAt))
+  ].join(" · ")+'</div>';
+  const quotaCapacity = g => {
+    const newest=key=>g.rows.slice().sort((a,b)=>(b.account[key]??-1)-(a.account[key]??-1)||a.host.localeCompare(b.host)||a.index-b.index)[0];
+    const c=newest("creditObservedAt"),r=newest("resetObservedAt");
+    const differences=(latest,keys,label,value,time,state)=>{
+      if(!latest||!g.rows.some(v=>keys.some(k=>v.account[k]!==latest.account[k])))return "";
+      return '<div class="quota-disagreement"><strong>'+esc(label)+' readings differ · separate observations</strong>'
+        +g.rows.map(v=>'<div class="source-meta">'+esc(v.host)+' · '+esc(v.account.label)+' · '+esc(value(v.account))+' · '+esc(quotaFresh(v.account[state],v.account[time]))+' · observed '+esc(agoText(v.account[time]))+'</div>').join("")+'</div>';
+    };
+    return (c?'<div class="source-meta">Credits · '+esc(c.host)+' · '+esc(c.account.label)+' · '+esc(quotaFresh(c.account.creditState,c.account.creditObservedAt))+' · observed '+esc(agoText(c.account.creditObservedAt))+'</div>'+missing(c.account.unlimited===true?"Credits unlimited":c.account.credits!=null?"Credits remaining "+c.account.credits:"Credits unknown"):missing("Credits unknown"))
+      +(r?'<div class="source-meta">Manual resets · '+esc(r.host)+' · '+esc(r.account.label)+' · '+esc(quotaFresh(r.account.resetState,r.account.resetObservedAt))+' · observed '+esc(agoText(r.account.resetObservedAt))+'</div>'+missing(r.account.manualResets==null?"Manual resets unknown":r.account.manualResets+" manual resets available"):missing("Manual resets unknown"))
+      +differences(c,["credits","unlimited","creditState"],"Credit",a=>a.unlimited===true?"Credits unlimited":a.credits==null?"Credits unknown":"Credits remaining "+a.credits,"creditObservedAt","creditState")
+      +differences(r,["manualResets","resetState"],"Manual reset",a=>a.manualResets==null?"Manual resets unknown":a.manualResets+" manual resets available","resetObservedAt","resetState");
+  };
+  const quotaRows = h => h.accounts.slice(0,4).map(a=>'<div class="quota-account"><strong>'+esc(a.label)+'</strong>'
+    +windowRows(a).map(w=>quotaWindow(w,windowLabels[w.id]||w.label||"Window unknown")).join("")
+    +(a.windowsOmitted?missing(a.windowsOmitted+" windows omitted by source"):"")+quotaCredits(a)+'</div>').join("")
+    ||missing(h.state==="byte-budget"?"Quota withheld · host byte budget":h.state==="error"?"Quota source error · no quota data":"No quota data observed");
+  // The operator confirmed one subscription per provider. Host readings still stand separately.
   const quotaGroups = () => {
-    const groups=new Map([["codex",{name:"OpenAI Codex",rows:[]}],["claudeAgent",{name:"Claude",rows:[]}]]);
+    const groups=new Map([["codex",{name:"OpenAI Codex",provider:"codex",rows:[]}],["claudeAgent",{name:"Claude",provider:"claudeAgent",rows:[]}]]);
     const hosted=Array.isArray(quotaHosts());
-    const sources=hosted?quotaHosts().slice(0,16):[{host:"Local",accounts:snapshot?.quota.accounts||[]}];
+    const sources=hosted?quotaHosts().slice(0,16):[{host:"Local",accounts:snapshot?.quota?.accounts||[]}];
     for(const source of sources)for(const [index,account] of source.accounts.slice(0,hosted?4:32).entries()){
       const provider=/^codex account /i.test(account.label)?"codex":/^claudeAgent account /i.test(account.label)?"claudeAgent":/^opencode account /i.test(account.label)?"opencode":"unknown";
-      if(!groups.has(provider))groups.set(provider,{name:provider==="opencode"?"OpenCode":"Provider unknown",rows:[]});
+      if(!groups.has(provider))groups.set(provider,{name:provider==="opencode"?"OpenCode":"Provider unknown",provider,rows:[]});
       groups.get(provider).rows.push({host:source.host,index,account});
     }
     const at=a=>Number.isSafeInteger(a.observedAt)&&a.observedAt>0&&a.observedAt<=Date.now()?a.observedAt:-1;
-    return [...groups.values()].map(g=>({...g,rows:g.rows.sort((a,b)=>Number(Number.isFinite(b.account.used))-Number(Number.isFinite(a.account.used))||at(b.account)-at(a.account)||a.host.localeCompare(b.host)||a.index-b.index)}));
+    return [...groups.values()].map(g=>({...g,rows:g.rows.sort((a,b)=>at(b.account)-at(a.account)||a.host.localeCompare(b.host)||a.index-b.index)}));
   };
   const quotaReading = g => {
-    const r=g.rows[0],a=r?.account;
-    return a?'<strong>'+esc(g.name)+'</strong><div class="source-meta">Newest usage observation · '+esc(r.host)+' · '+esc(agoText(a.observedAt))+'</div>'
-      +(Number.isFinite(a.used)?resourceMeter(g.name+" used",a.used,a.used+"% used · "+Number((100-a.used).toFixed(2))+"% headroom"):missing("Usage unknown"))
-      +'<div class="source-meta">'+esc(a.state)+(a.duration==null?"":" · "+esc(a.duration)+" min window")+(a.resetsAt==null?" · reset unknown":" · reset "+timestamp(a.resetsAt))+'</div>'
-      :'<strong>'+esc(g.name)+'</strong>'+missing("Usage unknown · no provider observation");
+    const rows=g.rows.flatMap(r=>windowRows(r.account).map(w=>({...r,window:w})));
+    const ids=[...new Set([...(g.provider==="claudeAgent"?["five_hour","seven_day","seven_day_fable"]:[]),...rows.map(r=>r.window.id)])];
+    const shared=["codex","claudeAgent"].includes(g.provider);
+    return '<div class="quota-heading"><strong>'+esc(g.name)+'</strong><span class="source-meta">'+(shared?"Shared subscription · operator confirmed":"Subscription context unknown")+'</span></div>'
+      +missing("Host observations; account identity unverified. Percentages are never added.")
+      +(ids.length?ids.map(id=>{
+        const readings=rows.filter(r=>r.window.id===id).sort((a,b)=>(b.window.observedAt??-1)-(a.window.observedAt??-1)||a.host.localeCompare(b.host)||a.index-b.index);
+        const r=readings[0],label=windowLabels[id]||"Included window · name unavailable";
+        if(!r)return '<div class="quota-window"><strong>'+esc(label)+'</strong>'+missing(g.rows.length&&g.rows.every(v=>v.account.state==="unsupported")?"Quota not applicable":"Usage unknown · window not reported")+'</div>';
+        const differs=readings.some(v=>v.window.used!==r.window.used||v.window.resetsAt!==r.window.resetsAt||v.window.duration!==r.window.duration);
+        return quotaWindow(r.window,label)+'<div class="source-meta">Newest window observation · '+esc(r.host)+' · '+esc(agoText(r.window.observedAt))+' · '+esc(r.account.label)+' · '+readings.length+' / '+g.rows.length+' account readings report this window</div>'
+          +(differs?'<div class="quota-disagreement">'+missing("Host readings differ · separate observations")
+            +readings.map(v=>'<div class="source-meta">'+esc(v.host)+' · '+esc(v.account.label)+' · '+(v.window.used==null?"usage unknown":esc(v.window.used)+"% used")+' · '+esc(agoText(v.window.observedAt))+' · reset '+timestamp(v.window.resetsAt)+'</div>').join("")+'</div>':"");
+      }).join(""):missing(g.rows.length&&g.rows.every(v=>v.account.state==="unsupported")?"Quota not applicable":"Usage unknown · no provider observation"))
+      +g.rows.map(r=>(r.account.windowsOmitted?missing(r.host+" · "+r.account.windowsOmitted+" windows omitted by source"):"")
+        +(r.account.windows?.length===0?missing(r.host+(r.account.state==="unsupported"?" · quota not applicable":" · no recognized windows reported")):"")).join("")
+      +quotaCapacity(g)
+      +missing("Included usage and credits are separate. Total capacity is not established here.");
   };
   const quotaDetails = g => '<details><summary>'+g.rows.length+' separate readings · account identity unverified</summary>'
-    +g.rows.map(r=>'<div class="source-meta">Observed by '+esc(r.host)+' · '+esc(r.account.label)+'</div>'+quotaRows({accounts:[r.account]})).join("")
-    +missing("Readings may refer to different accounts or windows. Values are not combined.")+'</details>';
-  const quotaSourceCoverage = () => Array.isArray(quotaHosts())?'<details><summary>Source coverage</summary>'+quotaHosts().map(h=>'<div class="source-meta">'+esc(h.host)+' · '+esc(h.state)+(h.omitted?' · '+esc(h.omitted)+' account rows omitted by source':"")+'</div>'
-    +(!h.accounts.length?missing(h.state==="byte-budget"?"Quota withheld · host byte budget":h.state==="error"?"Quota source error · no quota data":"No quota data observed"):"")).join("")+'</details>':snapshot?.quota?.state==="error"?missing("Quota source error · no quota data observed"):"";
+    +g.rows.map(r=>'<div class="source-meta">Observed by '+esc(r.host)+' · '+esc(r.account.label)+'</div>'+quotaRows({accounts:[r.account]})).join("")+'</details>';
+  const quotaSourceCoverage = () => Array.isArray(quotaHosts())?'<div class="quota-coverage"><strong>Source coverage</strong>'+quotaHosts().map(h=>'<div class="source-meta">'+esc(h.host)+' · '+esc(h.state)+' · quota observed '+esc(agoText(h.observedAt))+(h.omitted?' · '+esc(h.omitted)+' account rows omitted by source':"")+'</div>'
+    +(!h.accounts.length?missing(h.state==="byte-budget"?"Quota withheld · host byte budget":h.state==="error"?"Quota source error · no quota data":"No quota data observed"):"")).join("")+'</div>':snapshot?.quota?.state==="error"?missing("Quota source error · no quota data observed"):"";
   const quotas = (area="acct") => quotaGroups().map(g=>{
     const a=g.rows[0]?.account;
     return panel(area,g.name,quotaReading(g)+quotaDetails(g),"quota",age(a?.observedAt),quotaFresh(a?.state,a?.observedAt),"quota-provider");

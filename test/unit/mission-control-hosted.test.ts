@@ -699,3 +699,63 @@ test("a completion timestamp beyond its source receipt remains unknown as the lo
  assert.equal(m.snapshot().agents[0]!.completedAt,null);
  assert.doesNotThrow(()=>captureSnapshot(m,"agent-a",epoch,1));
 });
+
+test("native quota windows preserve all three IDs, bounded omissions and old scalar readability",async()=>{
+ const {emptyHeadroom,newProvider,applyT3}=await import("../../src/quota/headroom.ts");
+ const {validateHostQuota,quotaAccounts}=await import("../../src/mission-control/contract.ts");
+ const m=live(),p=newProvider("PRIVATE-alias","claudeAgent"),head=emptyHeadroom();
+ const ids=["five_hour","seven_day","seven_day_fable"],used=[8,90,43];
+ applyT3(p,{usageLimits:{checkedAt:new Date(now0-100000).toISOString(),windows:ids.map((id,i)=>({id,kind:i?"weekly":"session",usedPercent:used[i]!,windowDurationMins:i?10080:300,resetsAt:new Date(now0+100000+i).toISOString()}))}} as any);
+ p.accountKey="f".repeat(64);head.providers=[p];m.setQuota(head);
+ const s=captureSnapshot(m,"agent-a",epoch,1)!,q=s.quota!;
+ assert.deepEqual(q.accounts[0]![13]!.windows.map(w=>w.id),ids);
+ assert.deepEqual(q.accounts[0]![13]!.windows.map(w=>w.used),used);
+ assert.equal(q.accounts[0]![3],8);assert.equal(q.accounts[0]![13]!.omitted,0);
+ assert.doesNotMatch(JSON.stringify(s),/PRIVATE-alias|accountKey|ffffff/);
+ const dir=scratch();
+ try{
+  const c=emptyCache();mergeStatus(c,s,now0);const path=join(dir.path,"quota-windows");writeCache(path,c);
+  const account=new CacheModel(path,()=>now0+2000).snapshot().quota.hosts![0]!.accounts[0]!;
+  assert.deepEqual(account.windows,q.accounts[0]![13]!.windows);assert.equal(account.ageSeconds,102);
+  const old=structuredClone(q);old.accounts[0]!.pop();validateHostQuota(old,now0);
+  assert.equal(quotaAccounts(old,now0)[0]!.used,8);assert.equal(quotaAccounts(old,now0)[0]!.windows,undefined);
+  p.included={...p.included,value:[...p.included.value!,{...p.included.value![0]!,id:"PRIVATE-provider-window"}]};
+  m.setQuota(head);const omitted=captureSnapshot(m,"agent-a",epoch,2)!.quota!.accounts[0]![13]!;
+  assert.equal(omitted.windows.length,3);assert.equal(omitted.omitted,1);assert.doesNotMatch(JSON.stringify(omitted),/PRIVATE/);
+  p.included={...p.included,value:[...p.included.value!,p.included.value![0]!]};m.setQuota(head);
+  const duplicate=captureSnapshot(m,"agent-a",epoch,3)!.quota!.accounts[0]![13]!;
+  assert.deepEqual(duplicate.windows.map(w=>w.id),["seven_day","seven_day_fable"]);assert.equal(duplicate.omitted,3);
+ }finally{dir.close();}
+ // Every new nested field is closed and bounded, including hostile in-memory input.
+ for(const mutate of [
+  (x:any)=>x.accounts[0][13].accountKey="PRIVATE",
+  (x:any)=>x.accounts[0][13].windows[0].label="PRIVATE",
+  (x:any)=>x.accounts[0][13].windows[0].id="PRIVATE-provider-window",
+  (x:any)=>x.accounts[0][13].windows[1].id="five_hour",
+  (x:any)=>x.accounts[0][13].windows[0].used=101,
+  (x:any)=>x.accounts[0][13].windows[0].duration=525601,
+  (x:any)=>x.accounts[0][13].windows[0].observedAt=now0+1,
+  (x:any)=>x.accounts[0][13].windows[0].resetsAt=Infinity,
+  (x:any)=>x.accounts[0][13].omitted=33,
+  (x:any)=>x.accounts[0][13].windows=Array(9).fill(x.accounts[0][13].windows[0]),
+  (x:any)=>x.accounts[0].push("PRIVATE"),
+ ]){const bad=structuredClone(q);mutate(bad);assert.throws(()=>validateHostQuota(bad,now0));}
+ const oversized=structuredClone(s) as any;oversized.quota.accounts[0][13].windows[0].id="x".repeat(8193);assert.throws(()=>validateHostSnapshot(oversized));
+});
+
+test("three-window quota fits nine useful activity rows and yields with explicit omissions under pressure",async()=>{
+ const {emptyHeadroom,newProvider}=await import("../../src/quota/headroom.ts");
+ const rows=Array.from({length:9},(_,i)=>({...row("quota-capacity-"+i),title:"Quota task "+i})),m=live(()=>now0,rows),head=emptyHeadroom();
+ for(const driver of ["claudeAgent","codex"]){const p=newProvider(driver,driver);
+  p.included={state:"fresh",source:"t3",error:null,observedAt:new Date(now0).toISOString(),value:["five_hour","seven_day","seven_day_fable"].map((id,i)=>({id,kind:"weekly",usedPercent:i*20,remainingPercent:100-i*20,windowDurationMins:10080,resetsAt:null}))};head.providers.push(p);}
+ m.setQuota(head);
+ for(const r of rows)m.detail(r.id,{kind:"recent-item",id:"actual",ordinal:1,type:"assistant",text:"Actual bounded activity. ".repeat(10),at:now0,status:"completed"});
+ const s=captureSnapshot(m,"agent-a",epoch,1)!;
+ assert.equal(s.agents.length,9);assert.equal(s.quota!.accounts.length,2);assert.ok(s.quota!.accounts.every(r=>r[13]?.windows.length===3));
+ assert.equal(normalizeRich(s.rich,new Set(s.agents.map(a=>a.id)),s.observedAt).details.filter(d=>d.value.fieldCoverage!=="identity-only"&&d.value.recent?.some(r=>r.preview.text)).length,9);
+ assert.ok(Buffer.byteLength(JSON.stringify(s))<=8192);
+ // A near-full base/identity set may shed windows, quota or rich detail, always within the same limit.
+ const full=live(()=>now0,Array.from({length:48},(_,i)=>row("full-quota-"+i)));full.setQuota(head);
+ const bounded=captureSnapshot(full,"agent-a",epoch,1)!;assert.ok(Buffer.byteLength(JSON.stringify(bounded))<=8192);validateHostSnapshot(bounded);
+ if(bounded.quota?.accounts.length)for(const r of bounded.quota.accounts)assert.equal((r[13]?.windows.length??0)+(r[13]?.omitted??0),3);
+});

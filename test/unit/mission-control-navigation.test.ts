@@ -719,7 +719,7 @@ test("completion expiry uses actual time at 59.999s and 60s without data, clamps
  b.click("overview");assert.doesNotMatch(b.elements.view!.querySelector(".p-threads")!.textContent,/Expiry [234]/);
 });
 
-test("provider summaries consistently select newest actual usage without merging readings or borrowing host freshness",()=>{
+test("provider summaries consistently select newest window observations without merging readings or borrowing host freshness",()=>{
  const start=Date.parse("2026-10-20T00:00:00Z"),clock={now:start},b=browser("https://board.example/?mode=quota",false,clock);
  const account=(label:string,used:number,observedAt:number|null,duration=300)=>({label,used,observedAt,state:"cached",duration,resetsAt:start+3600000,credits:"99",creditState:"cached",manualResets:9,resetState:"cached"});
  const hosts=[
@@ -732,18 +732,18 @@ test("provider summaries consistently select newest actual usage without merging
  assert.equal(cards.length,2);
  const codex=cards.find(c=>c.textContent.includes("OpenAI Codex"))!,claude=cards.find(c=>c.textContent.includes("Claude"))!;
  const codexBody=codex.querySelector(".body")!,claudeBody=claude.querySelector(".body")!;
- assert.match(codexBody.querySelector(".source-meta")!.textContent,/Newest usage observation · agent-a · 1s ago/);
- assert.match(claudeBody.querySelector(".source-meta")!.textContent,/Newest usage observation · agent-b · 1s ago/);
+ assert.match(codexBody.textContent,/Newest window observation · agent-a · 0s ago · codex account 5/);
+ assert.match(claudeBody.textContent,/Newest window observation · agent-b · 1s ago/);
  assert.match(codex.textContent,/80% used · 20% headroom/);assert.match(claude.textContent,/20% used · 80% headroom/);
  assert.equal(codex.querySelectorAll(".quota-account").length,4);assert.equal(claude.querySelectorAll(".quota-account").length,2);
  assert.match(codex.textContent,/10080 min window/);assert.match(codex.textContent,/90% used/);
- assert.match(codex.textContent,/credit\/manual reset times not shown/);assert.match(codex.textContent,/Values are not combined/);
+ assert.match(codex.textContent,/Credits · agent-a.*nosource · observed unknown/);assert.match(codex.textContent,/Percentages are never added/);
  clock.now+=60_000;b.snapshot({...snap,now:clock.now,quota:{...snap.quota,hosts:hosts.slice().reverse().map(h=>({...h,observedAt:clock.now}))}});
  assert.match(b.elements.view!.querySelector(".quota-provider")!.textContent,/agent-a · 1m ago/);
  b.click("overview");const overview=b.elements.view!.querySelector(".p-quota")!;
  assert.equal(overview.querySelectorAll(".quota-glance").length,2);
- assert.match(overview.textContent,/Newest usage observation · agent-a · 1m ago/);
- assert.match(overview.textContent,/Newest usage observation · agent-b · 1m ago/);
+ assert.match(overview.textContent,/Newest window observation · agent-a · 1m ago/);
+ assert.match(overview.textContent,/Newest window observation · agent-b · 1m ago/);
  b.click("quota");
  b.snapshot({...snap,quota:{...snap.quota,hosts:hosts.map(h=>({...h,accounts:h.accounts.filter(a=>a.label.startsWith("codex"))}))}});
  assert.match(b.elements.view!.querySelectorAll(".quota-provider")[1]!.textContent,/Claude.*Usage unknown/);
@@ -774,4 +774,58 @@ test("hosted quota groups retain all 16 bounded hosts and enforce four readings 
  b.snapshot({version:1,demo:false,sampled:true,now:start,source:{state:"live",observedAt:start},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]});
  assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,64);
  assert.match(b.elements.view!.textContent,/host-15/);assert.match(b.elements.view!.textContent,/account rows omitted by source/);
+});
+
+test("shared quota shows each native window, disagreement and missing coverage without opening details",async()=>{
+ const {MissionModel}=await import("../../src/mission-control/model.ts"),{newProvider,applyT3,emptyHeadroom}=await import("../../src/quota/headroom.ts");
+ const {captureSnapshot,quotaAccounts}=await import("../../src/mission-control/contract.ts");
+ const now=Date.now(),ids=["five_hour","seven_day","seven_day_fable"];
+ const account=(all:boolean)=>{
+  const m=new MissionModel(false,()=>now);m.shell({kind:"snapshot",sequence:1,threads:[]});m.shell({kind:"synchronized"});
+  const p=newProvider("PRIVATE","claudeAgent"),head=emptyHeadroom();
+  applyT3(p,{usageLimits:{checkedAt:new Date(now-(all?100000:1000)).toISOString(),windows:(all?ids:ids.slice(0,1)).map((id,i)=>({id,kind:i?"weekly":"session",usedPercent:all?[8,90,43][i]!:12,windowDurationMins:i?10080:300}))}} as any);
+  p.credits={state:"fresh",observedAt:new Date(now-(all?2000:5000)).toISOString(),error:null,source:"private",value:{balance:all?"250":"10",hasCredits:true,unlimited:false}};
+  p.manualResets={state:"fresh",observedAt:new Date(now-(all?2000:5000)).toISOString(),error:null,source:"private",value:{availableCount:all?3:1,nextExpiresAt:null}};
+  head.providers=[p];m.setQuota(head);
+  return quotaAccounts(captureSnapshot(m,"agent-a","a".repeat(32),1)!.quota!,now)[0]!;
+ };
+ const a=account(true),b=account(false),hosts=[{host:"agent-a",state:"cached",observedAt:now,omitted:0,accounts:[a]},{host:"agent-b",state:"cached",observedAt:now,omitted:0,accounts:[b]},{host:"laptop",state:"unknown",observedAt:null,omitted:0,accounts:[]}];
+ const snapshot={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]};
+ for(const width of [390,1280]){
+  const browserView=browser();browserView.resize(width,width===390?844:900);
+  for(const mode of ["overview","quota"]){
+   browserView.click(mode);browserView.snapshot(snapshot);
+   const html=browserView.elements.view!.innerHTML.replace(/<details>[\s\S]*?<\/details>/g,"");
+   for(const label of ["5 hour","7 day","7 day · Fable"])assert.ok(html.includes(label));
+   assert.match(html,/90% used · 10% headroom/);assert.match(html,/43% used · 57% headroom/);
+   assert.match(html,/12% used · 88% headroom/);assert.match(html,/Newest window observation · agent-b/);
+   assert.match(html,/Newest window observation · agent-a/);assert.match(html,/1 \/ 2 account readings report this window/);
+   assert.match(html,/Shared subscription · operator confirmed/);assert.match(html,/Host readings differ/);
+   assert.match(html,/agent-a · claudeAgent account 1 · 8% used/);assert.match(html,/agent-b · claudeAgent account 1 · 12% used/);
+   assert.match(html,/Credits · agent-a/);assert.match(html,/Credits remaining 250/);
+   assert.match(html,/Credit readings differ/);assert.match(html,/agent-b · claudeAgent account 1 · Credits remaining 10 · cached · observed 5s ago/);
+   assert.match(html,/Manual reset readings differ/);assert.match(html,/agent-a · claudeAgent account 1 · 3 manual resets available/);
+   assert.match(html,/agent-b · claudeAgent account 1 · 1 manual resets available · cached · observed 5s ago/);
+   assert.match(html,/Source coverage/);assert.match(html,/laptop · unknown/);
+   assert.doesNotMatch(html,/PRIVATE|undefined|NaN|total blocked|Credits unlimited/);
+  }
+  browserView.snapshot({...snapshot,quota:{...snapshot.quota,hosts:[{...hosts[0],accounts:[{...a,windows:a.windows!.slice(0,1),windowsOmitted:2}]}]}});
+  const missing=browserView.elements.view!.innerHTML.replace(/<details>[\s\S]*?<\/details>/g,"");
+  assert.match(missing,/7 day/);assert.match(missing,/Usage unknown · window not reported/);assert.match(missing,/2 windows omitted by source/);
+ }
+});
+
+test("included exhaustion keeps credits and unknown provider observations distinct",()=>{
+ const b=browser("https://board.example/?mode=quota"),now=Date.now();
+ const account={label:"codex account 1",state:"fresh",observedAt:now,used:100,resetsAt:null,duration:300,credits:"125",creditState:"fresh",creditObservedAt:now-2000,resetState:"unknown",unlimited:false,manualResets:null,windows:[{id:"primary",used:100,resetsAt:null,duration:300,observedAt:now}]};
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts:[{host:"agent-a",state:"cached",observedAt:now,omitted:0,accounts:[account,{...account,label:"Provider account 2",credits:null,windows:[]}]}]},hostSummary:[]};
+ b.snapshot(snap);const html=b.elements.view!.innerHTML.replace(/<details>[\s\S]*?<\/details>/g,"");
+ assert.match(html,/100% used · 0% headroom/);assert.match(html,/Credits remaining 125/);
+ assert.match(html,/Included usage and credits are separate/);assert.match(html,/Provider unknown/);assert.match(html,/Subscription context unknown/);
+ assert.doesNotMatch(html,/blocked|Credits unlimited|PRIVATE|undefined|NaN/);
+ for(const windows of [undefined,[]]){
+  b.snapshot({...snap,quota:{...snap.quota,hosts:[{...snap.quota.hosts[0],accounts:[{...account,label:"opencode account 1",state:"unsupported",used:null,windows}]}]}});
+  const unsupported=b.elements.view!.innerHTML.replace(/<details>[\s\S]*?<\/details>/g,"");
+  assert.match(unsupported,/Quota not applicable/);
+ }
 });

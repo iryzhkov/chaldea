@@ -3,6 +3,7 @@ import type { ShellEvent, ShellThread, MissionDetailEvent } from "../t3/adapter.
 import { ThreadDetails, aggregateDetails, validResources, safeProviderId, titlePreview, appThreadIdPreview, type Resources, emptyDetail } from "./details.ts";
 import { isolateDetail } from "./detail-contract.ts";
 import type { HeadroomState, Metric } from "../quota/headroom.ts";
+import { projectQuotaWindows, type QuotaWindow } from "./quota-windows.ts";
 export const MAX_AGENTS = 48, MAX_TURNS = 512, MAX_SAMPLES = 4096;
 const tools = new Set(["read","search","navigate","edit_apply","change_plan","verify_run","chaldea exec","t3_thread_read","t3_thread_list","jocasta","watch_pull_request","html_preview","delegate_task","chaldea_decision_prepare"]);
 const toolAliases = new Map<string,string>();
@@ -172,7 +173,7 @@ export class MissionModel {
     const freshness = (connected: boolean, observed: number | null, stale: number, lost: number) =>
       connected ? "live" : observed === null ? "nosource" : now - observed > lost ? "lost" : now - observed > stale ? "stale" : "disconnected";
     const metric = <T>(m: Metric<T>) => ({ state: m.state, observedAt: at(m.observedAt), ageSeconds: at(m.observedAt) === null ? null : Math.max(0, (now - at(m.observedAt)!) / 1000) });
-    const accounts: { label: string; state: string; observedAt: number | null; ageSeconds: number | null; used: number | null; resetsAt: number | null; duration: number | null; credits: string | null; creditState: string; resetState: string; unlimited: boolean | null; manualResets: number | null }[] = [];
+    const accounts: { label: string; state: string; observedAt: number | null; ageSeconds: number | null; used: number | null; resetsAt: number | null; duration: number | null; credits: string | null; creditState: string; resetState: string; unlimited: boolean | null; manualResets: number | null; creditObservedAt?:number|null; resetObservedAt?:number|null; windows?:QuotaWindow[]; windowsOmitted?:number }[] = [];
     const seen = new Set<string>();
     for (const p of (this.quota?.providers ?? []).slice(0, 32)) {
       // Dedup internally. No account identity/hash or provider alias leaves this process.
@@ -180,7 +181,8 @@ export class MissionModel {
       if (seen.has(key)) continue; seen.add(key);
       const m = p.included, w = m.value?.[0];
       const age = metric(m);
-      accounts.push({ label: safeLabel(p.driver, "Provider") + " account " + (accounts.length + 1),
+      accounts.push({ label: (["codex","claudeAgent","opencode"].includes(p.driver)?p.driver:"Provider") + " account " + (accounts.length + 1),
+        ...projectQuotaWindows(m.value??[],at(m.observedAt),now),creditObservedAt:at(p.credits.observedAt),resetObservedAt:at(p.manualResets.observedAt),
         ...age, state: this.quotaError ? "error" : age.ageSeconds !== null && age.ageSeconds > 5400 ? "lost" : age.ageSeconds !== null && age.ageSeconds > 1800 ? "stale" : m.state,
         used: w && Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent <= 100 ? w.usedPercent : null,
         resetsAt: at(w?.resetsAt), duration: count(w?.windowDurationMins) ? w.windowDurationMins : null,
