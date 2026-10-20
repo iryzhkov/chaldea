@@ -27,9 +27,9 @@ function preset(over: Record<string, unknown> = {}) {
     inputs: { scope: "status" }, project: "projectA", services: GRANTS, maxSeconds: 600, delegate: false,
     destinations: ["caller-project"], ...over };
 }
-function policy(presets: Record<string, unknown> = { reporter: preset(), short: preset({ maxSeconds: 2 }) }): SessionPolicy {
-  return parsePolicy({ version: 1, environment: "env", presets,
-    ceilings: [{ project: "projectA", maxSeconds: 3600, services: GRANTS, destinations: ["caller-project"] }] }, "env");
+const CEILING = { project: "projectA", maxSeconds: 3600, services: GRANTS, destinations: ["caller-project"] };
+function policy(presets: Record<string, unknown> = { reporter: preset(), short: preset({ maxSeconds: 2 }) }, ceilings: unknown[] = [CEILING]): SessionPolicy {
+  return parsePolicy({ version: 1, environment: "env", presets, ceilings }, "env");
 }
 type Lineage = { parent: string | null; root: string };
 function thread(id: string, project: string, lineage?: Lineage): WaitSnapshot {
@@ -107,7 +107,9 @@ function fixture(name: string) {
   make();
   return {
     t3, ref, get store() { return store; }, get engine() { return engine; },
-    async restart(extra: Partial<EngineOptions> = {}) { await engine.stop(); store.close(); store = new WakeStore(path, "env"); make(extra); },
+    async restart(extra: Partial<EngineOptions> = {}, down?: () => Promise<void>) {
+      await engine.stop(); store.close(); await down?.(); store = new WakeStore(path, "env"); make(extra);
+    },
     async close() { await engine.stop(); store.close(); dir.remove(); },
   };
 }
@@ -355,6 +357,23 @@ test("edited, removed and wrong-audience presets refuse issuance; terminal runs 
     assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "preset_changed" });
     f.ref.policy = policy({ short: preset({ maxSeconds: 2 }) });
     assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "preset_removed" });
+    // The preset is unchanged but the admitting ceiling narrows or disappears: issuance stops.
+    const presets = { reporter: preset(), short: preset({ maxSeconds: 2 }) };
+    const narrowed = (over: Record<string, unknown>) => policy(presets, [{ ...CEILING, ...over }]);
+    for (const p of [
+      narrowed({ services: [{ audience: "jocasta", grants: [{ resource: "project:projectA", actions: ["get", "list", "search"] }] }] }),
+      narrowed({ services: [{ audience: "jocasta", grants: [{ resource: "project:projectB", actions: ["get", "history", "list", "search"] }] }] }),
+      narrowed({ maxSeconds: 300 }),
+      narrowed({ destinations: ["elsewhere"] }),
+      narrowed({ project: "projectB" }),
+    ]) {
+      f.ref.policy = p;
+      assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "preset_exceeds_ceiling" });
+    }
+    // A compatible ceiling and unrelated policy edits keep issuance working.
+    f.ref.policy = policy({ reporter: preset(), other: preset({ title: "other" }) }, [
+      { ...CEILING, project: "projectB" }, { ...CEILING, maxSeconds: 600, destinations: ["caller-project", "elsewhere"] }]);
+    assert.ok(f.engine.authorizeIssue("reporter", "jocasta").ok);
     f.ref.policy = original;
     assert.ok(f.engine.authorizeIssue("reporter", "jocasta").ok);
     assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta", Date.parse(s.deadline)), { ok: false, refusal: "run_expired" });
@@ -364,6 +383,77 @@ test("edited, removed and wrong-audience presets refuse issuance; terminal runs 
     assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "no_active_run" });
     f.ref.policy = null;
     assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "sessions_disabled" });
+  } finally { await f.close(); }
+});
+
+test("a completion first seen after the deadline is a deadline outcome; a timely one still reads its result late", async () => {
+  const f = fixture("overdue");
+  try {
+    // Service down across the deadline while the root completes: no success and no result.
+    const a = await start(f, { preset: "short" });
+    await f.restart({}, async () => {
+      f.t3.say(a.threadId, "finished while the service was down");
+      complete(f, a.threadId);
+      await sleep(Date.parse(a.deadline) - Date.now() + 50);
+    });
+    await until(() => f.engine.sessionStatus(a.sessionId).occupancy === "released");
+    const late = f.engine.sessionStatus(a.sessionId);
+    assert.equal((late.outcome as { reason: string }).reason, "deadline"); assert.equal(late.result, null);
+    await until(() => wake(f, a.sessionId)[0]?.state === "sent");
+    assert.ok(!f.t3.wakes.some(p => JSON.parse(p).text.includes("finished while the service was down")));
+    // Completed before the deadline, but the result read fails until after it: still a success.
+    const read = f.t3.sessions.result;
+    let deadline = Infinity;
+    f.t3.sessions.result = async (threadId, runId) => {
+      if (Date.now() < deadline + 100) throw new Error("projection unavailable");
+      return read(threadId, runId);
+    };
+    const b = await start(f, { preset: "short" });
+    deadline = Date.parse(b.deadline);
+    f.t3.say(b.threadId, "timely report");
+    complete(f, b.threadId);
+    await until(() => f.engine.sessionStatus(b.sessionId).state === "resolved");
+    const timely = f.engine.sessionStatus(b.sessionId);
+    assert.ok(Date.now() > deadline);
+    assert.equal((timely.outcome as { reason: string }).reason, "succeeded"); assert.equal(timely.result, "timely report");
+    f.t3.sessions.result = read;
+    // A cancel while the timely read is in flight wins; the late read cannot overwrite it.
+    let release!: () => void;
+    f.t3.sessions.result = async (threadId, runId) => { await new Promise<void>(r => { release = r; }); return read(threadId, runId); };
+    await until(() => f.engine.sessionStatus(b.sessionId).occupancy === "released");
+    const c = await start(f, { preset: "short" });
+    f.t3.say(c.threadId, "raced report");
+    complete(f, c.threadId);
+    await until(() => release !== undefined);
+    f.engine.cancelSession(c.sessionId);
+    release();
+    await sleep(100);
+    const raced = f.engine.sessionStatus(c.sessionId);
+    assert.equal((raced.outcome as { reason: string }).reason, "operator_cancelled"); assert.equal(raced.result, null);
+    f.t3.sessions.result = read;
+  } finally { await f.close(); }
+});
+
+test("launch retries and ambiguous result reads have separate budgets", async () => {
+  const f = fixture("budgets");
+  try {
+    f.t3.mode = "offline";
+    const s = await start(f);
+    assert.equal(s.launch, "intent");
+    await until(() => f.t3.launches.length === 3);
+    f.t3.mode = "accept";
+    await until(() => f.engine.sessionStatus(s.sessionId).launch === "accepted");
+    assert.equal(f.t3.launches.length, 4);
+    // Three ambiguous reads are retried even after three not_sent launch attempts.
+    const read = f.t3.sessions.result;
+    let reads = 0;
+    f.t3.sessions.result = async (threadId, runId) => ++reads <= 3 ? { kind: "ambiguous", detail: "two final messages" } : read(threadId, runId);
+    f.t3.say(s.threadId, "report after retries");
+    complete(f, s.threadId);
+    await until(() => f.engine.sessionStatus(s.sessionId).state === "resolved");
+    const done = f.engine.sessionStatus(s.sessionId);
+    assert.equal((done.outcome as { reason: string }).reason, "succeeded"); assert.equal(done.result, "report after retries");
+    assert.equal(reads, 4);
   } finally { await f.close(); }
 });
 

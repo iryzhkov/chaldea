@@ -7,7 +7,7 @@ import { NativeDecisions, questionSchema } from "../decisions/native.ts";
 import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
 import type { WaitInput, NativeDecisionInput, AnswerSource } from "./types.ts";
-import { SessionLifecycle, type SessionOptions, type SessionStatus, type IssueDecision } from "../session/lifecycle.ts";
+import { SessionLifecycle, RESULT_GRACE_MS, type SessionOptions, type SessionStatus, type IssueDecision } from "../session/lifecycle.ts";
 
 export interface EngineOptions {
   // Test seam for abrupt process termination at durable/ambiguous boundaries.
@@ -240,7 +240,9 @@ export class WaitEngine {
           }
           continue;
         }
-        times.push(i.deadline);
+        // A session still active past its deadline is reading a timely result; its retries
+        // poke the pump, and the grace end is the next wake, so an overdue deadline never spins.
+        times.push(i.kind === "session" && i.deadline <= now ? i.deadline + RESULT_GRACE_MS : i.deadline);
         const input=JSON.parse(i.input) as WaitInput;
         if (input.condition?.kind === "time") times.push(Date.parse(input.condition.at));
       }

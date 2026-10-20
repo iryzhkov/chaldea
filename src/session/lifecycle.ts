@@ -10,7 +10,7 @@ import { completion, LIVE } from "../waits/completion.ts";
 import { validateAdmission, type RunAdmission } from "../access/run-lease.ts";
 import { AUDIENCES, type Grant } from "../access/token.ts";
 import { SessionRefusal, presetHash, type SessionPolicy } from "./policy.ts";
-import { admit, destination, startInput } from "./admit.ts";
+import { admit, destination, startInput, withinCeiling } from "./admit.ts";
 import { checkResult } from "./result.ts";
 import { launchPayload, type SessionT3 } from "./t3.ts";
 
@@ -35,8 +35,9 @@ export interface SessionStatus {
   delivery: Array<{ channel: string; state: string; disposition: string | null; attempts: number }>;
 }
 const MAX_LINEAGE = 8;
-const RESULT_GRACE_MS = 10 * 60_000;
+export const RESULT_GRACE_MS = 10 * 60_000;
 const AMBIGUOUS_READS = 3;
+type Phase = "launch" | "read";
 /** No run, queued request or native child of the thread can still act. */
 function quiescent(s: WaitSnapshot): boolean {
   return s.runs.every(r => !LIVE.has(r.status)) && s.pendingRuns.length === 0 && s.children.every(c => !LIVE.has(c.status));
@@ -49,8 +50,11 @@ export class SessionLifecycle {
   private launching = new Set<string>();
   private fetching = new Set<string>();
   private timers = new Set<NodeJS.Timeout>();
+  /** Retry counts and backoff, keyed by phase and session so launch retries never spend result reads. */
   private attempts = new Map<string, number>();
   private notBefore = new Map<string, number>();
+  /** Sessions whose root was seen completed before the deadline by this process. */
+  private timely = new Set<string>();
   private stopped = false;
   constructor(store: WakeStore, waits: WaitT3, options: SessionOptions, hooks: SessionHooks) {
     this.store = store; this.waits = waits; this.options = options; this.hooks = hooks;
@@ -106,9 +110,9 @@ export class SessionLifecycle {
       current = await this.waits.snapshot(parent);
     }
   }
-  private later(id: string): void {
-    const n = this.attempts.get(id) ?? 0, delay = backoff(n);
-    this.attempts.set(id, n + 1); this.notBefore.set(id, Date.now() + delay);
+  private later(phase: Phase, id: string): void {
+    const k = phase + ":" + id, n = this.attempts.get(k) ?? 0, delay = backoff(n);
+    this.attempts.set(k, n + 1); this.notBefore.set(k, Date.now() + delay);
     const timer = setTimeout(() => { this.timers.delete(timer); if (!this.stopped) this.hooks.poke(); }, delay);
     this.timers.add(timer);
   }
@@ -130,7 +134,7 @@ export class SessionLifecycle {
       }
       if (this.stopped) return;
       if (result.kind === "not_sent") {
-        if (this.store.sessionLaunch(id, ["dispatching"], "intent", result.detail)) this.later(id);
+        if (this.store.sessionLaunch(id, ["dispatching"], "intent", result.detail)) this.later("launch", id);
         return;
       }
       if (result.kind === "rejected") {
@@ -163,7 +167,7 @@ export class SessionLifecycle {
       if (!active || overdue) {
         if (overdue) this.store.finishSession(id, { reason: "deadline" }, null, now);
         this.store.releaseSession(id, "never_launched", now);
-      } else if ((this.notBefore.get(id) ?? 0) <= now) void this.launch(id);
+      } else if ((this.notBefore.get("launch:" + id) ?? 0) <= now) void this.launch(id);
       return;
     }
     if (s.launch === "dispatching" && this.launching.has(id)) {
@@ -201,16 +205,23 @@ export class SessionLifecycle {
     if (root && !s.root_run) this.store.sessionRoot(id, root);
     const done = root ? completion(snapshot, root) : null;
     if (active) {
-      if (done?.reason === "completed" && done.runId) void this.capture(s, done.runId, item);
-      else if (done) this.store.finishSession(id, { reason: done.reason, ...(done.runId ? { runId: done.runId } : {}) }, null, now);
-      else if (overdue) this.store.finishSession(id, { reason: "deadline" }, null, now);
+      const completed = done?.reason === "completed" && done.runId ? done.runId : null;
+      // T3 gives no completion time, so a root first seen finished after the deadline
+      // (for example after service downtime) counts as overdue and yields no result.
+      if (completed && !overdue) this.timely.add(id);
+      if (overdue && !this.timely.has(id)) this.store.finishSession(id, { reason: "deadline" }, null, now);
+      else if (completed) {
+        // A timely completion may finish its result read within a bounded grace, never indefinitely.
+        if (now >= item.deadline + RESULT_GRACE_MS) this.store.finishSession(id, { reason: "result_unavailable", runId: completed, detail: "grace_expired" }, null, now);
+        else void this.capture(s, completed, item);
+      } else if (done) this.store.finishSession(id, { reason: done.reason, ...(done.runId ? { runId: done.runId } : {}) }, null, now);
     }
     // Only runtime evidence frees the preset: the root cohort ended and nothing else in the thread runs.
     if (done && quiescent(snapshot)) this.store.releaseSession(id, "runtime_stopped", now);
   }
   private async capture(s: SessionRecord, runId: string, item: Item): Promise<void> {
     const id = s.item, t3 = this.options.t3;
-    if (this.fetching.has(id) || (this.notBefore.get(id) ?? 0) > Date.now()) return;
+    if (this.fetching.has(id) || (this.notBefore.get("read:" + id) ?? 0) > Date.now()) return;
     if (!t3) { this.store.finishSession(id, { reason: "result_unavailable", runId, detail: "no_t3" }); return; }
     this.fetching.add(id);
     try {
@@ -219,11 +230,11 @@ export class SessionLifecycle {
       catch {
         if (this.stopped) return;
         if (Date.now() >= item.deadline + RESULT_GRACE_MS) this.store.finishSession(id, { reason: "result_unavailable", runId, detail: "read_failed" });
-        else { this.hooks.report?.("session_result_retry"); this.later(id); }
+        else { this.hooks.report?.("session_result_retry"); this.later("read", id); }
         return;
       }
       if (this.stopped) return;
-      if (read.kind === "ambiguous" && (this.attempts.get(id) ?? 0) < AMBIGUOUS_READS) { this.later(id); return; }
+      if (read.kind === "ambiguous" && (this.attempts.get("read:" + id) ?? 0) < AMBIGUOUS_READS) { this.later("read", id); return; }
       if (read.kind === "missing") this.store.finishSession(id, { reason: "result_unavailable", runId });
       else if (read.kind === "ambiguous") this.store.finishSession(id, { reason: "result_ambiguous", runId, detail: read.detail });
       else {
@@ -268,6 +279,8 @@ export class SessionLifecycle {
     if (presetHash(current) !== s.preset_hash) return refuse("preset_changed");
     const admission = JSON.parse(s.admission) as RunAdmission;
     try { validateAdmission(admission, Math.floor(now / 1000)); } catch { return refuse("run_expired"); }
+    // The unchanged preset must still fit a current ceiling; unrelated policy edits do not matter.
+    if (!withinCeiling(policy, current, admission)) return refuse("preset_exceeds_ceiling");
     const service = admission.services.find(x => x.audience === audience);
     if (!service) return refuse("audience_not_admitted");
     return { ok: true, sessionId: s.item, runId: admission.runId, threadId: s.thread_id, profile: admission.profile,

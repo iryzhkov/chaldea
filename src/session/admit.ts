@@ -46,11 +46,19 @@ export function admit(policy: SessionPolicy, presetId: string, runId: string, no
     expiresAt: seconds + preset.maxSeconds, services: structuredClone(preset.services) };
   try { validateAdmission(admission, seconds); }
   catch (error) { throw new SessionRefusal("invalid_preset_admission", error instanceof AccessError ? error.message : undefined); }
-  const within = policy.ceilings.some(c => preset.maxSeconds <= c.maxSeconds &&
-    preset.destinations.every(d => c.destinations.includes(d)) &&
-    narrowing(admission, { runId, profile: preset.id, project: c.project, expiresAt: seconds + c.maxSeconds, services: c.services }));
-  if (!within) throw new SessionRefusal("preset_exceeds_ceiling");
+  if (!withinCeiling(policy, preset, admission)) throw new SessionRefusal("preset_exceeds_ceiling");
   return { preset, hash: presetHash(preset), admission };
+}
+/**
+ * True when the whole preset and its admission fit one of the policy's current
+ * ceilings. Used at admission and again at every issuance check, so narrowing
+ * or removing the admitting ceiling stops issuance for a run already started.
+ */
+export function withinCeiling(policy: SessionPolicy, preset: SessionPreset, admission: RunAdmission): boolean {
+  const started = admission.expiresAt - preset.maxSeconds;
+  return policy.ceilings.some(c => preset.maxSeconds <= c.maxSeconds &&
+    preset.destinations.every(d => c.destinations.includes(d)) &&
+    narrowing(admission, { runId: admission.runId, profile: preset.id, project: c.project, expiresAt: started + c.maxSeconds, services: c.services }));
 }
 /** The caller's T3 project is only the wake destination, checked against the preset. */
 export function destination(preset: SessionPreset, callerProject: string): void {

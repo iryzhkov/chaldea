@@ -148,6 +148,14 @@ When that run's cohort is terminal, these outcomes are possible:
 - **Deadline, operator cancellation or thread deletion:** a terminal outcome
   with no result.
 
+T3 reports no completion time, so the deadline wins unless this service saw
+the root completed before the deadline. A completion first observed later,
+for example after the service was down across the deadline, is a `deadline`
+outcome with no result. A timely completion may finish reading its result for
+up to 10 minutes after the deadline; after that the outcome is
+`result_unavailable`. A cancellation during that read wins. Launch retries
+and result-read retries have separate budgets.
+
 ### Preset occupancy
 
 Each preset has one runtime slot, because per-provider credentials are bound
@@ -191,8 +199,12 @@ cross-host message envelope is a separate contract.
 
 `authorizeIssue(preset, audience)` returns the active run, its grants and its
 expiry, or a refusal: `no_active_run`, `run_inactive`, `run_expired`,
-`run_not_launched`, `preset_changed`, `preset_removed`, `audience_not_admitted`
-or `sessions_disabled`. It never returns a token. It is not reachable over IPC
+`run_not_launched`, `preset_changed`, `preset_removed`, `preset_exceeds_ceiling`,
+`audience_not_admitted` or `sessions_disabled`. It re-reads the protected
+policy on every call and fails closed. An unchanged preset must still fit one
+of the current ceilings, using the same check as admission, so narrowing or
+removing the admitting ceiling stops issuance. Edits to unrelated presets or
+ceilings do not. It never returns a token. It is not reachable over IPC
 or MCP, and only tests call it.
 
 The actual helper, its socket, UID binding and Authentik enrollment are
