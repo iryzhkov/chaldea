@@ -75,7 +75,7 @@ test("publisher keeps common reset uncertainty across every three-alias order wi
       assert.equal(account.creditExpiresAt, a.creditExpiresAt);
       assert.equal(account.activeStop, false);
       assert.deepEqual(account.windows.map(w => w.id), scoped ? ["five_hour", "seven_day"] : []);
-      const received = mergeSnapshots([JSON.parse(JSON.stringify(s))], now).get(capacityKey(driver, a.accountKey!))!;
+      const received: import("../../src/quota/fleet.ts").MergedAccount = mergeSnapshots([JSON.parse(JSON.stringify(s))], now).get(capacityKey(driver, a.accountKey!))!;
       assert.equal(classifyCapacity(snapshotProvider(received, "receiver"), false, now).class, scoped ? "use-it" : "unknown");
       if (scoped) {
         const policy = modelWindowPolicy(received.windows, "claude-fable-5-1", now, .1, .1);
