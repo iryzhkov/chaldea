@@ -73,8 +73,13 @@ export function capacitySnapshot(host: string, providers: readonly ProviderHeadr
       ...(p.creditExpiresAt ? { creditExpiresAt: p.creditExpiresAt } : {}), activeStop: stops.has(p.alias) };
     const id = capacityKey(a.provider, a.accountKey), prior = accounts.get(id);
     if (!prior || Date.parse(a.observedAt) > Date.parse(prior.observedAt)) accounts.set(id, { ...a, activeStop: a.activeStop || !!prior?.activeStop });
-    else if (Date.parse(a.observedAt) === Date.parse(prior.observedAt)) accounts.set(id, reconcile(prior, a).account);
-    else if (a.activeStop) accounts.set(id, { ...prior, activeStop: true });
+    else if (Date.parse(a.observedAt) === Date.parse(prior.observedAt)) {
+      const merged = reconcile(prior, a);
+      // Version 1 has no conflict field. A missing common window makes all included
+      // evidence unknown; keep that empty intersection through later same-time aliases.
+      if (merged.conflicts.some(c => c.includes("reset epoch") && !/^seven_day_/.test(c))) merged.account.windows = [];
+      accounts.set(id, merged.account);
+    } else if (a.activeStop) accounts.set(id, { ...prior, activeStop: true });
   }
   return validateSnapshot({ version: 1, host, generatedAt: new Date(now).toISOString(), accounts: [...accounts.values()].slice(0, 32) });
 }

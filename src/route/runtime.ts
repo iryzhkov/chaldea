@@ -170,9 +170,9 @@ async function collectContext(options: RouteOptions) {
     }
     if (row) {
       const classified = classifyCapacity(row, account?.activeStop || stop, now, capacityConfig);
-      if (quota[p.providerInstanceId]?.incomplete && !["tight", "stopped"].includes(classified.class)) {
-        delete classified.creditFunded;
-        classified.class = "unknown"; classified.reasons.push("conflicting reset epoch; capacity unknown");
+      if (quota[p.providerInstanceId]?.incomplete) {
+        classified.reasons.push("conflicting reset epoch; included capacity unknown");
+        if (!classified.creditFunded && !["tight", "stopped"].includes(classified.class)) classified.class = "unknown";
       }
       capacity[p.providerInstanceId] = classified;
     }

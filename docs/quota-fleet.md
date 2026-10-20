@@ -124,6 +124,14 @@ including aliases on the same host, reconcile matching window IDs and reset
 epochs with the minimum remaining quota. Conflicting epochs leave the window
 unknown. The lexically first host supplies provenance for a tie; local conflict
 diagnostics survive account deduplication without entering the wire schema.
+When equal-time local aliases have a missing or reset-conflicting account-wide
+window, the publisher sends `windows: []` at the original observation time.
+Version 1 has no conflict field, so all included evidence remains unknown at
+remote consumers. Later equal-time aliases cannot restore those windows.
+A scoped-only conflict omits that scoped window and retains common windows;
+Fable scope remains unknown. Real wallet, reset inventory and active-stop facts
+still reconcile normally. A newer unknown observation replaces older generous
+included evidence.
 Every local alias is classified from the reconciled account evidence. Packaging uses
 the oldest observation timestamp among the metrics it includes, so publishing
 cannot rejuvenate an old wallet or window. Local active usage stops still
@@ -148,12 +156,14 @@ Expired, stale or zero credits add no capacity. An active usage stop still
 classifies as stopped. This is routing advice; Chaldea does not purchase,
 redeem or spend credits itself.
 
-Admission despite an exhausted included short window additionally requires
+Admission despite an exhausted included window additionally requires
 fresh same-account local credits and fresh local `spendControlReached: false`.
-A window-only disagreement keeps that proof when reconciled credits and expiry
-agree with the fresh local wallet. The local wallet's original observation time
-is retained. Remote credits cannot supply or refresh local admission proof,
-and an active local stop still blocks the account.
+A window-only disagreement, including a conflicting short or weekly reset epoch,
+keeps that proof when reconciled credits and expiry agree with the fresh local
+wallet. Included uncertainty remains explicit in quota and conflict diagnostics
+without downgrading proven funded capacity. The local wallet's original
+observation time is retained. Remote credits cannot supply or refresh local
+admission proof, and an active local stop still blocks the account.
 
 ## Activation follow-ups
 

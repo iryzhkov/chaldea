@@ -7,6 +7,7 @@ import { capacitySnapshot, mergeSnapshots, snapshotProvider, validateSnapshot, f
 import { newProvider, emptyHeadroom, HeadroomMonitor } from "../../src/quota/headroom.ts";
 import { headroomConfig } from "../../src/quota/codex-balance.ts";
 import { classifyCapacity, classifyCapacities } from "../../src/quota/capacity.ts";
+import { modelWindowPolicy } from "../../src/quota/window-policy.ts";
 import { collectClaudeUsage, CLAUDE_CADENCE_MS } from "../../src/route/claude-usage.ts";
 import { normalize } from "../../src/akasha/schema.ts";
 import { scopeSql } from "../../src/akasha/store.ts";
@@ -47,6 +48,48 @@ test("three hosts, two accounts per provider: newest account wins, stale and fut
   assert.throws(() => validateSnapshot({ ...snapshots[0], credentials: "secret" }));
   const injected = structuredClone(snapshots[0]!); (injected.accounts[0] as any).accessToken = "secret";
   assert.throws(() => validateSnapshot(injected));
+});
+test("publisher keeps common reset uncertainty across every three-alias order without changing version 1", () => {
+  for (const id of ["five_hour", "seven_day", "seven_day_fable"]) for (const missing of [false, true]) {
+    const scoped = id === "seven_day_fable", driver = scoped ? "claudeAgent" : "codex";
+    const a = newProvider("first", driver); a.accountKey = accountKey("publisher-conflict")!;
+    a.included = metric([
+      { id: "five_hour", kind: "session", usedPercent: 10, remainingPercent: 90,
+        windowDurationMins: 300, resetsAt: iso(now + 3600000) },
+      ...["seven_day", "seven_day_fable"].map(id => ({ id, kind: "weekly", usedPercent: 20, remainingPercent: 80,
+        windowDurationMins: 10080, resetsAt: iso(now + 86400000) })),
+    ], now - 60000);
+    a.credits = metric({ balance: "0", hasCredits: false, unlimited: false }, now - 60000);
+    a.manualResets = metric({ availableCount: 2, nextExpiresAt: iso(now + 7 * 86400000) }, now - 60000);
+    a.creditExpiresAt = iso(now + 86400000);
+    const b = { ...structuredClone(a), alias: "second" }, c = { ...structuredClone(a), alias: "third" };
+    b.included = { ...b.included, value: missing ? b.included.value!.filter(w => w.id !== id)
+      : b.included.value!.map(w => w.id === id ? { ...w, resetsAt: iso(Date.parse(w.resetsAt!) + 60000) } : w) };
+    for (const rows of [[a, b, c], [a, c, b], [b, a, c], [b, c, a], [c, a, b], [c, b, a]]) {
+      const s = capacitySnapshot("producer", rows, new Set(), now), account = s.accounts[0]!;
+      assert.equal(s.version, 1);
+      assert.equal(s.accounts.length, 1);
+      assert.equal(account.observedAt, iso(now - 60000));
+      assert.deepEqual(account.credits, a.credits.value);
+      assert.deepEqual(account.resets, a.manualResets.value);
+      assert.equal(account.creditExpiresAt, a.creditExpiresAt);
+      assert.equal(account.activeStop, false);
+      assert.deepEqual(account.windows.map(w => w.id), scoped ? ["five_hour", "seven_day"] : []);
+      const received = mergeSnapshots([JSON.parse(JSON.stringify(s))], now).get(capacityKey(driver, a.accountKey!))!;
+      assert.equal(classifyCapacity(snapshotProvider(received, "receiver"), false, now).class, scoped ? "use-it" : "unknown");
+      if (scoped) {
+        const policy = modelWindowPolicy(received.windows, "claude-fable-5-1", now, .1, .1);
+        assert.equal(policy.scopeKnown, false);
+        assert.equal(policy.pace, null);
+      }
+      const stopped = capacitySnapshot("producer", rows, new Set(["second"]), now).accounts[0]!;
+      assert.deepEqual(stopped, { ...account, activeStop: true });
+      assert.equal(classifyCapacity(snapshotProvider(stopped, "receiver"), stopped.activeStop, now).class, "stopped");
+      const wallet = { balance: "25", hasCredits: true, unlimited: false };
+      const funded = capacitySnapshot("producer", rows.map(p => ({ ...p, credits: metric(wallet, now - 60000) })), new Set(), now).accounts[0]!;
+      assert.deepEqual(funded, { ...account, credits: wallet });
+    }
+  }
 });
 test("status keys capacity by provider/account, deduplicates aliases and preserves stops", () => {
   const old = { ...row("codex", 1, now - 60000), alias: "old" }, fresh = { ...row("codex", 1), alias: "current" };
