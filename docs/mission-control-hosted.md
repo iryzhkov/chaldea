@@ -275,6 +275,35 @@ including after another host poll or an omitted sample. Zero remains distinct
 from unknown. Actual capture-UID readability on production hosts still needs
 the later operator preflight.
 
+The passive shared-subscription display appends an optional 14th account tuple
+field, exactly `{windows, omitted}`. The original 13 scalar fields keep their
+positions and meaning. Each account admits at most eight windows and at most
+32 observed/omitted windows in total. Each window has exactly `id, used,
+resetsAt, duration, observedAt`; only fixed public IDs are admitted:
+five_hour, seven_day, seven_day_fable, primary, secondary, session, weekly,
+monthly. Labels and kinds come from a fixed display vocabulary, never raw
+provider text. Durations are positive minutes capped at 525600; percentages
+are 0..100 or unknown; observation times cannot exceed their enclosing sample.
+Unknown and duplicate IDs count as omissions. Window detail yields to scalar
+quota under the unchanged 8 KiB budget, retaining the omitted count.
+
+This is backward readability by the new consumer, not old-reader acceptance.
+Old strict 13-field readers reject extended rows. Roll out the Akasha ingest
+validator first, then the hosted reader/cache/web consumer, then capture/client
+producers on each enrolled host. Keep producers on the scalar payload until
+all consumers accept the extension. No new grants, identity, publisher, store
+or direct OAuth path is introduced.
+
+The operator confirmed one shared Claude subscription and one shared Codex
+subscription across the enrolled fleet. The UI states this context without
+claiming source identity proof. It selects the newest observation separately
+for every stable window and for credit/reset metrics, names the source and
+age, and leaves host/account readings separate. All three native Claude
+windows, missing windows, differing observations, omissions and source coverage
+are visible in overview and quota without opening details. Legacy scalar
+payloads remain readable with an unknown window name. Percentages are never
+summed, and included capacity never implies total capacity or available credits.
+
 Operations requires optional reader.json `operationsEnabled: true`, absent by
 default for legacy configurations. Install the compatible reader before rendering
 that new key. The existing N service identity keeps its four status source IDs.

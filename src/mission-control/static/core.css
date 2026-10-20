@@ -548,3 +548,42 @@ b, strong, .b { font-weight:600; }
   #view.agents .grid-controls { gap:4px; font-size:12px; }
   #view.agents .grid-controls :is(select,button) { padding:3px; }
 }
+
+/* Shared quota uses the same content-sized cards in overview and quota. */
+#view.quota { grid-template-columns:repeat(2,minmax(0,1fr)); }
+#view.overview { grid-template-areas:"kpi kpi kpi" "threads threads hosts" "quota quota quota" "inbox events events"; }
+#view.overview .p-quota > .body { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+#view.overview .p-quota :is(.quota-coverage,.detail-link) { grid-column:1 / -1; }
+#view.overview .quota-glance { border:0; align-content:start; }
+@media (max-width:1050px) {
+  #view.overview { grid-template-areas:"kpi kpi" "threads hosts" "quota quota" "events inbox"; }
+}
+@media (max-width:850px) {
+  #view.quota { grid-template-columns:minmax(0,1fr); }
+}
+
+.quota-heading { display:flex; flex-wrap:wrap; align-items:baseline; justify-content:space-between; gap:6px 12px; }
+.quota-heading > strong { font-size:var(--t3); }
+.quota-window { display:grid; gap:6px; padding-top:12px; min-width:0; }
+.quota-window .metric.stack { display:flex; flex-wrap:wrap; gap:6px; }
+.quota-window .metric .l { display:none; }
+.quota-window .metric .v { text-align:left; white-space:normal; overflow-wrap:anywhere; }
+.quota-window .metric .meter { width:100%; order:2; }
+.quota-window .source-meta,.quota-capacity,.quota-disagreement,.quota-coverage { white-space:normal; overflow-wrap:anywhere; }
+.quota-capacity,.quota-disagreement,.quota-coverage { border-top:1px solid var(--line); padding-top:10px; margin-top:8px; }
+.quota-disagreement { border-left:2px solid var(--warn); padding-left:10px; }
+.quota-coverage { display:grid; gap:6px; align-content:start; }
+#view.quota > .quota-coverage { grid-column:1 / -1; padding:14px; }
+#view:is(.overview,.quota) .p-quota > header,#view.quota .quota-provider > header { flex-wrap:wrap; height:auto; min-height:44px; gap:6px 12px; }
+#view.overview .quota-glance { padding:14px 0; gap:8px; }
+#view.overview .quota-glance:first-child { padding-top:0; }
+#view.tokens { grid-template-columns:repeat(2,minmax(0,1fr)); grid-template-rows:none; grid-template-areas:"thero models"; grid-auto-rows:max-content; align-content:start; }
+#view.tokens > .panel { min-height:max-content; }
+#view.tokens > .panel > .body { flex:none; overflow:visible; }
+@media (max-width:650px) {
+  #view.tokens { grid-template-columns:minmax(0,1fr); grid-template-areas:"thero" "models"; }
+  .quota-heading { display:grid; justify-content:start; }
+  #view.overview { grid-template-areas:"kpi" "threads" "hosts" "quota" "events" "inbox"; }
+  #view.overview .p-quota > .body { grid-template-columns:minmax(0,1fr); }
+  #view.overview .p-hosts > .body { grid-template-columns:minmax(0,1fr); }
+}

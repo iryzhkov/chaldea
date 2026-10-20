@@ -456,3 +456,28 @@ test("v5 actual completion capture crosses authenticated ingest store restricted
   assert.equal((await h.post(invalid,"v5-active-completion")).status,400);
  }finally{await h.close();}
 });
+
+test("native three-window capture survives authenticated ingest, store, reader and public DTO",async()=>{
+ const {MissionModel}=await import("../../src/mission-control/model.ts");
+ const {captureSnapshot}=await import("../../src/mission-control/contract.ts");
+ const {newProvider,applyT3,emptyHeadroom}=await import("../../src/quota/headroom.ts");
+ const h=await hostedRig(),now=N*1000,ids=["five_hour","seven_day","seven_day_fable"],m=new MissionModel(false,()=>now);
+ try{
+  m.shell({kind:"snapshot",sequence:1,threads:[]});m.shell({kind:"synchronized"});
+  const p=newProvider("PRIVATE-instance","claudeAgent");
+  applyT3(p,{usageLimits:{checkedAt:new Date(now-100000).toISOString(),windows:ids.map((id,i)=>({id,kind:i?"weekly":"session",usedPercent:[8,90,43][i]!,windowDurationMins:i?10080:300,resetsAt:new Date(now+86400000).toISOString()}))}} as any);
+  const head=emptyHeadroom();head.providers=[p];m.setQuota(head);
+  const body={...payload(),data:{...payload().data,snapshot:captureSnapshot(m,"agent-a","a".repeat(32),1)!}};
+  assert.equal((await h.post(body)).status,201);
+  const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>now});
+  assert.deepEqual(cache.snapshots[0]!.quota,body.data.snapshot.quota);
+  const stored=JSON.parse(String(h.x.store.db.prepare("SELECT envelope FROM events").get()!.envelope));
+  assert.deepEqual(stored.data.snapshot.quota,body.data.snapshot.quota);
+  writeCache(h.config.cacheFile,cache);
+  const a=new CacheModel(h.config.cacheFile,()=>now+2000).snapshot().quota.hosts![0]!.accounts[0]!;
+  assert.deepEqual(a.windows?.map(w=>w.id),ids);assert.deepEqual(a.windows?.map(w=>w.used),[8,90,43]);
+  assert.ok(a.windows?.every(w=>w.observedAt===now-100000));assert.equal(a.ageSeconds,102);
+  const bad=structuredClone(body) as any;bad.data.snapshot.quota.accounts[0][13].windows[0].accountKey="PRIVATE";
+  assert.equal((await h.post(bad,"private-window")).status,400);
+ }finally{await h.close();}
+});

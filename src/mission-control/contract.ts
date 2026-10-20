@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { validateRich, isolateDetail, compactDetail, normalizeRich, type RichSnapshot } from "./detail-contract.ts";
 import { utf8, type Detail, type Preview } from "./details.ts";
 import type { MissionModel } from "./model.ts";
+import { MAX_QUOTA_WINDOWS, quotaWindowId, type QuotaWindow } from "./quota-windows.ts";
 export const SNAPSHOT_SCHEMA = "mission-control.host.v1", SNAPSHOT_BYTES = 8192;
 export const HOSTS = ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"] as const;
 export const MODELS = ["gpt-6.1-sol","gpt-6-sol","gpt-6-astra","gpt-6-luna","gpt-5.6-sol","claude-opus-5-5","claude-haiku-4-5","unknown"] as const;
@@ -82,6 +83,8 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     }
     // Quota yields before admitted identities and resources, and before activity upgrades.
     try{snapshot.quota=quotaProjection(v.quota,observedAt,model.quotaTimes());}catch{snapshot.quota={state:"error",observedAt:null,omitted:0,accounts:[]};}
+    // Window detail yields before scalar quota; omissions remain explicit.
+    for(const row of [...snapshot.quota.accounts].reverse())while(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&row[13]?.windows.length){row[13].windows.pop();row[13].omitted++;}
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)snapshot.quota={state:"byte-budget",observedAt:snapshot.quota.observedAt,omitted:snapshot.quota.accounts.length+snapshot.quota.omitted,accounts:[]};
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.quota;
     // Completion evidence yields to resources, identities and quota. Missing entries remain unknown.
@@ -127,9 +130,10 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
 }
 
 // Compact, fixed-order account rows carry no account key, alias or source string.
+// Old 13-field rows remain readable. The optional 14th field needs consumer-first rollout.
 // [provider, included state/time, used, reset, duration, credits/state, reset state,
 // unlimited, manual resets, credits time, manual resets time].
-export type QuotaRow=[string,string,number|null,number|null,number|null,number|null,string|null,string,string,boolean|null,number|null,number|null,number|null];
+export type QuotaRow=[string,string,number|null,number|null,number|null,number|null,string|null,string,string,boolean|null,number|null,number|null,number|null,{windows:QuotaWindow[];omitted:number}?];
 export interface HostQuota {state:"unknown"|"cached"|"error"|"byte-budget";observedAt:number|null;omitted:number;accounts:QuotaRow[]}
 const metricStates=["fresh","stale","lost","unknown","unsupported","error"];
 export function validateHostQuota(raw:unknown,at:number):HostQuota {
@@ -137,23 +141,33 @@ export function validateHostQuota(raw:unknown,at:number):HostQuota {
   check(["unknown","cached","error","byte-budget"].includes(String(q.state))&&count(q.omitted)&&Array.isArray(q.accounts)&&q.accounts.length<=4);
   const stamp=(v:unknown)=>v===null||time(v)&&v<=at;
   check(stamp(q.observedAt));
-  for(const row of q.accounts){check(Array.isArray(row)&&row.length===13);const r=row as QuotaRow;
+  for(const row of q.accounts){check(Array.isArray(row)&&(row.length===13||row.length===14));const r=row as QuotaRow;
     check(["codex","claudeAgent","opencode","Provider"].includes(r[0])&&metricStates.includes(r[1])&&stamp(r[2]));
     check(r[3]===null||typeof r[3]==="number"&&Number.isFinite(r[3])&&r[3]>=0&&r[3]<=100);
     check(r[4]===null||time(r[4]));check(r[5]===null||count(r[5]));
     check(r[6]===null||typeof r[6]==="string"&&/^\d+(?:\.\d+)?$/.test(r[6])&&r[6].length<=24);
     check(metricStates.includes(r[7])&&metricStates.includes(r[8])&&(r[9]===null||typeof r[9]==="boolean")&&(r[10]===null||count(r[10]))&&stamp(r[11])&&stamp(r[12]));
+    if(row.length===14){const ext=object(r[13]);exact(ext,["windows","omitted"]);
+      check(count(ext.omitted)&&ext.omitted<=32&&Array.isArray(ext.windows)&&ext.windows.length<=MAX_QUOTA_WINDOWS&&ext.windows.length+ext.omitted<=32);
+      const ids=new Set<string>();for(const raw of ext.windows){const w=object(raw);exact(w,["id","used","resetsAt","duration","observedAt"]);
+        check(quotaWindowId(w.id)&&!ids.has(w.id));ids.add(w.id);
+        check(w.used===null||typeof w.used==="number"&&Number.isFinite(w.used)&&w.used>=0&&w.used<=100);
+        check((w.resetsAt===null||time(w.resetsAt))&&(w.duration===null||count(w.duration)&&w.duration>0&&w.duration<=525600)&&stamp(w.observedAt)&&w.observedAt===r[2]);
+      }
+    }
   }
   check(q.state!=="byte-budget"||q.accounts.length===0);
   return structuredClone(q) as unknown as HostQuota;
 }
 export function quotaProjection(q:ReturnType<MissionModel["snapshot"]>["quota"],at:number,times:[number|null,number|null][]=[]):HostQuota {
-  const accounts:QuotaRow[]=q.accounts.slice(0,4).map((a,i)=>[a.label.startsWith("codex " )?"codex":a.label.startsWith("claudeAgent ")?"claudeAgent":a.label.startsWith("opencode ")?"opencode":"Provider",a.state,a.observedAt,a.used,a.resetsAt,a.duration,a.credits,a.creditState,a.resetState,a.unlimited,a.manualResets,times[i]?.[0]??null,times[i]?.[1]??null]);
+  const accounts:QuotaRow[]=q.accounts.slice(0,4).map((a,i)=>{const row:QuotaRow=[a.label.startsWith("codex " )?"codex":a.label.startsWith("claudeAgent ")?"claudeAgent":a.label.startsWith("opencode ")?"opencode":"Provider",a.state,a.observedAt,a.used,a.resetsAt,a.duration,a.credits,a.creditState,a.resetState,a.unlimited,a.manualResets,times[i]?.[0]??null,times[i]?.[1]??null];
+    if(a.windows!==undefined)row[13]={windows:a.windows,omitted:a.windowsOmitted??0};return row;
+  });
   return validateHostQuota({state:q.state,observedAt:accounts.some(a=>a[2]!==null||a[11]!==null||a[12]!==null)?Math.max(...accounts.flatMap(a=>[a[2]??0,a[11]??0,a[12]??0])):null,omitted:Math.max(0,q.accounts.length-4),accounts},at);
 }
 export function quotaAccounts(q:HostQuota,now:number):ReturnType<MissionModel["snapshot"]>["quota"]["accounts"] {
   const state=(s:string,t:number|null)=>t!==null&&now-t>5400_000?"lost":t!==null&&now-t>1800_000?"stale":s;
-  return q.accounts.map((r,i)=>({label:r[0]+" account "+(i+1),state:state(r[1],r[2]),observedAt:r[2],ageSeconds:r[2]===null?null:Math.max(0,(now-r[2])/1000),used:r[3],resetsAt:r[4],duration:r[5],credits:r[6],creditState:state(r[7],r[11]),resetState:state(r[8],r[12]),unlimited:r[9],manualResets:r[10]}));
+  return q.accounts.map((r,i)=>({label:r[0]+" account "+(i+1),state:state(r[1],r[2]),observedAt:r[2],ageSeconds:r[2]===null?null:Math.max(0,(now-r[2])/1000),used:r[3],resetsAt:r[4],duration:r[5],credits:r[6],creditState:state(r[7],r[11]),resetState:state(r[8],r[12]),unlimited:r[9],manualResets:r[10],creditObservedAt:r[11],resetObservedAt:r[12],...(r[13]?{windows:structuredClone(r[13].windows),windowsOmitted:r[13].omitted}:{})}));
 }
 
 
