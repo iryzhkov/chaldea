@@ -1,4 +1,5 @@
 import test from "node:test";
+import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { mkdtempSync,mkdirSync,writeFileSync,readFileSync,statSync,rmSync } from "node:fs";
 import { join } from "node:path";
@@ -587,4 +588,114 @@ test("compact telemetry capacity matrix preserves base, identities and freshness
    assert.deepEqual(d.recent?.map(r=>r.at),d.recent?.map(r=>r.at).toSorted((a,b)=>Number(b)-Number(a)));
   }
  }
+});
+
+test("completion evidence crosses v5 rich transport and hosted reload without renewing its lifetime",async()=>{
+ const {projectClientSnapshot}=await import("../../src/mission-control/static/client.js" as string);
+ const d=scratch();let now=now0+59_999;
+ const completed={...row("completed"),status:"completed",activeRunId:null,latestRunStartedAt:new Date(now0-1000).toISOString(),latestRunCompletedAt:new Date(now0).toISOString()};
+ const m=live(()=>now,[completed]),first=captureSnapshot(m,"agent-a",epoch,1)!;
+ assert.equal(m.snapshot().agents[0]!.completedAt,now0);
+ assert.equal(first.rich!.v,5);assert.deepEqual(first.rich!.completionTimes,[[first.agents[0]!.id,now0]]);
+ assert.equal(validateHostSnapshot(sample()).rich,undefined,"legacy base-only producers remain readable");
+ assert.throws(()=>validateHostSnapshot({...first,rich:{...first.rich,v:4}}),"older rich version cannot silently carry new fields");
+ for(const time of [now0+60_000,0,-1,1.5]){
+  assert.throws(()=>validateHostSnapshot({...first,rich:{...first.rich,completionTimes:[[first.agents[0]!.id,time]]}}));
+ }
+ assert.throws(()=>validateHostSnapshot({...first,agents:[{...first.agents[0]!,state:"working"}]}));
+ try{
+  const path=join(d.path,"completion-cache"),cache=emptyCache();mergeStatus(cache,first,now);writeCache(path,cache);
+  const hosted=new CacheModel(path,()=>now),v=hosted.snapshot();
+  assert.equal(v.agents[0]!.completedAt,now0);
+  assert.equal(projectClientSnapshot(v,now,true).threadAgents.length,1);
+  now=now0+60_000;
+  assert.equal(projectClientSnapshot(v,now,false).threadAgents.length,0);
+  m.shell({kind:"snapshot",sequence:2,threads:[completed]});m.shell({kind:"synchronized"});
+  const refreshed=captureSnapshot(m,"agent-a",epoch,2)!;
+  assert.deepEqual(refreshed.rich!.completionTimes,first.rich!.completionTimes);
+  mergeStatus(cache,refreshed,now);writeCache(path,cache);hosted.reload();
+  assert.equal(projectClientSnapshot(hosted.snapshot(),now,true).threadAgents.length,0);
+  assert.equal(hosted.snapshot().agents.length,1);assert.equal(hosted.snapshot().hostSummary[0]!.shown,1);
+  m.shell({kind:"thread",sequence:3,thread:{...completed,status:"running",activeRunId:"new-run"}});
+  const running=captureSnapshot(m,"agent-a",epoch,3)!;mergeStatus(cache,running,now);writeCache(path,cache);hosted.reload();
+  assert.equal(hosted.snapshot().agents[0]!.completedAt,null);
+  assert.equal(projectClientSnapshot(hosted.snapshot(),now,true).threadAgents.length,1);
+ }finally{d.close();}
+ for(const latestRunCompletedAt of [null,"invalid",new Date(now+1).toISOString(),new Date(now0-2000).toISOString()]){
+  const unknown=live(()=>now,[{...completed,latestRunCompletedAt}]).snapshot();
+  assert.equal(unknown.agents[0]!.completedAt,null);assert.equal(projectClientSnapshot(unknown,now,true).threadAgents.length,1);
+ }
+});
+test("active admission and resumption survive pressured capture with aligned opaque identities",()=>{
+ const rows=Array.from({length:48},(_,i)=>({...row("done-"+i),status:"completed",activeRunId:null,latestRunStartedAt:new Date(now0-1000-i).toISOString(),latestRunCompletedAt:new Date(now0).toISOString()}));
+ const full=live(()=>now0,rows),active={...row("active"),latestRunStartedAt:new Date(now0).toISOString()};
+ full.shell({kind:"thread",sequence:2,thread:active});
+ const resumed=rows.find(r=>r.id===full.ids().at(-2))!;
+ full.shell({kind:"thread",sequence:3,thread:{...resumed,status:"running",activeRunId:"resumed"}});
+ for(let i=0;i<10;i++)full.shell({kind:"thread",sequence:4+i,thread:{...active,id:"new-active-"+i}});
+ const activeIds=full.ids().slice(0,12);
+ assert.equal(full.snapshot().total,null);assert.equal(full.ids().length,48);
+ assert.ok(activeIds.includes(active.id));assert.ok(activeIds.includes(resumed.id));
+ // Exercise the byte cap with the maximum bounded tool history on every row.
+ for(const id of full.ids())for(const tool of ["read","search","navigate","edit_apply","change_plan","verify_run"])full.detail(id,{kind:"activity",tool});
+ const view=full.snapshot(),captured=captureSnapshot(full,"agent-a",epoch,1)!;
+ assert.ok(captured.agents.length<48);assert.equal(captured.truncated,true);
+ assert.ok(Buffer.byteLength(JSON.stringify(captured))<=8192);
+ for(const [i,a] of captured.agents.entries()){
+  assert.equal(a.id,createHash("sha256").update(epoch+"\0"+full.ids()[i]).digest("hex").slice(0,16));
+  assert.equal(a.state,view.agents[i]!.state);assert.equal(a.startedAt,view.agents[i]!.startedAt);
+ }
+ for(const id of activeIds){
+  const opaque=createHash("sha256").update(epoch+"\0"+id).digest("hex").slice(0,16);
+  assert.equal(captured.agents.find(a=>a.id===opaque)?.state,"working");
+ }
+});
+test("optional completion evidence preserves base coverage and remains bounded through cache trimming",async()=>{
+ const {projectClientSnapshot}=await import("../../src/mission-control/static/client.js" as string);
+ for(const count of [44,48]){
+  const rows=Array.from({length:count},(_,i)=>({...row("done-"+i),status:"completed",activeRunId:null,latestRunCompletedAt:new Date(now0).toISOString()}));
+  const without=captureSnapshot(live(()=>now0,rows.map(r=>({...r,latestRunCompletedAt:null}))),"agent-a",epoch,1)!;
+  const withTimes=captureSnapshot(live(()=>now0,rows),"agent-a",epoch,1)!;
+  assert.deepEqual(withTimes.agents,without.agents);assert.equal(withTimes.total,without.total);assert.equal(withTimes.truncated,without.truncated);
+  assert.ok(Buffer.byteLength(JSON.stringify(withTimes))<=8192);
+  const times=withTimes.rich?.completionTimes??[];
+  assert.ok(times.length<withTimes.agents.length,"completion metadata yields before base rows");
+  const d=scratch();try{
+   const local=emptyCache();mergeStatus(local,withTimes,now0);const path=join(d.path,"partial-completion-cache");writeCache(path,local);
+   const hosted=new CacheModel(path,()=>now0+60_000).snapshot(),unknown=hosted.agents.filter(a=>a.completedAt===null);
+   assert.equal(unknown.length,withTimes.agents.length-times.length);
+   assert.equal(projectClientSnapshot(hosted,now0+60_000,true).threadAgents.length,unknown.length);
+  }finally{d.close();}
+  const cache=emptyCache();
+  for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"])mergeStatus(cache,{...withTimes,host},now0);
+  for(const snapshot of cache.snapshots){
+   validateHostSnapshot(snapshot);
+   for(const [id,time] of snapshot.rich?.completionTimes??[]){
+    assert.equal(snapshot.agents.find(a=>a.id===id)?.state,"completed");assert.equal(time,now0);
+   }
+  }
+ }
+});
+
+test("completion evidence yields to resource and identity coverage under byte pressure",()=>{
+ const identities=(s:ReturnType<typeof captureSnapshot>)=>s!.rich?normalizeRich(s!.rich,new Set(s!.agents.map(a=>a.id)),s!.observedAt).details.map(d=>[d.id,d.value.identity]):[];
+ for(let count=12;count<=44;count++){
+  const rows=Array.from({length:count},(_,i)=>({...row("budget-"+i),title:"Resource priority task "+i,status:"completed",activeRunId:null}));
+  const models=[null,new Date(now0).toISOString()].map(latestRunCompletedAt=>live(()=>now0,rows.map(r=>({...r,latestRunCompletedAt}))));
+  for(const m of models)m.setResources({state:"reported",sample:{sampledAt:now0,cpuUtilization:0.25,cpuCount:12,availableMemoryBytes:400,totalMemoryBytes:1000}});
+  const [without,withTimes]=models.map(m=>captureSnapshot(m,"agent-a",epoch,1)!);
+  assert.deepEqual(withTimes!.agents,without!.agents,"completion metadata cannot remove base rows");
+  assert.deepEqual(withTimes!.rich?.resources,without!.rich?.resources,"completion metadata cannot displace resources");
+  assert.deepEqual(identities(withTimes!),identities(without!),"completion metadata cannot displace useful identities");
+  assert.ok(Buffer.byteLength(JSON.stringify(withTimes))<=8192);
+ }
+});
+
+test("a completion timestamp beyond its source receipt remains unknown as the local clock advances",()=>{
+ let now=now0;
+ const m=live(()=>now,[{...row(),status:"completed",activeRunId:null,latestRunCompletedAt:new Date(now0+1).toISOString()}]);
+ assert.equal(m.snapshot().agents[0]!.completedAt,null);
+ now+=120_000;
+ assert.equal(m.snapshot().agents[0]!.completedAt,null);
+ assert.doesNotThrow(()=>captureSnapshot(m,"agent-a",epoch,1));
 });

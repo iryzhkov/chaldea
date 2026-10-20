@@ -11,6 +11,20 @@ import type { ShellThread } from "../../src/t3/adapter.ts";
 import { emptyHeadroom, newProvider } from "../../src/quota/headroom.ts";
 const row=(id="private-thread-id"):ShellThread=>({id,title:"Implement canary",status:"running",providerInstanceId:"private-account",modelSelection:{instanceId:"private-account",model:"gpt-6.1-sol"},latestRunId:"private-run",activeRunId:"private-run",latestRunStartedAt:"2026-10-18T00:00:00Z",latestRunCompletedAt:null,lastErrorClass:null,usageLimitResetAt:null,limitRecovery:null,relationshipToParent:null,archived:false,deleted:false});
 const initialized=(now:()=>number=Date.now)=>{const m=new MissionModel(false,now);m.shell({kind:"snapshot",sequence:1,threads:[row()]});m.shell({kind:"synchronized"});m.detail("private-thread-id",{kind:"synchronized"});return m;};
+test("local card identity stays with its thread across active ordering and snapshot churn",()=>{
+ const now=Date.parse("2026-10-18T00:01:00Z"),m=new MissionModel(false,()=>now);
+ const rows=[row("first-task"),row("second-task"),row("third-task")];
+ m.shell({kind:"snapshot",sequence:1,threads:rows});m.shell({kind:"synchronized"});
+ const ids=new Map(m.ids().map((id,i)=>[id,m.snapshot().agents[i]!.id])),selected=ids.get("second-task")!;
+ const retained=()=>{const view=m.snapshot();for(const [i,id] of m.ids().entries())assert.equal(view.agents[i]!.id,ids.get(id));assert.equal(view.agents.find(a=>a.id===selected)!.details.identity.appThreadId.text,"second-task");};
+ m.shell({kind:"thread",sequence:2,thread:{...rows[0]!,status:"completed",activeRunId:null,latestRunCompletedAt:new Date(now).toISOString()}});retained();
+ assert.notEqual(m.ids()[0],"first-task");
+ m.shell({kind:"thread",sequence:3,thread:{...rows[0]!,status:"running",activeRunId:"resumed"}});retained();
+ m.shell({kind:"snapshot",sequence:4,threads:rows.toReversed()});m.shell({kind:"synchronized"});retained();
+ m.shell({kind:"removed",sequence:5,threadId:"second-task"});assert.equal(m.snapshot().agents.some(a=>a.id===selected),false);
+ m.shell({kind:"thread",sequence:6,thread:rows[1]!});assert.notEqual(m.snapshot().agents.find(a=>a.details.identity.appThreadId.text==="second-task")!.id,selected);
+ assert.equal(new Set(m.snapshot().agents.map(a=>a.id)).size,3);
+});
 test("detail retention follows admitted rows during churn and immediate snapshot replacement",()=>{
  const m=initialized(),retained=()=> (m as unknown as {detailStates:Map<string,unknown>}).detailStates.size;
  let seq=2;

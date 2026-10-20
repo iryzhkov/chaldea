@@ -1,16 +1,22 @@
+// A missing, invalid or future completion time cannot establish an expiry.
+function completionTime(a, now) {
+  return a.state==="completed" && Number.isSafeInteger(a.completedAt) && a.completedAt>0 && a.completedAt<=now ? a.completedAt : null;
+}
 // Age the retained source snapshot even when the browser transport is quiet or lost.
 export function projectClientSnapshot(snapshot, now, connected) {
   if (!snapshot) return null;
   const lost = !connected || !Number.isFinite(snapshot.now) || now - snapshot.now > 30_000;
+  const agents=snapshot.agents.map(a => ({ ...a,
+      detailObservedAt: !snapshot.sampled && a.activityFreshness === "live" ? snapshot.now : a.detailObservedAt,
+      activityFreshness: lost && a.activityFreshness === "live" ? "disconnected" : a.activityFreshness,
+    }));
   return { ...snapshot,
+    threadAgents: agents.filter(a => completionTime(a,now)===null || now-completionTime(a,now)<60_000),
     source: { ...snapshot.source, observedAt: !snapshot.sampled && snapshot.source.state === "live" ? snapshot.now : snapshot.source.observedAt,
       state: lost && snapshot.source.state === "live" ? "disconnected" : snapshot.source.state },
     ...(snapshot.hostSummary ? { hostSummary: snapshot.hostSummary.map(h => ({ ...h,
       freshness: lost && h.freshness === "live" ? "disconnected" : h.freshness })) } : {}),
-    agents: snapshot.agents.map(a => ({ ...a,
-      detailObservedAt: !snapshot.sampled && a.activityFreshness === "live" ? snapshot.now : a.detailObservedAt,
-      activityFreshness: lost && a.activityFreshness === "live" ? "disconnected" : a.activityFreshness,
-    })),
+    agents,
   };
 }
 // Browser receives only the allowlisted MissionModel snapshot. No credentials or T3 access.
@@ -24,31 +30,50 @@ script.onload = () => {
   document.getElementById("view").setAttribute("aria-label","Mission Control page");
   const esc = v => String(v ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const missing = text => '<div class="muted">' + esc(text) + '</div>';
-  let snapshot = null, receivedSnapshot = null, transportConnected = false, mode = window.MC.modeFromURL();
+  let snapshot = null, receivedSnapshot = null, transportConnected = false, expiryTimer = null, mode = window.MC.modeFromURL();
   const age = at => at == null ? null : Math.max(0,Math.floor((Date.now()-at)/1000));
   const sourcePanel = (area,title,body,kind="t3shell") => panel(area,title,body,kind,age(snapshot?.source.observedAt),snapshot?.source.state === "live" ? "live" : snapshot?.source.state === "nosource" ? "nosource" : age(snapshot?.source.observedAt)>(snapshot?.sampled?600:300) ? "lost" : "stale");
   const unavailable = (area,title) => panel(area,title,missing("Unavailable · no authorized source"),"host",null,"nosource");
-  const accountBody = a => {
-    const used = a.used == null ? missing(a.state === "unsupported" ? "Quota not applicable" : "Usage unknown") : gauge(a.used,"pri",undefined,a.used + "%","used · " + (a.duration == null ? "window duration unknown" : a.duration + " min window"));
-    const reset = a.resetsAt == null ? "Reset unknown" : "Reset in " + Math.max(0,Math.ceil((a.resetsAt-Date.now())/60000)) + " min";
-    return '<div class="acard">' + used + '<div class="facts"><div>' + esc(a.state) + '</div><div>' + esc(reset) + '</div><div>' + (a.unlimited === true ? "Credit balance unlimited" : a.credits == null ? "Credit balance unknown" : "Credits " + esc(a.credits) + " remaining") + '</div><div>' + (a.manualResets == null ? "Manual resets unknown" : a.manualResets + " manual resets available") + '</div><div class="t1 muted">Credits ' + esc(a.creditState) + ' · resets ' + esc(a.resetState) + '</div><div class="t1 muted">Cached quota · observed ' + (age(a.observedAt) ?? "unknown") + 's ago</div></div><div class="more">Window history unavailable</div></div>';
-  };
   const agoText = at => age(at) == null ? "unknown" : age(at)<60 ? age(at)+"s ago" : age(at)<3600 ? Math.floor(age(at)/60)+"m ago" : Math.floor(age(at)/3600)+"h ago";
   const timestamp = at => Number.isFinite(at) ? '<time datetime="'+new Date(at).toISOString()+'">'+esc(new Date(at).toISOString().replace("T"," ").slice(0,19)+" UTC")+'</time>' : "unknown";
   const quotaHosts = () => snapshot?.quota?.hosts;
   const quotaFresh = (state,at) => state==="error" ? "error" : at==null ? "nosource" : age(at)>5400 ? "lost" : age(at)>1800 ? "stale" : "cached";
   const quotaRows = h => h.accounts.slice(0,4).map(a=>{
     const used=Number.isFinite(a.used)?a.used:null;
-    return '<div class="quota-account"><strong>'+esc(a.label)+'</strong><span class="source-meta">'+esc(a.state)+' · observed '+esc(agoText(a.observedAt))+'</span>'
+    return '<div class="quota-account" data-fresh="'+esc(quotaFresh(a.state,a.observedAt))+'"><strong>'+esc(a.label)+'</strong><span class="source-meta">'+esc(a.state)+' · usage observed '+esc(agoText(a.observedAt))+'</span>'
       +(used==null?missing(a.state==="unsupported"?"Quota not applicable":"Usage unknown"):resourceMeter(a.label+" used",used,used+"% used · "+Number((100-used).toFixed(2))+"% headroom"))
       +'<div class="source-meta">'+(a.duration==null?"":esc(a.duration)+" min window · ")+(a.resetsAt==null?"Reset unknown":"Reset "+timestamp(a.resetsAt))+'</div>'
-      +((a.unlimited===true||a.credits!=null||a.manualResets!=null)?'<div class="source-meta">'+[a.unlimited===true?"Credits unlimited":a.credits!=null?"Credits remaining "+esc(a.credits):"",a.manualResets!=null?esc(a.manualResets)+" manual resets available":""].filter(Boolean).join(" · ")+'</div>':"")+'</div>';
+      +((a.unlimited===true||a.credits!=null||a.manualResets!=null)?'<div class="source-meta">'+[a.unlimited===true?"Credits unlimited":a.credits!=null?"Credits remaining "+esc(a.credits):"",a.manualResets!=null?esc(a.manualResets)+" manual resets available":""].filter(Boolean).join(" · ")+' · credit/manual reset times not shown</div>':"")+'</div>';
   }).join("") || missing(h.state==="byte-budget"?"Quota withheld · host byte budget":h.state==="error"?"Quota source error · no quota data":"No quota data observed");
-  const quotaHostCard = (h,area="acct") => panel(area,"Observed by "+h.host,
-    '<div class="source-meta">'+esc(h.state)+' · quota source '+esc(agoText(h.observedAt))+'</div>'+quotaRows(h)+(h.omitted?'<div class="more">'+esc(h.omitted)+' account rows omitted by source</div>':""),
-    "quota",age(h.observedAt),quotaFresh(h.state,h.observedAt),"quota-host");
-  const quotas = (area="acct") => Array.isArray(quotaHosts()) ? '<div class="host-coverage">Per-host quota observations · the same account may appear on multiple hosts</div>'+(quotaHosts().map(h=>quotaHostCard(h,area)).join("")||missing("No host quota observations"))
-    : snapshot?.quota.accounts.length ? budget(snapshot.quota.accounts,6,a=>panel(area,a.label,accountBody(a),"quota",age(a.observedAt),["unknown","error"].includes(a.state) ? "nosource" : a.state === "unsupported" ? "unsupported" : ["stale","lost"].includes(a.state) ? a.state : undefined),"accounts") : unavailable(area,"Quota · " + (snapshot?.quota.state || "unknown"));
+  // Group presentation by provider, never by an inferred shared account identity.
+  const quotaGroups = () => {
+    const groups=new Map([["codex",{name:"OpenAI Codex",rows:[]}],["claudeAgent",{name:"Claude",rows:[]}]]);
+    const hosted=Array.isArray(quotaHosts());
+    const sources=hosted?quotaHosts().slice(0,16):[{host:"Local",accounts:snapshot?.quota.accounts||[]}];
+    for(const source of sources)for(const [index,account] of source.accounts.slice(0,hosted?4:32).entries()){
+      const provider=/^codex account /i.test(account.label)?"codex":/^claudeAgent account /i.test(account.label)?"claudeAgent":/^opencode account /i.test(account.label)?"opencode":"unknown";
+      if(!groups.has(provider))groups.set(provider,{name:provider==="opencode"?"OpenCode":"Provider unknown",rows:[]});
+      groups.get(provider).rows.push({host:source.host,index,account});
+    }
+    const at=a=>Number.isSafeInteger(a.observedAt)&&a.observedAt>0&&a.observedAt<=Date.now()?a.observedAt:-1;
+    return [...groups.values()].map(g=>({...g,rows:g.rows.sort((a,b)=>Number(Number.isFinite(b.account.used))-Number(Number.isFinite(a.account.used))||at(b.account)-at(a.account)||a.host.localeCompare(b.host)||a.index-b.index)}));
+  };
+  const quotaReading = g => {
+    const r=g.rows[0],a=r?.account;
+    return a?'<strong>'+esc(g.name)+'</strong><div class="source-meta">Newest usage observation · '+esc(r.host)+' · '+esc(agoText(a.observedAt))+'</div>'
+      +(Number.isFinite(a.used)?resourceMeter(g.name+" used",a.used,a.used+"% used · "+Number((100-a.used).toFixed(2))+"% headroom"):missing("Usage unknown"))
+      +'<div class="source-meta">'+esc(a.state)+(a.duration==null?"":" · "+esc(a.duration)+" min window")+(a.resetsAt==null?" · reset unknown":" · reset "+timestamp(a.resetsAt))+'</div>'
+      :'<strong>'+esc(g.name)+'</strong>'+missing("Usage unknown · no provider observation");
+  };
+  const quotaDetails = g => '<details><summary>'+g.rows.length+' separate readings · account identity unverified</summary>'
+    +g.rows.map(r=>'<div class="source-meta">Observed by '+esc(r.host)+' · '+esc(r.account.label)+'</div>'+quotaRows({accounts:[r.account]})).join("")
+    +missing("Readings may refer to different accounts or windows. Values are not combined.")+'</details>';
+  const quotaSourceCoverage = () => Array.isArray(quotaHosts())?'<details><summary>Source coverage</summary>'+quotaHosts().map(h=>'<div class="source-meta">'+esc(h.host)+' · '+esc(h.state)+(h.omitted?' · '+esc(h.omitted)+' account rows omitted by source':"")+'</div>'
+    +(!h.accounts.length?missing(h.state==="byte-budget"?"Quota withheld · host byte budget":h.state==="error"?"Quota source error · no quota data":"No quota data observed"):"")).join("")+'</details>':snapshot?.quota?.state==="error"?missing("Quota source error · no quota data observed"):"";
+  const quotas = (area="acct") => quotaGroups().map(g=>{
+    const a=g.rows[0]?.account;
+    return panel(area,g.name,quotaReading(g)+quotaDetails(g),"quota",age(a?.observedAt),quotaFresh(a?.state,a?.observedAt),"quota-provider");
+  }).join("")+quotaSourceCoverage();
   const eventRows = () => (snapshot?.events?.rows||[]).filter(r=>["chaldea-fleet-pull","chaldea-retention"].includes(r.job)&&["changed","failed"].includes(r.status)).slice().sort((a,b)=>b.occurredAt-a.occurredAt);
   const eventBody = (limit=64) => {
     const rows=eventRows();
@@ -60,23 +85,19 @@ script.onload = () => {
   };
   const eventFresh = () => snapshot?.events?.state==="error"?"error":snapshot?.events?.checkedAt==null?"nosource":age(snapshot.events.checkedAt)>900?"stale":"cached";
   R.overview = () => {
-    const s=snapshot,agents=window.MC.orderThreads(s?.agents||[]),hosts=hostList(),observed=hosts.filter(h=>h.observedAt!=null).length;
+    const s=snapshot,agents=window.MC.orderThreads(s?.threadAgents||[]),hosts=hostList(),observed=hosts.filter(h=>h.observedAt!=null).length;
     const stats=[[s?agents.filter(a=>["working","thinking"].includes(a.state)).length:"—","working"],[s?agents.filter(a=>a.state.startsWith("waiting")).length:"—","waiting"],[hosts.length?observed+" / "+hosts.length:"—","hosts observed"]];
     if(s?.tokens.rate!=null)stats.push([s.tokens.rate.toFixed(1),s.tokens.coverage==="partial"?"rate lower bound":"output tok/s"]);
     const kpi='<div class="stats hero-row">'+stats.map(x=>heroStat(...x)).join("")+'</div><div class="source-meta">Needs Igor, incidents, exec slots, queued jobs, shipped and daily totals: not connected</div>';
     const rowLimit=innerWidth<=650?2:4;
     const rows=agents.slice(0,rowLimit).map(a=>'<div class="item overview-thread"><div class="l1"><span class="t two">'+esc(a.title)+'</span>'+UI.providerMark(a)+'</div><div class="activity-preview">'+esc(activityItems(a)[0]?.text||"Previews unavailable")+'</div><div class="source-meta">'+st(a.state,a.state)+' · '+esc(a.model)+' · '+esc(a.host)+'</div></div>').join("");
-    const q=Array.isArray(quotaHosts())?(quotaHosts().map(h=>{
-      const accounts=h.accounts||[], known=accounts.filter(a=>Number.isFinite(a.used)), values=known.map(a=>a.used);
-      const usage=known.length?' · '+Math.min(...values)+'–'+Math.max(...values)+'% used across '+known.length+' known windows':' · usage unknown';
-      return '<div class="quota-glance"><strong>'+esc(h.host)+'</strong><div class="source-meta">'+esc(h.state)+' · '+accounts.length+' account observations'+esc(usage)+'</div><div class="source-meta">Source '+esc(agoText(h.observedAt))+(h.omitted?' · '+esc(h.omitted)+' omitted by source':'')+'</div></div>';
-    }).join("")||missing("No host quota observations")):s?.quota.accounts.length?budget(s.quota.accounts,2,a=>'<div class="item">'+esc(a.label)+' · '+esc(a.state)+' · '+(a.used==null?"usage unknown":a.used+"% used")+'</div>',"accounts"):missing("No cached quota");
+    const q=quotaGroups().map(g=>'<div class="quota-glance">'+quotaReading(g)+quotaDetails(g)+'</div>').join("")+quotaSourceCoverage();
 
     return sourcePanel("kpi",(s?.sampled?"Enrolled sources · sampled":"Local observations")+" · "+(s?.source.state||"connecting"),kpi)
       +unavailable("inbox","Decision inbox")
-      +sourcePanel("threads","Threads · "+threadCoverage(Math.min(rowLimit,agents.length)),(rows||missing("No observed threads"))+'<a class="detail-link" href="?mode=agents">All threads · active first, including completed</a>')
+      +sourcePanel("threads","Threads · "+threadCoverage(Math.min(rowLimit,agents.length),agents.length),(rows||missing("No observed threads"))+'<a class="detail-link" href="?mode=agents">All threads · active first, completed for 60s</a>')
       +panel("hosts","Hosts · CPU / RAM",hosts.map(h=>compactHost(h)).join("")||missing("No host observations"),"host",null,"cached","overview-resources")
-      +panel("quota","Quota by observing host",q+'<div class="source-meta">Same account may repeat across hosts</div><a class="detail-link" href="?mode=quota">All quota observations / details</a>',"quota",null,"cached")
+      +panel("quota","Quota by provider",q+'<a class="detail-link" href="?mode=quota">All quota observations / details</a>',"quota",null,"cached")
       +panel("events","Latest maintenance changes / failures",eventCoverage()+eventBody(2),"akasha",age(s?.events?.checkedAt),eventFresh());
   };
   R.tokens = () => {
@@ -172,12 +193,13 @@ script.onload = () => {
     return '<div class="agent-detail">'+identityBody+'<div class="facts"><div>Effort '+esc(effort)+'</div><div>Assistant: '+esc(previewText(p)??p.state)+' · '+esc(p.state)+'</div><div>'+esc(commandLabel(a))+': '+(commands.length?commands.map(p=>esc(previewText(p)??p.state)+" ("+esc(p.state)+")").join(" · "):"not reported / no active observation")+(d.commandsOmitted?" · "+d.commandsOmitted+" omitted":"")+'</div><div>'+esc(usage(d.usage))+'</div><div>Context '+(d.context?d.context.used+" / "+(d.context.max??"?"):"not reported")+'</div><div>Children '+(c?c.active+" active / "+c.queued+" queued / "+c.completed+" completed observed":"not reported")+' · delegates '+esc(countWork(w.delegates))+' · native subagents '+esc(countWork(w.subagents))+' · monitors '+(w.monitors??"not reported")+' · background '+(w.background??"not reported")+' · durable waits unavailable · '+esc(w.coverage)+'</div></div></div>';
   };
   // Counts describe the received observation set, never an inferred fleet total.
-  const threadCoverage = (visible=snapshot?.agents.length??0) => {
-    const received=snapshot?.agents.length??0;
+  const threadCoverage = (visible=snapshot?.agents.length??0,received=snapshot?.agents.length??0) => {
     return "showing "+visible+" of "+received+" observed threads"+(snapshot?.truncated?" · capture truncated; upstream reports "+(snapshot.total??"unknown")+"; fleet total unknown":"") ;
   };
   const coverage = () => threadCoverage()+" · 48-row bound";
-  UI.threadCoverage=(visible,received,start)=>threadCoverage(visible)+(received>visible?" · rows "+(start+1)+"–"+(start+visible)+" of received set":"");
+  UI.threadCoverage=(visible,received,start)=>threadCoverage(visible,received)+(received>visible?" · rows "+(start+1)+"–"+(start+visible)+" of filtered set":"")
+    +(snapshot?.agents.length>received?" · "+(snapshot.agents.length-received)+" completed hidden; "+snapshot.agents.length+" source rows retained":"")
+    +((snapshot?.threadAgents||[]).some(a=>a.state==="completed"&&completionTime(a,Date.now())===null)?" · completion time unknown; retained":"");
   const commandIsCurrent = a => ["working","thinking"].includes(a.state) && a.activityFreshness==="live" && age(a.detailObservedAt)!=null && age(a.detailObservedAt)<=60;
   const commandLabel = a => commandIsCurrent(a)?"Active command observed":"Last observed command · outcome unknown";
   const activityItems = a => {
@@ -253,13 +275,17 @@ script.onload = () => {
   });
   document.addEventListener("mc:mode",e=>{mode=e.detail;});
   function render() {
-    snapshot = projectClientSnapshot(receivedSnapshot, Date.now(), transportConnected);
+    const now=Date.now();
+    snapshot = projectClientSnapshot(receivedSnapshot, now, transportConnected);
+    if(expiryTimer!==null)clearTimeout(expiryTimer);
+    const deadlines=(snapshot?.threadAgents||[]).map(a=>completionTime(a,now)).filter(at=>at!==null).map(at=>at+60_000);
+    expiryTimer=deadlines.length?setTimeout(render,Math.max(1,Math.min(...deadlines)-now)):null;
     const sourceLabel = snapshot?.sampled ? "Akasha status snapshots" : snapshot ? "Local T3 snapshots" : "No observed source";
     window.MC.SOURCES.t3shell.label = sourceLabel;
     window.MC.SOURCES.t3thread.label = sourceLabel;
     if(snapshot) {
       DATA.demo=snapshot.demo; DATA.agentSourceAge=age(snapshot.source.observedAt);
-      DATA.threads=snapshot.agents.map(a=>({ ...a, activityObservedAt:receivedSnapshot.agents.find(raw=>raw.id===a.id)?.detailObservedAt, state:a.state, sourceFreshness:snapshot.source.state!=="live"?snapshot.source.state:hostFreshness(snapshot.hostSummary?.find(h=>h.host===a.host)||a), observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort?.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
+      DATA.threads=snapshot.threadAgents.map(a=>({ ...a, activityObservedAt:receivedSnapshot.agents.find(raw=>raw.id===a.id)?.detailObservedAt, state:a.state, sourceFreshness:snapshot.source.state!=="live"?snapshot.source.state:hostFreshness(snapshot.hostSummary?.find(h=>h.host===a.host)||a), observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort?.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
       DATA.agentPool=DATA.threads; DATA.sources=[];
     }
     window.MC.show(window.MC.MODES.includes(mode)?mode:"overview");

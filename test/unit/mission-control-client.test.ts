@@ -52,3 +52,18 @@ test("upstream detail disconnect and its timestamp survive browser reconnection"
   assert.equal(projectClientSnapshot(raw,1_001_000,true).agents[0].activityFreshness,"stale");
   assert.equal(projectClientSnapshot(raw,1_001_000,true).agents[0].detailObservedAt,900_000);
 });
+
+test("completion filtering retains failed, cancelled and unknown times without changing token or host coverage",()=>{
+ const at=1_000_000;
+ const states=["completed","working","waiting-children","queued","failed","cancelled","idle"];
+ const raw={...sample(),agents:states.map((state,i)=>({id:String(i),state,completedAt:at})),tokens:{output:99},hostSummary:[{shown:7,total:7,freshness:"live"}]};
+ for(const elapsed of [59_999,60_000,120_000]){
+  const v=projectClientSnapshot(raw,at+elapsed,true);
+  assert.equal(v.threadAgents.length,elapsed<60_000?7:6);
+  assert.equal(v.agents.length,7);assert.deepEqual(v.tokens,raw.tokens);assert.equal(v.hostSummary[0].shown,7);
+ }
+ for(const completedAt of [undefined,null,0,-1,NaN,Infinity,"1000000",at+60_001]){
+  assert.equal(projectClientSnapshot({...raw,agents:[{state:"completed",completedAt}]},at+60_000,true).threadAgents.length,1);
+ }
+ assert.equal(raw.agents.length,7);
+});

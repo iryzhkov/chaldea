@@ -46,7 +46,7 @@ export function mergeStatus(cache:StatusCache,raw:HostSnapshot,now=Date.now()):b
       const row={host:s.host,quota:structuredClone(s.quota)};if(q<0)cache.quotas.push(row);else cache.quotas[q]=row;
     }
   }
-  while(cache.snapshots.reduce((n,v)=>n+v.agents.length,0)>48){const largest=cache.snapshots.toSorted((a,b)=>b.agents.length-a.agents.length||a.host.localeCompare(b.host))[0]!;const removed=largest.agents.pop();largest.truncated=true;if(largest.rich){largest.rich.details=largest.rich.details.filter(d=>d.id!==removed?.id);largest.rich.omitted=largest.agents.length-largest.rich.details.length;}}
+  while(cache.snapshots.reduce((n,v)=>n+v.agents.length,0)>48){const largest=cache.snapshots.toSorted((a,b)=>b.agents.length-a.agents.length||a.host.localeCompare(b.host))[0]!;const removed=largest.agents.pop();largest.truncated=true;if(largest.rich){if(largest.rich.completionTimes)largest.rich.completionTimes=largest.rich.completionTimes.filter(([id])=>id!==removed?.id);largest.rich.details=largest.rich.details.filter(d=>d.id!==removed?.id);largest.rich.omitted=largest.agents.length-largest.rich.details.length;}}
   return true;
 }
 export class CacheModel {
@@ -79,7 +79,7 @@ export class CacheModel {
       if(s.rich?.v===2){delete detail.provider;delete detail.recent;}
       return detail;
     };
-    base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:s.rich?.details.find(d=>d.id===a.id)?.value.identity.title.text??"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
+    base.agents=snapshots.flatMap(s=>s.agents.map(a=>({id:s.host+"-"+a.id,title:s.rich?.details.find(d=>d.id===a.id)?.value.identity.title.text??"Task",model:a.model==="unknown"?"Model unknown":a.model,host:s.host,state:a.state,startedAt:a.startedAt,completedAt:s.rich?.completionTimes?.find(([id])=>id===a.id)?.[1]??null,observedAt:a.observedAt,detailObservedAt:a.detailObservedAt,
       freshness:freshness(s.connected,s.observedAt)==="live"&&!this.warmSources.has(s.host)?"cached":freshness(s.connected,s.observedAt),activityFreshness:s.connected&&a.connected&&this.warmSources.has(s.host)&&freshness(s.connected,s.observedAt)==="live"?"live":freshness(false,a.detailObservedAt,60_000,600_000),steps:[...a.steps],details:publicDetail(s,a.id),detailCoverage:s.rich?(s.rich.details.some(d=>d.id===a.id)?"reported":"byte-budget"):"legacy"}))).slice(0,48);
     base.hostSummary=HOSTS.map(host=>{
       const s=snapshots.find(s=>s.host===host);

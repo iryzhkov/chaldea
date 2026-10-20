@@ -426,3 +426,33 @@ test("sparse v4 nine-thread capture survives authenticated ingest store restrict
   assert.equal((await h.post(p,"v4-reader-append",append)).status,403);
  }finally{await h.close();}
 });
+
+test("v5 actual completion capture crosses authenticated ingest store restricted reader and public cache expiry",async()=>{
+ const {MissionModel}=await import("../../src/mission-control/model.ts");
+ const {captureSnapshot}=await import("../../src/mission-control/contract.ts");
+ const {projectClientSnapshot}=await import("../../src/mission-control/static/client.js" as string);
+ const h=await hostedRig(),completedAt=(N-10)*1000;
+ try{
+  const m=new MissionModel(false,()=>N*1000);
+  m.shell({kind:"snapshot",sequence:1,threads:[{id:"mcp:synthetic-completed",title:"Synthetic completed task",status:"completed",providerInstanceId:"codex",modelSelection:{instanceId:"codex",model:"gpt-6.1-sol"},latestRunId:"synthetic-run",activeRunId:null,latestRunStartedAt:new Date(completedAt-1000).toISOString(),latestRunCompletedAt:new Date(completedAt).toISOString(),lastErrorClass:null,usageLimitResetAt:null,limitRecovery:null,relationshipToParent:null,archived:false,deleted:false}]});
+  m.shell({kind:"synchronized"});
+  const snapshot=captureSnapshot(m,"agent-a","a".repeat(32),1)!,p:any=payload();p.data.snapshot=snapshot;
+  assert.equal(snapshot.rich!.v,5);assert.deepEqual(snapshot.rich!.completionTimes,[[snapshot.agents[0]!.id,completedAt]]);
+  assert.equal((await h.post(p)).status,201);
+  const stored=JSON.parse(String(h.x.store.db.prepare("SELECT envelope FROM events").get()!.envelope));
+  assert.deepEqual(stored.data.snapshot,snapshot);
+  const cache=await refreshStatus(h.config,emptyCache(),{token:async()=>h.readToken,fetch:h.readerFetch,now:()=>N*1000});
+  assert.deepEqual(cache.snapshots[0],snapshot);writeCache(h.config.cacheFile,cache);
+  const web=missionServer(new CacheModel(h.config.cacheFile,()=>N*1000));await web.listen(0);
+  try{
+   const port=(web.server.address()as{port:number}).port;
+   const dto:any=await(await fetch("http://127.0.0.1:"+port+"/api/snapshot")).json();
+   assert.equal(dto.agents[0].completedAt,completedAt);
+   assert.equal(projectClientSnapshot(dto,completedAt+59_999,true).threadAgents.length,1);
+   assert.equal(projectClientSnapshot(dto,completedAt+60_000,false).threadAgents.length,0);
+   assert.equal(dto.agents.length,1);assert.equal(dto.hostSummary[0].shown,1);
+  }finally{await web.close();}
+  const invalid=structuredClone(p);invalid.data.snapshot.agents[0].state="working";
+  assert.equal((await h.post(invalid,"v5-active-completion")).status,400);
+ }finally{await h.close();}
+});

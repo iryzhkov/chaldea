@@ -5,7 +5,7 @@ import { runInNewContext } from "node:vm";
 
 // Execute both shipped scripts against the small DOM/history seam they use.
 // Rendering remains real; no copied navigation implementation.
-function browser(href = "https://board.example/?palette=mocr-1969", reduced = false) {
+function browser(href = "https://board.example/?palette=mocr-1969", reduced = false, clock?:{now:number}) {
   let width=3840,height=1800;
   const animations: string[] = [];
   class Element extends EventTarget {
@@ -108,11 +108,14 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   };
   let eventSource: EventTarget;
   const intervals: (() => void)[] = []; let frame = () => {};
+  const timeouts=new Map<number,{fn:()=>void;at:number}>();let timeoutId=0;
   const context: any = {
-    document, location, history, URL, URLSearchParams, Date, performance, CustomEvent,
+    document, location, history, URL, URLSearchParams, Date:class extends Date {static override now(){return clock?.now??Date.now();}}, performance, CustomEvent,
     innerWidth: width, innerHeight:height, matchMedia: (q: string) => ({ matches: q.includes("reduced-motion") && reduced }),
     requestAnimationFrame: (fn: () => void) => { frame = fn; },
     setInterval: (fn: () => void) => { intervals.push(fn); },
+    setTimeout: (fn:()=>void,delay:number) => {const id=++timeoutId;timeouts.set(id,{fn,at:(clock?.now??Date.now())+delay});return id;},
+    clearTimeout: (id:number) => timeouts.delete(id),
     addEventListener: window.addEventListener.bind(window),
     EventSource: class extends EventTarget { constructor(){super();eventSource=this;} close() {} },
   };
@@ -129,6 +132,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   };
   const travel = (delta: number) => { index += delta; location.href = entries[index]!; window.dispatchEvent(new Event("popstate")); };
   return { elements, location, entries, click, travel, frame: () => frame(),
+    tick: (now:number) => {assert.ok(clock);clock.now=now;for(const [id,timer] of [...timeouts])if(timer.at<=now){timeouts.delete(id);timer.fn();}},
     resize: (w:number,h:number) => {width=w;height=h;context.innerWidth=w;context.innerHeight=h;window.dispatchEvent(new Event("resize"));},
     grid: (value:string) => { const el=elements.view!.querySelector("[data-thread-grid]")!;el.value=value;const e=new Event("change");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     page: (delta:number) => {const el=elements.view!.querySelector(`[data-thread-page="${delta}"]`)!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
@@ -434,7 +438,7 @@ test("resource instruments preserve measured CPU zero, independent stale samples
  }
 });
 
-test("hosted quota keeps observing hosts separate, source ages and known zero",()=>{
+test("provider quota cards retain separate host readings, source ages and known zero",()=>{
  const b=browser("https://board.example/?mode=quota"),now=Date.now();
  const account={label:"Codex account 1",state:"cached",observedAt:now-4000000,used:0,resetsAt:now+3600000,duration:300,credits:"0",creditState:"cached",resetState:"unknown",unlimited:false,manualResets:0};
  const hosts=[{host:"agent-a",state:"cached",observedAt:now-4000000,omitted:2,accounts:[account]},{host:"agent-b",state:"cached",observedAt:now,omitted:0,accounts:[{...account,observedAt:now}]},{host:"laptop",state:"byte-budget",observedAt:null,omitted:0,accounts:[]},{host:"omarchy-pc",state:"error",observedAt:null,omitted:0,accounts:[]}];
@@ -442,14 +446,14 @@ test("hosted quota keeps observing hosts separate, source ages and known zero",(
  b.snapshot(snap);let html=b.elements.view!.innerHTML;
  assert.equal((html.match(/class="quota-account"/g)||[]).length,2);
  assert.match(html,/Observed by agent-a/);assert.match(html,/Observed by agent-b/);
- assert.match(html,/same account may appear on multiple hosts/);
+ assert.equal(b.elements.view!.querySelectorAll(".quota-provider").length,2);assert.match(html,/account identity unverified/);
  assert.match(html,/0% used · 100% headroom/);assert.match(html,/aria-valuenow="0.00"/);
  assert.match(html,/Credits remaining 0/);assert.match(html,/0 manual resets available/);
- assert.match(html,/data-fresh="stale"/);assert.match(html,/quota source 1h ago/);
+ assert.match(html,/data-fresh="stale"/);assert.match(html,/usage observed 1h ago/);
  assert.match(html,/Quota withheld · host byte budget/);assert.match(html,/Quota source error/);
  assert.match(html,/2 account rows omitted/);assert.doesNotMatch(html,/undefined|NaN|financial|quality score/);
  b.snapshot({...snap,quota:{state:"cached",accounts:[account]}});html=b.elements.view!.innerHTML;
- assert.match(html,/Codex account 1/);assert.doesNotMatch(html,/Observed by/);
+ assert.match(html,/Codex account 1/);assert.match(html,/Observed by Local/);
 });
 
 test("Events uses actual maintenance occurrence order, coverage and safe labels",()=>{
@@ -572,15 +576,16 @@ test("token unknown timestamps and unqualified coverage cannot imply freshness",
  assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"nosource","legacy process freshness cannot qualify transported usage");
 });
 
-test("Overview quota summary bounds four accounts per host and links all observations",()=>{
+test("Overview groups bounded readings into provider cards and links all observations",()=>{
  const b=browser(),now=Date.now();
- const hosts=["a","b","c","d"].map(host=>({host,state:"cached",observedAt:now,omitted:2,accounts:Array.from({length:4},(_,i)=>({label:"Account "+i,used:i===0?0:i*20,state:"cached",observedAt:now}))}));
+ const hosts=["a","b","c","d"].map(host=>({host,state:"cached",observedAt:now,omitted:2,accounts:Array.from({length:4},(_,i)=>({label:(i<2?"codex":"claudeAgent")+" account "+i,used:i===0?0:i*20,state:"cached",observedAt:now}))}));
  b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]});
  const quota=b.elements.view!.querySelector(".p-quota")!;
- assert.equal(quota.querySelectorAll(".quota-glance").length,4);
- assert.equal(quota.querySelectorAll(".quota-account").length,0);
- assert.match(quota.textContent,/4 account observations.*0–60% used across 4 known windows/);
- assert.match(quota.textContent,/2 omitted by source/);assert.match(quota.innerHTML,/href="\?mode=quota"/);
+ assert.equal(quota.querySelectorAll(".quota-glance").length,2);
+ assert.equal(quota.querySelectorAll(".quota-account").length,16);
+ assert.match(quota.textContent,/0% used · 100% headroom/);assert.match(quota.textContent,/40% used · 60% headroom/);
+ assert.match(quota.textContent,/account identity unverified/);
+ assert.match(quota.textContent,/2 account rows omitted by source/);assert.match(quota.innerHTML,/href="\?mode=quota"/);
  b.click("quota");assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,16);
 });
 
@@ -647,4 +652,90 @@ test("Tokens uses retained transported detail usage with subsets, zeros, partial
  text=b.elements.view!.textContent;assert.match(text,/source stale/);assert.match(text,/0 \/ 1 threads report this field/);assert.doesNotMatch(text,/120/);
  b.snapshot({...snap,agents:[{...row,details:{...d,fieldCoverage:"identity-only"}}]});
  text=b.elements.view!.textContent;assert.match(text,/0 usable turns \/ 0 usable threads/);assert.match(text,/Generation rate, p95, daily totals and model history unavailable/);
+});
+
+test("completion expiry uses actual time at 59.999s and 60s without data, clamps paging and keeps source evidence",()=>{
+ const start=Date.parse("2026-10-20T00:00:00Z"),clock={now:start+59_999};
+ const b=browser("https://board.example/?mode=agents&grid=2x2",false,clock);
+ const states=["working","completed","completed","completed","completed","failed","cancelled","completed"];
+ const agents=states.map((state,i)=>({id:"expiry-"+i,title:"Expiry "+i,model:"sol",host:"agent-a",state,completedAt:i===7?null:start,startedAt:start-1000,observedAt:clock.now,detailObservedAt:clock.now,activityFreshness:"live",freshness:"live",steps:[]}));
+ const hostSummary=[{host:"agent-a",shown:8,total:8,truncated:false,observedAt:clock.now,freshness:"live",states:{completed:5,working:1,failed:1,cancelled:1},models:[]}];
+ const snap={version:1,demo:false,sampled:true,now:clock.now,source:{state:"live",observedAt:clock.now},agents,shown:8,total:8,truncated:false,tokens:{output:123,rate:0,coverage:"observed"},quota:{state:"unknown",accounts:[]},hostSummary};
+ b.snapshot(snap);
+ assert.equal(b.context.DATA.threads.length,8);assert.match(b.elements.view!.textContent,/Page 1 of 2/);
+ b.page(1);assert.match(b.elements.view!.textContent,/Page 2 of 2/);
+ b.snapshot({...snap,now:clock.now}); // A refreshed sample cannot restart the lifetime.
+ assert.equal(b.context.DATA.threads.length,8);
+ b.tick(start+60_000); // Fires the shipped expiry timeout, with no new snapshot or interval tick.
+ assert.equal(b.context.DATA.threads.length,4);
+ assert.match(b.elements.view!.textContent,/Page 1 of 1/);
+ assert.equal(b.elements.view!.querySelectorAll("[data-thread-card]").length,4);
+ assert.match(b.elements.view!.textContent,/showing 4 of 4 observed threads/);
+ assert.match(b.elements.view!.textContent,/4 completed hidden; 8 source rows retained/);
+ assert.match(b.elements.view!.textContent,/completion time unknown; retained/);
+ assert.deepEqual(Array.from(b.context.DATA.threads,(a:any)=>a.state),["working","failed","cancelled","completed"]);
+ assert.equal(snap.agents.length,8);assert.equal(snap.hostSummary[0]!.shown,8);assert.equal(snap.tokens.output,123);
+ b.click("agent-summary");assert.match(b.elements.view!.textContent,/shown 8 \/ 8/);
+ b.click("tokens");assert.match(b.elements.view!.textContent,/shown 8 \/ 8 threads/);
+ b.snapshot({...snap,now:clock.now,agents:agents.map((a,i)=>i===1?{...a,state:"working"}:a)});
+ b.click("agents");assert.equal(b.context.DATA.threads.length,5);
+ assert.ok(b.context.DATA.threads.some((a:any)=>a.id==="expiry-1"));
+ b.click("overview");assert.doesNotMatch(b.elements.view!.querySelector(".p-threads")!.textContent,/Expiry [234]/);
+});
+
+test("provider summaries consistently select newest actual usage without merging readings or borrowing host freshness",()=>{
+ const start=Date.parse("2026-10-20T00:00:00Z"),clock={now:start},b=browser("https://board.example/?mode=quota",false,clock);
+ const account=(label:string,used:number,observedAt:number|null,duration=300)=>({label,used,observedAt,state:"cached",duration,resetsAt:start+3600000,credits:"99",creditState:"cached",manualResets:9,resetState:"cached"});
+ const hosts=[
+  {host:"agent-b",state:"cached",observedAt:start,omitted:0,accounts:[account("codex account 1",10,start-2000),account("claudeAgent account 2",20,start-1000)]},
+  {host:"agent-a",state:"cached",observedAt:start,omitted:0,accounts:[account("codex account 3",80,start-1000,10080),account("codex account 4",90,null),{...account("codex account 5",0,start),used:null,state:"unsupported"},account("claudeAgent account 1",70,start-3000)]}
+ ];
+ const snap={version:1,demo:false,sampled:true,now:start,source:{state:"live",observedAt:start},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]};
+ b.snapshot(snap);
+ const cards=b.elements.view!.querySelectorAll(".quota-provider");
+ assert.equal(cards.length,2);
+ const codex=cards.find(c=>c.textContent.includes("OpenAI Codex"))!,claude=cards.find(c=>c.textContent.includes("Claude"))!;
+ const codexBody=codex.querySelector(".body")!,claudeBody=claude.querySelector(".body")!;
+ assert.match(codexBody.querySelector(".source-meta")!.textContent,/Newest usage observation · agent-a · 1s ago/);
+ assert.match(claudeBody.querySelector(".source-meta")!.textContent,/Newest usage observation · agent-b · 1s ago/);
+ assert.match(codex.textContent,/80% used · 20% headroom/);assert.match(claude.textContent,/20% used · 80% headroom/);
+ assert.equal(codex.querySelectorAll(".quota-account").length,4);assert.equal(claude.querySelectorAll(".quota-account").length,2);
+ assert.match(codex.textContent,/10080 min window/);assert.match(codex.textContent,/90% used/);
+ assert.match(codex.textContent,/credit\/manual reset times not shown/);assert.match(codex.textContent,/Values are not combined/);
+ clock.now+=60_000;b.snapshot({...snap,now:clock.now,quota:{...snap.quota,hosts:hosts.slice().reverse().map(h=>({...h,observedAt:clock.now}))}});
+ assert.match(b.elements.view!.querySelector(".quota-provider")!.textContent,/agent-a · 1m ago/);
+ b.click("overview");const overview=b.elements.view!.querySelector(".p-quota")!;
+ assert.equal(overview.querySelectorAll(".quota-glance").length,2);
+ assert.match(overview.textContent,/Newest usage observation · agent-a · 1m ago/);
+ assert.match(overview.textContent,/Newest usage observation · agent-b · 1m ago/);
+ b.click("quota");
+ b.snapshot({...snap,quota:{...snap.quota,hosts:hosts.map(h=>({...h,accounts:h.accounts.filter(a=>a.label.startsWith("codex"))}))}});
+ assert.match(b.elements.view!.querySelectorAll(".quota-provider")[1]!.textContent,/Claude.*Usage unknown/);
+});
+
+test("local quota retains all 32 separate readings and provider errors across Quota and Overview",()=>{
+ const start=Date.parse("2026-10-20T00:00:00Z"),b=browser("https://board.example/?mode=quota",false,{now:start});
+ const accounts=Array.from({length:32},(_,i)=>({label:(i===31?"claudeAgent":"codex")+" account "+(i+1),used:i,observedAt:start-1000-i,state:"cached",duration:300,resetsAt:null,credits:null,manualResets:null}));
+ const snap={version:1,demo:false,now:start,source:{state:"live",observedAt:start},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts},hostSummary:[]};
+ b.snapshot({...snap,quota:{state:"cached",accounts:[...accounts.slice(0,4),accounts[31]]}});
+ assert.match(b.elements.view!.querySelectorAll(".quota-provider").find(c=>c.textContent.includes("Claude"))!.textContent,/31% used/);
+ b.snapshot(snap);
+ assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,32);
+ const claude=b.elements.view!.querySelectorAll(".quota-provider").find(c=>c.textContent.includes("Claude"))!;
+ assert.match(claude.textContent,/31% used/);assert.match(claude.textContent,/1 separate readings/);
+ assert.match(b.elements.view!.textContent,/31 separate readings/);
+ b.click("overview");
+ assert.equal(b.elements.view!.querySelector(".p-quota")!.querySelectorAll(".quota-account").length,32);
+ assert.match(b.elements.view!.querySelector(".p-quota")!.textContent,/31% used/);
+ for(const mode of ["quota","overview"]){
+  b.click(mode);b.snapshot({...snap,quota:{state:"error",accounts:[]}});
+  assert.match(b.elements.view!.textContent,/Quota source error/);
+ }
+});
+test("hosted quota groups retain all 16 bounded hosts and enforce four readings per host",()=>{
+ const start=Date.parse("2026-10-20T00:00:00Z"),b=browser("https://board.example/?mode=quota",false,{now:start});
+ const hosts=Array.from({length:16},(_,h)=>({host:"host-"+h,state:"cached",observedAt:start,omitted:1,accounts:Array.from({length:5},(_,i)=>({label:(i===3?"claudeAgent":"codex")+" account "+i,used:i,observedAt:start-h,state:"cached"}))}));
+ b.snapshot({version:1,demo:false,sampled:true,now:start,source:{state:"live",observedAt:start},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]});
+ assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,64);
+ assert.match(b.elements.view!.textContent,/host-15/);assert.match(b.elements.view!.textContent,/account rows omitted by source/);
 });

@@ -38,6 +38,10 @@ export function validateHostSnapshot(raw:unknown):HostSnapshot {
   }
   if(Object.hasOwn(s,"rich")){
     const rich=normalizeRich(s.rich,ids,Number(s.observedAt));
+    for(const [id,time] of rich.completionTimes??[]){
+      const agent=(s.agents as HostSnapshot["agents"]).find(a=>a.id===id)!;
+      check(agent.state==="completed"&&(agent.startedAt===null||time>=agent.startedAt));
+    }
     for(const row of rich.details){const app=row.value.identity.appThreadId;
       if(app.state==="reported"&&app.text!==null)check(createHash("sha256").update(String(s.epoch)+"\0"+app.text).digest("hex").slice(0,16)===row.id);
     }
@@ -62,7 +66,8 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     tokens:qualified?{qualified:true,output:v.tokens.output,rate:v.tokens.rate,observedAt:v.tokens.observedAt,coverage:v.tokens.coverage as "observed"|"partial"}:
       {qualified:false,output:null,rate:null,observedAt:null,coverage:"unknown"}};
   while(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){snapshot.agents.pop();snapshot.truncated=true;}
-  // Fit base rows first. Optional metadata never removes another row.
+  // v5 adds actual completion times through the existing rich schema seam.
+  // Older v1/v2/v3/v4 producers remain readable; older readers reject v5.
   const rich:RichSnapshot={v:4,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
   snapshot.rich=rich;
   if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
@@ -79,6 +84,13 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     try{snapshot.quota=quotaProjection(v.quota,observedAt,model.quotaTimes());}catch{snapshot.quota={state:"error",observedAt:null,omitted:0,accounts:[]};}
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)snapshot.quota={state:"byte-budget",observedAt:snapshot.quota.observedAt,omitted:snapshot.quota.accounts.length+snapshot.quota.omitted,accounts:[]};
     if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.quota;
+    // Completion evidence yields to resources, identities and quota. Missing entries remain unknown.
+    for(const [i,a] of snapshot.agents.entries()){
+      const completedAt=v.agents[i]!.completedAt;if(completedAt===null)continue;
+      rich.v=5;(rich.completionTimes??=[]).push([a.id,completedAt]);
+      if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)rich.completionTimes.pop();
+      if(!rich.completionTimes.length){delete rich.completionTimes;rich.v=4;}
+    }
     const candidates=new Map<string,Detail>();
     const preview=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).trimEnd(),state:"truncated"}:p;
     const command=(p:Preview):Preview=>p.text!==null&&Buffer.byteLength(p.text)>96?{text:utf8(p.text,96).split(" ").slice(0,-1).join(" "),state:"truncated"}:p;

@@ -24,7 +24,7 @@ export function safeLabel(value: unknown, fallback = "Task"): string {
 }
 const at = (s: string | null | undefined): number | null => s && Number.isFinite(Date.parse(s)) ? Date.parse(s) : null;
 const count = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
-type Thread = { row: ShellThread; observed: number; connected: boolean; detailObserved: number | null; steps: string[] };
+type Thread = { localId: string; row: ShellThread; observed: number; connected: boolean; detailObserved: number | null; steps: string[] };
 function threadState(row:ShellThread,details:import("./details.ts").Detail):string {
   if(row.pendingRequest){
     if(!row.pendingRequestKind||row.pendingRequestKind==="user_input")return "waiting-igor";
@@ -41,6 +41,7 @@ function threadState(row:ShellThread,details:import("./details.ts").Detail):stri
   if(row.activeRunId)return details.activity==="thinking"?"thinking":"working";
   return row.status==="completed"?"completed":"idle";
 }
+const activeThread = (row:ShellThread):boolean => /^(thinking|working|waiting(?:-|$)|queued$)/.test(threadState(row,emptyDetail()));
 export class MissionModel {
   private detailStates = new Map<string,ThreadDetails>();
   private providerCatalog=new Map<string,string|null>();
@@ -52,6 +53,7 @@ export class MissionModel {
   private resources:Resources={state:"unavailable",sample:null};
   setResources(resources:Resources):void {this.resources=resources.state==="reported"&&validResources(resources.sample)&&resources.sample.sampledAt<=this.now()?resources:{state:"unavailable",sample:null};this.changed();}
   private threads = new Map<string, Thread>();
+  private nextLocalId = 0;
   private turns = new Map<string, { output: number; at: number; live: boolean; fence: number }>();
   private evictedThrough: number | null = null;
   private accountingPartial = false;
@@ -83,9 +85,9 @@ export class MissionModel {
     if (event.kind === "snapshot") {
       const rows = event.threads.filter(t => !t.archived && !t.deleted && !t.settled);
       this.total = rows.length; this.coverageExact = true;
-      const selected = rows.toSorted((a,b) => (a.latestRunStartedAt ?? "").localeCompare(b.latestRunStartedAt ?? "") || a.id.localeCompare(b.id)).slice(0, MAX_AGENTS);
+      const selected = rows.toSorted((a,b) => Number(activeThread(b))-Number(activeThread(a)) || (a.latestRunStartedAt ?? "").localeCompare(b.latestRunStartedAt ?? "") || a.id.localeCompare(b.id)).slice(0, MAX_AGENTS);
       const previous = this.threads; this.threads = new Map();
-      for (const row of selected) this.threads.set(row.id, { connected: false, detailObserved: null, steps: [], ...previous.get(row.id), row, observed: now });
+      for (const row of selected) this.threads.set(row.id, { localId: previous.get(row.id)?.localId ?? "agent-" + this.nextLocalId++, connected: false, detailObserved: null, steps: [], ...previous.get(row.id), row, observed: now });
       for (const id of this.detailStates.keys()) if (!this.threads.has(id)) this.detailStates.delete(id);
     } else if (event.kind === "thread") {
       const row = event.thread;
@@ -97,8 +99,13 @@ export class MissionModel {
       else if (this.threads.has(row.id)) { this.threads.get(row.id)!.row = row; this.threads.get(row.id)!.observed = now; }
       else {
         if (this.total > this.threads.size || this.threads.size >= MAX_AGENTS) this.coverageExact = false;
+        // Active work can replace a retained terminal row without claiming exact coverage.
+        if (this.threads.size >= MAX_AGENTS && activeThread(row)) {
+          const victim=[...this.threads].find(([,t])=>!activeThread(t.row))?.[0];
+          if(victim!==undefined){this.threads.delete(victim);this.detailStates.delete(victim);}
+        }
         if (this.threads.size < MAX_AGENTS) {
-          this.threads.set(row.id, { row, observed: now, connected: false, detailObserved: null, steps: [] });
+          this.threads.set(row.id, { localId: "agent-" + this.nextLocalId++, row, observed: now, connected: false, detailObserved: null, steps: [] });
           if (this.coverageExact) this.total++;
         }
       }
@@ -107,6 +114,8 @@ export class MissionModel {
       if (this.threads.delete(event.threadId)) this.total = Math.max(0, this.total - 1);
       else if (this.total > this.threads.size) this.coverageExact = false;
     }
+    // Keep both public projections in the same active-first map order, including resumed rows.
+    this.threads = new Map([...this.threads].toSorted(([,a],[,b])=>Number(activeThread(b.row))-Number(activeThread(a.row))));
     this.observed = now; this.changed();
   }
   disconnected(): void { this.providerCatalog.clear(); if (this.connected) this.observed = this.now(); this.connected = false; for (const t of this.threads.values()) { if (t.connected) t.detailObserved = this.now(); t.connected = false; } this.changed(); }
@@ -179,14 +188,18 @@ export class MissionModel {
         creditState: p.credits.state, resetState: p.manualResets.state,
         unlimited: p.credits.value?.unlimited ?? null, manualResets: count(p.manualResets.value?.availableCount) ? p.manualResets.value.availableCount : null });
     }
-    const agents = [...this.threads.values()].map((t,i) => {
+    const agents = [...this.threads.values()].map(t => {
       const instance=t.row.modelSelection?.instanceId??t.row.providerInstanceId;
       const provider=safeProviderId(instance)&&instance===t.row.providerInstanceId?{instanceId:instance,driver:this.providerCatalog.get(instance)??null}:null;
       const details={...emptyDetail(),...isolateDetail({...(this.detailStates.get(t.row.id)??new ThreadDetails()).snapshot(t.row.modelSelection,now,t.connected&&this.connected),provider,identity:{title:titlePreview(t.row.title),appThreadId:appThreadIdPreview(t.row.id)}},now)};
+      const state=threadState(t.row,details),completedAt=at(t.row.latestRunCompletedAt);
       return ({
-      id: "agent-" + i, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
-      host: "omarchy-pc", state:threadState(t.row,details),
-      startedAt: at(t.row.latestRunStartedAt), observedAt: t.observed, detailObservedAt: t.detailObserved,
+      id: t.localId, title: safeLabel(t.row.title), model: safeLabel(t.row.modelSelection?.model, "Model unknown"),
+      host: "omarchy-pc", state,
+      startedAt: at(t.row.latestRunStartedAt),
+      // Only the owning run's actual completion is authoritative. Unknown time stays unknown.
+      completedAt: state==="completed" && completedAt!==null && completedAt>0 && completedAt<=now && completedAt<=t.observed && completedAt>=(at(t.row.latestRunStartedAt)??0) ? completedAt : null,
+      observedAt: t.observed, detailObservedAt: t.detailObserved,
       freshness: freshness(this.connected, this.observed, 30_000, 300_000),
       activityFreshness: freshness(t.connected, t.detailObserved, 60_000, 600_000), steps: [...t.steps],
       detailCoverage:"reported" as string,
