@@ -20,13 +20,16 @@ export interface SessionOptions {
   t3?: SessionT3;
   /** Bounded wait for the first launch answer inside one start call. */
   launchWaitMs?: number;
+  /** Token acquisition seams for tests; production uses HTTPS fetch and the system clock. */
+  credentials?: import("./credential.ts").CredentialOptions;
 }
 export interface SessionHooks {
   poke(): void; fault(error: unknown): void;
   boundary?: ((name: string, item: string) => void) | undefined; report?: ((event: string) => void) | undefined;
 }
 export type IssueDecision =
-  | { ok: true; sessionId: string; runId: string; threadId: string; profile: string; project: string; audience: string; grants: Grant[]; expiresAt: number }
+  | { ok: true; sessionId: string; runId: string; threadId: string; profile: string; project: string; audience: string; grants: Grant[];
+      expiresAt: number; presetHash: string }
   | { ok: false; refusal: string };
 export interface SessionStatus {
   sessionId: string; requestId: string; preset: string; threadId: string; state: Item["state"]; disposition: string | null;
@@ -263,12 +266,16 @@ export class SessionLifecycle {
     return this.status(id);
   }
   /**
-   * Internal issuance gate for a future preset-bound credential helper. Nothing
-   * calls it in production yet; it returns grants and expiry, never a token.
+   * Issuance gate for the preset-bound credential helper. It names the preset's
+   * currently active session; it returns grants and expiry, never a token.
    */
   authorizeIssue(presetId: string, audience: string, now = Date.now()): IssueDecision {
-    const refuse = (refusal: string): IssueDecision => ({ ok: false, refusal });
-    let policy: SessionPolicy | null;
+    return this.issueGate(presetId, audience, now).decision;
+  }
+  /** The gate plus the protected policy it read, so enrollment data comes from the same read. */
+  issueGate(presetId: string, audience: string, now = Date.now()): { decision: IssueDecision; policy: SessionPolicy | null } {
+    let policy: SessionPolicy | null = null;
+    const refuse = (refusal: string) => ({ decision: { ok: false, refusal } as IssueDecision, policy });
     try { policy = this.options.policy(); } catch { return refuse("session_policy_unavailable"); }
     if (!policy) return refuse("sessions_disabled");
     if (!(AUDIENCES as readonly string[]).includes(audience)) return refuse("invalid_audience");
@@ -287,8 +294,8 @@ export class SessionLifecycle {
     if (!withinCeiling(policy, current, admission)) return refuse("preset_exceeds_ceiling");
     const service = admission.services.find(x => x.audience === audience);
     if (!service) return refuse("audience_not_admitted");
-    return { ok: true, sessionId: s.item, runId: admission.runId, threadId: s.thread_id, profile: admission.profile,
-      project: admission.project, audience, grants: structuredClone(service.grants), expiresAt: admission.expiresAt };
+    return { policy, decision: { ok: true, sessionId: s.item, runId: admission.runId, threadId: s.thread_id, profile: admission.profile,
+      project: admission.project, audience, grants: structuredClone(service.grants), expiresAt: admission.expiresAt, presetHash: s.preset_hash } };
   }
   status(id: string): SessionStatus {
     const item = this.store.get(id);

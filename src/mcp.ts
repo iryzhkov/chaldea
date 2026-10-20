@@ -35,6 +35,8 @@ export const SESSION_TOOLS=[
     inputSchema:schema({...identity,preset:{...str,description:"Configured preset name"}},["threadId","requestId","preset"])},
   {name:"chaldea_session_status",description:"Read a session's launch, outcome and exact stored result text. Read it when the wake says result_in_status.",inputSchema:schema({id:str},["id"])},
 ];
+/** Private-IPC methods for native helpers only. MCP never lists or forwards them, whatever the config. */
+export const NATIVE_ONLY_METHODS:readonly string[]=["chaldea_session_headers"];
 export async function runMcp(socket:string,sessions=false):Promise<void>{
   const tools=()=>[...WAIT_TOOLS,...(sessions?SESSION_TOOLS:[]),...messageTools()];
   let buffer="";let chain=Promise.resolve();
@@ -51,7 +53,7 @@ export async function runMcp(socket:string,sessions=false):Promise<void>{
       if(r.method==="tools/list"){reply(id,{tools:tools()});return;}
       if(r.method==="tools/call"){
         const p=r.params as {name:string;arguments?:unknown};
-        if(!tools().some(t=>t.name===p?.name))throw new Error("Unknown tool");
+        if(NATIVE_ONLY_METHODS.includes(String(p?.name))||!tools().some(t=>t.name===p?.name))throw new Error("Unknown tool");
         try{
           const result=p.name==="chaldea_route" ? await route(p.arguments??{}) :
             p.name==="chaldea_message_send" ? await message("send",p.arguments??{}) :

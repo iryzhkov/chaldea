@@ -12,6 +12,7 @@ import { boundedLog } from "./log.ts";
 import { object, text, waitDescription, type WaitInput } from "./types.ts";
 import { loadSessionPolicy } from "../session/policy.ts";
 import { createSessionT3 } from "../session/t3.ts";
+import { CredentialRefusal } from "../session/credential.ts";
 
 export async function body(req: IncomingMessage, limit=8192): Promise<string> {
   const parts:Buffer[]=[];let n=0;
@@ -52,6 +53,13 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       if(req.method!=="POST"||req.url!=="/rpc"){send(res,404,{error:"Unknown endpoint"});return;}
       if(!engine){send(res,503,{error:"Starting"});return;}
       const v=object(JSON.parse(await body(req)));const input=object(v.input??{});
+      if(v.method==="chaldea_session_headers"){
+        // Native helper path only; MCP never lists or forwards it. The reply is the header or a fixed refusal code.
+        let headers:{Authorization:string};
+        try{headers=await engine.sessionHeaders(input);}
+        catch(error){send(res,400,{error:error instanceof CredentialRefusal?error.code:"headers_unavailable"});return;}
+        send(res,200,headers);return;
+      }
       let result:unknown;
       switch(v.method){
         case "chaldea_wait":result=await engine.register("wait",input);break;
@@ -154,12 +162,14 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
     }};
   }catch(error){ipc.close();page?.close();store?.close();throw error;}
 }
-export function callService(socket:string,method:string,input:unknown):Promise<unknown>{
+/** The service answered with a refusal; its message is the service's own error text. */
+export class ServiceRefusal extends Error { constructor(message:string){super(message);this.name="ServiceRefusal";} }
+export function callService(socket:string,method:string,input:unknown,timeout=15_000):Promise<unknown>{
   return new Promise((resolve,reject)=>{
     // Do not reuse a keep-alive Unix connection across watcher replacement.
-    const req=request({socketPath:socket,path:"/rpc",method:"POST",agent:false,headers:{"Content-Type":"application/json"},timeout:15_000},res=>{
+    const req=request({socketPath:socket,path:"/rpc",method:"POST",agent:false,headers:{"Content-Type":"application/json"},timeout},res=>{
       let data="";res.setEncoding("utf8");res.on("data",s=>{data+=s;if(Buffer.byteLength(data)>16384)req.destroy(new Error("IPC response exceeds cap"));});
-      res.on("end",()=>{try{const value=JSON.parse(data);res.statusCode===200?resolve(value):reject(new Error(value.error??"Service refused"));}catch(e){reject(e);}});
+      res.on("end",()=>{try{const value=JSON.parse(data);res.statusCode===200?resolve(value):reject(new ServiceRefusal(typeof value?.error==="string"?value.error:"Service refused"));}catch(e){reject(e);}});
     });
     req.on("timeout",()=>req.destroy(new Error("IPC timed out")));req.on("error",reject);
     req.end(JSON.stringify({method,input}));

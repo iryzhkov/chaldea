@@ -71,7 +71,9 @@ Waits keys remain unchanged: `environment`, `t3BaseDir`, `serverUrl`, `tokenFile
 `database`, `socket`, `listenAddress`, `port`, `answerBaseUrl`, `answerTokenFile`,
 `logFile`. Its config/tokens, database/log and socket defaults now use the XDG bases.
 The optional `sessionPolicy` key names an absolute, operator-owned fixed-preset policy;
-without it sessions are disabled (see [sessions.md](sessions.md)).
+without it sessions are disabled (see [sessions.md](sessions.md)). That policy's optional
+`enrollments` map holds public Authentik enrollment fields only; each names an owner-only
+secret file and never contains the secret.
 
 Quota's existing `contexts`, nested `assertRuntimeHome`, and
 `lowHeadroomPercent` remain unchanged. The same file can also supply

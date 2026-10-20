@@ -8,6 +8,7 @@ import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
 import type { WaitInput, NativeDecisionInput, AnswerSource } from "./types.ts";
 import { SessionLifecycle, RESULT_GRACE_MS, type SessionOptions, type SessionStatus, type IssueDecision } from "../session/lifecycle.ts";
+import { CredentialRefusal, SessionCredentials } from "../session/credential.ts";
 
 export interface EngineOptions {
   // Test seam for abrupt process termination at durable/ambiguous boundaries.
@@ -22,6 +23,7 @@ export class WaitEngine {
   private options: EngineOptions;
   private native: NativeDecisions;
   private sessions: SessionLifecycle;
+  private credentials: SessionCredentials;
   private clock = new Deadlines();
   private snapshots = new Map<string,WaitSnapshot|null>();
   private cursors = new Map<string,number>();
@@ -67,7 +69,8 @@ export class WaitEngine {
     this.native=new NativeDecisions(store,options.boundary);
     this.sessions=new SessionLifecycle(store,t3,options.sessions ?? {policy:()=>null},{poke:()=>this.poke(),
       fault:error=>{ if (error instanceof CheckpointBlockedError) this.backoffStorage(); else this.failStorage(); },
-      boundary:options.boundary,report:options.report}); }
+      boundary:options.boundary,report:options.report});
+    this.credentials=new SessionCredentials((preset,audience,now)=>this.sessions.issueGate(preset,audience,now),options.sessions?.credentials); }
   start(): void { this.poke(); }
   async startSession(value: unknown): Promise<SessionStatus> {
     if (this.fatal) throw new Error("Watcher needs attention");
@@ -76,8 +79,13 @@ export class WaitEngine {
   sessionStatus(id: string): SessionStatus { return this.sessions.status(id); }
   cancelSession(id: string): SessionStatus { const status=this.sessions.cancel(id); this.poke(); return status; }
   reconcileSession(id: string): Promise<SessionStatus> { return this.sessions.reconcileNow(id); }
-  /** Internal gate for a future preset-bound helper; deliberately not reachable over IPC. */
+  /** The issuance gate alone: grants and expiry for the preset's active session, never a token. */
   authorizeIssue(preset: string, audience: string, now?: number): IssueDecision { return this.sessions.authorizeIssue(preset,audience,now); }
+  /** Native helper path only (private IPC); never an MCP tool. Refusals are fixed codes. */
+  async sessionHeaders(value: unknown): Promise<{Authorization:string}> {
+    if (this.fatal || this.stopped) throw new CredentialRefusal("sessions_unavailable");
+    return this.credentials.headers(value);
+  }
   trackedNative(parent:string):ReturnType<WakeStore["nativeTracking"]>{
     if(this.fatal)throw new Error("Watcher needs attention");
     try{return this.store.nativeTracking(parent);}

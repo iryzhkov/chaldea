@@ -1,7 +1,7 @@
 // Protected fixed session presets. The policy file is operator-owned public
 // configuration: it names instances, prompts and grant ceilings, never credentials.
 import { lstatSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, normalize } from "node:path";
 import { createHash } from "node:crypto";
 import { readTrustedFile } from "../config/files.ts";
 import { AccessError, audienceName, grants as checkGrants, identifier, strictJson } from "../access/token.ts";
@@ -27,7 +27,22 @@ export interface SessionPreset {
   projectId: string; title: string; prompt: string; inputs: Record<string, string>;
   project: string; services: TokenGrant[]; maxSeconds: number; delegate: boolean; destinations: string[];
 }
-export interface SessionPolicy { environment: string; ceilings: SessionCeiling[]; presets: Record<string, SessionPreset> }
+/**
+ * Public description of one ordinary host×profile Authentik enrollment for a
+ * preset. It names where to ask and what to expect, never the secret itself:
+ * secretFile points at the owner-only app password on this host.
+ */
+export interface Enrollment {
+  form: "app_password"; issuer: string; tokenUrl: string; jwksUrl: string; clientId: string; username: string;
+  scope: typeof ENROLLMENT_SCOPE; resource: string; project: string; maxTokenSeconds: typeof ENROLLMENT_TOKEN_SECONDS; secretFile: string;
+}
+export const ENROLLMENT_SCOPE = "jocasta.read";
+export const ENROLLMENT_TOKEN_SECONDS = 300;
+export interface SessionPolicy {
+  environment: string; ceilings: SessionCeiling[]; presets: Record<string, SessionPreset>;
+  /** Optional; absent leaves sessions and their gate exactly as before. Keyed by preset ID. */
+  enrollments?: Record<string, Enrollment>;
+}
 
 const invalid = (detail: string): never => { throw new SessionRefusal("session_policy_invalid", detail); };
 function record(value: unknown, name: string, required: readonly string[], optional: readonly string[] = []): Record<string, unknown> {
@@ -109,8 +124,54 @@ function preset(key: string, value: unknown): SessionPreset {
   if (Buffer.byteLength(presetMessage(out)) > MAX_PROMPT_BYTES) invalid(name + " message exceeds 8 KiB");
   return out;
 }
+/** A canonical HTTPS URL: no credentials, query or fragment, and exactly as the URL parser writes it. */
+function httpsUrl(value: unknown, name: string): URL {
+  const text = string(value, name, 2048);
+  let url: URL | undefined;
+  try { url = new URL(text); } catch { invalid(name + " must be an absolute URL"); }
+  if (!url || url.protocol !== "https:" || url.username || url.password || url.search || url.hash ||
+    text.includes("?") || text.includes("#") || url.href !== text)
+    invalid(name + " must be a canonical HTTPS URL without credentials, query or fragment");
+  return url!;
+}
+function printable(value: unknown, name: string, max: number): string {
+  if (typeof value !== "string" || !new RegExp("^[\\x21-\\x7e]{1," + max + "}$").test(value)) invalid(name + " must be printable ASCII without spaces");
+  return value as string;
+}
+const ENROLLMENT_KEYS = ["form", "issuer", "tokenUrl", "jwksUrl", "clientId", "username", "scope", "resource", "project",
+  "maxTokenSeconds", "secretFile"] as const;
+function enrollment(key: string, value: unknown, presets: Record<string, SessionPreset>): Enrollment {
+  const name = "enrollment " + key;
+  const preset = Object.hasOwn(presets, key) ? presets[key] : undefined;
+  if (!preset) return invalid(name + " names no preset");
+  const e = record(value, name, ENROLLMENT_KEYS);
+  // Only the primary ordinary app-password form exists; a fallback form needs its own review.
+  if (e.form !== "app_password") invalid(name + " form must be app_password");
+  const issuer = httpsUrl(e.issuer, name + " issuer"), tokenUrl = httpsUrl(e.tokenUrl, name + " tokenUrl");
+  const jwksUrl = httpsUrl(e.jwksUrl, name + " jwksUrl"), resource = httpsUrl(e.resource, name + " resource");
+  if (tokenUrl.origin !== issuer.origin || jwksUrl.origin !== issuer.origin) invalid(name + " tokenUrl and jwksUrl must share the issuer origin");
+  if (e.scope !== ENROLLMENT_SCOPE) invalid(name + " scope must be " + ENROLLMENT_SCOPE);
+  if (e.maxTokenSeconds !== ENROLLMENT_TOKEN_SECONDS) invalid(name + " maxTokenSeconds must be " + ENROLLMENT_TOKEN_SECONDS);
+  const project = id(e.project, name + " project");
+  if (project !== preset.project) invalid(name + " project must equal the preset project");
+  // The preset must admit Jocasta, and only reads of exactly this project.
+  const jocasta = preset.services.find(s => s.audience === "jocasta");
+  if (!jocasta || !jocasta.grants.every(g => g.resource === "project:" + project))
+    invalid(name + " preset must grant Jocasta access to exactly project:" + project);
+  const secretFile = string(e.secretFile, name + " secretFile", 4096);
+  if (!isAbsolute(secretFile) || normalize(secretFile) !== secretFile || secretFile.endsWith("/"))
+    invalid(name + " secretFile must be a normalized absolute path");
+  // Fixed key order makes the enrollment digest deterministic.
+  return { form: "app_password", issuer: issuer.href, tokenUrl: tokenUrl.href, jwksUrl: jwksUrl.href,
+    clientId: printable(e.clientId, name + " clientId", 255), username: printable(e.username, name + " username", 150),
+    scope: ENROLLMENT_SCOPE, resource: resource.href, project, maxTokenSeconds: ENROLLMENT_TOKEN_SECONDS, secretFile };
+}
+/** Public digest over every enrollment field; any edit changes it and invalidates cached tokens. */
+export function enrollmentDigest(e: Enrollment): string {
+  return createHash("sha256").update(JSON.stringify(e)).digest("hex");
+}
 export function parsePolicy(value: unknown, environment: string): SessionPolicy {
-  const v = record(value, "policy", ["version", "environment", "ceilings", "presets"]);
+  const v = record(value, "policy", ["version", "environment", "ceilings", "presets"], ["enrollments"]);
   if (v.version !== 1) invalid("unsupported version");
   if (v.environment !== environment) throw new SessionRefusal("session_policy_environment", "policy names another T3 environment");
   const ceilings = list(v.ceilings, "ceilings", 8, (c, n) => {
@@ -122,7 +183,12 @@ export function parsePolicy(value: unknown, environment: string): SessionPolicy 
   if (Object.keys(raw).length > MAX_PRESETS) invalid("more than 16 presets");
   const presets: Record<string, SessionPreset> = Object.create(null);
   for (const [key, value] of Object.entries(raw)) presets[key] = preset(key, value);
-  return { environment, ceilings, presets };
+  if (v.enrollments === undefined) return { environment, ceilings, presets };
+  const rawEnrollments = dict(v.enrollments, "enrollments");
+  if (Object.keys(rawEnrollments).length > MAX_PRESETS) invalid("more than 16 enrollments");
+  const enrollments: Record<string, Enrollment> = Object.create(null);
+  for (const [key, value] of Object.entries(rawEnrollments)) enrollments[key] = enrollment(key, value, presets);
+  return { environment, ceilings, presets, enrollments };
 }
 export function presetHash(preset: SessionPreset): string {
   return createHash("sha256").update(JSON.stringify(preset)).digest("hex");

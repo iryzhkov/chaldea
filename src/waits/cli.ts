@@ -2,7 +2,7 @@ import { parseArgs } from "node:util";
 import { randomUUID } from "node:crypto";
 import { loadConfig } from "./config.ts";
 import { requestTime } from "./types.ts";
-import { callService, runWaitService } from "./service.ts";
+import { callService, runWaitService, ServiceRefusal } from "./service.ts";
 export const WAIT_USAGE=`chaldea waits serve [--config PATH]
 chaldea wait time --at RFC3339 --thread ID [--request-id EPOCH:KEY] [--description TEXT] [--deadline RFC3339]
 chaldea wait time --after 30s --thread ID [--request-id EPOCH:KEY] [--description TEXT]
@@ -17,11 +17,38 @@ chaldea decision ask --thread ID --question TEXT --option TEXT --option TEXT
 chaldea decision answer ID --answer TEXT
 chaldea decision status ID
 chaldea mcp [--config PATH]
+chaldea session headers --preset NAME --audience jocasta [--config PATH]
 All commands accept --config PATH. Registration commits immediately. Retry the same request-id and arguments.
 Defaults only skip or defer the dependent action. They never grant approval or permission.
 `;
+const SESSION_USAGE="chaldea session headers --preset NAME --audience jocasta [--config PATH]\n";
+const BEARER=/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+/**
+ * Native credential helper: stdout is exactly {"Authorization":"Bearer ..."} and a
+ * newline. Every failure is one fixed refusal code on stderr and exit status 1;
+ * no receipts, tracing, service text or token bytes reach stderr.
+ */
+export async function sessionCli(args:ReadonlyArray<string>):Promise<number>{
+  const refuse=(code:string)=>{process.stderr.write(code+"\n");return 1;};
+  if(args.length===1&&(args[0]==="--help"||args[0]==="-h")){process.stdout.write(SESSION_USAGE);return 0;}
+  let values:{preset?:string|undefined;audience?:string|undefined;config?:string|undefined};
+  try{
+    const parsed=parseArgs({args:[...args],allowPositionals:true,strict:true,options:{preset:{type:"string"},audience:{type:"string"},config:{type:"string"}}});
+    if(parsed.positionals.length!==1||parsed.positionals[0]!=="headers"||parsed.values.preset===undefined||parsed.values.audience===undefined)return refuse("invalid_request");
+    values=parsed.values;
+  }catch{return refuse("invalid_request");}
+  let socket:string;
+  try{socket=loadConfig(values.config).socket;}catch{return refuse("config_unavailable");}
+  let result:unknown;
+  try{result=await callService(socket,"chaldea_session_headers",{preset:values.preset,audience:values.audience},10_000);}
+  catch(error){return refuse(error instanceof ServiceRefusal&&/^[a-z_]{1,64}$/.test(error.message)?error.message:"service_unavailable");}
+  const header=result&&typeof result==="object"&&!Array.isArray(result)&&Object.keys(result).length===1?(result as Record<string,unknown>).Authorization:undefined;
+  if(typeof header!=="string"||!BEARER.test(header))return refuse("invalid_response");
+  process.stdout.write(JSON.stringify({Authorization:header})+"\n");return 0;
+}
 export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
   const [group,...args]=argv;
+  if(group==="session")return sessionCli(args);
   const {values:v,positionals:p}=parseArgs({args,allowPositionals:true,options:{
     config:{type:"string"},thread:{type:"string"},"request-id":{type:"string"},deadline:{type:"string"},
     description:{type:"string"},at:{type:"string"},after:{type:"string"},target:{type:"string"},run:{type:"string"},
