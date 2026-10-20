@@ -64,7 +64,7 @@ export type DetailEvent =
  | {kind:"assistant";text:string;at:number}
  | {kind:"command";id:string;input:string;running:boolean}
  | {kind:"metadata";reported:unknown;context:{used:number;max:number|null}|null;work:Detail["work"]}
- | {kind:"turn-usage";id:string;usage:TurnUsage;at:number};
+ | {kind:"turn-usage";id:string;usage:TurnUsage;at:number;partial?:boolean};
 export class ThreadDetails {
   private value=emptyDetail();
   private assistantAt=0;
@@ -86,6 +86,7 @@ export class ThreadDetails {
     if(e.kind==="command"){if(!e.running)this.commands.delete(e.id);else if(this.commands.has(e.id)||this.commands.size<32)this.commands.set(e.id,commandPreview(e.input));else this.partial=true;}
     if(e.kind==="metadata"){this.value.effort=effort(e.reported,"reported");this.value.context=e.context;this.value.work=e.work;}
     if(e.kind==="turn-usage"&&integer(e.at)&&e.usage.usageScope==="main_agent"){
+      if(e.partial)this.partial=true;
       const old=this.turns.get(e.id);
       if(old&&old.at>e.at)return;
       // Replacement by stable identity, including reconnect and corrections; never sum counters.

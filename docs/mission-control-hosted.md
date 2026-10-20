@@ -43,17 +43,21 @@ Usage uses normalized main-agent turn totals, replaced by stable internal turn
 identity across reconnects. Snapshot replacement clears the retained usage window,
 including removed turns. Missing normalized turns make coverage partial.
 A separate usage-only proof requires an exact app/provider-thread association,
-a same-thread self-rooted root_turn node, reciprocal provider/turn/node/run IDs,
-and matching run-attempt relationships when present. Missing, ambiguous or
-contradictory tuples are excluded. A nullable provider owner is accepted only
-through this proof; a contradictory non-null owner is rejected. The existing
+a unique same-thread self-rooted root_turn node and its matching provider thread.
+Optional resolved run/attempt rows must agree with present non-null ownership
+fields. Missing historical rows and null reverse pointers are neutral. Reverse
+turn pointers name the latest turn, so multiple turns per root/run are legal.
+Duplicate identities, conflicting root ownership and contradictory non-null
+provider owners are rejected using the full snapshot before selection. The existing
 provider metadata, activity ownership and child-roster admission guard is intact.
-Proof storage is bounded to 16 providers, 64 roots, 128 runs, 128 attempts and
-eight pending/observed turns per thread. Only relationship fields and normalized
+Proof storage is bounded to 16 relevant providers, 64 nodes, 128 runs, 128 attempts,
+128 turn identities and eight pending/observed turns per thread. Stream proof
+overflow fails closed until a new snapshot; ambiguity poison is never evicted.
+Only relationship fields and normalized
 usage are retained. Event ordering can defer qualification; later contradictory
 updates withdraw contributions, and reconnect snapshots replace the proof window.
 No history database or additional RPC is used. At most eight observed turns per shown thread are
-retained; eviction marks coverage partial. Input + output is the observed total.
+retained; snapshot truncation and stream eviction mark coverage partial across reconnect. Input + output is the observed total.
 Cache reads/writes are input subsets and reasoning is an output subset. Context
 occupancy is separate. Live context counters do not qualify a generation rate:
 rate stays null/not reported, as do daily totals and cost. Host/model aggregates

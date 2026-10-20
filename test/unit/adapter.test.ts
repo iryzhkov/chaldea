@@ -297,7 +297,7 @@ for(const denied of [false,true])test("provider catalog shares ONE shell client 
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
 });
 
-for(const scenario of ["null-owner","owned","foreign-app","foreign-root","subagent","dangling-node","missing-run","wrong-run-root","wrong-node-turn","wrong-node-provider","foreign-run","wrong-run-provider","wrong-root-parent","wrong-root-self","ambiguous-node","ambiguous-turn","ambiguous-run","duplicate-provider","duplicate-turn","duplicate-node","duplicate-run","owner-contradiction","attempt","wrong-attempt","reorder","replay","correction","withdraw","snapshot-removal","eviction"])test("official usage tuple fixture "+scenario,async()=>{
+for(const scenario of ["runtime-shape","multiple-turns","historical-owner","historical-provider","child-crowding","owner-foreign","owner-nonself","foreign-reverse","snapshot-truncation","poison-reintroduction","stream-overflow","completed-time","stream-child-crowding","root-conflict-reintroduction","null-owner","owned","foreign-app","foreign-root","subagent","dangling-node","missing-run","wrong-run-root","wrong-node-turn","wrong-node-provider","foreign-run","wrong-run-provider","wrong-root-parent","wrong-root-self","ambiguous-node","ambiguous-turn","ambiguous-run","duplicate-provider","duplicate-turn","duplicate-node","duplicate-run","owner-contradiction","attempt","wrong-attempt","reorder","replay","correction","withdraw","snapshot-removal","eviction"])test("official usage tuple fixture "+scenario,async()=>{
  const {connectMissionThread}=await import("../../src/t3/adapter.ts");
  const {MissionModel}=await import("../../src/mission-control/model.ts");
  const server=createServer(),wss=new WebSocketServer({server}),controller=new AbortController();
@@ -334,8 +334,52 @@ for(const scenario of ["null-owner","owned","foreign-app","foreign-root","subage
  if(scenario==="attempt"||scenario==="wrong-attempt"){
   for(const t of projection.providerTurns){t.runAttemptId="attempt-"+t.id;projection.attempts.push({id:t.runAttemptId,runId:"run-"+(t.ordinal-1),attemptOrdinal:1,rootNodeId:t.nodeId,providerInstanceId:"custom",providerThreadId:"provider",providerTurnId:scenario==="attempt"?t.id:"wrong",reason:"initial",status:t.status,startedAt:stamp,completedAt:t.completedAt});}
  }
- if(["foreign-app","foreign-root","subagent","dangling-node","missing-run","wrong-run-root","wrong-node-turn","wrong-node-provider","foreign-run","wrong-run-provider","wrong-root-parent","wrong-root-self","ambiguous-node","ambiguous-turn","ambiguous-run","duplicate-provider","owner-contradiction","wrong-attempt"].includes(scenario)){expected=0;expectedTurns=0;}
- if(["duplicate-turn","duplicate-node","duplicate-run"].includes(scenario)){expected=5*120;expectedTurns=5;}
+ if(["foreign-app","foreign-root","subagent","dangling-node","wrong-run-root","wrong-node-provider","foreign-run","wrong-run-provider","wrong-root-parent","wrong-root-self","ambiguous-node","duplicate-provider","owner-contradiction","owner-foreign","owner-nonself","foreign-reverse"].includes(scenario)){expected=0;expectedTurns=0;}
+ if(["duplicate-turn","duplicate-node","duplicate-run","poison-reintroduction"].includes(scenario)){expected=5*120;expectedTurns=5;}
+ if(scenario==="runtime-shape"){
+  projection.nodes=nodes.slice(0,4).map(n=>({...n,providerTurnId:null}));
+  projection.providerTurns=turns.slice(0,4).map((t,i)=>({...t,runAttemptId:"attempt-"+i,...(i===3?{turnTokenUsage:undefined}: {})}));
+  projection.runs=[runs[3]];
+  projection.attempts=[{id:"attempt-3",runId:runs[3]!.id,attemptOrdinal:1,rootNodeId:nodes[3]!.id,providerInstanceId:"custom",providerThreadId:"provider",providerTurnId:null,reason:"initial",status:"running",startedAt:stamp,completedAt:null}];
+  expected=360;expectedTurns=3;
+ }
+ if(scenario==="multiple-turns"){
+  projection.nodes=[{...nodes[0],providerTurnId:turns.at(-1)!.id}];projection.runs=[runs[0]];
+  projection.providerTurns=turns.map(t=>({...t,nodeId:nodes[0]!.id,runAttemptId:"shared"}));
+  projection.attempts=[{id:"shared",runId:runs[0]!.id,attemptOrdinal:1,rootNodeId:nodes[0]!.id,providerInstanceId:"custom",providerThreadId:"provider",providerTurnId:turns.at(-1)!.id,reason:"initial",status:"running",startedAt:stamp,completedAt:null}];
+ }
+ if(scenario==="historical-owner"){
+  provider.ownerNodeId="root-0" as never;
+  for(let i=0;i<80;i++)projection.nodes.push({...nodes[0],id:"old-"+i,rootNodeId:"old-"+i,providerTurnId:null});
+ }
+ if(scenario==="historical-provider")for(let i=0;i<20;i++)projection.providerThreads.push({...provider,id:"other-"+i});
+ if(scenario==="child-crowding")for(let i=0;i<12;i++){
+  projection.nodes.push({...nodes[0],id:"child-"+i,kind:"subagent",providerTurnId:"child-turn-"+i});
+  projection.providerTurns.push({...turns[6],id:"child-turn-"+i,nodeId:"child-"+i});
+ }
+ if(scenario==="owner-foreign"||scenario==="owner-nonself"){
+  provider.ownerNodeId="bad-owner" as never;
+  projection.nodes.push({...nodes[0],id:"bad-owner",threadId:scenario==="owner-foreign"?"foreign":threadId,rootNodeId:"not-self"});
+ }
+ if(scenario==="foreign-reverse"){
+  projection.providerTurns.push({...turns[0],id:"foreign-pointer",providerThreadId:"foreign",nodeId:"foreign"});
+  for(const n of nodes)n.providerTurnId="foreign-pointer";
+ }
+ if(scenario==="snapshot-truncation"){
+  for(const t of turns)t.turnTokenUsage={...turns[0]!.turnTokenUsage!};
+  for(let i=7;i<11;i++){
+   const n={...nodes[0],id:"root-"+i,rootNodeId:"root-"+i,runId:"run-"+i,providerTurnId:"turn-"+i};
+   projection.nodes.push(n);projection.runs.push({...runs[0],id:n.runId,rootNodeId:n.id,ordinal:i+1});
+   projection.providerTurns.push({...turns[0],id:n.providerTurnId,nodeId:n.id,ordinal:i+1});
+  }expected=960;expectedTurns=8;
+ }
+ if(scenario==="stream-child-crowding"){
+  for(const t of turns)t.turnTokenUsage={...turns[0]!.turnTokenUsage!};
+  const n={...nodes[0],id:"eighth",rootNodeId:"eighth",runId:"eighth-run",providerTurnId:"eighth-turn"};
+  projection.nodes.push(n);projection.runs.push({...runs[0],id:n.runId,rootNodeId:n.id,ordinal:8});
+  projection.providerTurns.push({...turns[0],id:n.providerTurnId,nodeId:n.id,ordinal:8});expected=960;expectedTurns=8;
+ }
+ if(scenario==="poison-reintroduction")projection.nodes.push({...nodes[0]});
  let sequence=1;
  const event=(type:string,payload:unknown)=>({kind:"event",sequence:++sequence,event:{id:"event-"+sequence,threadId,occurredAt:stamp,type,payload}});
  const snapshot=()=>({kind:"snapshot",snapshotSequence:++sequence,projection:structuredClone(projection)});
@@ -350,6 +394,20 @@ for(const scenario of ["null-owner","owned","foreign-app","foreign-root","subage
    const n={...nodes[0],id:"root-"+i,rootNodeId:"root-"+i,runId:"run-"+i,providerTurnId:"turn-"+i};
    values.push(event("provider-turn.updated",{...turns[0],id:n.providerTurnId,nodeId:n.id,ordinal:i+1}),event("run.updated",{...runs[0],id:n.runId,rootNodeId:n.id,ordinal:i+1}),event("node.updated",n));
   }expected=7*120;expectedTurns=7;
+ }
+ if(scenario==="completed-time")values.push({...event("provider-turn.updated",turns[0]),event:{id:"late",threadId,occurredAt:"2026-10-18T00:00:10.000Z",type:"provider-turn.updated",payload:turns[0]}});
+ if(scenario==="stream-child-crowding")for(let i=0;i<12;i++){
+  values.push(event("node.updated",{...nodes[0],id:"stream-child-"+i,kind:"subagent",providerTurnId:"stream-child-turn-"+i}),
+   event("provider-turn.updated",{...turns[6],id:"stream-child-turn-"+i,nodeId:"stream-child-"+i}));
+ }
+ if(scenario==="root-conflict-reintroduction"){
+  values.push(event("node.updated",{...nodes[0],threadId:"foreign"}),event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));expected=600;expectedTurns=5;
+ }
+ if(scenario==="snapshot-truncation")values.push(snapshot());
+ if(scenario==="poison-reintroduction")values.push(event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));
+ if(scenario==="stream-overflow"){
+  for(let i=0;i<70;i++)values.push(event("node.updated",{...nodes[0],id:"overflow-"+i,rootNodeId:"overflow-"+i,providerTurnId:null}));
+  values.push(event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));expected=0;expectedTurns=0;
  }
  values.push({kind:"synchronized"});
  const seen:import("../../src/t3/adapter.ts").MissionDetailEvent[]=[];
@@ -367,10 +425,11 @@ for(const scenario of ["null-owner","owned","foreign-app","foreign-root","subage
 
   const usage=model.snapshot().agents[0]!.details.usage;
   assert.equal(usage.total,expected||null,scenario);assert.equal(usage.turns,expectedTurns,scenario);
-  if(expectedTurns){assert.equal(usage.cacheWrite,0);assert.equal(usage.coverage,"partial");assert.equal(usage.rate,null);}
+  if(scenario==="completed-time")assert.equal(usage.observedAt,now);
+  if(expectedTurns){assert.equal(usage.cacheWrite,0);assert.equal(usage.coverage,scenario==="stream-child-crowding"?"observed":"partial",scenario);assert.equal(usage.rate,null);}
 
   assert.equal(model.snapshot().agents.length,1,"base row survives missing ownership details");
-  assert.deepEqual(model.snapshot().agents[0]!.details.context,scenario==="owned"?{used:500,max:1000}:null);
-  if(scenario!=="owned")assert.ok(!seen.some(e=>e.kind==="metadata"&&e.work.monitors===1),"usage path does not admit provider roster");
+  assert.deepEqual(model.snapshot().agents[0]!.details.context,["owned","historical-owner","owner-nonself"].includes(scenario)?{used:500,max:1000}:null);
+  if(!["owned","historical-owner","owner-nonself"].includes(scenario))assert.ok(!seen.some(e=>e.kind==="metadata"&&e.work.monitors===1),"usage path does not admit provider roster");
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
 });
