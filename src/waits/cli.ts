@@ -30,7 +30,7 @@ export async function waitsCli(argv:ReadonlyArray<string>):Promise<number>{
   }});
   if(v.help){process.stdout.write(WAIT_USAGE);return 0;}
   if(group==="waits"&&p[0]==="serve"){await runWaitService(v.config);return 0;}
-  if(group==="mcp"){const {runMcp}=await import("../mcp.ts");await runMcp(loadConfig(v.config).socket);return 0;}
+  if(group==="mcp"){const {runMcp}=await import("../mcp.ts");const c=loadConfig(v.config);await runMcp(c.socket,c.sessionPolicy!==undefined);return 0;}
   const config=loadConfig(v.config);let method:string;let input:unknown;
   const requestId=v["request-id"]??Date.now()+":"+randomUUID();
   if(group==="wait"&&["time","thread"].includes(p[0]??"")){

@@ -10,6 +10,8 @@ import { discoverServerUrl } from "../t3/adapter.ts";
 import { loadConfig, privateFile, type WaitConfig } from "./config.ts";
 import { boundedLog } from "./log.ts";
 import { object, text, waitDescription, type WaitInput } from "./types.ts";
+import { loadSessionPolicy } from "../session/policy.ts";
+import { createSessionT3 } from "../session/t3.ts";
 
 export async function body(req: IncomingMessage, limit=8192): Promise<string> {
   const parts:Buffer[]=[];let n=0;
@@ -60,6 +62,9 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
         case "chaldea_decision_answer":result=await engine.answerFromThread(text(input.id,"id"),text(input.answer,"answer",256),text(input.answeringThreadId,"answeringThreadId"));break;
         case "chaldea_decision_answer_cli":result=engine.answer(text(input.id,"id"),text(input.answer,"answer",256),"cli");break;
         case "chaldea_wait_status":case "chaldea_decision_status":result=engine.store.get(text(input.id,"id"));break;
+        // Session results are plain status objects, never decorated as wait items.
+        case "chaldea_session_start":result=await engine.startSession(input);break;
+        case "chaldea_session_status":result=engine.sessionStatus(text(input.id,"id"));break;
         default:throw new Error("Unknown method");
       }
       if (result && typeof result === "object" && "kind" in result && "id" in result) {
@@ -79,12 +84,17 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
     // Check the answer credential before accepting questions; log no exception data.
     try { privateFile(config.answerTokenFile); } catch(error) { report("startup_credential_unavailable"); throw error; }
     store=new WakeStore(config.database,config.environment);
-    const t3=createWaitT3(()=>{
+    const connect=()=>{
       const serverUrl=config.serverUrl??discoverServerUrl(config.t3BaseDir);
       if(!serverUrl)throw new Error("T3 is offline");
       return {serverUrl,token:privateFile(config.tokenFile),signal:AbortSignal.timeout(10_000)};
-    },config.environment,id=>engine!.trackedNative(id));
-    engine=new WaitEngine(store,t3,{report,...extras});
+    };
+    const t3=createWaitT3(connect,config.environment,id=>engine!.trackedNative(id));
+    // Disabled unless the operator names a protected policy; it is re-read for every start and gate check.
+    const policyFile=config.sessionPolicy;
+    const sessions=policyFile===undefined ? {} : {sessions:{policy:()=>loadSessionPolicy(policyFile,config.environment),
+      t3:createSessionT3(connect,config.environment)}};
+    engine=new WaitEngine(store,t3,{report,...sessions,...extras});
     const running=engine;
     page=createServer(async(req,res)=>{
       res.setHeader("Cache-Control","no-store");

@@ -9,6 +9,8 @@ import type { OrchestrationV2ThreadProjection, OrchestrationV2UserInputQuestion 
 export interface WaitRun {
   id: string; ordinal: number; status: string; started: string | null; workStarted: string | null;
   restartOf: string | null; continuationOf?: string; failure: string | null; root: string | null;
+  /** The user message that started the run; binds a session to its own root run. */
+  message?: string;
 }
 export type NativeQuestion = Pick<OrchestrationV2UserInputQuestion,"id"|"allowCustomAnswer"|"multiSelect"> &
   Partial<Pick<OrchestrationV2UserInputQuestion,"header"|"question">> &
@@ -24,6 +26,8 @@ export interface WaitSnapshot {
   pendingRuns: Array<string | null>;
   requests?: NativeRequest[];
   children: Array<{id:string; runId:string|null; childThreadId:string|null; status:string; delivery?:string}>;
+  /** T3 thread lineage. Context for refusing known limited sessions, never authority. */
+  lineage?: {parent:string|null; root:string};
 }
 export interface WaitT3 {
   environment(): Promise<string>;
@@ -47,7 +51,7 @@ export function waitSnapshot(p: OrchestrationV2ThreadProjection): WaitSnapshot {
         (r.userMessageId === switchIds(p.thread.id,source.id).dispatch ||
           r.userMessageId.startsWith("limit-resume:" + p.thread.id + ":" + source.id + ":")));
       return {...(previous ? {continuationOf:previous.id} : {}),id:r.id,ordinal:r.ordinal,status:r.status,started:iso(r.startedAt),workStarted:iso(r.workStartedAt),
-        restartOf:r.restartContinuationOfRunId??null,root:r.rootNodeId,
+        restartOf:r.restartContinuationOfRunId??null,root:r.rootNodeId,message:r.userMessageId,
         failure:failure?.type === "error" ? failure.failure?.class??null : null};
     }),
     requests:p.runtimeRequests.map(r => {
@@ -57,6 +61,7 @@ export function waitSnapshot(p: OrchestrationV2ThreadProjection): WaitSnapshot {
     }),
     pendingRuns:p.runtimeRequests.filter(r => r.status === "pending").map(r => p.nodes.find(n => n.id === r.nodeId)?.runId ?? null),
     children:p.subagents.map(s => ({id:s.id,runId:s.runId,childThreadId:s.childThreadId,status:s.status,...(s.completionDelivery ? {delivery:s.completionDelivery.state} : {})})),
+    ...(p.thread.lineage ? {lineage:{parent:p.thread.lineage.parentThreadId,root:p.thread.lineage.rootThreadId}} : {}),
   };
 }
 /** A projection error alone is never evidence of deletion. */

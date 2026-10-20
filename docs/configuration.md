@@ -70,6 +70,8 @@ redirects them into the scratch HOME.
 Waits keys remain unchanged: `environment`, `t3BaseDir`, `serverUrl`, `tokenFile`,
 `database`, `socket`, `listenAddress`, `port`, `answerBaseUrl`, `answerTokenFile`,
 `logFile`. Its config/tokens, database/log and socket defaults now use the XDG bases.
+The optional `sessionPolicy` key names an absolute, operator-owned fixed-preset policy;
+without it sessions are disabled (see [sessions.md](sessions.md)).
 
 Quota's existing `contexts`, nested `assertRuntimeHome`, and
 `lowHeadroomPercent` remain unchanged. The same file can also supply

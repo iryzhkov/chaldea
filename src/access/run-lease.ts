@@ -9,7 +9,8 @@ export interface RunAdmission {
   runId: string; profile: string; project: string; expiresAt: number; services: TokenGrant[];
 }
 interface LeaseRecord { admission: RunAdmission; status: "active" | "cancelled" | "ended"; revision: number }
-function validateAdmission(value: RunAdmission, now: number): void {
+/** Pure checks, also used by fixed session presets; `now` is epoch seconds. */
+export function validateAdmission(value: RunAdmission, now: number): void {
   identifier(value.runId); identifier(value.profile); identifier(value.project); seconds(value.expiresAt);
   requireAccess(value.expiresAt > now && value.expiresAt <= now + 86400, "invalid_run_deadline");
   requireAccess(Array.isArray(value.services) && value.services.length > 0 && value.services.length <= 7, "invalid_services");
@@ -21,7 +22,7 @@ function validateAdmission(value: RunAdmission, now: number): void {
     else requireAccess(s.source === undefined, "unexpected_source");
   }
 }
-function narrowing(next: RunAdmission, old: RunAdmission): boolean {
+export function narrowing(next: RunAdmission, old: RunAdmission): boolean {
   return next.runId === old.runId && next.profile === old.profile && next.project === old.project &&
     next.expiresAt <= old.expiresAt && next.services.every(s => old.services.some(o =>
       s.audience === o.audience && s.source === o.source && subset(s.grants, o.grants)));

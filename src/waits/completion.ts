@@ -1,7 +1,7 @@
 import type { WaitSnapshot, WaitRun } from "../t3/waits.ts";
 import type { Outcome } from "./types.ts";
 
-const LIVE = new Set(["preparing","queued","starting","running","waiting","pending","idle"]);
+export const LIVE = new Set(["preparing","queued","starting","running","waiting","pending","idle"]);
 export function completion(snapshot: WaitSnapshot, pinnedRun: string): Outcome | null {
   const root = snapshot.runs.find(r => r.id === pinnedRun);
   if (!root) return null; // A compacted/missing run needs attention; it is never success.

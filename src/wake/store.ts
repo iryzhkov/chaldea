@@ -7,9 +7,11 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { MAX_AGE, validate, waitDescription, type WaitInput, type Input, type DecisionInput, type Outcome, type AnswerSource } from "../waits/types.ts";
+import { SessionRefusal } from "../session/policy.ts";
+import { sessionWake, type SessionOutcome } from "../session/result.ts";
 
 export interface Item {
-  id: string; kind: "wait" | "decision" | "native"; parent: string; project: string; request_key: string; request_at: number;
+  id: string; kind: "wait" | "decision" | "native" | "session"; parent: string; project: string; request_key: string; request_at: number;
   hash: string; input: string; deadline: number; target_run: string | null; cursor: number;
   state: "parked" | "resolved" | "cancelled" | "orphaned" | "needs_attention"; disposition: string | null;
   outcome: string | null; created: number; terminal: number | null;
@@ -20,6 +22,20 @@ export interface Delivery {
 }
 export interface NativePolicy { item: string; request_id: string | null; bind_until: number; baseline: string; questions: string|null; turn_item:string|null; created?:number }
 export interface Registration { id: string; kind: Item["kind"]; input: Input; deadline: number; requestAt: number; hash: string }
+/** Launch: intent (nothing sent) -> dispatching -> accepted | rejected | uncertain | mismatch.
+ * Occupancy is the preset's runtime slot. It is released only by T3 evidence that the
+ * session thread stopped (or never started), never by a logical deadline or cancellation. */
+export interface SessionRecord {
+  item: string; preset: string; preset_hash: string; admission: string; thread_id: string; command_id: string; message_id: string;
+  t3_project: string; payload: string; launch: "intent" | "dispatching" | "accepted" | "rejected" | "uncertain" | "mismatch";
+  launch_detail: string | null; root_run: string | null; result: string | null; result_state: string | null; result_bytes: number | null;
+  occupancy: "held" | "released"; released: string | null; released_at: number | null;
+}
+export interface SessionRegistration {
+  id: string; requestId: string; requestAt: number; hash: string; input: unknown; parent: string; project: string; deadline: number;
+  preset: string; presetHash: string; admission: string; threadId: string; commandId: string; messageId: string; t3Project: string; payload: string;
+}
+export const MAX_ACTIVE_SESSIONS = 4;
 const DB_LIMIT = 64 * 1024 * 1024;
 function waitSummary(row: Item, outcome: Outcome): string {
   const context = waitDescription(JSON.parse(row.input) as WaitInput, row.target_run);
@@ -74,6 +90,14 @@ export class WakeStore {
     if (!(this.db.prepare("PRAGMA table_info(outbox)").all() as Array<{name:string}>).some(c=>c.name==="batch_id"))
       this.db.exec("ALTER TABLE outbox ADD COLUMN batch_id TEXT");
     }]);
+    // Additive and idempotent outside user_version, so a rollback that never used
+    // sessions still opens this journal. Retention never prunes a held slot.
+    this.db.exec(`CREATE TABLE IF NOT EXISTS sessions(
+        item TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE, preset TEXT NOT NULL, preset_hash TEXT NOT NULL,
+        admission TEXT NOT NULL, thread_id TEXT UNIQUE NOT NULL, command_id TEXT UNIQUE NOT NULL, message_id TEXT UNIQUE NOT NULL,
+        t3_project TEXT NOT NULL, payload TEXT NOT NULL, launch TEXT NOT NULL, launch_detail TEXT, root_run TEXT,
+        result TEXT, result_state TEXT, result_bytes INTEGER, occupancy TEXT NOT NULL, released TEXT, released_at INTEGER);
+      CREATE INDEX IF NOT EXISTS sessions_held ON sessions(occupancy,preset);`);
     const env = this.meta("environment");
     if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
@@ -109,7 +133,7 @@ export class WakeStore {
   bytes(): number {
     return [this.path, this.path + "-wal"].reduce((sum, p) => { try { return sum + statSync(p).size; } catch { return sum; } }, 0);
   }
-  prepare(kind: Item["kind"], value: unknown, now = Date.now()): Registration {
+  prepare(kind: Exclude<Item["kind"], "session">, value: unknown, now = Date.now()): Registration {
     const {input, deadline, requestAt} = validate(kind, value, now);
     const hash = createHash("sha256").update(JSON.stringify({kind,input})).digest("hex");
     return {id: randomUUID(), kind, input, deadline, requestAt, hash};
@@ -124,7 +148,7 @@ export class WakeStore {
       const existing = this.existing(reg); if (existing) return existing;
       if (reg.requestAt <= Number(this.meta("replay_fence"))) throw new Error("requestId retired by retention fence");
       if (this.bytes() > DB_LIMIT - 1024 * 1024) throw new Error("Disk pressure: registration parked");
-      const count = (this.db.prepare("SELECT count(*) AS n FROM items WHERE state='parked' AND (CASE WHEN kind='wait' THEN 'wait' ELSE 'decision' END)=?").get(reg.kind === "wait" ? "wait" : "decision") as {n:number}).n;
+      const count = (this.db.prepare("SELECT count(*) AS n FROM items WHERE state='parked' AND (CASE WHEN kind='wait' THEN 'wait' WHEN kind='session' THEN 'session' ELSE 'decision' END)=?").get(reg.kind === "wait" ? "wait" : "decision") as {n:number}).n;
       if (count >= 128) throw new Error("Active " + reg.kind + " limit (128)");
       if (reg.kind === "native") {
         const preparing=this.db.prepare("SELECT i.id FROM items i JOIN native_decisions n ON n.item=i.id WHERE i.parent=? AND i.state='parked' AND n.request_id IS NULL").get(reg.input.threadId);
@@ -356,6 +380,7 @@ export class WakeStore {
       // Never prune unresolved or ambiguous delivery. Retire request keys before removing tombstones.
       const candidates = this.db.prepare(`SELECT id,request_at,terminal FROM items WHERE state<>'parked'
         AND id NOT IN (SELECT item FROM outbox WHERE state IN ('pending','sending','blocked','uncertain'))
+        AND id NOT IN (SELECT item FROM sessions WHERE occupancy='held')
         ORDER BY terminal DESC,id`).all() as unknown as Array<{id:string;request_at:number;terminal:number}>;
       const remove = candidates.filter((r,i) => i >= 10000 || r.terminal < now - MAX_AGE);
       if (remove.length) {
@@ -363,6 +388,79 @@ export class WakeStore {
         this.db.prepare("UPDATE meta SET value=? WHERE key='replay_fence'").run(String(fence));
         const del = this.db.prepare("DELETE FROM items WHERE id=?"); for (const r of remove) del.run(r.id);
       }
+    });
+  }
+  session(id: string): SessionRecord {
+    const row = this.db.prepare("SELECT * FROM sessions WHERE item=?").get(id) as SessionRecord | undefined;
+    if (!row) throw new Error("Not a session"); return row;
+  }
+  /** Same requestId and arguments return the stored session; changed arguments are refused. */
+  sessionRequest(requestId: string, hash: string): Item | undefined {
+    const row = this.db.prepare("SELECT * FROM items WHERE request_key=?").get(requestId) as Item | undefined;
+    if (row && (row.kind !== "session" || row.hash !== hash)) throw new Error("requestId reused with changed payload");
+    return row;
+  }
+  presetHeld(preset: string): SessionRecord | undefined {
+    return this.db.prepare("SELECT * FROM sessions WHERE preset=? AND occupancy='held'").get(preset) as SessionRecord | undefined;
+  }
+  /** Every session thread ever started here and still retained: known limited lineage. */
+  sessionThreads(): Set<string> {
+    return new Set((this.db.prepare("SELECT thread_id FROM sessions").all() as Array<{thread_id:string}>).map(r => r.thread_id));
+  }
+  /** Sessions that still need lifecycle work: logically active, or holding their preset slot. */
+  liveSessions(): SessionRecord[] {
+    return this.db.prepare("SELECT s.* FROM sessions s JOIN items i ON i.id=s.item WHERE i.state='parked' OR s.occupancy='held' ORDER BY i.created,s.item").all() as unknown as SessionRecord[];
+  }
+  registerSession(r: SessionRegistration, now = Date.now(), maxActive = MAX_ACTIVE_SESSIONS): Item {
+    return this.transaction(() => {
+      const existing = this.sessionRequest(r.requestId, r.hash); if (existing) return existing;
+      if (r.requestAt <= Number(this.meta("replay_fence"))) throw new Error("requestId retired by retention fence");
+      if (this.bytes() > DB_LIMIT - 1024 * 1024) throw new Error("Disk pressure: registration parked");
+      if (this.presetHeld(r.preset)) throw new SessionRefusal("preset_busy", "the preset's previous session has not been observed to stop");
+      const held = (this.db.prepare("SELECT count(*) AS n FROM sessions WHERE occupancy='held'").get() as {n:number}).n;
+      if (held >= maxActive) throw new SessionRefusal("session_limit", "active session limit (" + maxActive + ")");
+      this.db.prepare("INSERT INTO items(id,kind,parent,project,request_key,request_at,hash,input,deadline,target_run,state,created) VALUES(?,'session',?,?,?,?,?,?,?,NULL,'parked',?)")
+        .run(r.id,r.parent,r.project,r.requestId,r.requestAt,r.hash,JSON.stringify(r.input),r.deadline,now);
+      this.db.prepare(`INSERT INTO sessions(item,preset,preset_hash,admission,thread_id,command_id,message_id,t3_project,payload,launch,occupancy)
+        VALUES(?,?,?,?,?,?,?,?,?,'intent','held')`)
+        .run(r.id,r.preset,r.presetHash,r.admission,r.threadId,r.commandId,r.messageId,r.t3Project,r.payload);
+      return this.get(r.id);
+    });
+  }
+  /** Compare-and-set launch transition; false when another path already moved it. */
+  sessionLaunch(id: string, from: readonly SessionRecord["launch"][], to: SessionRecord["launch"], detail: string | null = null): boolean {
+    return this.transaction(() => {
+      const s = this.session(id);
+      if (!from.includes(s.launch)) return false;
+      this.db.prepare("UPDATE sessions SET launch=?,launch_detail=coalesce(?,launch_detail) WHERE item=?").run(to,detail,id);
+      return true;
+    });
+  }
+  sessionRoot(id: string, run: string): void {
+    this.transaction(() => {
+      this.db.prepare("UPDATE sessions SET root_run=coalesce(root_run,?) WHERE item=?").run(run,id);
+      this.db.prepare("UPDATE items SET target_run=coalesce(target_run,?) WHERE id=?").run(run,id);
+    });
+  }
+  releaseSession(id: string, reason: string, now = Date.now()): void {
+    this.transaction(() => this.db.prepare("UPDATE sessions SET occupancy='released',released=?,released_at=? WHERE item=? AND occupancy='held'").run(reason,now,id));
+  }
+  /** One terminal outcome and one deterministic wake per session. The slot is unaffected. */
+  finishSession(id: string, outcome: SessionOutcome, result: string | null = null, now = Date.now()): Item {
+    return this.transaction(() => {
+      const row = this.get(id);
+      if (row.kind !== "session" || row.state !== "parked") return row;
+      const s = this.session(id);
+      const runId = outcome.runId ?? s.root_run ?? undefined;
+      const final: SessionOutcome = {...outcome, ...(runId ? {runId} : {})};
+      const wake = sessionWake({id, parent: row.parent, preset: s.preset, thread: s.thread_id, outcome: final, result});
+      final.wake = wake.wake;
+      this.db.prepare("UPDATE items SET state='resolved',outcome=?,terminal=? WHERE id=?").run(JSON.stringify(final),now,id);
+      this.db.prepare("UPDATE sessions SET result=?,result_state=?,result_bytes=? WHERE item=?")
+        .run(result,outcome.reason === "succeeded" ? "stored" : outcome.reason.startsWith("result_") ? outcome.reason : null,outcome.bytes ?? null,id);
+      this.db.prepare("INSERT INTO outbox(id,item,channel,payload,state,next_at) VALUES(?,?,'wake',?,'pending',?)")
+        .run("chaldea-session:" + id + ":wake",id,wake.payload,now);
+      return this.get(id);
     });
   }
   close(): void { try { this.checkpoint(); } finally { try { this.db.close(); } finally { this.releaseOwner(); } } }
