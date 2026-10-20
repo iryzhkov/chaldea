@@ -271,7 +271,8 @@ test("a surviving reporter keeps its preset quarantined after deadline and cance
     const grant = f.engine.authorizeIssue("short", "jocasta");
     if (!grant.ok) throw new Error(grant.refusal);
     assert.equal(grant.runId, a.sessionId); assert.equal(grant.threadId, a.threadId);
-    assert.deepEqual(grant.grants, GRANTS[0]!.grants);
+    assert.ok("grants" in grant.service);
+    assert.deepEqual(grant.service.grants, GRANTS[0]!.grants);
     await until(() => f.engine.sessionStatus(a.sessionId).state === "resolved");
     assert.equal((f.engine.sessionStatus(a.sessionId).outcome as { reason: string }).reason, "deadline");
     // The old root still runs: no issuance for it and no new run that a preset-bound helper could serve.
@@ -374,7 +375,7 @@ test("edited, removed and wrong-audience presets refuse issuance; terminal runs 
     assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "no_active_run" });
     const s = await start(f);
     assert.ok(f.engine.authorizeIssue("reporter", "jocasta").ok);
-    assert.deepEqual(f.engine.authorizeIssue("reporter", "akasha"), { ok: false, refusal: "audience_not_admitted" });
+    assert.deepEqual(f.engine.authorizeIssue("reporter", "akasha"), { ok: false, refusal: "invalid_audience" });
     assert.deepEqual(f.engine.authorizeIssue("reporter", "nope"), { ok: false, refusal: "invalid_audience" });
     const original = f.ref.policy;
     f.ref.policy = policy({ reporter: preset({ prompt: "Report projectA and more." }), short: preset({ maxSeconds: 2 }) });
@@ -627,3 +628,46 @@ test("disabled sessions leave waits and decisions unchanged and refuse starts", 
     assert.deepEqual(engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "sessions_disabled" });
   } finally { await engine.stop(); store.close(); dir.remove(); }
 });
+
+for (const service of [
+  { audience: "ov", scope: "ov.read", ov_namespaces: ["viking://resources/reports"] },
+  { audience: "homelab", scope: "homelab.read", homelab_services: ["dns"], homelab_hosts: ["host-a"] },
+  { audience: "ha", scope: "ha.read", ha_entities: ["sensor.qualified_example"], ha_actions: ["state.read"] },
+]) {
+  test(service.audience + ": destination, restart, ceiling, cancellation and quarantine preserve run boundaries", async () => {
+    const f = fixture("typed-" + service.audience);
+    try {
+      const doc = { version: 1, environment: "env", presets: { reporter: preset({ services: [service] }) },
+        ceilings: [{ ...CEILING, services: [service] }], enrollments: { reporter: {
+          form: "app_password", issuer: "https://auth.example.test/application/o/" + service.audience + "/",
+          tokenUrl: "https://auth.example.test/application/o/token/", jwksUrl: "https://auth.example.test/application/o/" + service.audience + "/jwks/",
+          clientId: "client", username: "ordinary", resource: "https://" + service.audience + ".mcp.ryzhkov.dev/mcp",
+          ...service, maxTokenSeconds: 300, secretFile: "/etc/chaldea/synthetic.secret",
+        } } };
+      f.ref.policy = parsePolicy(doc, "env");
+      f.ref.policy.presets.reporter!.destinations = ["elsewhere"];
+      await assert.rejects(start(f), /preset_exceeds_ceiling/); assert.equal(f.t3.launches.length, 0);
+      f.ref.policy = parsePolicy(doc, "env");
+      const run = await start(f), grant = f.engine.authorizeIssue("reporter", service.audience);
+      assert.ok(grant.ok);
+      assert.deepEqual(grant.service, service); assert.equal(grant.project, "projectA");
+      assert.equal(f.t3.get(run.threadId).project, "reporter-project");
+      assert.deepEqual(f.engine.authorizeIssue("reporter", "jocasta"), { ok: false, refusal: "audience_not_admitted" });
+      await f.restart();
+      assert.deepEqual(f.engine.authorizeIssue("reporter", service.audience), grant);
+      f.ref.policy!.ceilings[0]!.project = "other-project";
+      assert.deepEqual(f.engine.authorizeIssue("reporter", service.audience), { ok: false, refusal: "preset_exceeds_ceiling" });
+      f.ref.policy = parsePolicy(doc, "env");
+      assert.deepEqual(f.engine.authorizeIssue("reporter", service.audience, Date.parse(run.deadline)), { ok: false, refusal: "run_expired" });
+      f.engine.cancelSession(run.sessionId);
+      assert.deepEqual(f.engine.authorizeIssue("reporter", service.audience), { ok: false, refusal: "run_inactive" });
+      await assert.rejects(start(f), /preset_busy/);
+      await f.restart();
+      assert.deepEqual(f.engine.authorizeIssue("reporter", service.audience), { ok: false, refusal: "run_inactive" });
+      complete(f, run.threadId);
+      await until(() => f.engine.sessionStatus(run.sessionId).occupancy === "released");
+      const next = await start(f), nextGrant = f.engine.authorizeIssue("reporter", service.audience);
+      assert.ok(nextGrant.ok); assert.notEqual(nextGrant.runId, grant.runId); assert.notEqual(next.threadId, run.threadId);
+    } finally { await f.close(); }
+  });
+}

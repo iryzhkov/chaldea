@@ -4,8 +4,9 @@ import { lstatSync } from "node:fs";
 import { dirname, isAbsolute, normalize } from "node:path";
 import { createHash } from "node:crypto";
 import { readTrustedFile } from "../config/files.ts";
-import { AccessError, audienceName, grants as checkGrants, identifier, strictJson } from "../access/token.ts";
-import type { TokenGrant } from "../access/issuer.ts";
+import { AccessError, identifier, strictJson } from "../access/token.ts";
+import { isDeepStrictEqual } from "node:util";
+import { grantKeys, isNew, parseServiceGrant, RESOURCES, type NewServiceGrant, type SessionServiceGrant } from "./service-grant.ts";
 
 export const MAX_PRESETS = 16;
 export const MAX_SESSION_SECONDS = 86_400;
@@ -20,19 +21,24 @@ export class SessionRefusal extends Error {
     super(detail ? code + ": " + detail : code); this.code = code; this.name = "SessionRefusal";
   }
 }
-export interface SessionCeiling { project: string; maxSeconds: number; services: TokenGrant[]; destinations: string[] }
+export interface SessionCeiling { project: string; maxSeconds: number; services: SessionServiceGrant[]; destinations: string[] }
 export interface SessionPreset {
   id: string; instanceId: string; model: string; options?: Array<{ id: string; value: string | boolean }>;
   runtimeMode: typeof RUNTIME_MODES[number]; interactionMode: typeof INTERACTION_MODES[number];
   projectId: string; title: string; prompt: string; inputs: Record<string, string>;
-  project: string; services: TokenGrant[]; maxSeconds: number; delegate: boolean; destinations: string[];
+  project: string; services: SessionServiceGrant[]; maxSeconds: number; delegate: boolean; destinations: string[];
 }
 /**
  * Public description of one ordinary host×profile Authentik enrollment for a
  * preset. It names where to ask and what to expect, never the secret itself:
  * secretFile points at the owner-only app password on this host.
  */
-export interface Enrollment {
+interface CommonEnrollment {
+  form: "app_password"; issuer: string; tokenUrl: string; jwksUrl: string; clientId: string; username: string;
+  resource: string; maxTokenSeconds: typeof ENROLLMENT_TOKEN_SECONDS; secretFile: string;
+}
+export type Enrollment = LegacyJocastaEnrollment | (CommonEnrollment & NewServiceGrant);
+export interface LegacyJocastaEnrollment {
   form: "app_password"; issuer: string; tokenUrl: string; jwksUrl: string; clientId: string; username: string;
   scope: typeof ENROLLMENT_SCOPE; resource: string; project: string; maxTokenSeconds: typeof ENROLLMENT_TOKEN_SECONDS; secretFile: string;
 }
@@ -72,12 +78,10 @@ function list<T>(value: unknown, name: string, max: number, item: (v: unknown, n
   if (!Array.isArray(value) || value.length < 1 || value.length > max) invalid(name + " must hold 1.." + max + " entries");
   return (value as unknown[]).map((v, i) => item(v, name + "[" + i + "]"));
 }
-function services(value: unknown, name: string): TokenGrant[] {
+function services(value: unknown, name: string): SessionServiceGrant[] {
   const out = list(value, name, 7, (v, n) => {
-    const s = record(v, n, ["audience", "grants"]);
-    try { audienceName(s.audience); checkGrants(s.grants); }
-    catch (error) { invalid(n + " " + (error instanceof AccessError ? error.message : "invalid")); }
-    return { audience: s.audience, grants: structuredClone(s.grants) } as TokenGrant;
+    try { return parseServiceGrant(v); }
+    catch (error) { return invalid(n + " " + (error instanceof AccessError ? error.message : "invalid")); }
   });
   if (new Set(out.map(s => s.audience)).size !== out.length) invalid(name + " repeats an audience");
   return out;
@@ -144,33 +148,54 @@ function enrollment(key: string, value: unknown, presets: Record<string, Session
   const name = "enrollment " + key;
   const preset = Object.hasOwn(presets, key) ? presets[key] : undefined;
   if (!preset) return invalid(name + " names no preset");
-  const e = record(value, name, ENROLLMENT_KEYS);
+  const raw = dict(value, name), typed = Object.hasOwn(raw, "audience");
+  let service: NewServiceGrant | undefined;
+  if (typed) {
+    try {
+      const keys = grantKeys(raw.audience);
+      service = parseServiceGrant(Object.fromEntries(keys.map(k => [k, raw[k]]))) as NewServiceGrant;
+    } catch { invalid(name + " invalid service grant"); }
+  }
+  const e = record(value, name, typed
+    ? [...ENROLLMENT_KEYS.filter(k => k !== "project" && k !== "scope"), ...grantKeys(raw.audience)] : ENROLLMENT_KEYS);
   // Only the primary ordinary app-password form exists; a fallback form needs its own review.
   if (e.form !== "app_password") invalid(name + " form must be app_password");
   const issuer = httpsUrl(e.issuer, name + " issuer"), tokenUrl = httpsUrl(e.tokenUrl, name + " tokenUrl");
   const jwksUrl = httpsUrl(e.jwksUrl, name + " jwksUrl"), resource = httpsUrl(e.resource, name + " resource");
   if (tokenUrl.origin !== issuer.origin || jwksUrl.origin !== issuer.origin) invalid(name + " tokenUrl and jwksUrl must share the issuer origin");
-  if (e.scope !== ENROLLMENT_SCOPE) invalid(name + " scope must be " + ENROLLMENT_SCOPE);
+  if (!typed && e.scope !== ENROLLMENT_SCOPE) invalid(name + " scope must be " + ENROLLMENT_SCOPE);
   if (e.maxTokenSeconds !== ENROLLMENT_TOKEN_SECONDS) invalid(name + " maxTokenSeconds must be " + ENROLLMENT_TOKEN_SECONDS);
-  const project = id(e.project, name + " project");
-  if (project !== preset.project) invalid(name + " project must equal the preset project");
-  // The preset must admit Jocasta, and only reads of exactly this project.
-  const jocasta = preset.services.find(s => s.audience === "jocasta");
-  if (!jocasta || !jocasta.grants.every(g => g.resource === "project:" + project))
-    invalid(name + " preset must grant Jocasta access to exactly project:" + project);
+  let project: string | undefined;
+  if (service) {
+    if (!issuer.href.endsWith("/") || jwksUrl.href !== issuer.href + "jwks/" ||
+      tokenUrl.href !== issuer.origin + "/application/o/token/" || resource.href !== RESOURCES[service.audience])
+      invalid(name + " endpoints do not match the service provider");
+    if (preset.services.length !== 1 || !isDeepStrictEqual(preset.services[0], service))
+      invalid(name + " must exactly match the preset service");
+  } else {
+    project = id(e.project, name + " project");
+    if (project !== preset.project) invalid(name + " project must equal the preset project");
+    const jocasta = preset.services.find(s => !isNew(s) && s.audience === "jocasta");
+    if (!jocasta || isNew(jocasta) || !jocasta.grants.every(g => g.resource === "project:" + project))
+      invalid(name + " preset must grant Jocasta access to exactly project:" + project);
+  }
   const secretFile = string(e.secretFile, name + " secretFile", 4096);
   if (!isAbsolute(secretFile) || normalize(secretFile) !== secretFile || secretFile.endsWith("/"))
     invalid(name + " secretFile must be a normalized absolute path");
-  // Fixed key order makes the enrollment digest deterministic.
+  if (service) return { form: "app_password", issuer: issuer.href, tokenUrl: tokenUrl.href, jwksUrl: jwksUrl.href,
+    clientId: printable(e.clientId, name + " clientId", 255), username: printable(e.username, name + " username", 150),
+    resource: resource.href, ...service, maxTokenSeconds: ENROLLMENT_TOKEN_SECONDS, secretFile };
+  // Fixed key order makes the legacy enrollment digest deterministic.
   return { form: "app_password", issuer: issuer.href, tokenUrl: tokenUrl.href, jwksUrl: jwksUrl.href,
     clientId: printable(e.clientId, name + " clientId", 255), username: printable(e.username, name + " username", 150),
-    scope: ENROLLMENT_SCOPE, resource: resource.href, project, maxTokenSeconds: ENROLLMENT_TOKEN_SECONDS, secretFile };
+    scope: ENROLLMENT_SCOPE, resource: resource.href, project: project!, maxTokenSeconds: ENROLLMENT_TOKEN_SECONDS, secretFile };
 }
 /** Public digest over every enrollment field; any edit changes it and invalidates cached tokens. */
 export function enrollmentDigest(e: Enrollment): string {
   return createHash("sha256").update(JSON.stringify(e)).digest("hex");
 }
 export function parsePolicy(value: unknown, environment: string): SessionPolicy {
+  if (Buffer.byteLength(JSON.stringify(value) ?? "") > 65_536) invalid("policy exceeds 64 KiB");
   const v = record(value, "policy", ["version", "environment", "ceilings", "presets"], ["enrollments"]);
   if (v.version !== 1) invalid("unsupported version");
   if (v.environment !== environment) throw new SessionRefusal("session_policy_environment", "policy names another T3 environment");
@@ -183,11 +208,25 @@ export function parsePolicy(value: unknown, environment: string): SessionPolicy 
   if (Object.keys(raw).length > MAX_PRESETS) invalid("more than 16 presets");
   const presets: Record<string, SessionPreset> = Object.create(null);
   for (const [key, value] of Object.entries(raw)) presets[key] = preset(key, value);
-  if (v.enrollments === undefined) return { environment, ceilings, presets };
+  if (v.enrollments === undefined) {
+    if (Object.values(presets).some(p => p.services.some(isNew))) invalid("new services require enrollment");
+    return { environment, ceilings, presets };
+  }
   const rawEnrollments = dict(v.enrollments, "enrollments");
   if (Object.keys(rawEnrollments).length > MAX_PRESETS) invalid("more than 16 enrollments");
   const enrollments: Record<string, Enrollment> = Object.create(null);
   for (const [key, value] of Object.entries(rawEnrollments)) enrollments[key] = enrollment(key, value, presets);
+  const typed = Object.entries(enrollments).filter(([, e]) => "audience" in e);
+  for (const [key, e] of typed) for (const [otherKey, other] of Object.entries(enrollments)) {
+    if (key === otherKey || !("audience" in e)) continue;
+    if (e.secretFile === other.secretFile || (new URL(e.issuer).origin === new URL(other.issuer).origin && e.username === other.username))
+      invalid("new enrollments must use distinct secret files and accounts");
+    if (new URL(e.issuer).origin === new URL(other.issuer).origin && e.audience !== ("audience" in other ? other.audience : "jocasta") &&
+      (e.issuer === other.issuer || e.clientId === other.clientId))
+      invalid("different services require distinct providers and client IDs");
+  }
+  for (const p of Object.values(presets)) if (p.services.some(isNew) &&
+    (!Object.hasOwn(enrollments, p.id) || !("audience" in enrollments[p.id]!))) invalid("new services require enrollment");
   return { environment, ceilings, presets, enrollments };
 }
 export function presetHash(preset: SessionPreset): string {

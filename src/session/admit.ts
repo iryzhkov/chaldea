@@ -1,12 +1,13 @@
 // Whole-preset admission. A caller names a preset; it never selects or reduces limits.
 import { createHash } from "node:crypto";
-import { validateAdmission, narrowing, type RunAdmission } from "../access/run-lease.ts";
+import { validateAdmission, narrowing, type RunAdmission } from "./service-grant.ts";
+import { isDeepStrictEqual } from "node:util";
+import { isNew, issuable } from "./service-grant.ts";
 import { AccessError } from "../access/token.ts";
 import { MAX_AGE, object, requestTime, text } from "../waits/types.ts";
 import { SessionRefusal, presetHash, type SessionPolicy, type SessionPreset } from "./policy.ts";
 
-/** Jocasta reads in this first slice; writes and other audiences are refused. */
-export const READ_ONLY_ACTIONS: readonly string[] = ["get", "history", "list", "search"];
+export { READ_ONLY_ACTIONS } from "./service-grant.ts";
 const LIMIT_KEYS = new Set(["maxSeconds", "deadline", "expiresAt", "services", "grants", "audience", "limits", "destination",
   "destinations", "delegate", "instanceId", "model", "options", "projectId", "project", "prompt", "inputs", "runtimeMode",
   "interactionMode", "workspace", "workspaceStrategy", "environment", "argv", "helper", "endpoint"]);
@@ -37,9 +38,8 @@ export function admit(policy: SessionPolicy, presetId: string, runId: string, no
   if (!preset) throw new SessionRefusal("unknown_preset");
   if (preset.delegate !== false) throw new SessionRefusal("delegation_unsupported", "presets must set delegate:false");
   for (const service of preset.services) {
-    if (service.audience !== "jocasta") throw new SessionRefusal("unsupported_audience", service.audience);
-    if (!service.grants.every(g => g.actions.every(a => READ_ONLY_ACTIONS.includes(a))))
-      throw new SessionRefusal("unsupported_grant", "only read-only Jocasta actions are supported");
+    if (!isNew(service) && service.audience !== "jocasta") throw new SessionRefusal("unsupported_audience", service.audience);
+    if (!issuable(service)) throw new SessionRefusal("unsupported_grant");
   }
   const seconds = Math.floor(now / 1000);
   const admission: RunAdmission = { runId, profile: preset.id, project: preset.project,
@@ -55,6 +55,8 @@ export function admit(policy: SessionPolicy, presetId: string, runId: string, no
  * or removing the admitting ceiling stops issuance for a run already started.
  */
 export function withinCeiling(policy: SessionPolicy, preset: SessionPreset, admission: RunAdmission): boolean {
+  if (preset.delegate !== false || admission.profile !== preset.id || admission.project !== preset.project ||
+    !isDeepStrictEqual(admission.services, preset.services)) return false;
   const started = admission.expiresAt - preset.maxSeconds;
   return policy.ceilings.some(c => preset.maxSeconds <= c.maxSeconds &&
     preset.destinations.every(d => c.destinations.includes(d)) &&
