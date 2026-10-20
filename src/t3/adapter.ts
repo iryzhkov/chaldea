@@ -600,10 +600,112 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     const keys=[...(c.childThreadId?[childKey(c.childThreadId)]:[]),...(scope&&ref?.nativeId&&ref.strength!=="none"?[nativeKey(ref.driver,c.providerInstanceId,scope,ref.nativeId)]:[])];
     if(children.has(c.id)||children.size<128)children.set(c.id,{status:c.status,keys:keys.length?keys:[JSON.stringify(["node",c.id])],origin:c.origin});
   };
-  const turn=(t:OrchestrationV2ThreadProjection["providerTurns"][number],stamp:number)=>{
-    // Normalized per-turn main-agent totals are independent of live context counters.
-    if(providers.has(t.providerThreadId)&&t.turnTokenUsage)onEvent({kind:"turn-usage",id:t.id,usage:t.turnTokenUsage,at:t.completedAt?DateTime.toEpochMillis(t.completedAt):stamp});
+
+  // Usage has its own finite proof window. This never enrolls a provider in
+  // metadata, activity ownership or the child roster.
+  type Projection=OrchestrationV2ThreadProjection;
+  type UsageProvider=Pick<Projection["providerThreads"][number],"id"|"appThreadId"|"ownerNodeId"|"providerInstanceId">;
+  type UsageNode=Pick<Projection["nodes"][number],"id"|"threadId"|"kind"|"parentNodeId"|"rootNodeId"|"runId"|"providerThreadId"|"providerTurnId">;
+  type UsageRun=Pick<Projection["runs"][number],"id"|"threadId"|"rootNodeId"|"providerThreadId"|"providerInstanceId">;
+  type UsageAttempt=Pick<Projection["attempts"][number],"id"|"runId"|"rootNodeId"|"providerThreadId"|"providerInstanceId"|"providerTurnId">;
+  type UsageTurn=Pick<Projection["providerTurns"][number],"id"|"nodeId"|"providerThreadId"|"runAttemptId"|"turnTokenUsage"|"completedAt">;
+  const usageProviders=new Map<string,UsageProvider|null>(),usageNodes=new Map<string,UsageNode|null>(),usageRuns=new Map<string,UsageRun|null>(),usageAttempts=new Map<string,UsageAttempt|null>();
+  const usageTurns=new Map<string,{turn:UsageTurn|null;at:number;published:boolean}>();
+  let usageOverflow=false,usagePartial=false;
+  const usageTurnProofs=new Map<string,Pick<UsageTurn,"id"|"nodeId"|"providerThreadId"|"runAttemptId">|null>();
+  const pinnedUsage=(map:Map<string,unknown>,id:string)=>{
+    for(const [turnId,{turn}] of usageTurns){
+      if(!turn)continue;
+      const n=usageNodes.get(turn.nodeId),p=usageProviders.get(turn.providerThreadId);
+      const a=turn.runAttemptId?usageAttempts.get(turn.runAttemptId):undefined;
+      if(map===usageProviders&&id===turn.providerThreadId
+        ||map===usageNodes&&(id===turn.nodeId||id===p?.ownerNodeId)
+        ||map===usageRuns&&(id===n?.runId||id===a?.runId)
+        ||map===usageAttempts&&id===turn.runAttemptId
+        ||map===usageTurnProofs&&(id===turnId||id===n?.providerTurnId||id===a?.providerTurnId))return true;
+    }
+    return false;
   };
+  const makeUsageRoom=(map:Map<string,unknown>,id:string,limit:number)=>{
+    if(map.has(id)||map.size<limit)return true;
+    // Rotate ordinary history, keeping retained dependencies and every poison.
+    const evict=[...map].find(([key,value])=>value!==null&&!pinnedUsage(map,key));
+    if(evict){map.delete(evict[0]);usagePartial=true;return true;}
+    usageOverflow=true;return false;
+  };
+  const retain=<T extends {id:string}>(map:Map<string,T|null>,value:T,limit:number,identity:(v:T)=>unknown= v=>v,nullable=false)=>{
+    if(map.has(value.id)&&map.get(value.id)===null)return;
+    const old=map.get(value.id);
+    if(old){
+      const before=identity(old),after=identity(value);
+      const conflict=nullable&&Array.isArray(before)&&Array.isArray(after)
+        ?before.some((field,i)=>field!=null&&after[i]!=null&&field!==after[i])
+        :JSON.stringify(before)!==JSON.stringify(after);
+      if(conflict){map.set(value.id,null);return;}
+    }
+    if(!makeUsageRoom(map,value.id,limit))return;
+    const retained={...value};
+    if(nullable&&old)for(const key in old)if(retained[key]==null&&old[key]!=null)retained[key]=old[key];
+    map.set(value.id,retained);
+  };
+  const usageProvider=(p:Projection["providerThreads"][number])=>retain(usageProviders,{id:p.id,appThreadId:p.appThreadId,ownerNodeId:p.ownerNodeId,providerInstanceId:p.providerInstanceId},16,p=>[p.appThreadId,p.providerInstanceId,p.ownerNodeId],true);
+  const usageNode=(n:Projection["nodes"][number])=>{
+    if(n.kind==="root_turn"||n.kind==="subagent"||usageNodes.has(n.id)||[...usageProviders.values()].some(p=>p?.ownerNodeId===n.id)||[...usageTurns.values()].some(t=>t.turn?.nodeId===n.id))
+      retain(usageNodes,{id:n.id,threadId:n.threadId,kind:n.kind,parentNodeId:n.parentNodeId,rootNodeId:n.rootNodeId,runId:n.runId,providerThreadId:n.providerThreadId,providerTurnId:n.providerTurnId},64,n=>[n.threadId,n.kind,n.parentNodeId,n.rootNodeId,n.providerThreadId],true);
+  };
+  const usageRun=(r:Projection["runs"][number])=>retain(usageRuns,{id:r.id,threadId:r.threadId,rootNodeId:r.rootNodeId,providerThreadId:r.providerThreadId,providerInstanceId:r.providerInstanceId},128,r=>[r.threadId,r.rootNodeId,r.providerThreadId,r.providerInstanceId],true);
+  const usageAttempt=(a:Projection["attempts"][number])=>retain(usageAttempts,{id:a.id,runId:a.runId,rootNodeId:a.rootNodeId,providerThreadId:a.providerThreadId,providerInstanceId:a.providerInstanceId,providerTurnId:a.providerTurnId},128,a=>[a.runId,a.rootNodeId,a.providerThreadId,a.providerInstanceId],true);
+  const ownsUsage=(t:UsageTurn,snapshot?:Projection)=>{
+    const resolve=<T extends {id:string}>(rows:readonly T[]|undefined,map:Map<string,T|null>,id:string):T|null|undefined=>{
+      if(!rows)return map.get(id);
+      const matches=rows.filter(r=>r.id===id);return matches.length>1?null:matches[0];
+    };
+    const p=resolve(snapshot?.providerThreads,usageProviders,t.providerThreadId),n=resolve(snapshot?.nodes,usageNodes,t.nodeId);
+    if(!p||p.appThreadId!==threadId||!n||n.threadId!==threadId||n.kind!=="root_turn"||n.parentNodeId!==null||n.rootNodeId!==n.id||n.providerThreadId!==p.id)return false;
+    const same=(actual:unknown,expected:unknown)=>actual==null||expected==null||actual===expected;
+    const reverse=(id:string|null,attemptId?:string)=>{
+      if(id===null)return true;
+      const turn=resolve(snapshot?.providerTurns,usageTurnProofs,id);
+      // Reverse IDs are latest pointers, not one-to-one historical links.
+      return turn!==null&&(!turn||turn.providerThreadId===p.id&&turn.nodeId===n.id&&(attemptId===undefined||turn.runAttemptId===attemptId));
+    };
+    if(!reverse(n.providerTurnId))return false;
+    if((snapshot?.nodes??[...usageNodes.values()]).some(other=>other&&other.id!==n.id&&other.providerTurnId===t.id))return false;
+    if(p.ownerNodeId!==null){
+      const owner=resolve(snapshot?.nodes,usageNodes,p.ownerNodeId);
+      if(owner===null||owner&&(owner.threadId!==threadId||owner.kind!=="root_turn"||owner.parentNodeId!==null||owner.rootNodeId!==owner.id||owner.providerThreadId!==p.id))return false;
+    }
+    const attempt=t.runAttemptId?resolve(snapshot?.attempts,usageAttempts,t.runAttemptId):undefined;
+    if(attempt===null||attempt&&(!same(attempt.runId,n.runId)||!same(attempt.rootNodeId,n.id)||!same(attempt.providerThreadId,p.id)||!same(attempt.providerInstanceId,p.providerInstanceId)||!reverse(attempt.providerTurnId,attempt.id)))return false;
+    for(const id of [n.runId,attempt?.runId]){
+      const r=id?resolve(snapshot?.runs,usageRuns,id):undefined;
+      if(r===null||r&&(!same(r.threadId,threadId)||!same(r.rootNodeId,n.id)||!same(r.providerThreadId,p.id)||!same(r.providerInstanceId,p.providerInstanceId)))return false;
+    }
+    return resolve(snapshot?.providerTurns,usageTurnProofs,t.id)!==null;
+  };
+  const unavailable=(id:string,at:number)=>onEvent({kind:"turn-usage",id,usage:{usageScope:"main_agent",usageStatus:"unavailable",hasSubagents:false},at,partial:usagePartial||usageOverflow});
+  const reconcileUsage=()=>{
+    if(usageOverflow)usagePartial=true;
+    for(const [id,entry] of usageTurns){
+      if(!usageOverflow&&entry.turn&&ownsUsage(entry.turn)){
+        onEvent({kind:"turn-usage",id,usage:entry.turn.turnTokenUsage??{usageScope:"main_agent",usageStatus:"unavailable",hasSubagents:false},at:entry.at,partial:usagePartial});entry.published=true;
+      }else {unavailable(id,entry.at);entry.published=false;}
+    }
+  };
+  const rememberTurn=(t:Projection["providerTurns"][number],stamp:number)=>{
+    retain(usageTurnProofs,{id:t.id,nodeId:t.nodeId,providerThreadId:t.providerThreadId,runAttemptId:t.runAttemptId},128);
+    const old=usageTurns.get(t.id);if(old?.turn===null)return;
+    const n=usageNodes.get(t.nodeId),p=usageProviders.get(t.providerThreadId);
+    // Known children/foreign turns cannot consume the main-agent window.
+    if(n&&(n.threadId!==threadId||n.kind!=="root_turn"||n.parentNodeId!==null||n.rootNodeId!==n.id)||p&&p.appThreadId!==threadId)return;
+    if(!old&&usageTurns.size>=8){
+      const id=[...usageTurns].find(([,entry])=>!entry.turn||!ownsUsage(entry.turn))?.[0]??usageTurns.keys().next().value!;
+      const evicted=usageTurns.get(id)!;if(evicted.published)unavailable(id,evicted.at);
+      usageTurns.delete(id);usagePartial=true;
+    }
+    usageTurns.set(t.id,{turn:{id:t.id,nodeId:t.nodeId,providerThreadId:t.providerThreadId,runAttemptId:t.runAttemptId,...(t.turnTokenUsage?{turnTokenUsage:t.turnTokenUsage}:{}),completedAt:t.completedAt},at:t.completedAt?DateTime.toEpochMillis(t.completedAt):stamp,published:old?.published??false});
+  };
+
   const node=(n:OrchestrationV2ThreadProjection["nodes"][number])=>{
     if(n.threadId!==threadId)return;
     if(n.kind==="root_turn"){rememberRoot(n.id);return;}
@@ -639,7 +741,53 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     if(item.kind==="synchronized"){onEvent({kind:"synchronized"});return;}
     if(item.kind==="snapshot"){
       providers.clear();children.clear();mainRoots.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
+      usageProviders.clear();usageNodes.clear();usageRuns.clear();usageAttempts.clear();usageTurns.clear();
+      usageTurnProofs.clear();usageOverflow=false;usagePartial=false;
       if(item.projection.thread.id!==threadId)return;
+      const projection=item.projection;
+      // Qualify against the entire envelope before selecting a bounded window.
+      const owned=projection.providerTurns.filter(t=>ownsUsage(t,projection));
+      if(owned.length>8)usagePartial=true;
+      if(projection.providerTurns.some(t=>{
+        const n=projection.nodes.find(n=>n.id===t.nodeId);
+        return n?.threadId===threadId&&n.kind==="root_turn"&&!owned.includes(t);
+      }))usagePartial=true;
+      // Retain already-observed contradictions even when their turns are not selected.
+      // Missing forward evidence stays pending; only fully linked rejected roots poison.
+      for(const t of projection.providerTurns){
+        if(owned.includes(t))continue;
+        const n=projection.nodes.find(n=>n.id===t.nodeId),p=projection.providerThreads.find(p=>p.id===t.providerThreadId);
+        if(n?.threadId===threadId&&n.kind==="root_turn"&&n.parentNodeId===null&&n.rootNodeId===n.id
+          &&n.providerThreadId===t.providerThreadId&&p?.appThreadId===threadId){
+          if(!makeUsageRoom(usageTurnProofs,t.id,128))break;
+          usageTurnProofs.set(t.id,null);
+        }
+      }
+      const selected=owned.slice(-8);
+      for(const t of selected){
+        const p=projection.providerThreads.find(p=>p.id===t.providerThreadId)!;
+        usageProvider(p);
+        const n=projection.nodes.find(n=>n.id===t.nodeId)!;
+        usageNode(n);
+        if(p.ownerNodeId){const owner=projection.nodes.find(n=>n.id===p.ownerNodeId);if(owner)usageNode(owner);}
+        const r=projection.runs.find(r=>r.id===n.runId);if(r)usageRun(r);
+        const attempt=projection.attempts.find(a=>a.id===t.runAttemptId);if(attempt)usageAttempt(attempt);
+        for(const id of [n.providerTurnId,attempt?.providerTurnId]){
+          const reverse=projection.providerTurns.find(t=>t.id===id);
+          if(reverse)retain(usageTurnProofs,{id:reverse.id,nodeId:reverse.nodeId,providerThreadId:reverse.providerThreadId,runAttemptId:reverse.runAttemptId},128);
+        }
+        rememberTurn(t,DateTime.toEpochMillis(projection.updatedAt));
+        if(!ownsUsage(t,projection))usageTurnProofs.set(t.id,null);
+      }
+      // Carry duplicate identity poison until replacement snapshot or fail-closed overflow.
+      const poison=<T extends {id:string}>(rows:readonly T[],map:Map<string,unknown>,limit:number)=>{
+        for(const row of rows)if(rows.some(other=>other!==row&&other.id===row.id)){
+          if(!makeUsageRoom(map,row.id,limit))break;map.set(row.id,null);
+        }
+      };
+      poison(projection.providerThreads,usageProviders,16);poison(projection.nodes,usageNodes,64);
+      poison(projection.runs,usageRuns,128);poison(projection.attempts,usageAttempts,128);poison(projection.providerTurns,usageTurnProofs,128);
+      reconcileUsage();
       for(const run of item.projection.runs.slice(-128))if(["completed","failed","cancelled","interrupted"].includes(run.status))terminalRuns.add(run.id);
       for(const n of item.projection.nodes)if(n.kind==="root_turn")node(n);
       // Provider creation can predate the retained owner window. Verify against
@@ -648,7 +796,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       for(const n of item.projection.nodes)if(n.kind!=="root_turn")node(n);
       for(const c of item.projection.subagents)child(c);
       metadata();
-      for(const t of item.projection.providerTurns.slice(-128))turn(t,DateTime.toEpochMillis(item.projection.updatedAt));
+
       // Iterate oldest first; model deduplicates assistant updates by source timestamp.
       const items=new Map([...item.projection.turnItems,...item.projection.visibleTurnItems.map(r=>r.item)].map(r=>[r.id,r]));
       for(const r of [...items.values()].toSorted((a,b)=>a.ordinal-b.ordinal))activity(r as OrchestrationV2ThreadProjection["turnItems"][number]);
@@ -661,12 +809,18 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     if(item.kind==="event"){
       const e=item.event;
       if(e.threadId!==threadId)return;
+      if(e.type==="run.updated")usageRun(e.payload);
+      else if(e.type==="run-attempt.updated")usageAttempt(e.payload);
+      else if(e.type==="provider-turn.updated")rememberTurn(e.payload,DateTime.toEpochMillis(e.occurredAt));
+      else if(e.type==="node.updated")usageNode(e.payload);
+      else if(e.type==="provider-thread.updated")usageProvider(e.payload);
+      if(["run.updated","run-attempt.updated","provider-turn.updated","node.updated","provider-thread.updated"].includes(e.type))reconcileUsage();
       if(e.type==="run.updated"&&["completed","failed","cancelled","interrupted"].includes(e.payload.status)){
         onEvent({kind:"clear-activity"});
         if(terminalRuns.size>=128)terminalRuns.delete(terminalRuns.values().next().value!);terminalRuns.add(e.payload.id);
         for(const [id,run] of activeCommands)if(run===e.payload.id){activeCommands.delete(id);onEvent({kind:"command",id,input:"",running:false});onEvent({kind:"activity-state",id,type:"working",running:false});}
       }
-      else if(e.type==="provider-turn.updated")turn(e.payload,DateTime.toEpochMillis(e.occurredAt));
+
       else if(e.type==="turn-item.updated")activity(e.payload);
       else if(e.type==="message.updated"&&e.payload.role==="assistant")onEvent({kind:"assistant",text:e.payload.text,at:DateTime.toEpochMillis(e.payload.updatedAt)});
       else if(e.type==="node.updated")node(e.payload);

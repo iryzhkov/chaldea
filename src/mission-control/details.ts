@@ -64,7 +64,7 @@ export type DetailEvent =
  | {kind:"assistant";text:string;at:number}
  | {kind:"command";id:string;input:string;running:boolean}
  | {kind:"metadata";reported:unknown;context:{used:number;max:number|null}|null;work:Detail["work"]}
- | {kind:"turn-usage";id:string;usage:TurnUsage;at:number};
+ | {kind:"turn-usage";id:string;usage:TurnUsage;at:number;partial?:boolean};
 export class ThreadDetails {
   private value=emptyDetail();
   private assistantAt=0;
@@ -74,7 +74,7 @@ export class ThreadDetails {
   private turns=new Map<string,{usage:TurnUsage;at:number}>();
   private partial=false;
   apply(e:DetailEvent):void {
-    if(e.kind==="reset"){this.recent.clear();this.commands.clear();this.activeItems.clear();this.value.work=emptyDetail().work;this.value.context=null;this.value.effort=emptyDetail().effort;}
+    if(e.kind==="reset"){this.turns.clear();this.partial=false;this.recent.clear();this.commands.clear();this.activeItems.clear();this.value.work=emptyDetail().work;this.value.context=null;this.value.effort=emptyDetail().effort;}
     if(e.kind==="clear-activity"){this.activeItems.clear();this.commands.clear();for(const r of this.recent.values())if(r.value.status==="running")r.value.status="unknown";}
     if(e.kind==="recent-item"&&integer(e.ordinal)){
       this.recent.set(e.id,{ordinal:e.ordinal,value:{kind:e.type,preview:e.type==="assistant"?assistantPreview(e.text):commandPreview(e.text),at:e.at,status:e.status}});
@@ -86,6 +86,7 @@ export class ThreadDetails {
     if(e.kind==="command"){if(!e.running)this.commands.delete(e.id);else if(this.commands.has(e.id)||this.commands.size<32)this.commands.set(e.id,commandPreview(e.input));else this.partial=true;}
     if(e.kind==="metadata"){this.value.effort=effort(e.reported,"reported");this.value.context=e.context;this.value.work=e.work;}
     if(e.kind==="turn-usage"&&integer(e.at)&&e.usage.usageScope==="main_agent"){
+      if(e.partial)this.partial=true;
       const old=this.turns.get(e.id);
       if(old&&old.at>e.at)return;
       // Replacement by stable identity, including reconnect and corrections; never sum counters.
@@ -104,7 +105,7 @@ export class ThreadDetails {
       const sum=(key:keyof TurnUsage)=>{if(!values.every(v=>integer(v.usage[key])))return null;const n=values.reduce((n,v)=>n+Number(v.usage[key]),0);return integer(n)?n:null;};
       const u=result.usage;u.input=sum("inputTokens");u.output=sum("outputTokens");u.cacheRead=sum("cachedInputTokens");u.cacheWrite=sum("cacheCreationTokens");u.reasoning=sum("reasoningTokens");
       u.total=u.input!==null&&u.output!==null&&integer(u.input+u.output)?u.input+u.output:null;u.turns=values.length;u.observedAt=Math.max(...values.map(v=>v.at));
-      u.coverage=this.partial||u.total===null||values.some(v=>v.usage.usageStatus!=="complete")?"partial":"observed";
+      u.coverage=this.partial||values.length<this.turns.size||u.total===null||values.some(v=>v.usage.usageStatus!=="complete")?"partial":"observed";
       // Completed turn totals do not qualify an instantaneous or rolling generation rate.
     }
     return result;
@@ -117,7 +118,7 @@ export function validResources(value:unknown):value is ResourceSample {
 export function aggregateDetails(details:Detail[],total:number):{usage:Usage;work:Detail["work"];coverage:string} {
   const usage=emptyUsage(),known=details.filter(d=>d.usage.coverage!=="not-reported");
   if(known.length){
-    for(const key of ["input","output","cacheRead","cacheWrite","reasoning","total"] as const)usage[key]=known.every(d=>d.usage[key]!==null)?known.reduce((n,d)=>n+d.usage[key]!,0):null;
+    for(const key of ["input","output","cacheRead","cacheWrite","reasoning","total"] as const){const n=known.every(d=>d.usage[key]!==null)?known.reduce((n,d)=>n+d.usage[key]!,0):null;usage[key]=integer(n)?n:null;}
     usage.turns=known.reduce((n,d)=>n+d.usage.turns,0);usage.observedAt=Math.min(...known.map(d=>d.usage.observedAt!));
     usage.coverage=known.length<total||known.some(d=>d.usage.coverage==="partial")?"partial":"observed";
   }
