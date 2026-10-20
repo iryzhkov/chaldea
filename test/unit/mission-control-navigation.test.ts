@@ -215,7 +215,7 @@ test("cards render sanitized title and footer state with full identity and prove
  b.snapshot(snapshot);
  let html=b.elements.view!.innerHTML;
  assert.match(b.elements.view!.querySelector(".card-status")!.textContent,/Thinking/);
- assert.equal(b.elements.view!.querySelector(".card-effort"),null);
+ assert.equal(b.elements.view!.querySelector(".card-effort")!.textContent,"high configured");
  d.effort={value:"high",source:"reported"};b.snapshot(snapshot);
  assert.match(b.elements.view!.querySelector(".card-effort")!.textContent,/high/);
  d.effort={value:"high",source:"configured"};b.snapshot(snapshot);
@@ -353,7 +353,7 @@ test("compact cards use current state, bounded previews, safe provider identity 
   const card=b.elements.view!.querySelector(".tile")!;
   assert.match(card.innerHTML,new RegExp(state==="idle"?"Idle":state==="failed"?"Failed":"Completed"));
   assert.match(card.innerHTML,/Last observed command · outcome unknown/);
-  assert.doesNotMatch(card.innerHTML,/Command running|Active command observed|App thread|Effort|Usage not reported/);
+  assert.doesNotMatch(card.innerHTML,/Command running|Active command observed|App thread|Usage not reported/);
   assert.equal((card.innerHTML.match(/class="activity-item"/g)||[]).length,3);
   assert.match(card.querySelector("header")!.textContent,/A meaningful task title/);
   assert.doesNotMatch(card.querySelector("header")!.textContent,/Task |Completed|Failed|Idle/);
@@ -412,8 +412,10 @@ test("card metrics stay in the footer and visual updates follow real evidence on
   b.snapshot({...snap,agents:[{...row,state:"completed",detailObservedAt:now-120000,activityFreshness:"stale",details:{...d,effort:{value:null,source:null},usage:{coverage:"not-reported"},recent:[{kind:"command",preview:{text:"PRIVATE WITHHELD",state:"withheld"},at:now,status:"running"}]}}]});
   const card=b.elements.view!.querySelector(".tile")!;
   assert.match(card.querySelector(".card-status")!.textContent,/Completed/);
-  assert.match(card.querySelector(".card-fresh")!.textContent,/Activity stale/);
-  assert.doesNotMatch(card.innerHTML,/PRIVATE WITHHELD|Command · running|card-effort|card-usage|not reported/);
+  assert.match(card.querySelector(".card-fresh")!.textContent,/Completed · last activity 2m ago/);
+  assert.equal(card.getAttribute("data-fresh"),"cached");
+  assert.equal(card.querySelector(".card-effort")!.textContent,"effort unknown");
+  assert.doesNotMatch(card.innerHTML,/PRIVATE WITHHELD|Command · running|card-usage|not reported/);
   assert.equal(card.querySelector(".recent-activity")!.textContent,"Previews unavailable");
  }
 });
@@ -509,4 +511,74 @@ test("Overview renders four compact resource summaries without full host-card st
  const css=readFileSync(new URL("../../src/mission-control/static/core.css",import.meta.url),"utf8");
  assert.match(css,/#view.overview \{ grid-template-columns:minmax\(0,1.25fr\) minmax\(300px,1fr\)/);
  assert.match(css,/@media \(max-width:650px\)/);
+});
+
+test("active threads precede completed rows before Overview and mobile pagination",()=>{
+ const b=browser("https://board.example/?mode=agents"),now=Date.now();b.resize(390,844);
+ const states=["completed","idle","cancelled","working","thinking","waiting-igor","queued","waiting-ci"];
+ const agents=states.map((state,i)=>({id:"priority-"+i,title:"Priority "+state,model:"sol",host:"agent-a",state,startedAt:now,observedAt:now,detailObservedAt:now-i*1000,activityFreshness:"live",freshness:"live",steps:[]}));
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents,shown:8,total:8,truncated:false,tokens:{rate:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+ b.snapshot(snap);
+ const ordered=b.context.MC.orderThreads(agents).map((a:any)=>a.state);
+ assert.deepEqual(Array.from(ordered),["working","thinking","waiting-igor","queued","waiting-ci","completed","idle","cancelled"]);
+ assert.equal(agents[0]!.state,"completed");
+ const seen:string[]=[];
+ for(let i=0;i<8;i++){
+   seen.push(...b.elements.view!.querySelectorAll(".tile").map(e=>e.getAttribute("data-thread-card")!));
+   if(b.elements.view!.querySelector('[data-thread-page="1"]')!.getAttribute("aria-disabled")==="true")break;
+   b.page(1);
+ }
+ assert.equal(new Set(seen).size,8);
+ assert.equal(seen[0],"priority-3");assert.ok(seen.indexOf("priority-0")>seen.indexOf("priority-7"));
+ b.click("overview");
+ const overview=b.elements.view!.querySelector(".p-threads")!;
+ assert.equal(overview.querySelectorAll(".overview-thread").length,2);
+ assert.match(overview.textContent,/showing 2 of 8 observed threads/);
+ assert.match(overview.textContent,/Priority working/);assert.doesNotMatch(overview.textContent,/Priority completed/);
+ assert.match(overview.innerHTML,/href="\?mode=agents"/);
+ const tied=[{...agents[3],id:"b"},{...agents[3],id:"a"}];
+ assert.deepEqual(Array.from(b.context.MC.orderThreads(tied),(a:any)=>a.id),["a","b"]);
+ b.snapshot({...snap,agents:[...agents].reverse()});assert.match(b.elements.view!.innerHTML,/Priority working/);
+});
+
+test("completed inactivity stays neutral only with fresh source evidence",()=>{
+ const b=browser("https://board.example/?mode=agents"),now=Date.now();
+ const row={id:"done",title:"Done",model:"sol",host:"agent-a",state:"completed",observedAt:now,detailObservedAt:now-3600000,activityFreshness:"stale",freshness:"live",steps:[]};
+ const host={host:"agent-a",observedAt:now,freshness:"live",shown:1,total:1,states:{},models:[]};
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[row],tokens:{rate:null,coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[host]};
+ b.snapshot(snap);
+ let card=b.elements.view!.querySelector(".tile")!;
+ assert.equal(card.getAttribute("data-fresh"),"cached");assert.match(card.textContent,/Completed · last activity 1h 0m ago/);
+ b.snapshot({...snap,hostSummary:[{...host,observedAt:now-120000}]});
+ card=b.elements.view!.querySelector(".tile")!;
+ assert.equal(card.getAttribute("data-fresh"),"stale");assert.match(card.textContent,/Source stale/);
+ b.snapshot({...snap,source:{state:"disconnected",observedAt:now}});
+ assert.match(b.elements.view!.querySelector(".card-fresh")!.textContent,/Source disconnected/);
+ b.snapshot({...snap,agents:[{...row,state:"working"}]});
+ assert.equal(b.elements.view!.querySelector(".tile")!.getAttribute("data-fresh"),"stale");
+});
+
+test("token unknown timestamps and unqualified coverage cannot imply freshness",()=>{
+ const b=browser("https://board.example/?mode=tokens"),now=Date.now();
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{rate:null,output:null,coverage:"unknown",observedAt:null},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+ b.snapshot(snap);
+ assert.match(b.elements.view!.textContent,/Update time unknown/);
+ assert.doesNotMatch(b.elements.view!.textContent,/unknowns ago/);
+ assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"nosource");
+ b.snapshot({...snap,tokens:{...snap.tokens,observedAt:now}});
+ assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"nosource");
+ b.snapshot({...snap,tokens:{...snap.tokens,coverage:"partial",observedAt:now}});
+ assert.equal(b.elements.view!.querySelector(".p-thero")!.getAttribute("data-fresh"),"cached");
+});
+
+test("Overview quota summary bounds four accounts per host and links all observations",()=>{
+ const b=browser(),now=Date.now();
+ const hosts=["a","b","c","d"].map(host=>({host,state:"cached",observedAt:now,omitted:2,accounts:Array.from({length:4},(_,i)=>({label:"Account "+i,used:i===0?0:i*20,state:"cached",observedAt:now}))}));
+ b.snapshot({version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[],tokens:{coverage:"unknown"},quota:{state:"cached",accounts:[],hosts},hostSummary:[]});
+ const quota=b.elements.view!.querySelector(".p-quota")!;
+ assert.equal(quota.querySelectorAll(".quota-glance").length,4);
+ assert.equal(quota.querySelectorAll(".quota-account").length,0);
+ assert.match(quota.textContent,/4 account observations.*0–60% used across 4 known windows/);
+ assert.match(quota.textContent,/2 omitted by source/);assert.match(quota.innerHTML,/href="\?mode=quota"/);
+ b.click("quota");assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,16);
 });

@@ -60,20 +60,31 @@ script.onload = () => {
   };
   const eventFresh = () => snapshot?.events?.state==="error"?"error":snapshot?.events?.checkedAt==null?"nosource":age(snapshot.events.checkedAt)>900?"stale":"cached";
   R.overview = () => {
-    const s=snapshot,agents=s?.agents||[],hosts=hostList(),observed=hosts.filter(h=>h.observedAt!=null).length;
+    const s=snapshot,agents=window.MC.orderThreads(s?.agents||[]),hosts=hostList(),observed=hosts.filter(h=>h.observedAt!=null).length;
     const stats=[[s?agents.filter(a=>["working","thinking"].includes(a.state)).length:"—","working"],[s?agents.filter(a=>a.state.startsWith("waiting")).length:"—","waiting"],[hosts.length?observed+" / "+hosts.length:"—","hosts observed"]];
     if(s?.tokens.rate!=null)stats.push([s.tokens.rate.toFixed(1),s.tokens.coverage==="partial"?"rate lower bound":"output tok/s"]);
     const kpi='<div class="stats hero-row">'+stats.map(x=>heroStat(...x)).join("")+'</div><div class="source-meta">Needs Igor, incidents, exec slots, queued jobs, shipped and daily totals: not connected</div>';
-    const rows=agents.slice(0,4).map(a=>'<div class="item overview-thread"><div class="l1"><span class="t two">'+esc(a.title)+'</span>'+UI.providerMark(a)+'</div><div class="activity-preview">'+esc(activityItems(a)[0]?.text||"Previews unavailable")+'</div><div class="source-meta">'+st(a.state,a.state)+' · '+esc(a.model)+' · '+esc(a.host)+'</div></div>').join("");
-    const q=Array.isArray(quotaHosts())?(quotaHosts().map(h=>'<div class="quota-glance"><strong>Observed by '+esc(h.host)+'</strong><div class="source-meta">'+esc(h.state)+' · quota source '+esc(agoText(h.observedAt))+'</div>'+quotaRows(h)+(h.omitted?'<div class="source-meta">'+esc(h.omitted)+' omitted</div>':"")+'</div>').join("")||missing("No host quota observations")):s?.quota.accounts.length?budget(s.quota.accounts,2,a=>'<div class="item">'+esc(a.label)+' · '+esc(a.state)+' · '+(a.used==null?"usage unknown":a.used+"% used")+'</div>',"accounts"):missing("No cached quota");
+    const rowLimit=innerWidth<=650?2:4;
+    const rows=agents.slice(0,rowLimit).map(a=>'<div class="item overview-thread"><div class="l1"><span class="t two">'+esc(a.title)+'</span>'+UI.providerMark(a)+'</div><div class="activity-preview">'+esc(activityItems(a)[0]?.text||"Previews unavailable")+'</div><div class="source-meta">'+st(a.state,a.state)+' · '+esc(a.model)+' · '+esc(a.host)+'</div></div>').join("");
+    const q=Array.isArray(quotaHosts())?(quotaHosts().map(h=>{
+      const accounts=h.accounts||[], known=accounts.filter(a=>Number.isFinite(a.used)), values=known.map(a=>a.used);
+      const usage=known.length?' · '+Math.min(...values)+'–'+Math.max(...values)+'% used across '+known.length+' known windows':' · usage unknown';
+      return '<div class="quota-glance"><strong>'+esc(h.host)+'</strong><div class="source-meta">'+esc(h.state)+' · '+accounts.length+' account observations'+esc(usage)+'</div><div class="source-meta">Source '+esc(agoText(h.observedAt))+(h.omitted?' · '+esc(h.omitted)+' omitted by source':'')+'</div></div>';
+    }).join("")||missing("No host quota observations")):s?.quota.accounts.length?budget(s.quota.accounts,2,a=>'<div class="item">'+esc(a.label)+' · '+esc(a.state)+' · '+(a.used==null?"usage unknown":a.used+"% used")+'</div>',"accounts"):missing("No cached quota");
+
     return sourcePanel("kpi",(s?.sampled?"Enrolled sources · sampled":"Local observations")+" · "+(s?.source.state||"connecting"),kpi)
       +unavailable("inbox","Decision inbox")
-      +sourcePanel("threads","Threads · "+threadCoverage(Math.min(4,agents.length)),rows||missing("No observed threads"))
+      +sourcePanel("threads","Threads · "+threadCoverage(Math.min(rowLimit,agents.length)),(rows||missing("No observed threads"))+'<a class="detail-link" href="?mode=agents">All threads · active first, including completed</a>')
       +panel("hosts","Hosts · CPU / RAM",hosts.map(h=>compactHost(h)).join("")||missing("No host observations"),"host",null,"cached","overview-resources")
-      +panel("quota","Quota by observing host",q,"quota",null,"cached")
+      +panel("quota","Quota by observing host",q+'<div class="source-meta">Same account may repeat across hosts</div><a class="detail-link" href="?mode=quota">All quota observations / details</a>',"quota",null,"cached")
       +panel("events","Latest maintenance changes / failures",eventCoverage()+eventBody(2),"akasha",age(s?.events?.checkedAt),eventFresh());
   };
-  R.tokens = () => sourcePanel("thero",snapshot?.tokens.coverage==="partial"?"Partial output · 60 s average":"Output rate · 60 s average",'<div class="stats">' + heroStat(snapshot?.tokens.rate == null ? "—" : snapshot.tokens.rate.toFixed(1),snapshot?.tokens.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg") + heroStat(snapshot?.tokens.output ?? "—",snapshot?.tokens.coverage==="partial"?"output lower bound":"observed output","since process start") + '</div>',"t3thread") + panel("models","Observation scope",missing(snapshot?.tokens.scope || "No usage data") + missing("Updated " + (age(snapshot?.tokens.observedAt) ?? "unknown") + "s ago · daily totals and model history unavailable"),"t3thread",age(snapshot?.tokens.observedAt),snapshot?.source.state === "live" ? undefined : "stale") + unavailable("hourly","Today by hour");
+  R.tokens = () => {
+    const tokens=snapshot?.tokens,at=tokens?.observedAt,qualified=Number.isFinite(at)&&tokens?.coverage!=="unknown"&&tokens?.coverage!=null;
+    const fresh=qualified?(snapshot?.source.state==="live"&&age(at)<=90?"cached":"stale"):"nosource";
+    return panel("thero",tokens?.coverage==="partial"?"Partial output · 60 s average":"Output rate · 60 s average",'<div class="stats">'+heroStat(tokens?.rate==null?"—":tokens.rate.toFixed(1),tokens?.coverage==="partial"?"rate lower bound":"output rate","tok/s · 60 s avg")+heroStat(tokens?.output??"—",tokens?.coverage==="partial"?"output lower bound":"observed output","since process start")+'</div>',"t3thread",qualified?age(at):null,fresh)
+      +panel("models","Observation scope",missing(tokens?.scope||"No usage data")+missing((Number.isFinite(at)?"Updated "+age(at)+"s ago":"Update time unknown")+" · daily totals and model history unavailable"),"t3thread",qualified?age(at):null,fresh)+unavailable("hourly","Today by hour");
+  };
   R.quota=()=>quotas();
   R.events=()=>panel("ecount","Maintenance observations",eventCoverage(),"akasha",age(snapshot?.events?.checkedAt),eventFresh())
     +panel("timeline","Changed / failed timer runs",eventBody(),"akasha",age(snapshot?.events?.checkedAt),eventFresh());
@@ -174,10 +185,10 @@ script.onload = () => {
   const compactTokens = n => n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(n>=1e4?0:1)+'K' : String(n);
   UI.agentMetrics = a => {
     const d=a.details, reported=d && (!a.detailCoverage || a.detailCoverage==="reported") && d.fieldCoverage!=="identity-only";
-    const effort=reported && d.effort?.source==="reported"?d.effort.value:null, u=reported?d.usage:null;
+    const effort=reported && ["reported","configured"].includes(d.effort?.source) && d.effort.value ? d.effort.value+" "+d.effort.source : "effort unknown", u=reported?d.usage:null;
     const tokens=u && u.coverage!=="not-reported" && Number.isFinite(u.total)?u.total:null;
     return (a.model && a.model!=="unknown"?'<span class="card-model" title="'+esc(a.model)+'">'+esc(a.model)+'</span>':'')
-      +(effort?'<span class="card-effort" title="Reported effort">'+esc(effort)+'</span>':'')
+      +'<span class="card-effort" title="Effort provenance">'+esc(effort)+'</span>'
       +(tokens==null?'':'<span class="card-usage" title="'+esc(usage(u))+'">'+esc(compactTokens(tokens))+' tok</span>');
   };
   UI.agentChangeStamp = a => {
@@ -231,7 +242,7 @@ script.onload = () => {
     window.MC.SOURCES.t3thread.label = sourceLabel;
     if(snapshot) {
       DATA.demo=snapshot.demo; DATA.agentSourceAge=age(snapshot.source.observedAt);
-      DATA.threads=snapshot.agents.map(a=>({ ...a, activityObservedAt:receivedSnapshot.agents.find(raw=>raw.id===a.id)?.detailObservedAt, state:a.state, observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort?.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
+      DATA.threads=snapshot.agents.map(a=>({ ...a, activityObservedAt:receivedSnapshot.agents.find(raw=>raw.id===a.id)?.detailObservedAt, state:a.state, sourceFreshness:snapshot.source.state!=="live"?snapshot.source.state:hostFreshness(snapshot.hostSummary?.find(h=>h.host===a.host)||a), observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort?.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
       DATA.agentPool=DATA.threads; DATA.sources=[];
     }
     window.MC.show(window.MC.MODES.includes(mode)?mode:"overview");

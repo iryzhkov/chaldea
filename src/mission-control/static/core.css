@@ -51,7 +51,7 @@ b, strong, .b { font-weight:600; }
 #top .brand { color:var(--ink); font-weight:600; }
 #top .brand .code { color:var(--accent); }
 #tabs { display:flex; gap:calc(var(--u) * 0.2); margin-left:auto; }
-#tabs button { all:unset; cursor:pointer; position:relative; padding:0.15em 0.45em; color:var(--ink-3); border:var(--hair) solid var(--frame); font-size:var(--t1); letter-spacing:0.08em; }
+#tabs button { all:unset; cursor:pointer; position:relative; padding:0.15em 0.45em; color:var(--ink-2); border:var(--hair) solid var(--frame); font-size:var(--t1); letter-spacing:0.08em; }
 #tabs button.on { color:var(--accent); border-color:var(--accent); }
 #tabs button .bar { position:absolute; left:-1px; right:-1px; bottom:-1px; height:2px; overflow:hidden; }
 #tabs button .bar i { display:block; height:100%; width:0; background:var(--accent); }
@@ -428,15 +428,16 @@ b, strong, .b { font-weight:600; }
 .card-status .st { flex:none; font-weight:600; color:var(--accent); }
 .tile:is(.completed,.idle,.cancelled) .card-status .st { color:var(--ink-2); }
 .tile.failed .card-status .st { color:var(--fail); }
-.tile[data-fresh]:not([data-fresh="live"]) .card-status .st { color:var(--stale); }
+.tile[data-fresh]:not([data-fresh="live"]):not([data-fresh="cached"]) .card-status .st { color:var(--stale); }
 .card-model { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-2); }
 .card-effort,.card-usage { flex:none; color:var(--ink-2); }
+.card-effort { font-size:12px; }
 .card-usage { margin-left:auto; }
 .card-fresh { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--ink-2); }
-.tile[data-fresh]:not([data-fresh="live"]) .card-fresh { color:var(--warn); }
+.tile[data-fresh]:not([data-fresh="live"]):not([data-fresh="cached"]) .card-fresh { color:var(--warn); }
 .card-access button { margin-left:auto; flex:none; font:inherit; color:var(--ink-2); background:transparent; border:0; padding:1px 3px; cursor:pointer; }
 @container (max-width:460px) { .card-usage { display:none; } }
-@container (max-width:360px) { .card-effort { display:none; } }
+
 .thread-drawer { --t1:14px; --t2:18px; color:var(--ink); background:var(--bg); border:1px solid var(--frame); width:min(720px,95vw); max-height:90dvh; padding:16px; overflow:auto; font:16px/1.4 var(--font-ui); }
 .thread-drawer::backdrop { background:rgb(0 0 0 / .65); }
 .thread-drawer button { font:inherit; color:inherit; background:var(--dim); border:1px solid var(--frame); padding:6px; }
@@ -473,7 +474,7 @@ b, strong, .b { font-weight:600; }
 #view.overview .stat .v { font-size:clamp(28px,2.5vw,64px); }
 #view.overview .stat .unit-slot { display:none; }
 #view.overview .panel > .body { overflow:visible; }
-#view.overview .p-quota > .body { max-height:440px; overflow:auto; }
+#view.overview .p-quota > .body { overflow:visible; }
 #view.overview .p-inbox { align-self:start; }
 #view.overview .overview-thread .t { font-size:var(--t2); }
 #view.overview .overview-thread .activity-preview { font-size:var(--t1); }
@@ -519,3 +520,21 @@ b, strong, .b { font-weight:600; }
   #view.overview .p-quota > .body { max-height:none; overflow:visible; }
 }
 #view:focus-visible { outline:2px solid var(--accent); outline-offset:-2px; }
+
+/* Content-sized summary tracks prevent panel clipping; only the main view scrolls. */
+#view:is(.overview,.ops) { grid-template-rows:none; grid-auto-rows:max-content; }
+#view:is(.overview,.ops) > .panel { min-height:max-content; }
+#view:is(.overview,.ops) > .panel > .body { flex:none; overflow:visible; }
+#view.overview .p-hosts > .body { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+#view.overview .host-glance { padding:0; border:0; align-content:start; }
+#view.overview .p-threads .activity-preview { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; }
+.detail-link { color:var(--ink-2); font-size:var(--t1); overflow-wrap:anywhere; }
+@media (max-width:650px) {
+  #view.overview .p-hosts > .body { grid-template-columns:minmax(0,1fr); }
+  #view.agents .agents-summary { gap:6px; }
+  #view.agents .agents-summary > .t, #view.agents [data-grid-fit] { display:none; }
+  #view.agents .p-summary > header { padding:3px 8px; }
+  #view.agents .p-summary > .body { padding:6px 8px; gap:6px; }
+  #view.agents .grid-controls { gap:4px; font-size:12px; }
+  #view.agents .grid-controls :is(select,button) { padding:3px; }
+}
