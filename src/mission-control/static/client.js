@@ -166,13 +166,14 @@ script.onload = () => {
   const activityItems = a => {
     const d=a.details;
     if(!d || a.detailCoverage && a.detailCoverage!=="reported" || d.fieldCoverage==="identity-only")return [];
-    if(Array.isArray(d.recent))return d.recent.slice(0,3).filter(p=>["assistant","command"].includes(p.kind)&&previewText(p.preview)).map(p=>({
+    const recent=Array.isArray(d.recent)?d.recent.filter(p=>["assistant","command"].includes(p.kind)&&previewText(p.preview)).slice(0,3):[];
+    if(recent.length)return recent.map(p=>({
       kind:(p.kind==="assistant"?"Assistant":p.status==="running"?(commandIsCurrent(a)?"Active command observed":"Last observed command · outcome unknown"):"Command · "+(["completed","failed","cancelled"].includes(p.status)?p.status:"outcome unknown"))+(!Number.isFinite(p.at)?"":" · observed "+age(p.at)+"s ago")+previewLabel(p.preview),
-      text:p.preview.text
+      text:p.preview.text, stamp:[p.kind,p.preview.text,p.preview.state,p.at,p.status]
     }));
     const items=[];
-    if(previewText(d.assistant))items.push({kind:"Assistant"+previewLabel(d.assistant),text:d.assistant.text});
-    for(const p of d.commands||[])if(previewText(p))items.push({kind:commandLabel(a)+previewLabel(p),text:p.text});
+    if(previewText(d.assistant))items.push({kind:"Assistant"+previewLabel(d.assistant),text:d.assistant.text,stamp:["assistant",d.assistant.text,d.assistant.state]});
+    for(const p of d.commands||[])if(previewText(p))items.push({kind:commandLabel(a)+previewLabel(p),text:p.text,stamp:["command",p.text,p.state]});
     return items.slice(0,3);
   };
   UI.providerMark = a => {
@@ -192,8 +193,7 @@ script.onload = () => {
       +(tokens==null?'':'<span class="card-usage" title="'+esc(usage(u))+'">'+esc(compactTokens(tokens))+' tok</span>');
   };
   UI.agentChangeStamp = a => {
-    const d=a.details, reported=d && (!a.detailCoverage || a.detailCoverage==="reported") && d.fieldCoverage!=="identity-only";
-    const previews=!reported?[]:Array.isArray(d.recent)?d.recent.slice(0,3).filter(p=>["assistant","command"].includes(p.kind)&&previewText(p.preview)).map(p=>[p.kind,p.preview.text,p.preview.state,p.at,p.status]):[previewText(d.assistant),(d.commands||[]).map(previewText)];
+    const previews=activityItems(a).map(p=>p.stamp);
     return JSON.stringify([a.observedAt,a.activityObservedAt,a.state,a.title,previews]);
   };
   UI.agentActivity = a => {

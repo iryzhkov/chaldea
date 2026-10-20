@@ -380,7 +380,7 @@ test("compact cards use current state, bounded previews, safe provider identity 
  assert.match(html,/Earlier actual message/);assert.match(html,/Command · completed/);assert.match(html,/truncated/);assert.match(html,/redacted/);assert.doesNotMatch(html,/Sanitized assistant preview|safe command/);
  b.openDetails("one");assert.match(dialog.innerHTML,/Earlier actual message/);assert.match(dialog.innerHTML,/Observed completed command/);b.closeDetails();
  b.snapshot({...snap,agents:[{...row,details:{...d,provider:{instanceId:"custom-claude",driver:"claudeAgent"},recent:[]}}]});
- html=b.elements.view!.innerHTML;assert.match(html,/Claude · custom-claude/);assert.doesNotMatch(html,/Earlier actual message|Sanitized assistant preview/);
+ html=b.elements.view!.innerHTML;assert.match(html,/Claude · custom-claude/);assert.doesNotMatch(html,/Earlier actual message/);assert.match(html,/Sanitized assistant preview/);
  b.snapshot({...snap,agents:[{...row,state:"working",detailObservedAt:now-90000,details:{...d,recent:[{kind:"command",preview:{text:"Old command",state:"reported"},at:now-90000,status:"running"}]}}]});
  assert.doesNotMatch(b.elements.view!.innerHTML,/Active command observed/);
  assert.match(b.elements.view!.innerHTML,/Last observed command/);
@@ -581,4 +581,28 @@ test("Overview quota summary bounds four accounts per host and links all observa
  assert.match(quota.textContent,/4 account observations.*0–60% used across 4 known windows/);
  assert.match(quota.textContent,/2 omitted by source/);assert.match(quota.innerHTML,/href="\?mode=quota"/);
  b.click("quota");assert.equal(b.elements.view!.querySelectorAll(".quota-account").length,16);
+});
+
+test("sparse v4 fallback shares display selection and stable change evidence",async()=>{
+ const {emptyDetail}=await import("../../src/mission-control/details.ts"),{compactDetail,normalizeRich}=await import("../../src/mission-control/detail-contract.ts");
+ const now=Date.now(),d=emptyDetail();d.assistant={text:"Approved fallback",state:"reported"};
+ const sparse=compactDetail(d);assert.equal(Object.hasOwn(sparse,"recent"),false);
+ const decoded=normalizeRich({v:4,resources:{state:"unavailable",sample:null},details:[{id:"fallback",value:sparse}],omitted:0},new Set(["fallback"]),now).details[0]!.value;
+ if(decoded.fieldCoverage==="identity-only")throw new Error("Expected full detail");
+ assert.deepEqual(decoded.recent,[]);
+ const b=browser("https://board.example/?mode=agents"),row={id:"fallback",title:"Fallback",host:"agent-a",model:"sol",state:"working",observedAt:now,detailObservedAt:now,activityFreshness:"live",freshness:"live",steps:[],details:decoded,detailCoverage:"reported"};
+ const snap={version:1,demo:false,sampled:true,now,source:{state:"live",observedAt:now},agents:[row],tokens:{coverage:"unknown"},quota:{state:"unknown",accounts:[]},hostSummary:[]};
+ const display=(details:any,coverage="reported")=>{b.snapshot({...snap,agents:[{...row,details,detailCoverage:coverage}]});return b.elements.view!.querySelector(".recent-activity")!.textContent;};
+ const stamp=(details:any)=>b.context.MC.UI.agentChangeStamp({...row,details});
+ assert.match(display(decoded),/Approved fallback/);
+ const updated={...decoded,assistant:{text:"Changed fallback",state:"reported"}};
+ assert.notEqual(stamp(decoded),stamp(updated));assert.match(display(updated),/Changed fallback/);assert.equal(b.animations.length,1);
+ b.refresh();assert.equal(b.animations.length,1);
+ const withheld={...decoded,recent:[{kind:"command",preview:{text:"PRIVATE",state:"withheld"},at:now,status:"running"}],commands:[{text:null,state:"withheld"}]};
+ assert.match(display(withheld),/Approved fallback/);assert.doesNotMatch(display(withheld),/PRIVATE|Command/);
+ const actual={...withheld,recent:[{kind:"command",preview:{text:"First actual",state:"redacted"},at:now,status:"completed"},{kind:"assistant",preview:{text:"Second actual",state:"truncated"},at:now-1000,status:"unknown"}]};
+ assert.match(display(actual),/First actual.*Second actual/s);assert.match(display(actual),/redacted/);assert.match(display(actual),/truncated/);assert.doesNotMatch(display(actual),/Approved fallback/);
+ assert.equal(stamp(actual),stamp({...actual,assistant:{text:"Hidden fallback change",state:"reported"}}));
+ assert.equal(display({...withheld,assistant:{text:null,state:"withheld"}}),"Previews unavailable");
+ assert.equal(display(decoded,"byte-budget"),"Previews unavailable");
 });
