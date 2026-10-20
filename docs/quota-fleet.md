@@ -88,7 +88,13 @@ A failed collector preserves its last successful observation until stale.
 
 ## Shared snapshots and fallback
 
-The fleet switch is off by default. When enabled, the observer publishes one
+The fleet switch is off by default. Route readiness is `absent` when the quota
+configuration omits `fleet`, including when the default quota file is missing.
+An explicit `fleet: null`, `fleet: {}`, or `fleet: { enabled: false }` retains
+the existing disabled defaults and reports `disabled`. Both states keep routing
+local. Enabled configuration is still validated before reads or publication.
+
+When enabled, the observer publishes one
 combined quota_headroom_snapshot per host per 15-minute bucket through
 POST /api/v1/events. Persistent reservations, a process lock and the immutable
 key capacity:HOST:BUCKET bound publication to four records per aligned hour,
@@ -113,8 +119,12 @@ unreachable store or stale shared snapshot leaves local routing available.
 
 Merge uses the freshest observation per provider/account, never the host or
 local instance alias. Future observations and snapshots past their own
-maxAgeMs are ignored. maxAgeMs cannot exceed 15 minutes. Ties choose the
-lexically first host, so read order does not change the result. Packaging uses
+maxAgeMs are ignored. maxAgeMs cannot exceed 15 minutes. Equal-time observations,
+including aliases on the same host, reconcile matching window IDs and reset
+epochs with the minimum remaining quota. Conflicting epochs leave the window
+unknown. The lexically first host supplies provenance for a tie; local conflict
+diagnostics survive account deduplication without entering the wire schema.
+Every local alias is classified from the reconciled account evidence. Packaging uses
 the oldest observation timestamp among the metrics it includes, so publishing
 cannot rejuvenate an old wallet or window. Local active usage stops still
 block that local instance. Output reports the winning host and age in seconds.
@@ -137,6 +147,13 @@ Credits expiring within expiryHorizonMs, default 24 hours, classify as use-it.
 Expired, stale or zero credits add no capacity. An active usage stop still
 classifies as stopped. This is routing advice; Chaldea does not purchase,
 redeem or spend credits itself.
+
+Admission despite an exhausted included short window additionally requires
+fresh same-account local credits and fresh local `spendControlReached: false`.
+A window-only disagreement keeps that proof when reconciled credits and expiry
+agree with the fresh local wallet. The local wallet's original observation time
+is retained. Remote credits cannot supply or refresh local admission proof,
+and an active local stop still blocks the account.
 
 ## Activation follow-ups
 

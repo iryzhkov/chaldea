@@ -58,8 +58,10 @@ export function headroomConfig(raw: unknown = {}, home = homedir()): HeadroomCon
   }
   const claude = claudeContexts(c.claudeContexts);
   if (claude.some(ctx => seen.has(ctx.providerInstanceId))) throw new Error("duplicate provider alias");
+  // Omission means no fleet configuration. Explicit null/{} retain the legacy
+  // disabled defaults; fleetConfig itself still accepts omitted input.
   return { contexts: [...grouped.values()], lowHeadroomPercent: low, claudeContexts: claude,
-    fleet: fleetConfig(c.fleet, home) };
+    ...(c.fleet === undefined ? {} : { fleet: fleetConfig(c.fleet, home) }) };
 }
 /** Missing default config leaves balance unknown; explicit paths and malformed files fail closed. */
 export function loadHeadroomConfig(home: string, path?: string): HeadroomConfig {

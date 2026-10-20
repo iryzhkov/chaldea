@@ -1,4 +1,5 @@
 import { homedir } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { join } from "node:path";
 import { loadState, emptyState } from "../quota/state.ts";
 import { loadHeadroomConfig } from "../quota/codex-balance.ts";
@@ -135,10 +136,13 @@ async function collectContext(options: RouteOptions) {
   }
   const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.accountKey && quota[p.alias]?.activeStop)
     .map(p => capacityKey(p.driver, p.accountKey!)));
-  const local = capacitySnapshot(reporting.fleet?.host ?? "local", capacityState.headroom.providers,
-    new Set(Object.entries(quota).filter(([, q]) => q.activeStop).map(([id]) => id)), now);
+  const localHost = reporting.fleet?.host ?? "local";
+  const localStops = new Set(Object.entries(quota).filter(([, q]) => q.activeStop).map(([id]) => id));
+  // Keep aliases separate until reconciliation so local conflicts survive the wire
+  // snapshot's account deduplication. Conflict advice never enters the closed schema.
+  const localSnapshots = capacityState.headroom.providers.map(p => capacitySnapshot(localHost, [p], localStops, now));
   const fleet = await readSnapshotsDetailed(reporting.fleet, now, options.fetcher);
-  const merged = mergeSnapshots([...fleet.snapshots, local], now);
+  const merged = mergeSnapshots([...fleet.snapshots, ...localSnapshots], now);
   const capacity: Record<string, ReturnType<typeof classifyCapacity>> = {};
   const boundCatalog = catalog.map(p => {
     let row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
@@ -146,7 +150,20 @@ async function collectContext(options: RouteOptions) {
     const account = key ? merged.get(capacityKey(p.driverKind, key)) : undefined;
     const stop = !!quota[p.providerInstanceId]?.activeStop || !!key && stoppedAccounts.has(capacityKey(p.driverKind, key));
     if (account) {
-      if (account.host !== local.host || account.conflicts.length) row = snapshotProvider(account, p.providerInstanceId);
+      const observed = row;
+      row = snapshotProvider(account, p.providerInstanceId);
+      // All aliases use reconciled capacity. Spend-control admission remains local:
+      // remote credits cannot create or refresh the proof of a funded lane.
+      if (observed?.accountKey === account.accountKey && observed.driver === account.provider) {
+        row.ordinaryUsageAllowed = observed.ordinaryUsageAllowed;
+        if (observed.burnHistory) row.burnHistory = observed.burnHistory;
+        if (observed.spendControlReached.value === true) row.spendControlReached = observed.spendControlReached;
+        if (metricNow(observed.credits, now).state === "fresh" &&
+            isDeepStrictEqual(observed.credits.value, account.credits) && observed.creditExpiresAt === account.creditExpiresAt) {
+          row.credits = observed.credits;
+          row.spendControlReached = observed.spendControlReached;
+        }
+      }
       quota[p.providerInstanceId] = { observedAt: account.observedAt, windows: account.windows, activeStop: account.activeStop || stop,
         incomplete: account.conflicts.some(c => c.includes("reset epoch") && !/^seven_day_/.test(c)) };
       reasons.push(p.providerInstanceId + " account " + key + " observed on " + account.host + "; age " + account.ageSeconds + "s");
@@ -166,7 +183,7 @@ async function collectContext(options: RouteOptions) {
     provenance: Object.fromEntries(boundCatalog.map(p => {
       const row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
       const account = p.accountKey ? merged.get(capacityKey(p.driverKind, p.accountKey)) : undefined;
-      return [p.providerInstanceId, { source: account && account.host !== local.host ? "fleet:" + account.host : row?.included.source ?? "unknown",
+      return [p.providerInstanceId, { source: account && account.host !== localHost ? "fleet:" + account.host : row?.included.source ?? "unknown",
         bindingSource: mappings.has(p.providerInstanceId) ? "configured" : catalog.find(c => c.providerInstanceId === p.providerInstanceId)?.accountKey ? "catalog" : row?.accountKey ? "observer" : "unbound",
         conflicts: account?.conflicts ?? [] }];
     })) };
