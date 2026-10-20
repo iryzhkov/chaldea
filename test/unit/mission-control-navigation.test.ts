@@ -785,7 +785,7 @@ test("shared quota shows each native window, disagreement and missing coverage w
   const p=newProvider("PRIVATE","claudeAgent"),head=emptyHeadroom();
   applyT3(p,{usageLimits:{checkedAt:new Date(now-(all?100000:1000)).toISOString(),windows:(all?ids:ids.slice(0,1)).map((id,i)=>({id,kind:i?"weekly":"session",usedPercent:all?[8,90,43][i]!:12,windowDurationMins:i?10080:300}))}} as any);
   p.credits={state:"fresh",observedAt:new Date(now-(all?2000:5000)).toISOString(),error:null,source:"private",value:{balance:all?"250":"10",hasCredits:true,unlimited:false}};
-  p.manualResets={state:"fresh",observedAt:new Date(now-(all?2000:5000)).toISOString(),error:null,source:"private",value:{availableCount:all?3:1}};
+  p.manualResets={state:"fresh",observedAt:new Date(now-(all?2000:5000)).toISOString(),error:null,source:"private",value:{availableCount:all?3:1,nextExpiresAt:null}};
   head.providers=[p];m.setQuota(head);
   return quotaAccounts(captureSnapshot(m,"agent-a","a".repeat(32),1)!.quota!,now)[0]!;
  };
