@@ -297,7 +297,7 @@ for(const denied of [false,true])test("provider catalog shares ONE shell client 
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
 });
 
-for(const scenario of ["runtime-shape","multiple-turns","historical-owner","historical-provider","child-crowding","owner-foreign","owner-nonself","foreign-reverse","snapshot-truncation","poison-reintroduction","stream-overflow","completed-time","stream-child-crowding","root-conflict-reintroduction","null-owner","owned","foreign-app","foreign-root","subagent","dangling-node","missing-run","wrong-run-root","wrong-node-turn","wrong-node-provider","foreign-run","wrong-run-provider","wrong-root-parent","wrong-root-self","ambiguous-node","ambiguous-turn","ambiguous-run","duplicate-provider","duplicate-turn","duplicate-node","duplicate-run","owner-contradiction","attempt","wrong-attempt","reorder","replay","correction","withdraw","snapshot-removal","eviction"])test("official usage tuple fixture "+scenario,async()=>{
+for(const scenario of ["qualified-crowding","same-provider-root-pointer","same-provider-attempt-pointer","nullable-forward","conflicting-forward","long-stream","long-stream-pinned-owner","poison-overflow","runtime-shape","multiple-turns","historical-owner","historical-provider","child-crowding","owner-foreign","owner-nonself","foreign-reverse","snapshot-truncation","poison-reintroduction","stream-overflow","completed-time","stream-child-crowding","root-conflict-reintroduction","null-owner","owned","foreign-app","foreign-root","subagent","dangling-node","missing-run","wrong-run-root","wrong-node-turn","wrong-node-provider","foreign-run","wrong-run-provider","wrong-root-parent","wrong-root-self","ambiguous-node","ambiguous-turn","ambiguous-run","duplicate-provider","duplicate-turn","duplicate-node","duplicate-run","owner-contradiction","attempt","wrong-attempt","reorder","replay","correction","withdraw","snapshot-removal","eviction"])test("official usage tuple fixture "+scenario,async()=>{
  const {connectMissionThread}=await import("../../src/t3/adapter.ts");
  const {MissionModel}=await import("../../src/mission-control/model.ts");
  const server=createServer(),wss=new WebSocketServer({server}),controller=new AbortController();
@@ -380,6 +380,24 @@ for(const scenario of ["runtime-shape","multiple-turns","historical-owner","hist
   projection.providerTurns.push({...turns[0],id:n.providerTurnId,nodeId:n.id,ordinal:8});expected=960;expectedTurns=8;
  }
  if(scenario==="poison-reintroduction")projection.nodes.push({...nodes[0]});
+ if(scenario==="qualified-crowding"){
+  projection.nodes=[nodes[0]];projection.runs=[runs[0]];projection.providerTurns=[turns[0]];
+  for(let i=0;i<8;i++){
+   const n={...nodes[0],id:"bad-root-"+i,rootNodeId:"bad-root-"+i,providerThreadId:"bad-provider-"+i,providerTurnId:"bad-turn-"+i};
+   projection.nodes.push(n);projection.providerThreads.push({...provider,id:n.providerThreadId,ownerNodeId:"bad-owner-"+i});
+   projection.nodes.push({...n,id:"bad-owner-"+i,kind:"subagent"});
+   projection.providerTurns.push({...turns[0],id:n.providerTurnId,nodeId:n.id,providerThreadId:n.providerThreadId});
+  }expected=120;expectedTurns=1;
+ }
+ if(scenario==="same-provider-root-pointer"){nodes[0]!.providerTurnId=turns[1]!.id;expected=480;expectedTurns=4;}
+ if(scenario==="same-provider-attempt-pointer"){
+  projection.attempts=[{id:"attempt-a",runId:runs[0]!.id,attemptOrdinal:1,rootNodeId:nodes[0]!.id,providerInstanceId:"custom",providerThreadId:"provider",providerTurnId:"other-attempt-turn",reason:"initial",status:"completed",startedAt:stamp,completedAt:stamp}];
+  turns[0]!.runAttemptId="attempt-a" as never;
+  projection.providerTurns.push({...turns[0],id:"other-attempt-turn",runAttemptId:"attempt-b",turnTokenUsage:undefined});
+  expected=600;expectedTurns=5;
+ }
+ if(scenario==="nullable-forward")projection.nodes=nodes.map(n=>({...n,providerThreadId:null}));
+ if(scenario==="long-stream-pinned-owner")provider.ownerNodeId="root-0" as never;
  let sequence=1;
  const event=(type:string,payload:unknown)=>({kind:"event",sequence:++sequence,event:{id:"event-"+sequence,threadId,occurredAt:stamp,type,payload}});
  const snapshot=()=>({kind:"snapshot",snapshotSequence:++sequence,projection:structuredClone(projection)});
@@ -404,10 +422,48 @@ for(const scenario of ["runtime-shape","multiple-turns","historical-owner","hist
   values.push(event("node.updated",{...nodes[0],threadId:"foreign"}),event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));expected=600;expectedTurns=5;
  }
  if(scenario==="snapshot-truncation")values.push(snapshot());
- if(scenario==="poison-reintroduction")values.push(event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));
+ if(scenario==="poison-reintroduction"){
+  for(let i=0;i<100;i++)values.push(event("node.updated",{...nodes[0],id:"rotated-"+i,rootNodeId:"rotated-"+i,providerTurnId:null}));
+  values.push(event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));
+ }
  if(scenario==="stream-overflow"){
   for(let i=0;i<70;i++)values.push(event("node.updated",{...nodes[0],id:"overflow-"+i,rootNodeId:"overflow-"+i,providerTurnId:null}));
+  values.push(event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));
+ }
+ if(scenario==="nullable-forward"){
+  values.push(event("provider-thread.updated",provider));
+  for(const n of nodes)values.push(event("node.updated",{...n,providerThreadId:null}),event("node.updated",n),event("provider-turn.updated",turns[nodes.indexOf(n)]));
+ }
+ if(scenario==="conflicting-forward"){
+  values.push(event("node.updated",{...nodes[0],providerThreadId:"other"}),event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));expected=600;expectedTurns=5;
+ }
+ if(scenario==="poison-overflow"){
+  for(let i=0;i<70;i++){
+   const n={...nodes[0],id:"poison-"+i,rootNodeId:"poison-"+i,providerTurnId:null};
+   values.push(event("node.updated",n),event("node.updated",{...n,threadId:"foreign"}));
+  }
   values.push(event("node.updated",nodes[0]),event("provider-turn.updated",turns[0]));expected=0;expectedTurns=0;
+ }
+ if(scenario==="long-stream"||scenario==="long-stream-pinned-owner"){
+  const latest:any[]=[];
+  for(let i=0;i<100;i++){
+   const providerId=scenario==="long-stream"?"stream-provider-"+i:"provider";
+   const n={...nodes[0],id:"stream-root-"+i,rootNodeId:"stream-root-"+i,runId:"stream-run-"+i,providerThreadId:providerId,providerTurnId:"stream-turn-"+i};
+   const r={...runs[0],id:n.runId,rootNodeId:n.id,providerThreadId:providerId};
+   const a={id:"stream-attempt-"+i,runId:r.id,attemptOrdinal:1,rootNodeId:n.id,providerInstanceId:"custom",providerThreadId:providerId,providerTurnId:n.providerTurnId,reason:"initial",status:"completed",startedAt:stamp,completedAt:stamp};
+   const t={...turns[0],id:n.providerTurnId,nodeId:n.id,providerThreadId:providerId,runAttemptId:a.id};
+   if(scenario==="long-stream")values.push(event("provider-thread.updated",{...provider,id:providerId,ownerNodeId:n.id}));
+   values.push(event("node.updated",n),event("run.updated",r),event("run-attempt.updated",a),event("provider-turn.updated",t));
+   for(let j=0;j<3;j++){
+    const id="noise-"+i+"-"+j;
+    values.push(event("node.updated",{...n,id,kind:"subagent",parentNodeId:n.id,providerTurnId:id}),
+     event("run.updated",{...r,id}),event("run-attempt.updated",{...a,id}),
+     event("provider-turn.updated",{...t,id,nodeId:id}));
+   }
+   latest.push(t);if(latest.length>8)latest.shift();
+  }
+  for(const t of latest)values.push(event("provider-turn.updated",t));
+  expected=960;expectedTurns=8;
  }
  values.push({kind:"synchronized"});
  const seen:import("../../src/t3/adapter.ts").MissionDetailEvent[]=[];
@@ -426,10 +482,14 @@ for(const scenario of ["runtime-shape","multiple-turns","historical-owner","hist
   const usage=model.snapshot().agents[0]!.details.usage;
   assert.equal(usage.total,expected||null,scenario);assert.equal(usage.turns,expectedTurns,scenario);
   if(scenario==="completed-time")assert.equal(usage.observedAt,now);
+  if(scenario.startsWith("long-stream")){
+   const retained=seen.filter(e=>e.kind==="turn-usage"&&e.usage.usageStatus==="complete").slice(-8);
+   assert.deepEqual(retained.map(e=>e.kind==="turn-usage"?e.id:""),Array.from({length:8},(_,i)=>"stream-turn-"+(92+i)),"latest eight dependencies survive rotation");
+  }
   if(expectedTurns){assert.equal(usage.cacheWrite,0);assert.equal(usage.coverage,scenario==="stream-child-crowding"?"observed":"partial",scenario);assert.equal(usage.rate,null);}
 
   assert.equal(model.snapshot().agents.length,1,"base row survives missing ownership details");
-  assert.deepEqual(model.snapshot().agents[0]!.details.context,["owned","historical-owner","owner-nonself"].includes(scenario)?{used:500,max:1000}:null);
-  if(!["owned","historical-owner","owner-nonself"].includes(scenario))assert.ok(!seen.some(e=>e.kind==="metadata"&&e.work.monitors===1),"usage path does not admit provider roster");
+  assert.deepEqual(model.snapshot().agents[0]!.details.context,["owned","historical-owner","owner-nonself","long-stream-pinned-owner"].includes(scenario)?{used:500,max:1000}:null);
+  if(!["owned","historical-owner","owner-nonself","long-stream-pinned-owner"].includes(scenario))assert.ok(!seen.some(e=>e.kind==="metadata"&&e.work.monitors===1),"usage path does not admit provider roster");
  }finally{clearTimeout(timer);for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
 });

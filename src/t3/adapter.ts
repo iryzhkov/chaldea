@@ -612,7 +612,27 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   const usageProviders=new Map<string,UsageProvider|null>(),usageNodes=new Map<string,UsageNode|null>(),usageRuns=new Map<string,UsageRun|null>(),usageAttempts=new Map<string,UsageAttempt|null>();
   const usageTurns=new Map<string,{turn:UsageTurn|null;at:number;published:boolean}>();
   let usageOverflow=false,usagePartial=false;
-  const usageTurnProofs=new Map<string,Pick<UsageTurn,"id"|"nodeId"|"providerThreadId">|null>();
+  const usageTurnProofs=new Map<string,Pick<UsageTurn,"id"|"nodeId"|"providerThreadId"|"runAttemptId">|null>();
+  const pinnedUsage=(map:Map<string,unknown>,id:string)=>{
+    for(const [turnId,{turn}] of usageTurns){
+      if(!turn)continue;
+      const n=usageNodes.get(turn.nodeId),p=usageProviders.get(turn.providerThreadId);
+      const a=turn.runAttemptId?usageAttempts.get(turn.runAttemptId):undefined;
+      if(map===usageProviders&&id===turn.providerThreadId
+        ||map===usageNodes&&(id===turn.nodeId||id===p?.ownerNodeId)
+        ||map===usageRuns&&(id===n?.runId||id===a?.runId)
+        ||map===usageAttempts&&id===turn.runAttemptId
+        ||map===usageTurnProofs&&(id===turnId||id===n?.providerTurnId||id===a?.providerTurnId))return true;
+    }
+    return false;
+  };
+  const makeUsageRoom=(map:Map<string,unknown>,id:string,limit:number)=>{
+    if(map.has(id)||map.size<limit)return true;
+    // Rotate ordinary history, keeping retained dependencies and every poison.
+    const evict=[...map].find(([key,value])=>value!==null&&!pinnedUsage(map,key));
+    if(evict){map.delete(evict[0]);usagePartial=true;return true;}
+    usageOverflow=true;return false;
+  };
   const retain=<T extends {id:string}>(map:Map<string,T|null>,value:T,limit:number,identity:(v:T)=>unknown= v=>v,nullable=false)=>{
     if(map.has(value.id)&&map.get(value.id)===null)return;
     const old=map.get(value.id);
@@ -623,8 +643,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
         :JSON.stringify(before)!==JSON.stringify(after);
       if(conflict){map.set(value.id,null);return;}
     }
-    // Never evict a poison or a dependency and later silently re-admit it.
-    if(!map.has(value.id)&&map.size>=limit){usageOverflow=true;return;}
+    if(!makeUsageRoom(map,value.id,limit))return;
     const retained={...value};
     if(nullable&&old)for(const key in old)if(retained[key]==null&&old[key]!=null)retained[key]=old[key];
     map.set(value.id,retained);
@@ -632,7 +651,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
   const usageProvider=(p:Projection["providerThreads"][number])=>retain(usageProviders,{id:p.id,appThreadId:p.appThreadId,ownerNodeId:p.ownerNodeId,providerInstanceId:p.providerInstanceId},16,p=>[p.appThreadId,p.providerInstanceId,p.ownerNodeId],true);
   const usageNode=(n:Projection["nodes"][number])=>{
     if(n.kind==="root_turn"||n.kind==="subagent"||usageNodes.has(n.id)||[...usageProviders.values()].some(p=>p?.ownerNodeId===n.id)||[...usageTurns.values()].some(t=>t.turn?.nodeId===n.id))
-      retain(usageNodes,{id:n.id,threadId:n.threadId,kind:n.kind,parentNodeId:n.parentNodeId,rootNodeId:n.rootNodeId,runId:n.runId,providerThreadId:n.providerThreadId,providerTurnId:n.providerTurnId},64,n=>[n.threadId,n.kind,n.parentNodeId,n.rootNodeId,n.providerThreadId]);
+      retain(usageNodes,{id:n.id,threadId:n.threadId,kind:n.kind,parentNodeId:n.parentNodeId,rootNodeId:n.rootNodeId,runId:n.runId,providerThreadId:n.providerThreadId,providerTurnId:n.providerTurnId},64,n=>[n.threadId,n.kind,n.parentNodeId,n.rootNodeId,n.providerThreadId],true);
   };
   const usageRun=(r:Projection["runs"][number])=>retain(usageRuns,{id:r.id,threadId:r.threadId,rootNodeId:r.rootNodeId,providerThreadId:r.providerThreadId,providerInstanceId:r.providerInstanceId},128,r=>[r.threadId,r.rootNodeId,r.providerThreadId,r.providerInstanceId],true);
   const usageAttempt=(a:Projection["attempts"][number])=>retain(usageAttempts,{id:a.id,runId:a.runId,rootNodeId:a.rootNodeId,providerThreadId:a.providerThreadId,providerInstanceId:a.providerInstanceId,providerTurnId:a.providerTurnId},128,a=>[a.runId,a.rootNodeId,a.providerThreadId,a.providerInstanceId],true);
@@ -644,11 +663,11 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     const p=resolve(snapshot?.providerThreads,usageProviders,t.providerThreadId),n=resolve(snapshot?.nodes,usageNodes,t.nodeId);
     if(!p||p.appThreadId!==threadId||!n||n.threadId!==threadId||n.kind!=="root_turn"||n.parentNodeId!==null||n.rootNodeId!==n.id||n.providerThreadId!==p.id)return false;
     const same=(actual:unknown,expected:unknown)=>actual==null||expected==null||actual===expected;
-    const reverse=(id:string|null)=>{
+    const reverse=(id:string|null,attemptId?:string)=>{
       if(id===null)return true;
       const turn=resolve(snapshot?.providerTurns,usageTurnProofs,id);
       // Reverse IDs are latest pointers, not one-to-one historical links.
-      return turn!==null&&(!turn||turn.providerThreadId===p.id);
+      return turn!==null&&(!turn||turn.providerThreadId===p.id&&turn.nodeId===n.id&&(attemptId===undefined||turn.runAttemptId===attemptId));
     };
     if(!reverse(n.providerTurnId))return false;
     if((snapshot?.nodes??[...usageNodes.values()]).some(other=>other&&other.id!==n.id&&other.providerTurnId===t.id))return false;
@@ -657,7 +676,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       if(owner===null||owner&&(owner.threadId!==threadId||owner.kind!=="root_turn"||owner.parentNodeId!==null||owner.rootNodeId!==owner.id||owner.providerThreadId!==p.id))return false;
     }
     const attempt=t.runAttemptId?resolve(snapshot?.attempts,usageAttempts,t.runAttemptId):undefined;
-    if(attempt===null||attempt&&(!same(attempt.runId,n.runId)||!same(attempt.rootNodeId,n.id)||!same(attempt.providerThreadId,p.id)||!same(attempt.providerInstanceId,p.providerInstanceId)||!reverse(attempt.providerTurnId)))return false;
+    if(attempt===null||attempt&&(!same(attempt.runId,n.runId)||!same(attempt.rootNodeId,n.id)||!same(attempt.providerThreadId,p.id)||!same(attempt.providerInstanceId,p.providerInstanceId)||!reverse(attempt.providerTurnId,attempt.id)))return false;
     for(const id of [n.runId,attempt?.runId]){
       const r=id?resolve(snapshot?.runs,usageRuns,id):undefined;
       if(r===null||r&&(!same(r.threadId,threadId)||!same(r.rootNodeId,n.id)||!same(r.providerThreadId,p.id)||!same(r.providerInstanceId,p.providerInstanceId)))return false;
@@ -674,7 +693,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     }
   };
   const rememberTurn=(t:Projection["providerTurns"][number],stamp:number)=>{
-    retain(usageTurnProofs,{id:t.id,nodeId:t.nodeId,providerThreadId:t.providerThreadId},128);
+    retain(usageTurnProofs,{id:t.id,nodeId:t.nodeId,providerThreadId:t.providerThreadId,runAttemptId:t.runAttemptId},128);
     const old=usageTurns.get(t.id);if(old?.turn===null)return;
     const n=usageNodes.get(t.nodeId),p=usageProviders.get(t.providerThreadId);
     // Known children/foreign turns cannot consume the main-agent window.
@@ -723,16 +742,17 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
     if(item.kind==="snapshot"){
       providers.clear();children.clear();mainRoots.clear();mainOwners.clear();activeCommands.clear();terminalRuns.clear();onEvent({kind:"reset"});
       usageProviders.clear();usageNodes.clear();usageRuns.clear();usageAttempts.clear();usageTurns.clear();
+      usageTurnProofs.clear();usageOverflow=false;usagePartial=false;
       if(item.projection.thread.id!==threadId)return;
       const projection=item.projection;
-      usageTurnProofs.clear();usageOverflow=false;usagePartial=false;
       // Qualify against the entire envelope before selecting a bounded window.
       const owned=projection.providerTurns.filter(t=>ownsUsage(t,projection));
       if(owned.length>8)usagePartial=true;
-      const selected=projection.providerTurns.filter(t=>{
-        const n=projection.nodes.find(n=>n.id===t.nodeId),p=projection.providerThreads.find(p=>p.id===t.providerThreadId);
-        return n?.threadId===threadId&&n.kind==="root_turn"&&n.parentNodeId===null&&n.rootNodeId===n.id&&p?.appThreadId===threadId;
-      }).slice(-8);
+      if(projection.providerTurns.some(t=>{
+        const n=projection.nodes.find(n=>n.id===t.nodeId);
+        return n?.threadId===threadId&&n.kind==="root_turn"&&!owned.includes(t);
+      }))usagePartial=true;
+      const selected=owned.slice(-8);
       for(const t of selected){
         const p=projection.providerThreads.find(p=>p.id===t.providerThreadId)!;
         usageProvider(p);
@@ -743,7 +763,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
         const attempt=projection.attempts.find(a=>a.id===t.runAttemptId);if(attempt)usageAttempt(attempt);
         for(const id of [n.providerTurnId,attempt?.providerTurnId]){
           const reverse=projection.providerTurns.find(t=>t.id===id);
-          if(reverse)retain(usageTurnProofs,{id:reverse.id,nodeId:reverse.nodeId,providerThreadId:reverse.providerThreadId},128);
+          if(reverse)retain(usageTurnProofs,{id:reverse.id,nodeId:reverse.nodeId,providerThreadId:reverse.providerThreadId,runAttemptId:reverse.runAttemptId},128);
         }
         rememberTurn(t,DateTime.toEpochMillis(projection.updatedAt));
         if(!ownsUsage(t,projection))usageTurnProofs.set(t.id,null);
@@ -751,7 +771,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       // Carry duplicate identity poison until replacement snapshot or fail-closed overflow.
       const poison=<T extends {id:string}>(rows:readonly T[],map:Map<string,unknown>,limit:number)=>{
         for(const row of rows)if(rows.some(other=>other!==row&&other.id===row.id)){
-          if(!map.has(row.id)&&map.size>=limit){usageOverflow=true;break;}map.set(row.id,null);
+          if(!makeUsageRoom(map,row.id,limit))break;map.set(row.id,null);
         }
       };
       poison(projection.providerThreads,usageProviders,16);poison(projection.nodes,usageNodes,64);
@@ -783,7 +803,7 @@ export async function connectMissionThread(options: ConnectOptions, threadId: st
       else if(e.type==="provider-turn.updated")rememberTurn(e.payload,DateTime.toEpochMillis(e.occurredAt));
       else if(e.type==="node.updated")usageNode(e.payload);
       else if(e.type==="provider-thread.updated")usageProvider(e.payload);
-      reconcileUsage();
+      if(["run.updated","run-attempt.updated","provider-turn.updated","node.updated","provider-thread.updated"].includes(e.type))reconcileUsage();
       if(e.type==="run.updated"&&["completed","failed","cancelled","interrupted"].includes(e.payload.status)){
         onEvent({kind:"clear-activity"});
         if(terminalRuns.size>=128)terminalRuns.delete(terminalRuns.values().next().value!);terminalRuns.add(e.payload.id);

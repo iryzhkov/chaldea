@@ -50,9 +50,11 @@ turn pointers name the latest turn, so multiple turns per root/run are legal.
 Duplicate identities, conflicting root ownership and contradictory non-null
 provider owners are rejected using the full snapshot before selection. The existing
 provider metadata, activity ownership and child-roster admission guard is intact.
-Proof storage is bounded to 16 relevant providers, 64 nodes, 128 runs, 128 attempts,
-128 turn identities and eight pending/observed turns per thread. Stream proof
-overflow fails closed until a new snapshot; ambiguity poison is never evicted.
+Proof storage is bounded to 16 providers matching retained turns or recent pending
+rows, 64 nodes, 128 runs, 128 attempts, 128 turn identities and eight pending/observed
+turns per thread. Retained turn dependencies stay pinned while unrelated ordinary
+history rotates through the remaining space. Ambiguity poison is never evicted;
+exhausted poison capacity fails closed until a new snapshot.
 Only relationship fields and normalized
 usage are retained. Event ordering can defer qualification; later contradictory
 updates withdraw contributions, and reconnect snapshots replace the proof window.
