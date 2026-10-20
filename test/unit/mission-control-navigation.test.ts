@@ -110,7 +110,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   const intervals: (() => void)[] = []; let frame = () => {};
   const timeouts=new Map<number,{fn:()=>void;at:number}>();let timeoutId=0;
   const context: any = {
-    document, location, history, URL, URLSearchParams, Date:class extends Date {static now(){return clock?.now??Date.now();}}, performance, CustomEvent,
+    document, location, history, URL, URLSearchParams, Date:class extends Date {static override now(){return clock?.now??Date.now();}}, performance, CustomEvent,
     innerWidth: width, innerHeight:height, matchMedia: (q: string) => ({ matches: q.includes("reduced-motion") && reduced }),
     requestAnimationFrame: (fn: () => void) => { frame = fn; },
     setInterval: (fn: () => void) => { intervals.push(fn); },
@@ -453,7 +453,7 @@ test("provider quota cards retain separate host readings, source ages and known 
  assert.match(html,/Quota withheld · host byte budget/);assert.match(html,/Quota source error/);
  assert.match(html,/2 account rows omitted/);assert.doesNotMatch(html,/undefined|NaN|financial|quality score/);
  b.snapshot({...snap,quota:{state:"cached",accounts:[account]}});html=b.elements.view!.innerHTML;
- assert.match(html,/Codex account 1/);assert.doesNotMatch(html,/Observed by/);
+ assert.match(html,/Codex account 1/);assert.match(html,/Observed by Local/);
 });
 
 test("Events uses actual maintenance occurrence order, coverage and safe labels",()=>{

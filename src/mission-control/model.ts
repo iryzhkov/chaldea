@@ -195,7 +195,7 @@ export class MissionModel {
       host: "omarchy-pc", state,
       startedAt: at(t.row.latestRunStartedAt),
       // Only the owning run's actual completion is authoritative. Unknown time stays unknown.
-      completedAt: state==="completed" && completedAt!==null && completedAt>0 && completedAt<=now && completedAt>=(at(t.row.latestRunStartedAt)??0) ? completedAt : null,
+      completedAt: state==="completed" && completedAt!==null && completedAt>0 && completedAt<=now && completedAt<=t.observed && completedAt>=(at(t.row.latestRunStartedAt)??0) ? completedAt : null,
       observedAt: t.observed, detailObservedAt: t.detailObserved,
       freshness: freshness(this.connected, this.observed, 30_000, 300_000),
       activityFreshness: freshness(t.connected, t.detailObserved, 60_000, 600_000), steps: [...t.steps],

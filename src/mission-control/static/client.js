@@ -6,16 +6,17 @@ function completionTime(a, now) {
 export function projectClientSnapshot(snapshot, now, connected) {
   if (!snapshot) return null;
   const lost = !connected || !Number.isFinite(snapshot.now) || now - snapshot.now > 30_000;
+  const agents=snapshot.agents.map(a => ({ ...a,
+      detailObservedAt: !snapshot.sampled && a.activityFreshness === "live" ? snapshot.now : a.detailObservedAt,
+      activityFreshness: lost && a.activityFreshness === "live" ? "disconnected" : a.activityFreshness,
+    }));
   return { ...snapshot,
-    threadAgents: snapshot.agents.filter(a => completionTime(a,now)===null || now-completionTime(a,now)<60_000),
+    threadAgents: agents.filter(a => completionTime(a,now)===null || now-completionTime(a,now)<60_000),
     source: { ...snapshot.source, observedAt: !snapshot.sampled && snapshot.source.state === "live" ? snapshot.now : snapshot.source.observedAt,
       state: lost && snapshot.source.state === "live" ? "disconnected" : snapshot.source.state },
     ...(snapshot.hostSummary ? { hostSummary: snapshot.hostSummary.map(h => ({ ...h,
       freshness: lost && h.freshness === "live" ? "disconnected" : h.freshness })) } : {}),
-    agents: snapshot.agents.map(a => ({ ...a,
-      detailObservedAt: !snapshot.sampled && a.activityFreshness === "live" ? snapshot.now : a.detailObservedAt,
-      activityFreshness: lost && a.activityFreshness === "live" ? "disconnected" : a.activityFreshness,
-    })),
+    agents,
   };
 }
 // Browser receives only the allowlisted MissionModel snapshot. No credentials or T3 access.

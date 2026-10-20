@@ -641,3 +641,12 @@ test("active work is admitted before terminal history at the model cap and compl
  }
  for(const snapshot of cache.snapshots){validateHostSnapshot(snapshot);assert.equal(snapshot.rich!.completionTimes!.length,snapshot.agents.length);}
 });
+
+test("a completion timestamp beyond its source receipt remains unknown as the local clock advances",()=>{
+ let now=now0;
+ const m=live(()=>now,[{...row(),status:"completed",activeRunId:null,latestRunCompletedAt:new Date(now0+1).toISOString()}]);
+ assert.equal(m.snapshot().agents[0]!.completedAt,null);
+ now+=120_000;
+ assert.equal(m.snapshot().agents[0]!.completedAt,null);
+ assert.doesNotThrow(()=>captureSnapshot(m,"agent-a",epoch,1));
+});
