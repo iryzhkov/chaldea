@@ -53,7 +53,7 @@ test("CLI and existing MCP route against real T3 cached catalog; no wait service
       value: { fetchedAt: new Date(now).toISOString(), sourceFetchedAt: new Date(now).toISOString(), endExclusive: new Date(now).toISOString(), models: {} } });
     writeFileSync(configPath, JSON.stringify({ t3BaseDir: t3.baseDir, tokenFile, stateFile, cacheDir }));
     const env = { ...process.env, HOME: d.path, CHALDEA_ROUTE_CONFIG: configPath };
-    const cli = spawnSync(process.execPath, ["bin/chaldea", "route", "--role", "builder"], { encoding: "utf8", env, timeout: 20000 });
+    const cli = spawnSync(process.execPath, ["bin/chaldea", "route", "--role", "builder", "--explain"], { encoding: "utf8", env, timeout: 20000 });
     assert.equal(cli.status, 0, cli.stderr);
     const target = JSON.parse(cli.stdout);
     assert.equal(target.model, "claude-opus-5-5");

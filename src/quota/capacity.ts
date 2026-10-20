@@ -103,6 +103,7 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   // With the included lane open, credits keep their earlier advisory meaning unless spend is known blocked.
   if (wallet && spendControl !== true) return creditCapacity("fresh Codex credits available; no credit reserve floor");
   if (wallet) c.reasons.push("spend control reached; credits do not add capacity");
+  if (advice.limit && advice.limit !== advice.pacing) return finish("tight", "applicable included window under minimum remaining quota");
   const w = advice.pacing;
   if (!w) return finish("unknown", "missing, stale or expired weekly/longest included window; short windows never establish pacing");
   const hours = (Date.parse(w.resetsAt!) - now) / 3600000, durationHours = w.windowDurationMins! / 60;

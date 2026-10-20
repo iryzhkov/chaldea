@@ -421,7 +421,7 @@ export class HeadroomMonitor {
       const u = usage.value;
       if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt) || row.included.source === "t3" && !nativeKey()) {
         retainBurnSample(row, u.observedAt);
-        row.included = { ...observed(u.windows.map(w => ({ ...w, id: w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt), error };
+        row.included = { ...observed(u.windows.map(w => ({ ...w, id: w.id ?? w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt), error };
         if (u.accountKey) row.accountKey = u.accountKey; else delete row.accountKey;
         this.#changed = true;
       }

@@ -25,11 +25,12 @@ export function parseClaudeUsage(raw: unknown, now: number): ClaudeUsage {
   const r = raw as Record<string, { utilization?: unknown; resets_at?: unknown }> | null;
   if (!r || typeof r !== "object") throw new Error("Invalid Claude usage");
   const windows: QuotaWindow[] = [];
-  for (const [key, kind, minutes] of [["five_hour", "session", 300], ["seven_day", "weekly", 10080]] as const) {
+  for (const [key, kind, minutes] of [["five_hour", "session", 300], ["seven_day", "weekly", 10080], ["seven_day_fable", "weekly", 10080]] as const) {
     const w = r[key];
+    if (key === "seven_day_fable" && w == null) continue;
     if (!w || !percent(w.utilization) || typeof w.resets_at !== "string" ||
       !Number.isFinite(Date.parse(w.resets_at))) throw new Error("Invalid Claude usage");
-    windows.push({ kind, remainingPercent: 100 - w.utilization, resetsAt: w.resets_at, windowDurationMins: minutes });
+    windows.push({ id: key, kind, remainingPercent: 100 - w.utilization, resetsAt: w.resets_at, windowDurationMins: minutes });
   }
   const key = claudeAccountKey(raw);
   return { ...(key ? { accountKey: key } : {}), observedAt: new Date(now).toISOString(), windows };
@@ -42,12 +43,16 @@ export function claudeAccountKey(raw: unknown): string | undefined {
 function validate(raw: unknown): ClaudeUsage {
   const u = raw as ClaudeUsage;
   if (!u || typeof u.observedAt !== "string" || !Number.isFinite(Date.parse(u.observedAt)) ||
-    !Array.isArray(u.windows) || u.windows.length !== 2 ||
+    !Array.isArray(u.windows) || ![2, 3].includes(u.windows.length) ||
+    new Set(u.windows.map(w => w.id ?? w.kind)).size !== u.windows.length ||
+    !u.windows.some(w => w.kind === "session" && (w.id === undefined || w.id === "five_hour")) ||
+    !u.windows.some(w => w.kind === "weekly" && (w.id === undefined || w.id === "seven_day")) ||
     !u.windows.every(w => percent(w.remainingPercent) && typeof w.resetsAt === "string" && Number.isFinite(Date.parse(w.resetsAt)) &&
-      (w.kind === "session" && w.windowDurationMins === 300 || w.kind === "weekly" && w.windowDurationMins === 10080))) throw new Error("Invalid Claude usage cache");
+      (w.kind === "session" && w.windowDurationMins === 300 && [undefined, "five_hour"].includes(w.id) ||
+       w.kind === "weekly" && w.windowDurationMins === 10080 && [undefined, "seven_day", "seven_day_fable"].includes(w.id)))) throw new Error("Invalid Claude usage cache");
   // Project explicitly; no raw OAuth payload ever reaches disk.
   return { ...(u.accountKey && /^[a-f0-9]{64}$/.test(u.accountKey) ? { accountKey: u.accountKey } : {}), observedAt: u.observedAt, windows: u.windows.map(w => ({
-    kind: w.kind, remainingPercent: w.remainingPercent, resetsAt: w.resetsAt, windowDurationMins: w.windowDurationMins,
+    ...(w.id ? { id: w.id } : {}), kind: w.kind, remainingPercent: w.remainingPercent, resetsAt: w.resetsAt, windowDurationMins: w.windowDurationMins,
   })) };
 }
 function accessToken(source: ClaudeTokenSource, now: number): string {
