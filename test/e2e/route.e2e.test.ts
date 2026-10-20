@@ -59,7 +59,10 @@ test("CLI and existing MCP route against real T3 cached catalog; no wait service
     assert.equal(target.model, "claude-opus-5-5");
     const frames = [{ jsonrpc: "2.0", id: 1, method: "tools/list" },
       { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder" } } },
-      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder", effortOverride: "max" } } }];
+      { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder", effortOverride: "max" } } },
+      { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder", responseMode: "compact" } } },
+      { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "chaldea_route_review_pair", arguments: { authorProvider: "codex" } } },
+      { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder", responseMode: "invalid" } } }];
     const mcp = spawnSync(process.execPath, ["--input-type=module", "-e",
       'const {runMcp} = await import(' + JSON.stringify(resolve("src/mcp.ts")) + '); await runMcp("/missing-waits.sock");'],
       { env, encoding: "utf8", timeout: 30000, input: frames.map(f => JSON.stringify(f)).join("\n") + "\n" });
@@ -70,6 +73,15 @@ test("CLI and existing MCP route against real T3 cached catalog; no wait service
     assert.equal(JSON.parse(replies[1].result.content[0].text).model, target.model);
     assert.deepEqual(JSON.parse(replies[1].result.content[0].text).byProvider, target.byProvider);
     assert.equal(replies[2].result.isError, true);
+    assert.equal(JSON.parse(replies[2].result.content[0].text).error.code, "usage");
+    const compact = JSON.parse(replies[3].result.content[0].text);
+    assert.equal(compact.model, target.model);assert.equal(compact.target.model, target.model);
+    assert.ok(!("diagnostics" in compact));assert.equal(compact.quality_source, "fixed_policy");
+    const pair = JSON.parse(replies[4].result.content[0].text);
+    assert.equal(pair.status, "complete");assert.equal(pair.main.providerInstanceId, "claudeAgent");
+    assert.equal(pair.peer.providerInstanceId, "codex");assert.equal(pair.quotaException, false);
+    assert.equal(replies[5].result.isError, true);
+    assert.equal(JSON.parse(replies[5].result.content[0].text).error.code, "usage");
     assert.equal(t3.fakeClaudeEvents().filter(e => e.event === "turn").length, 0);
   } finally { await t3.stop(); d.remove(); }
 });
