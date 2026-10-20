@@ -42,7 +42,7 @@ script.onload = () => {
   const windowRows = a => Array.isArray(a.windows)?a.windows.map(w=>({...w,state:a.state})):
     [{id:"legacy",label:"Included window · name unavailable",used:a.used,resetsAt:a.resetsAt,duration:a.duration,observedAt:a.observedAt,state:a.state}];
   const quotaWindow = (w,label) => '<div class="quota-window" data-fresh="'+esc(quotaFresh(w.state,w.observedAt))+'"><strong>'+esc(label)+'</strong>'
-    +(Number.isFinite(w.used)?resourceMeter(label+" used",w.used,w.used+"% used · "+Number((100-w.used).toFixed(2))+"% headroom"):missing("Usage unknown"))
+    +(Number.isFinite(w.used)?resourceMeter(label+" used",w.used,w.used+"% used · "+Number((100-w.used).toFixed(2))+"% headroom"):missing(w.state==="unsupported"?"Quota not applicable":"Usage unknown"))
     +'<div class="source-meta">'+esc(quotaFresh(w.state,w.observedAt))+' · usage observed '+esc(agoText(w.observedAt))+(w.duration==null?"":" · "+esc(w.duration)+" min window")+(w.resetsAt==null?" · reset unknown":" · reset "+timestamp(w.resetsAt))+'</div></div>';
   const quotaCredits = a => '<div class="quota-capacity source-meta">'+[
     a.unlimited===true?"Credits unlimited":a.credits!=null?"Credits remaining "+esc(a.credits):"Credits unknown",
@@ -53,8 +53,15 @@ script.onload = () => {
   const quotaCapacity = g => {
     const newest=key=>g.rows.slice().sort((a,b)=>(b.account[key]??-1)-(a.account[key]??-1)||a.host.localeCompare(b.host)||a.index-b.index)[0];
     const c=newest("creditObservedAt"),r=newest("resetObservedAt");
+    const differences=(latest,keys,label,value,time,state)=>{
+      if(!latest||!g.rows.some(v=>keys.some(k=>v.account[k]!==latest.account[k])))return "";
+      return '<div class="quota-disagreement"><strong>'+esc(label)+' readings differ · separate observations</strong>'
+        +g.rows.map(v=>'<div class="source-meta">'+esc(v.host)+' · '+esc(v.account.label)+' · '+esc(value(v.account))+' · '+esc(quotaFresh(v.account[state],v.account[time]))+' · observed '+esc(agoText(v.account[time]))+'</div>').join("")+'</div>';
+    };
     return (c?'<div class="source-meta">Credits · '+esc(c.host)+' · '+esc(c.account.label)+' · '+esc(quotaFresh(c.account.creditState,c.account.creditObservedAt))+' · observed '+esc(agoText(c.account.creditObservedAt))+'</div>'+missing(c.account.unlimited===true?"Credits unlimited":c.account.credits!=null?"Credits remaining "+c.account.credits:"Credits unknown"):missing("Credits unknown"))
-      +(r?'<div class="source-meta">Manual resets · '+esc(r.host)+' · '+esc(r.account.label)+' · '+esc(quotaFresh(r.account.resetState,r.account.resetObservedAt))+' · observed '+esc(agoText(r.account.resetObservedAt))+'</div>'+missing(r.account.manualResets==null?"Manual resets unknown":r.account.manualResets+" manual resets available"):missing("Manual resets unknown"));
+      +(r?'<div class="source-meta">Manual resets · '+esc(r.host)+' · '+esc(r.account.label)+' · '+esc(quotaFresh(r.account.resetState,r.account.resetObservedAt))+' · observed '+esc(agoText(r.account.resetObservedAt))+'</div>'+missing(r.account.manualResets==null?"Manual resets unknown":r.account.manualResets+" manual resets available"):missing("Manual resets unknown"))
+      +differences(c,["credits","unlimited","creditState"],"Credit",a=>a.unlimited===true?"Credits unlimited":a.credits==null?"Credits unknown":"Credits remaining "+a.credits,"creditObservedAt","creditState")
+      +differences(r,["manualResets","resetState"],"Manual reset",a=>a.manualResets==null?"Manual resets unknown":a.manualResets+" manual resets available","resetObservedAt","resetState");
   };
   const quotaRows = h => h.accounts.slice(0,4).map(a=>'<div class="quota-account"><strong>'+esc(a.label)+'</strong>'
     +windowRows(a).map(w=>quotaWindow(w,windowLabels[w.id]||w.label||"Window unknown")).join("")
@@ -82,14 +89,14 @@ script.onload = () => {
       +(ids.length?ids.map(id=>{
         const readings=rows.filter(r=>r.window.id===id).sort((a,b)=>(b.window.observedAt??-1)-(a.window.observedAt??-1)||a.host.localeCompare(b.host)||a.index-b.index);
         const r=readings[0],label=windowLabels[id]||"Included window · name unavailable";
-        if(!r)return '<div class="quota-window"><strong>'+esc(label)+'</strong>'+missing("Usage unknown · window not reported")+'</div>';
+        if(!r)return '<div class="quota-window"><strong>'+esc(label)+'</strong>'+missing(g.rows.length&&g.rows.every(v=>v.account.state==="unsupported")?"Quota not applicable":"Usage unknown · window not reported")+'</div>';
         const differs=readings.some(v=>v.window.used!==r.window.used||v.window.resetsAt!==r.window.resetsAt||v.window.duration!==r.window.duration);
         return quotaWindow(r.window,label)+'<div class="source-meta">Newest window observation · '+esc(r.host)+' · '+esc(agoText(r.window.observedAt))+' · '+esc(r.account.label)+' · '+readings.length+' / '+g.rows.length+' account readings report this window</div>'
           +(differs?'<div class="quota-disagreement">'+missing("Host readings differ · separate observations")
             +readings.map(v=>'<div class="source-meta">'+esc(v.host)+' · '+esc(v.account.label)+' · '+(v.window.used==null?"usage unknown":esc(v.window.used)+"% used")+' · '+esc(agoText(v.window.observedAt))+' · reset '+timestamp(v.window.resetsAt)+'</div>').join("")+'</div>':"");
-      }).join(""):missing("Usage unknown · no provider observation"))
+      }).join(""):missing(g.rows.length&&g.rows.every(v=>v.account.state==="unsupported")?"Quota not applicable":"Usage unknown · no provider observation"))
       +g.rows.map(r=>(r.account.windowsOmitted?missing(r.host+" · "+r.account.windowsOmitted+" windows omitted by source"):"")
-        +(r.account.windows?.length===0?missing(r.host+" · no recognized windows reported"):"")).join("")
+        +(r.account.windows?.length===0?missing(r.host+(r.account.state==="unsupported"?" · quota not applicable":" · no recognized windows reported")):"")).join("")
       +quotaCapacity(g)
       +missing("Included usage and credits are separate. Total capacity is not established here.");
   };

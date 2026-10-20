@@ -785,6 +785,7 @@ test("shared quota shows each native window, disagreement and missing coverage w
   const p=newProvider("PRIVATE","claudeAgent"),head=emptyHeadroom();
   applyT3(p,{usageLimits:{checkedAt:new Date(now-(all?100000:1000)).toISOString(),windows:(all?ids:ids.slice(0,1)).map((id,i)=>({id,kind:i?"weekly":"session",usedPercent:all?[8,90,43][i]!:12,windowDurationMins:i?10080:300}))}} as any);
   p.credits={state:"fresh",observedAt:new Date(now-(all?2000:5000)).toISOString(),error:null,source:"private",value:{balance:all?"250":"10",hasCredits:true,unlimited:false}};
+  p.manualResets={state:"fresh",observedAt:new Date(now-(all?2000:5000)).toISOString(),error:null,source:"private",value:{availableCount:all?3:1}};
   head.providers=[p];m.setQuota(head);
   return quotaAccounts(captureSnapshot(m,"agent-a","a".repeat(32),1)!.quota!,now)[0]!;
  };
@@ -802,6 +803,9 @@ test("shared quota shows each native window, disagreement and missing coverage w
    assert.match(html,/Shared subscription · operator confirmed/);assert.match(html,/Host readings differ/);
    assert.match(html,/agent-a · claudeAgent account 1 · 8% used/);assert.match(html,/agent-b · claudeAgent account 1 · 12% used/);
    assert.match(html,/Credits · agent-a/);assert.match(html,/Credits remaining 250/);
+   assert.match(html,/Credit readings differ/);assert.match(html,/agent-b · claudeAgent account 1 · Credits remaining 10 · cached · observed 5s ago/);
+   assert.match(html,/Manual reset readings differ/);assert.match(html,/agent-a · claudeAgent account 1 · 3 manual resets available/);
+   assert.match(html,/agent-b · claudeAgent account 1 · 1 manual resets available · cached · observed 5s ago/);
    assert.match(html,/Source coverage/);assert.match(html,/laptop · unknown/);
    assert.doesNotMatch(html,/PRIVATE|undefined|NaN|total blocked|Credits unlimited/);
   }
@@ -819,4 +823,9 @@ test("included exhaustion keeps credits and unknown provider observations distin
  assert.match(html,/100% used · 0% headroom/);assert.match(html,/Credits remaining 125/);
  assert.match(html,/Included usage and credits are separate/);assert.match(html,/Provider unknown/);assert.match(html,/Subscription context unknown/);
  assert.doesNotMatch(html,/blocked|Credits unlimited|PRIVATE|undefined|NaN/);
+ for(const windows of [undefined,[]]){
+  b.snapshot({...snap,quota:{...snap.quota,hosts:[{...snap.quota.hosts[0],accounts:[{...account,label:"opencode account 1",state:"unsupported",used:null,windows}]}]}});
+  const unsupported=b.elements.view!.innerHTML.replace(/<details>[\s\S]*?<\/details>/g,"");
+  assert.match(unsupported,/Quota not applicable/);
+ }
 });

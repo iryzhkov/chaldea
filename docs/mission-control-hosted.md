@@ -290,8 +290,8 @@ quota under the unchanged 8 KiB budget, retaining the omitted count.
 This is backward readability by the new consumer, not old-reader acceptance.
 Old strict 13-field readers reject extended rows. Roll out the Akasha ingest
 validator first, then the hosted reader/cache/web consumer, then capture/client
-producers on each enrolled host. Keep producers on the scalar payload until
-all consumers accept the extension. No new grants, identity, publisher, store
+producers on each enrolled host. Do not upgrade producer hosts until all
+consumers accept the extension; upgraded producers immediately emit it. No new grants, identity, publisher, store
 or direct OAuth path is introduced.
 
 The operator confirmed one shared Claude subscription and one shared Codex
