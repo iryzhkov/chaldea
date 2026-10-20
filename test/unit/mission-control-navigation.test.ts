@@ -5,7 +5,7 @@ import { runInNewContext } from "node:vm";
 
 // Execute both shipped scripts against the small DOM/history seam they use.
 // Rendering remains real; no copied navigation implementation.
-function browser(href = "https://board.example/?palette=mocr-1969", reduced = false) {
+function browser(href = "https://board.example/?palette=mocr-1969", reduced = false, clock?:{now:number}) {
   let width=3840,height=1800;
   const animations: string[] = [];
   class Element extends EventTarget {
@@ -108,11 +108,14 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   };
   let eventSource: EventTarget;
   const intervals: (() => void)[] = []; let frame = () => {};
+  const timeouts=new Map<number,{fn:()=>void;at:number}>();let timeoutId=0;
   const context: any = {
-    document, location, history, URL, URLSearchParams, Date, performance, CustomEvent,
+    document, location, history, URL, URLSearchParams, Date:class extends Date {static now(){return clock?.now??Date.now();}}, performance, CustomEvent,
     innerWidth: width, innerHeight:height, matchMedia: (q: string) => ({ matches: q.includes("reduced-motion") && reduced }),
     requestAnimationFrame: (fn: () => void) => { frame = fn; },
     setInterval: (fn: () => void) => { intervals.push(fn); },
+    setTimeout: (fn:()=>void,delay:number) => {const id=++timeoutId;timeouts.set(id,{fn,at:(clock?.now??Date.now())+delay});return id;},
+    clearTimeout: (id:number) => timeouts.delete(id),
     addEventListener: window.addEventListener.bind(window),
     EventSource: class extends EventTarget { constructor(){super();eventSource=this;} close() {} },
   };
@@ -129,6 +132,7 @@ function browser(href = "https://board.example/?palette=mocr-1969", reduced = fa
   };
   const travel = (delta: number) => { index += delta; location.href = entries[index]!; window.dispatchEvent(new Event("popstate")); };
   return { elements, location, entries, click, travel, frame: () => frame(),
+    tick: (now:number) => {assert.ok(clock);clock.now=now;for(const [id,timer] of [...timeouts])if(timer.at<=now){timeouts.delete(id);timer.fn();}},
     resize: (w:number,h:number) => {width=w;height=h;context.innerWidth=w;context.innerHeight=h;window.dispatchEvent(new Event("resize"));},
     grid: (value:string) => { const el=elements.view!.querySelector("[data-thread-grid]")!;el.value=value;const e=new Event("change");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
     page: (delta:number) => {const el=elements.view!.querySelector(`[data-thread-page="${delta}"]`)!;const e=new Event("click");Object.defineProperty(e,"target",{value:el});document.dispatchEvent(e);},
@@ -647,4 +651,33 @@ test("Tokens uses retained transported detail usage with subsets, zeros, partial
  text=b.elements.view!.textContent;assert.match(text,/source stale/);assert.match(text,/0 \/ 1 threads report this field/);assert.doesNotMatch(text,/120/);
  b.snapshot({...snap,agents:[{...row,details:{...d,fieldCoverage:"identity-only"}}]});
  text=b.elements.view!.textContent;assert.match(text,/0 usable turns \/ 0 usable threads/);assert.match(text,/Generation rate, p95, daily totals and model history unavailable/);
+});
+
+test("completion expiry uses actual time at 59.999s and 60s without data, clamps paging and keeps source evidence",()=>{
+ const start=Date.parse("2026-10-20T00:00:00Z"),clock={now:start+59_999};
+ const b=browser("https://board.example/?mode=agents&grid=2x2",false,clock);
+ const states=["working","completed","completed","completed","completed","failed","cancelled","completed"];
+ const agents=states.map((state,i)=>({id:"expiry-"+i,title:"Expiry "+i,model:"sol",host:"agent-a",state,completedAt:i===7?null:start,startedAt:start-1000,observedAt:clock.now,detailObservedAt:clock.now,activityFreshness:"live",freshness:"live",steps:[]}));
+ const hostSummary=[{host:"agent-a",shown:8,total:8,truncated:false,observedAt:clock.now,freshness:"live",states:{completed:5,working:1,failed:1,cancelled:1},models:[]}];
+ const snap={version:1,demo:false,sampled:true,now:clock.now,source:{state:"live",observedAt:clock.now},agents,shown:8,total:8,truncated:false,tokens:{output:123,rate:0,coverage:"observed"},quota:{state:"unknown",accounts:[]},hostSummary};
+ b.snapshot(snap);
+ assert.equal(b.context.DATA.threads.length,8);assert.match(b.elements.view!.textContent,/Page 1 of 2/);
+ b.page(1);assert.match(b.elements.view!.textContent,/Page 2 of 2/);
+ b.snapshot({...snap,now:clock.now}); // A refreshed sample cannot restart the lifetime.
+ assert.equal(b.context.DATA.threads.length,8);
+ b.tick(start+60_000); // Fires the shipped expiry timeout, with no new snapshot or interval tick.
+ assert.equal(b.context.DATA.threads.length,4);
+ assert.match(b.elements.view!.textContent,/Page 1 of 1/);
+ assert.equal(b.elements.view!.querySelectorAll("[data-thread-card]").length,4);
+ assert.match(b.elements.view!.textContent,/showing 4 of 4 observed threads/);
+ assert.match(b.elements.view!.textContent,/4 completed hidden; 8 source rows retained/);
+ assert.match(b.elements.view!.textContent,/completion time unknown; retained/);
+ assert.deepEqual(Array.from(b.context.DATA.threads,(a:any)=>a.state),["working","failed","cancelled","completed"]);
+ assert.equal(snap.agents.length,8);assert.equal(snap.hostSummary[0]!.shown,8);assert.equal(snap.tokens.output,123);
+ b.click("agent-summary");assert.match(b.elements.view!.textContent,/shown 8 \/ 8/);
+ b.click("tokens");assert.match(b.elements.view!.textContent,/shown 8 \/ 8 threads/);
+ b.snapshot({...snap,now:clock.now,agents:agents.map((a,i)=>i===1?{...a,state:"working"}:a)});
+ b.click("agents");assert.equal(b.context.DATA.threads.length,5);
+ assert.ok(b.context.DATA.threads.some((a:any)=>a.id==="expiry-1"));
+ b.click("overview");assert.doesNotMatch(b.elements.view!.querySelector(".p-threads")!.textContent,/Expiry [234]/);
 });

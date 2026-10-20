@@ -1,8 +1,13 @@
+// A missing, invalid or future completion time cannot establish an expiry.
+function completionTime(a, now) {
+  return a.state==="completed" && Number.isSafeInteger(a.completedAt) && a.completedAt>0 && a.completedAt<=now ? a.completedAt : null;
+}
 // Age the retained source snapshot even when the browser transport is quiet or lost.
 export function projectClientSnapshot(snapshot, now, connected) {
   if (!snapshot) return null;
   const lost = !connected || !Number.isFinite(snapshot.now) || now - snapshot.now > 30_000;
   return { ...snapshot,
+    threadAgents: snapshot.agents.filter(a => completionTime(a,now)===null || now-completionTime(a,now)<60_000),
     source: { ...snapshot.source, observedAt: !snapshot.sampled && snapshot.source.state === "live" ? snapshot.now : snapshot.source.observedAt,
       state: lost && snapshot.source.state === "live" ? "disconnected" : snapshot.source.state },
     ...(snapshot.hostSummary ? { hostSummary: snapshot.hostSummary.map(h => ({ ...h,
@@ -24,7 +29,7 @@ script.onload = () => {
   document.getElementById("view").setAttribute("aria-label","Mission Control page");
   const esc = v => String(v ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   const missing = text => '<div class="muted">' + esc(text) + '</div>';
-  let snapshot = null, receivedSnapshot = null, transportConnected = false, mode = window.MC.modeFromURL();
+  let snapshot = null, receivedSnapshot = null, transportConnected = false, expiryTimer = null, mode = window.MC.modeFromURL();
   const age = at => at == null ? null : Math.max(0,Math.floor((Date.now()-at)/1000));
   const sourcePanel = (area,title,body,kind="t3shell") => panel(area,title,body,kind,age(snapshot?.source.observedAt),snapshot?.source.state === "live" ? "live" : snapshot?.source.state === "nosource" ? "nosource" : age(snapshot?.source.observedAt)>(snapshot?.sampled?600:300) ? "lost" : "stale");
   const unavailable = (area,title) => panel(area,title,missing("Unavailable · no authorized source"),"host",null,"nosource");
@@ -60,7 +65,7 @@ script.onload = () => {
   };
   const eventFresh = () => snapshot?.events?.state==="error"?"error":snapshot?.events?.checkedAt==null?"nosource":age(snapshot.events.checkedAt)>900?"stale":"cached";
   R.overview = () => {
-    const s=snapshot,agents=window.MC.orderThreads(s?.agents||[]),hosts=hostList(),observed=hosts.filter(h=>h.observedAt!=null).length;
+    const s=snapshot,agents=window.MC.orderThreads(s?.threadAgents||[]),hosts=hostList(),observed=hosts.filter(h=>h.observedAt!=null).length;
     const stats=[[s?agents.filter(a=>["working","thinking"].includes(a.state)).length:"—","working"],[s?agents.filter(a=>a.state.startsWith("waiting")).length:"—","waiting"],[hosts.length?observed+" / "+hosts.length:"—","hosts observed"]];
     if(s?.tokens.rate!=null)stats.push([s.tokens.rate.toFixed(1),s.tokens.coverage==="partial"?"rate lower bound":"output tok/s"]);
     const kpi='<div class="stats hero-row">'+stats.map(x=>heroStat(...x)).join("")+'</div><div class="source-meta">Needs Igor, incidents, exec slots, queued jobs, shipped and daily totals: not connected</div>';
@@ -74,7 +79,7 @@ script.onload = () => {
 
     return sourcePanel("kpi",(s?.sampled?"Enrolled sources · sampled":"Local observations")+" · "+(s?.source.state||"connecting"),kpi)
       +unavailable("inbox","Decision inbox")
-      +sourcePanel("threads","Threads · "+threadCoverage(Math.min(rowLimit,agents.length)),(rows||missing("No observed threads"))+'<a class="detail-link" href="?mode=agents">All threads · active first, including completed</a>')
+      +sourcePanel("threads","Threads · "+threadCoverage(Math.min(rowLimit,agents.length),agents.length),(rows||missing("No observed threads"))+'<a class="detail-link" href="?mode=agents">All threads · active first, completed for 60s</a>')
       +panel("hosts","Hosts · CPU / RAM",hosts.map(h=>compactHost(h)).join("")||missing("No host observations"),"host",null,"cached","overview-resources")
       +panel("quota","Quota by observing host",q+'<div class="source-meta">Same account may repeat across hosts</div><a class="detail-link" href="?mode=quota">All quota observations / details</a>',"quota",null,"cached")
       +panel("events","Latest maintenance changes / failures",eventCoverage()+eventBody(2),"akasha",age(s?.events?.checkedAt),eventFresh());
@@ -172,12 +177,13 @@ script.onload = () => {
     return '<div class="agent-detail">'+identityBody+'<div class="facts"><div>Effort '+esc(effort)+'</div><div>Assistant: '+esc(previewText(p)??p.state)+' · '+esc(p.state)+'</div><div>'+esc(commandLabel(a))+': '+(commands.length?commands.map(p=>esc(previewText(p)??p.state)+" ("+esc(p.state)+")").join(" · "):"not reported / no active observation")+(d.commandsOmitted?" · "+d.commandsOmitted+" omitted":"")+'</div><div>'+esc(usage(d.usage))+'</div><div>Context '+(d.context?d.context.used+" / "+(d.context.max??"?"):"not reported")+'</div><div>Children '+(c?c.active+" active / "+c.queued+" queued / "+c.completed+" completed observed":"not reported")+' · delegates '+esc(countWork(w.delegates))+' · native subagents '+esc(countWork(w.subagents))+' · monitors '+(w.monitors??"not reported")+' · background '+(w.background??"not reported")+' · durable waits unavailable · '+esc(w.coverage)+'</div></div></div>';
   };
   // Counts describe the received observation set, never an inferred fleet total.
-  const threadCoverage = (visible=snapshot?.agents.length??0) => {
-    const received=snapshot?.agents.length??0;
+  const threadCoverage = (visible=snapshot?.agents.length??0,received=snapshot?.agents.length??0) => {
     return "showing "+visible+" of "+received+" observed threads"+(snapshot?.truncated?" · capture truncated; upstream reports "+(snapshot.total??"unknown")+"; fleet total unknown":"") ;
   };
   const coverage = () => threadCoverage()+" · 48-row bound";
-  UI.threadCoverage=(visible,received,start)=>threadCoverage(visible)+(received>visible?" · rows "+(start+1)+"–"+(start+visible)+" of received set":"");
+  UI.threadCoverage=(visible,received,start)=>threadCoverage(visible,received)+(received>visible?" · rows "+(start+1)+"–"+(start+visible)+" of filtered set":"")
+    +(snapshot?.agents.length>received?" · "+(snapshot.agents.length-received)+" completed hidden; "+snapshot.agents.length+" source rows retained":"")
+    +((snapshot?.threadAgents||[]).some(a=>a.state==="completed"&&completionTime(a,Date.now())===null)?" · completion time unknown; retained":"");
   const commandIsCurrent = a => ["working","thinking"].includes(a.state) && a.activityFreshness==="live" && age(a.detailObservedAt)!=null && age(a.detailObservedAt)<=60;
   const commandLabel = a => commandIsCurrent(a)?"Active command observed":"Last observed command · outcome unknown";
   const activityItems = a => {
@@ -253,13 +259,17 @@ script.onload = () => {
   });
   document.addEventListener("mc:mode",e=>{mode=e.detail;});
   function render() {
-    snapshot = projectClientSnapshot(receivedSnapshot, Date.now(), transportConnected);
+    const now=Date.now();
+    snapshot = projectClientSnapshot(receivedSnapshot, now, transportConnected);
+    if(expiryTimer!==null)clearTimeout(expiryTimer);
+    const deadlines=(snapshot?.threadAgents||[]).map(a=>completionTime(a,now)).filter(at=>at!==null).map(at=>at+60_000);
+    expiryTimer=deadlines.length?setTimeout(render,Math.max(1,Math.min(...deadlines)-now)):null;
     const sourceLabel = snapshot?.sampled ? "Akasha status snapshots" : snapshot ? "Local T3 snapshots" : "No observed source";
     window.MC.SOURCES.t3shell.label = sourceLabel;
     window.MC.SOURCES.t3thread.label = sourceLabel;
     if(snapshot) {
       DATA.demo=snapshot.demo; DATA.agentSourceAge=age(snapshot.source.observedAt);
-      DATA.threads=snapshot.agents.map(a=>({ ...a, activityObservedAt:receivedSnapshot.agents.find(raw=>raw.id===a.id)?.detailObservedAt, state:a.state, sourceFreshness:snapshot.source.state!=="live"?snapshot.source.state:hostFreshness(snapshot.hostSummary?.find(h=>h.host===a.host)||a), observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort?.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
+      DATA.threads=snapshot.threadAgents.map(a=>({ ...a, activityObservedAt:receivedSnapshot.agents.find(raw=>raw.id===a.id)?.detailObservedAt, state:a.state, sourceFreshness:snapshot.source.state!=="live"?snapshot.source.state:hostFreshness(snapshot.hostSummary?.find(h=>h.host===a.host)||a), observed:age(a.detailObservedAt), sourceObserved:age(snapshot.hostSummary?.find(h=>h.host===a.host)?.observedAt ?? a.observedAt), age:null, run:age(a.startedAt), effort:a.details?.effort?.value?a.details.effort.value+" ("+a.details.effort.source+")":"not reported", steps:a.steps.map(tool=>({tool})) }));
       DATA.agentPool=DATA.threads; DATA.sources=[];
     }
     window.MC.show(window.MC.MODES.includes(mode)?mode:"overview");

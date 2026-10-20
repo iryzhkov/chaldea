@@ -38,6 +38,10 @@ export function validateHostSnapshot(raw:unknown):HostSnapshot {
   }
   if(Object.hasOwn(s,"rich")){
     const rich=normalizeRich(s.rich,ids,Number(s.observedAt));
+    for(const [id,time] of rich.completionTimes??[]){
+      const agent=(s.agents as HostSnapshot["agents"]).find(a=>a.id===id)!;
+      check(agent.state==="completed"&&(agent.startedAt===null||time>=agent.startedAt));
+    }
     for(const row of rich.details){const app=row.value.identity.appThreadId;
       if(app.state==="reported"&&app.text!==null)check(createHash("sha256").update(String(s.epoch)+"\0"+app.text).digest("hex").slice(0,16)===row.id);
     }
@@ -62,9 +66,16 @@ export function captureSnapshot(model:MissionModel,host:string,epoch:string,sequ
     tokens:qualified?{qualified:true,output:v.tokens.output,rate:v.tokens.rate,observedAt:v.tokens.observedAt,coverage:v.tokens.coverage as "observed"|"partial"}:
       {qualified:false,output:null,rate:null,observedAt:null,coverage:"unknown"}};
   while(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){snapshot.agents.pop();snapshot.truncated=true;}
-  // Fit base rows first. Optional metadata never removes another row.
-  const rich:RichSnapshot={v:4,resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
+  // v5 adds actual completion times through the existing rich schema seam.
+  // Older v1/v2/v3/v4 producers remain readable; older readers reject v5.
+  const completionTimes:[string,number][]=snapshot.agents.flatMap((a,i)=>v.agents[i]!.completedAt===null?[]:[[a.id,v.agents[i]!.completedAt!] as [string,number]]);
+  const rich:RichSnapshot={v:completionTimes.length?5:4,...(completionTimes.length?{completionTimes}:{}),resources:{state:"unavailable",sample:null},details:[],omitted:snapshot.agents.length};
   snapshot.rich=rich;
+  // Completion evidence precedes optional detail. Never silently drop it for a retained row.
+  while(rich.v===5&&Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES&&snapshot.agents.length){
+    const removed=snapshot.agents.pop()!;snapshot.truncated=true;
+    rich.completionTimes=rich.completionTimes!.filter(([id])=>id!==removed.id);rich.omitted=snapshot.agents.length;
+  }
   if(Buffer.byteLength(JSON.stringify(snapshot))>SNAPSHOT_BYTES)delete snapshot.rich;
   else {
     try{rich.resources=validateRich({v:3,resources:v.resources,details:[],omitted:0},new Set(),observedAt).resources;}

@@ -3,7 +3,7 @@ export type SparsePreview={text?:string|null;state?:Preview["state"]};
 export type SparseDetail=Partial<Pick<Detail,"fieldCoverage">> & {identity:{title:SparsePreview;appThreadId:SparsePreview}} & Partial<Omit<Detail,"identity"|"fieldCoverage"|"usage"|"work"|"assistant"|"commands"|"recent"|"provider">> & {assistant?:SparsePreview;commands?:SparsePreview[];recent?:{kind:"assistant"|"command";preview:SparsePreview;at?:number|null;status?:string}[];provider?:{instanceId:string;driver?:string|null}|null;usage?:Partial<Detail["usage"]>;work?:Partial<Detail["work"]>;assistantFromRecent?:number;recentOmitted?:number};
 export type FullWireDetail=Detail|{identity:Detail["identity"];fieldCoverage:"identity-only"};
 export type WireDetail=FullWireDetail|SparseDetail;
-export interface RichSnapshot<D=WireDetail> {v:2|3|4;resources:Resources;details:{id:string;value:D}[];omitted:number}
+export interface RichSnapshot<D=WireDetail> {v:2|3|4|5;completionTimes?:[string,number][];resources:Resources;details:{id:string;value:D}[];omitted:number}
 const check=(v:unknown)=>{if(!v)throw new Error("invalid_host_detail");};
 const obj=(v:unknown):Record<string,unknown>=>{check(v&&typeof v==="object"&&!Array.isArray(v));return v as Record<string,unknown>;};
 const exact=(v:Record<string,unknown>,keys:string[])=>check(Object.keys(v).length===keys.length&&keys.every(k=>Object.hasOwn(v,k)));
@@ -25,7 +25,7 @@ export function isolateDetail(value:Detail,at:number):FullWireDetail {
  return {identity:{title:withheld,appThreadId:withheld},fieldCoverage:"identity-only"};
 }
 export function validateRich(raw:unknown,ids:Set<string>,at:number):RichSnapshot {
- const r=obj(raw);if(r.v===4){normalizeRich(raw,ids,at);return structuredClone(raw) as RichSnapshot;}
+ const r=obj(raw);if(r.v===4||r.v===5){normalizeRich(raw,ids,at);return structuredClone(raw) as RichSnapshot;}
  exact(r,["v","resources","details","omitted"]);check((r.v===2||r.v===3)&&integer(r.omitted)&&Array.isArray(r.details)&&r.details.length<=48);
  const resources=obj(r.resources);exact(resources,["state","sample"]);enums(resources.state,["reported","unavailable","byte-budget"]);
  check(resources.state!=="reported"?resources.sample===null:validResources(resources.sample)&&resources.sample.sampledAt<=at);
@@ -79,7 +79,20 @@ function compactPreview(p:Preview):SparsePreview {
 }
 /** Validate before expanding, and retain the sparse representation in every durable caller. */
 export function normalizeRich(raw:unknown,ids:Set<string>,at:number):RichSnapshot<FullWireDetail> {
- const r=obj(raw);if(r.v!==4)return validateRich(raw,ids,at) as RichSnapshot<FullWireDetail>;
+ const r=obj(raw);
+ if(r.v===5){
+  exact(r,["v","resources","details","omitted","completionTimes"]);
+  check(Array.isArray(r.completionTimes)&&r.completionTimes.length<=48);
+  const seen=new Set<string>();
+  for(const row of r.completionTimes as unknown[]){
+   check(Array.isArray(row)&&row.length===2);const [id,time]=row as unknown[];
+   check(typeof id==="string"&&ids.has(id)&&!seen.has(id));seen.add(String(id));
+   check(integer(time)&&Number(time)>0&&Number(time)<=at);
+  }
+  const {completionTimes,...rest}=r;
+  return {...normalizeRich({...rest,v:4},ids,at),v:5,completionTimes:structuredClone(completionTimes) as [string,number][]};
+ }
+ if(r.v!==4)return validateRich(raw,ids,at) as RichSnapshot<FullWireDetail>;
  exact(r,["v","resources","details","omitted"]);check(Array.isArray(r.details)&&r.details.length<=48);
  const details=(r.details as unknown[]).map(item=>{
   const row=obj(item);exact(row,["id","value"]);const d=obj(row.value);

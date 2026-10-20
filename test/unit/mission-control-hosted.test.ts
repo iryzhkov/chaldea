@@ -588,3 +588,56 @@ test("compact telemetry capacity matrix preserves base, identities and freshness
   }
  }
 });
+
+test("completion evidence crosses v5 rich transport and hosted reload without renewing its lifetime",async()=>{
+ const {projectClientSnapshot}=await import("../../src/mission-control/static/client.js" as string);
+ const d=scratch();let now=now0+59_999;
+ const completed={...row("completed"),status:"completed",activeRunId:null,latestRunStartedAt:new Date(now0-1000).toISOString(),latestRunCompletedAt:new Date(now0).toISOString()};
+ const m=live(()=>now,[completed]),first=captureSnapshot(m,"agent-a",epoch,1)!;
+ assert.equal(m.snapshot().agents[0]!.completedAt,now0);
+ assert.equal(first.rich!.v,5);assert.deepEqual(first.rich!.completionTimes,[[first.agents[0]!.id,now0]]);
+ assert.equal(validateHostSnapshot(sample()).rich,undefined,"legacy base-only producers remain readable");
+ assert.throws(()=>validateHostSnapshot({...first,rich:{...first.rich,v:4}}),"older rich version cannot silently carry new fields");
+ for(const time of [now0+60_000,0,-1,1.5]){
+  assert.throws(()=>validateHostSnapshot({...first,rich:{...first.rich,completionTimes:[[first.agents[0]!.id,time]]}}));
+ }
+ assert.throws(()=>validateHostSnapshot({...first,agents:[{...first.agents[0]!,state:"working"}]}));
+ try{
+  const path=join(d.path,"completion-cache"),cache=emptyCache();mergeStatus(cache,first,now);writeCache(path,cache);
+  const hosted=new CacheModel(path,()=>now),v=hosted.snapshot();
+  assert.equal(v.agents[0]!.completedAt,now0);
+  assert.equal(projectClientSnapshot(v,now,true).threadAgents.length,1);
+  now=now0+60_000;
+  assert.equal(projectClientSnapshot(v,now,false).threadAgents.length,0);
+  m.shell({kind:"snapshot",sequence:2,threads:[completed]});m.shell({kind:"synchronized"});
+  const refreshed=captureSnapshot(m,"agent-a",epoch,2)!;
+  assert.deepEqual(refreshed.rich!.completionTimes,first.rich!.completionTimes);
+  mergeStatus(cache,refreshed,now);writeCache(path,cache);hosted.reload();
+  assert.equal(projectClientSnapshot(hosted.snapshot(),now,true).threadAgents.length,0);
+  assert.equal(hosted.snapshot().agents.length,1);assert.equal(hosted.snapshot().hostSummary[0]!.shown,1);
+  m.shell({kind:"thread",sequence:3,thread:{...completed,status:"running",activeRunId:"new-run"}});
+  const running=captureSnapshot(m,"agent-a",epoch,3)!;mergeStatus(cache,running,now);writeCache(path,cache);hosted.reload();
+  assert.equal(hosted.snapshot().agents[0]!.completedAt,null);
+  assert.equal(projectClientSnapshot(hosted.snapshot(),now,true).threadAgents.length,1);
+ }finally{d.close();}
+ for(const latestRunCompletedAt of [null,"invalid",new Date(now+1).toISOString(),new Date(now0-2000).toISOString()]){
+  const unknown=live(()=>now,[{...completed,latestRunCompletedAt}]).snapshot();
+  assert.equal(unknown.agents[0]!.completedAt,null);assert.equal(projectClientSnapshot(unknown,now,true).threadAgents.length,1);
+ }
+});
+test("active work is admitted before terminal history at the model cap and completion tables survive bounded cache trimming",()=>{
+ const rows=Array.from({length:48},(_,i)=>({...row("done-"+i),status:"completed",activeRunId:null,latestRunStartedAt:new Date(now0-1000).toISOString(),latestRunCompletedAt:new Date(now0).toISOString()}));
+ const active={...row("active"),latestRunStartedAt:new Date(now0).toISOString()};
+ const m=live(()=>now0,[...rows,active]);
+ assert.ok(m.ids().includes(active.id));assert.equal(m.snapshot().total,49);assert.equal(m.snapshot().truncated,true);
+ const full=live(()=>now0,rows);
+ full.shell({kind:"thread",sequence:2,thread:active});assert.ok(full.ids().includes(active.id));assert.equal(full.snapshot().total,null);
+ const cache=emptyCache();
+ for(const host of ["agent-a","agent-b","omarchy-pc","omarchy-macbook-air-igor"]){
+  const snapshot=captureSnapshot(live(()=>now0,rows),host,epoch,1)!;
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot))<=8192);
+  assert.equal(snapshot.rich!.completionTimes!.length,snapshot.agents.length);
+  mergeStatus(cache,snapshot,now0);
+ }
+ for(const snapshot of cache.snapshots){validateHostSnapshot(snapshot);assert.equal(snapshot.rich!.completionTimes!.length,snapshot.agents.length);}
+});
