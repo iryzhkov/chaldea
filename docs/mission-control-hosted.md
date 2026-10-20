@@ -40,12 +40,35 @@ Existing density tiers and portrait paging are retained; state sits beside Task
 or Agent and the sanitized title is the main heading.
 
 Usage uses normalized main-agent turn totals, replaced by stable internal turn
-identity across reconnects. At most eight observed turns per shown thread are
-retained; eviction marks coverage partial. Input + output is the observed total.
+identity across reconnects. Snapshot replacement clears the retained usage window,
+including removed turns. Missing normalized turns make coverage partial.
+A separate usage-only proof requires an exact app/provider-thread association,
+a unique same-thread self-rooted root_turn node and its matching provider thread.
+Optional resolved run/attempt rows must agree with present non-null ownership
+fields. Missing historical rows and null reverse pointers are neutral. Reverse
+turn pointers name the latest turn, so multiple turns per root/run are legal.
+Duplicate identities, conflicting root ownership and contradictory non-null
+provider owners are rejected using the full snapshot before selection. The existing
+provider metadata, activity ownership and child-roster admission guard is intact.
+Proof storage is bounded to 16 providers matching retained turns or recent pending
+rows, 64 nodes, 128 runs, 128 attempts, 128 turn identities and eight pending/observed
+turns per thread. Retained turn dependencies stay pinned while unrelated ordinary
+history rotates through the remaining space. Ambiguity poison is never evicted;
+exhausted poison capacity fails closed until a new snapshot.
+Only relationship fields and normalized
+usage are retained. Event ordering can defer qualification; later contradictory
+updates withdraw contributions, and reconnect snapshots replace the proof window.
+No history database or additional RPC is used. At most eight observed turns per shown thread are
+retained; snapshot truncation and stream eviction mark coverage partial across reconnect. Input + output is the observed total.
 Cache reads/writes are input subsets and reasoning is an output subset. Context
 occupancy is separate. Live context counters do not qualify a generation rate:
 rate stays null/not reported, as do daily totals and cost. Host/model aggregates
-cover observed main-agent turns only and disclose missing rows. Child provider
+cover observed main-agent turns only and disclose missing rows. The Tokens page
+uses unique transported agent details, at most 48 shown threads, and does not add
+overlapping host summaries. Each field names its contributing thread count;
+zero is known and absence is unknown. Source freshness and retained coverage are
+shown separately. Generation rate, p95, daily totals and model history remain
+unavailable. Child provider
 turns are excluded from parent usage. Delegate/native child rosters deduplicate
 actual child IDs, distinguish active/queued/completed observations, and remain
 bounded; parent work rosters are not additive. Empty unsupported native

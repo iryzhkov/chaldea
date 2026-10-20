@@ -227,7 +227,7 @@ test("detail adapter uses only official read subscription and omits unknown raw 
   try{
     const port=(http.address() as {port:number}).port;
     const done=connectMissionThread({serverUrl:"http://127.0.0.1:"+port,token:"DISPOSABLE_FIXTURE",signal:controller.signal},"fixture-thread",7,event=>{seen.push(event);if(event.kind==="synchronized")controller.abort();});
-    await assert.rejects(done);assert.deepEqual(seen,[{kind:"cursor",sequence:8},{kind:"cursor",sequence:9},{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
+    await assert.rejects(done);assert.deepEqual(seen,[{kind:"cursor",sequence:8},{kind:"turn-usage",id:"fixture-turn",usage:{usageScope:"main_agent",usageStatus:"unavailable",hasSubagents:false},at:Date.parse("2026-10-18T18:00:00.000Z"),partial:false},{kind:"cursor",sequence:9},{kind:"synchronized"}]);assert.deepEqual(requests,["orchestration.subscribeThread"]);
   }finally{wss.close();http.close();}
 });
 
@@ -348,6 +348,7 @@ test("official detail events carry real metadata, deduplicate child roster and c
   event("provider-thread.updated",{...provider,id:"other-provider",updatedAt:"2026-10-17T23:59:59.000Z",nativeMetadata:{modelSelection:{instanceId:"private-provider",model:"gpt-6.1-sol",options:[{id:"reasoningEffort",value:"low"}]}},pendingBackgroundTasks:[{taskId:"scoped-native",kind:"subagent"}]}),
   event("subagent.updated",{...child,id:"native-node",origin:"provider_native",providerThreadId:"provider",childThreadId:null,nativeTaskRef:{driver:"codex",nativeId:"scoped-native",strength:"strong"}}),
   event("subagent.updated",{...child,id:"app-node",providerThreadId:"provider",childThreadId:null,nativeTaskRef:{driver:"codex",nativeId:"scoped-native",strength:"strong"}}),
+  event("run.updated",{id:"private-run",threadId:"fixture-thread",ordinal:1,providerInstanceId:"private-provider",modelSelection:{instanceId:"private-provider",model:"gpt-6.1-sol"},providerThreadId:"provider",userMessageId:"message",rootNodeId:"root",activeAttemptId:null,status:"running",requestedAt:stamp,startedAt:stamp,completedAt:null,checkpointId:null,contextHandoffId:null}),
   event("provider-turn.updated",turn),
   event("turn-item.updated",{...base,id:"command",type:"command_execution",status:"running",input:"go test -race ./...",output:"PRIVATE OUTPUT"}),
   event("turn-item.updated",{...base,id:"reasoning",type:"reasoning",status:"running",text:"HIDDEN REASONING",streaming:true}),
@@ -432,4 +433,17 @@ test("recent real-item projection bounds source order, replacement, privacy and 
  assert.equal(d.snapshot(null,now,true).recent![0]!.preview.text,"Safe  paragraph.");
  assert.equal(d.snapshot(null,now,false).recent![0]!.status,"unknown");
  d.apply({kind:"reset"});assert.deepEqual(d.snapshot(null,now,true).recent,[]);
+});
+
+test("retained usage marks missing normalized turns partial, clears snapshot removals and preserves zero subsets",()=>{
+ const d=new ThreadDetails(),u={usageScope:"main_agent" as const,usageStatus:"complete" as const,inputTokens:100,outputTokens:20,cachedInputTokens:30,cacheCreationTokens:0,reasoningTokens:5,hasSubagents:false};
+ d.apply({kind:"turn-usage",id:"one",usage:u,at:100});
+ d.apply({kind:"turn-usage",id:"missing",usage:{usageScope:"main_agent",usageStatus:"unavailable",hasSubagents:false},at:101});
+ let usage=d.snapshot(null,101,true).usage;
+ assert.equal(usage.total,120);assert.equal(usage.cacheWrite,0);assert.equal(usage.coverage,"partial");assert.equal(usage.turns,1);
+ d.apply({kind:"turn-usage",id:"one",usage:{usageScope:"main_agent",usageStatus:"unavailable",hasSubagents:false},at:100});
+ assert.equal(d.snapshot(null,101,true).usage.total,null);
+ d.apply({kind:"turn-usage",id:"one",usage:{...u,inputTokens:0,outputTokens:0,cachedInputTokens:0,reasoningTokens:0},at:100});
+ usage=d.snapshot(null,101,true).usage;assert.equal(usage.total,0);assert.equal(usage.reasoning,0);assert.equal(usage.coverage,"partial");
+ d.apply({kind:"reset"});usage=d.snapshot(null,101,true).usage;assert.equal(usage.total,null);assert.equal(usage.turns,0);
 });
