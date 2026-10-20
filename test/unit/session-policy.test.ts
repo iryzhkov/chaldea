@@ -51,7 +51,7 @@ test("protected public policy: owner and ancestor modes are enforced, strict JSO
     assert.throws(() => parsePolicy(document({ p: preset(bad) }), "env"), /session_policy_invalid/);
 });
 
-test("equal and narrow presets fit the ceiling; admission shape reuses run-lease validation", () => {
+test("equal and narrow legacy presets preserve the admission envelope and canonical services", () => {
   const now = Date.parse("2026-10-20T00:00:00Z");
   const policy = parsePolicy(document({ equal: preset(),
     narrow: preset({ maxSeconds: 60, destinations: ["second-project"], services: [{ audience: "jocasta", grants: [{ resource: "project:projectA", actions: ["get"] }] }] }) }), "env");
@@ -114,4 +114,115 @@ test("waits config enables sessions only with an absolute policy path; MCP lists
   assert.deepEqual(SESSION_TOOLS.map(t => t.name), ["chaldea_session_start", "chaldea_session_status"]);
   assert.deepEqual(SESSION_TOOLS[0]!.inputSchema.required, ["threadId", "requestId", "preset"]);
   assert.equal(SESSION_TOOLS[0]!.inputSchema.additionalProperties, false);
+});
+
+const typedGrants: Array<Record<string, unknown>> = [
+  { audience: "ov", scope: "ov.read", ov_namespaces: ["viking://resources/team/reports"] },
+  { audience: "homelab", scope: "homelab.read", homelab_services: ["dns"], homelab_hosts: ["host-a"] },
+  { audience: "ha", scope: "ha.read", ha_entities: ["sensor.qualified_example"], ha_actions: ["state.read"] },
+];
+function typedDocument(service: Record<string, unknown>, ceiling: Record<string, unknown> = service) {
+  return { version: 1, environment: "env", presets: { equal: preset({ services: [service] }) },
+    ceilings: [{ project: "projectA", maxSeconds: 3600, services: [ceiling], destinations: ["caller-project"] }],
+    enrollments: { equal: { form: "app_password", issuer: "https://auth.example.test/application/o/" + service.audience + "/",
+      tokenUrl: "https://auth.example.test/application/o/token/", jwksUrl: "https://auth.example.test/application/o/" + service.audience + "/jwks/",
+      clientId: "client-" + service.audience, username: "ordinary-" + service.audience,
+      resource: "https://" + service.audience + ".mcp.ryzhkov.dev/mcp", ...service, maxTokenSeconds: 300, secretFile: "/etc/chaldea/" + service.audience + ".secret" } as Record<string, unknown> } };
+}
+test("closed service parsing enforces exact fields, explicit bounds and canonical grants", () => {
+  for (const s of typedGrants) {
+    const p = parsePolicy(typedDocument(s), "env");
+    assert.deepEqual(admit(p, "equal", "run-typed", Date.now()).admission.services, [s]);
+    for (const field of Object.keys(s)) {
+      const missing = { ...s }; delete missing[field];
+      assert.throws(() => parsePolicy(typedDocument(missing), "env"), /session_policy_invalid/, field);
+      assert.throws(() => parsePolicy(typedDocument({ ...s, [field]: null }), "env"), /session_policy_invalid/, field);
+    }
+    for (const extra of [{ grants: [] }, { project: "synthetic" }, { unrelated: true }])
+      assert.throws(() => parsePolicy(typedDocument({ ...s, ...extra }), "env"), /session_policy_invalid/);
+    const d = typedDocument(s); delete (d as Partial<typeof d>).enrollments;
+    assert.throws(() => parsePolicy(d, "env"), /require enrollment/);
+  }
+  const [ov, homelab, ha] = typedGrants;
+  const invalid: Record<string, unknown>[] = [
+    ...["viking://resources/a/", "viking://resources/a//b", "viking://resources/.", "viking://resources/a/..",
+      "viking://resources/a%2fb", "viking://resources/*", "viking://resources/é", "viking://resources/a?x",
+      "viking://resources/" + "x".repeat(1006)].map(r => ({ ...ov, ov_namespaces: [r] })),
+    ...[[], ["viking://resources/a", "viking://resources/a"], ["viking://resources/a/b", "viking://resources/a"],
+      Array.from({ length: 17 }, (_, i) => "viking://resources/n" + i)].map(v => ({ ...ov, ov_namespaces: v })),
+    ...[["*"], ["a", "a"], ["-bad"], ["a.b"], ["x".repeat(65)], Array.from({ length: 129 }, (_, i) => "h" + i)]
+      .map(v => ({ ...homelab, homelab_hosts: v })),
+    ...[[], ["sensor.a", "sensor.a"], ["climate.a"], ["sensor.*"], ["lightXa"], ["sensor." + "a".repeat(97)],
+      Array.from({ length: 65 }, (_, i) => "sensor.s" + i)].map(v => ({ ...ha, ha_entities: v })),
+    ...[[], ["state.read", "state.read"], ["light.control"], ["*"]].map(v => ({ ...ha, ha_actions: v })),
+    ...["ha.read ha.read", "ha.read ", " ha.read", "ha.admin", "ha.read  ha.control"].map(scope => ({ ...ha, scope })),
+  ];
+  for (const s of invalid) assert.throws(() => parsePolicy(typedDocument(s), "env"), /session_policy_invalid/, JSON.stringify(s));
+  for (const s of [
+    { ...ov, ov_namespaces: ["viking://resources/" + "x".repeat(1005)] },
+    { ...ov, ov_namespaces: ["viking://resources/a", "viking://resources/ab"] },
+    { ...homelab, homelab_services: [], homelab_hosts: [] },
+    { ...homelab, homelab_hosts: Array.from({ length: 128 }, (_, i) => "h" + i) },
+    { ...ha, ha_entities: ["light." + "a".repeat(96)] },
+    { ...ha, scope: "ha.control ha.read", ha_actions: ["switch.control", "state.read"] },
+    { ...ha, scope: "ha.control", ha_actions: ["light.control"] },
+  ]) assert.ok(parsePolicy(typedDocument(s), "env"));
+});
+
+test("new enrollment binds the exact literal and ordered payload, one service, account and provider", () => {
+  const [ov, homelab, ha] = typedGrants;
+  for (const s of [ov!, homelab!, ha!]) {
+    const d = typedDocument(s), original = structuredClone(d);
+    for (const over of [{ project: "projectA" }, { resource: "https://other.test/mcp" },
+      { issuer: "https://auth.example.test/application/o/x" }, { jwksUrl: "https://auth.example.test/other/" },
+      { tokenUrl: "https://auth.example.test/token/" }, { audience: "jocasta" }, { maxTokenSeconds: 301 }]) {
+      d.enrollments.equal = { ...original.enrollments.equal, ...over };
+      assert.throws(() => parsePolicy(d, "env"), /session_policy_invalid/);
+    }
+  }
+  const two = { ...ov, ov_namespaces: ["viking://resources/b", "viking://resources/a"] };
+  const d = typedDocument(two);
+  d.enrollments.equal.ov_namespaces = ["viking://resources/a", "viking://resources/b"];
+  assert.throws(() => parsePolicy(d, "env"), /exactly match/);
+  const h = typedDocument({ ...ha, scope: "ha.read ha.control", ha_actions: ["state.read", "light.control"] });
+  h.enrollments.equal.scope = "ha.control ha.read";
+  assert.throws(() => parsePolicy(h, "env"), /exactly match/);
+  const multi = typedDocument(ov!); multi.presets.equal = preset({ services: [ov, homelab] });
+  assert.throws(() => parsePolicy(multi, "env"), /exactly match/);
+  const base = typedDocument(ov!);
+  const combined = { ...base, presets: { ...base.presets, second: preset({ services: [ov!] }) },
+    enrollments: { ...base.enrollments, second: { ...base.enrollments.equal } } };
+  assert.throws(() => parsePolicy(combined, "env"), /distinct secret/);
+  combined.enrollments.second.secretFile = "/etc/chaldea/second.secret";
+  assert.throws(() => parsePolicy(combined, "env"), /distinct secret/);
+  combined.enrollments.second.username = "second-account";
+  assert.ok(parsePolicy(combined, "env"));
+  const hb = typedDocument(homelab!);
+  const cross = { ...base, presets: { ...base.presets, second: hb.presets.equal },
+    enrollments: { ...base.enrollments, second: { ...hb.enrollments.equal, clientId: base.enrollments.equal.clientId } } };
+  assert.throws(() => parsePolicy(cross, "env"), /distinct providers/);
+});
+
+test("typed ceilings use static component subsets and never merge, reduce, or reinterpret legacy grants", () => {
+  const [ov, homelab, ha] = typedGrants;
+  assert.ok(admit(parsePolicy(typedDocument(ov!, { ...ov, ov_namespaces: ["viking://resources/team"] }), "env"), "equal", "r", Date.now()));
+  for (const [s, c] of [
+    [ov!, { ...ov, ov_namespaces: ["viking://resources/tea"] }],
+    [homelab!, { ...homelab, homelab_hosts: [] }],
+    [homelab!, { ...homelab, homelab_services: [] }],
+    [ha!, { ...ha, ha_entities: ["sensor.other"] }],
+    [ha!, { ...ha, scope: "ha.control", ha_actions: ["light.control"] }],
+    [ov!, { audience: "ov", grants: [{ resource: "viking://resources/team", actions: ["read"] }] }],
+  ]) assert.throws(() => admit(parsePolicy(typedDocument(s!, c!), "env"), "equal", "r", Date.now()), /preset_exceeds_ceiling/);
+  const s = { ...homelab, homelab_services: ["dns", "pve"] }, d = typedDocument(s, homelab!);
+  d.ceilings.push({ ...d.ceilings[0]!, services: [{ ...homelab, homelab_services: ["pve"] }] });
+  assert.throws(() => admit(parsePolicy(d, "env"), "equal", "r", Date.now()), /preset_exceeds_ceiling/);
+  const legacy = document({ equal: preset({ services: [{ audience: "ov", grants: [{ resource: "viking://resources/a", actions: ["read"] }] }] }) });
+  assert.throws(() => admit(parsePolicy(legacy, "env"), "equal", "r", Date.now()), /unsupported_audience/);
+  const compat = document(); compat.ceilings[0]!.services = [...GRANTS, { audience: "ov", grants: [{ resource: "unused", actions: ["read"] }] }];
+  const parsed = parsePolicy(compat, "env");
+  assert.ok(admit(parsed, "equal", "r", Date.now()));
+  assert.equal(JSON.stringify(parsed.presets.equal!.services), JSON.stringify(GRANTS));
+  const oversize = document(Object.fromEntries(Array.from({ length: 16 }, (_, i) => ["p" + i, preset({ prompt: "x".repeat(8000) })])));
+  assert.throws(() => parsePolicy(oversize, "env"), /64 KiB/);
 });

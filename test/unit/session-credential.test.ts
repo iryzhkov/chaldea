@@ -6,10 +6,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, chownSync, existsSync, linkSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { SignJWT, exportJWK, generateKeyPair, type JWTPayload } from "jose";
+import { CompactSign, SignJWT, exportJWK, generateKeyPair, type JWTPayload } from "jose";
 import { WakeStore } from "../../src/wake/store.ts";
 import { WaitEngine } from "../../src/waits/engine.ts";
 import { callService, ServiceRefusal, startWaitService } from "../../src/waits/service.ts";
@@ -251,7 +251,7 @@ test("every gate and request refusal happens before any credential read or netwo
     await refused(f.engine.sessionHeaders(null), "invalid_request");
     await refused(f.engine.sessionHeaders({ preset: "reporter" }), "invalid_request");
     const s = await start(f);
-    await refused(f.headers({ audience: "ov" }), "unsupported_audience");
+    await refused(f.headers({ audience: "ov" }), "audience_not_admitted");
     const original = f.ref.policy;
     const cases: Array<[SessionPolicy | null, string]> = [
       [policyOf(f.secretFile, { enrollments: null }), "enrollment_missing"],
@@ -658,4 +658,207 @@ test("MCP never lists or forwards chaldea_session_headers, with or without a ses
       assert.equal(fake.calls.length, 0);
     } finally { await fake.close(); }
   } finally { dir.remove(); }
+});
+
+type Service = import("../../src/session/service-grant.ts").NewServiceGrant;
+const serviceCases: Service[] = [
+  { audience: "ov", scope: "ov.read", ov_namespaces: ["viking://resources/team/reports", "viking://resources/other"] },
+  { audience: "homelab", scope: "homelab.read", homelab_services: ["dns"], homelab_hosts: ["host-a"] },
+  { audience: "ha", scope: "ha.read", ha_entities: ["sensor.qualified_example"], ha_actions: ["state.read"] },
+];
+function servicePolicy(f: Fixture, s: Service): SessionPolicy {
+  const { project: _project, ...common } = enrollment(f.secretFile);
+  return policyOf(f.secretFile, { presets: { reporter: preset({ services: [s] }) },
+    ceilings: [{ ...CEILING, services: [s] }], enrollments: { reporter: { ...common, ...s,
+      resource: "https://" + s.audience + ".mcp.ryzhkov.dev/mcp" } } });
+}
+function signedService(f: Fixture, s: Service, options: SignOptions = {}): Promise<Reply> {
+  const { audience, ...claims } = s;
+  return f.issuer.reply({ ...options, omit: [...(Object.hasOwn(options.claims ?? {}, "jocasta_projects") ? [] : ["jocasta_projects"]), ...options.omit ?? []],
+    claims: { ...claims, aud: "https://" + audience + ".mcp.ryzhkov.dev/mcp", sub: "same-subject", ...options.claims } });
+}
+for (const s of serviceCases) {
+  test(s.audience + ": signed exact grants, selected scope and cache identity; same subject never retains wider grants", async () => {
+    const f = await fixture("typed-" + s.audience), audience = s.audience;
+    try {
+      f.ref.policy = servicePolicy(f, s); f.issuer.onToken = () => signedService(f, s);
+      const run = await start(f);
+      // The absent secret makes the gate ordering observable.
+      unlinkSync(f.secretFile);
+      for (const wrong of ["jocasta", "ov", "homelab", "ha"].filter(a => a !== audience))
+        await refused(f.headers({ audience: wrong }), "audience_not_admitted");
+      assert.equal(f.issuer.requests.length, 0); resetSecret(f);
+      const first = await f.headers({ audience });
+      assert.deepEqual(await f.headers({ audience }), first); assert.equal(f.issuer.posts().length, 1);
+      const form = new URLSearchParams(f.issuer.posts()[0]!.body);
+      assert.equal(form.get("scope"), s.scope); assert.equal(form.has("audience"), false); assert.equal(form.has("resource"), false);
+      const grantField = s.audience === "ov" ? "ov_namespaces" : s.audience === "homelab" ? "homelab_hosts" : "ha_entities";
+      f.clock.offset = 275_000;
+      f.issuer.onToken = () => signedService(f, s, { claims: { [grantField]: s.audience === "ov" ? ["viking://resources/foreign"] :
+        s.audience === "homelab" ? ["host-b"] : ["sensor.other"] } });
+      await refused(f.headers({ audience }), "token_claims_invalid");
+      f.issuer.onToken = () => signedService(f, s);
+      const renewed = await f.headers({ audience }); assert.notDeepEqual(renewed, first);
+      // Rotation changes the cache identity even with unchanged subject, run and policy.
+      writeFileSync(f.secretFile, SECRET + "-rotated", { mode: 0o600 });
+      assert.notDeepEqual(await f.headers({ audience }), renewed);
+      f.clock.offset = Date.parse(run.deadline) - Date.now() - 299_000;
+      resetSecret(f); await refused(f.headers({ audience }), "run_ending");
+      f.clock.offset = 0; f.engine.cancelSession(run.sessionId);
+      await refused(f.headers({ audience }), "run_inactive");
+    } finally { await f.close(); }
+  });
+
+  test(s.audience + ": scalar resource, bounded identity, exact scope/arrays, foreign claims, signature and times fail closed", async () => {
+    const f = await fixture("typed-claims-" + s.audience), audience = s.audience;
+    try {
+      f.ref.policy = servicePolicy(f, s); await start(f);
+      const field = audience === "ov" ? "ov_namespaces" : audience === "homelab" ? "homelab_hosts" : "ha_entities";
+      const values = (s as unknown as Record<string, string[]>)[field]!;
+      const bad: SignOptions[] = [
+        { claims: { aud: ["https://" + audience + ".mcp.ryzhkov.dev/mcp"] } },
+        { claims: { aud: "https://other.mcp.ryzhkov.dev/mcp" } }, { claims: { iss: "https://wrong.test/" } },
+        { claims: { scope: s.scope + " " + s.scope } }, { claims: { scope: s.scope + " " } },
+        { claims: { scope: s.scope + " foreign.read" } }, { omit: ["scope"] }, { omit: [field] },
+        { claims: { [field]: null } }, { claims: { [field]: [...values, ...values] } },
+        { claims: { [field]: [...values, "extra"] } }, { claims: { [field]: ["*"] } },
+        { claims: { sub: "" } }, { claims: { sub: "x".repeat(257) } }, { omit: ["sub"] },
+        { omit: ["iat"] }, { omit: ["exp"] }, { claims: { nbf: null } },
+        { iat: Math.floor(f.now() / 1000) + (audience === "ov" ? 60 : 30), exp: Math.floor(f.now() / 1000) + 300 },
+        { iat: Math.floor(f.now() / 1000), exp: Math.floor(f.now() / 1000) + 301 }, { header: { jku: "https://evil.test/" } }, { header: { b64: true } }, { header: { kid: "" } },
+        { header: { kid: "x".repeat(129) } },
+        { claims: { jocasta_projects: ["projectA"] } }, { claims: { grants: [] } },
+        ...["ov_namespaces", "homelab_services", "homelab_hosts", "ha_entities", "ha_actions"]
+          .filter(k => !Object.hasOwn(s, k)).map(k => ({ claims: { [k]: [] } })),
+      ];
+      if (audience !== "ov") bad.push({ claims: { nbf: Math.floor(f.now() / 1000) + 300 } });
+      if (audience !== "homelab") bad.push({ claims: { sub: "bad\u0001subject" } });
+      if (audience === "ha") bad.push({ claims: { sub: "bad\u007fsubject" } });
+      if (audience === "ov") bad.push({ claims: { ov_namespaces: [...values].reverse() } }, { header: { typ: "unknown" } },
+        { claims: Object.fromEntries(Array.from({ length: 33 }, (_, i) => ["padding" + i, true])) });
+      const wrongKey = await generateKeyPair("RS256");
+      bad.push({ key: wrongKey.privateKey });
+      for (const o of bad) {
+        f.issuer.onToken = () => signedService(f, s, o);
+        const before = f.issuer.posts().length;
+        await assert.rejects(f.headers({ audience }), CredentialRefusal, JSON.stringify({ claims: o.claims, omit: o.omit, header: o.header, iat: o.iat, exp: o.exp, key: !!o.key }));
+        assert.equal(f.issuer.posts().length, before + 1, "single attempt, no cache reuse");
+      }
+      // A hashed subject is valid; it need not be the enrolled username.
+      f.issuer.onToken = () => signedService(f, s, { claims: { sub: "hashed-ordinary-identity" } });
+      assert.ok((await f.headers({ audience })).Authorization.startsWith("Bearer "));
+    } finally { await f.close(); }
+  });
+
+  for (const method of ["GET", "POST"] as const) {
+    test(s.audience + ": " + method + " in flight rechecks grants, ceiling, cancel and secret for every waiter", async () => {
+      for (const change of ["grants", "ceiling", "cancel", "secret"] as const) {
+        const f = await fixture("typed-race-" + audienceName(s) + "-" + change);
+        try {
+          f.ref.policy = servicePolicy(f, s); f.issuer.onToken = () => signedService(f, s);
+          const run = await start(f); f.issuer.pause(method);
+          const before = f.issuer.requests.length;
+          const a = f.headers({ audience: s.audience }), b = f.headers({ audience: s.audience });
+          // Install rejection handlers before releasing the paused request.
+          const results = Promise.allSettled([a, b]);
+          await until(() => f.issuer.requests.length > before && f.issuer.requests.at(-1)!.method === method);
+          if (change === "cancel") f.engine.cancelSession(run.sessionId);
+          else if (change === "secret") writeFileSync(f.secretFile, SECRET + "-changed", { mode: 0o600 });
+          else if (change === "ceiling") f.ref.policy!.ceilings[0]!.destinations = ["elsewhere"];
+          else {
+            const e = f.ref.policy!.enrollments!.reporter!;
+            assert.ok("audience" in e);
+            if (e.audience === "ov") e.ov_namespaces = ["viking://resources/changed"];
+            else if (e.audience === "homelab") e.homelab_hosts = ["changed"];
+            else e.ha_entities = ["sensor.changed"];
+          }
+          f.issuer.resume();
+          assert.ok((await results).every(r => r.status === "rejected" && r.reason instanceof CredentialRefusal));
+          assert.equal(f.issuer.posts().length, method === "GET" ? 0 : 1);
+        } finally { await f.close(); }
+      }
+    });
+  }
+}
+function audienceName(s: Service): string { return s.audience; }
+
+test("HA combined scope order is equivalent only on the signed wire; homelab explicit empty arrays grant nothing", async () => {
+  for (const s of [
+    { audience: "ha", scope: "ha.read ha.control", ha_entities: ["light.qualified_fixture"], ha_actions: ["state.read", "light.control"] },
+    { audience: "homelab", scope: "homelab.read", homelab_services: [], homelab_hosts: [] },
+  ] as Service[]) {
+    const f = await fixture("typed-scope-empty");
+    try {
+      f.ref.policy = servicePolicy(f, s); await start(f);
+      f.issuer.onToken = () => signedService(f, s, s.audience === "ha" ? { claims: { scope: "ha.control ha.read" } } : {});
+      assert.ok(await f.headers({ audience: s.audience }));
+    } finally { await f.close(); }
+  }
+});
+
+for (const s of serviceCases) {
+  test(s.audience + ": an old-run fetch cannot populate or serve the next run's cache", async () => {
+    const f = await fixture("typed-next-" + s.audience);
+    try {
+      f.ref.policy = servicePolicy(f, s); f.issuer.onToken = () => signedService(f, s);
+      const old = await start(f), first = await f.headers({ audience: s.audience });
+      writeFileSync(f.secretFile, SECRET + "-rotate", { mode: 0o600 });
+      f.issuer.pause("POST");
+      const pending = f.headers({ audience: s.audience }), outcome = Promise.allSettled([pending]);
+      await until(() => f.issuer.posts().length === 2);
+      f.t3.finish(old.threadId);
+      await until(() => f.engine.sessionStatus(old.sessionId).occupancy === "released");
+      const next = await start(f); assert.notEqual(next.sessionId, old.sessionId);
+      f.issuer.resume();
+      const [result] = await outcome; assert.equal(result!.status, "rejected");
+      assert.notDeepEqual(await f.headers({ audience: s.audience }), first);
+      assert.equal(f.issuer.posts().length, 3);
+    } finally { await f.close(); }
+  });
+}
+
+test("16 outstanding acquisitions is a hard bound; refusal orphans every old flight", async () => {
+  const f = await fixture("typed-flights"), s = serviceCases[0]!;
+  try {
+    f.ref.policy = servicePolicy(f, s); f.issuer.onToken = () => signedService(f, s); await start(f);
+    f.issuer.pause("GET");
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < 16; i++) {
+      writeFileSync(f.secretFile, SECRET + "-" + i, { mode: 0o600 });
+      const request = f.headers({ audience: s.audience }); request.catch(() => {});
+      promises.push(request);
+      await until(() => f.issuer.requests.length === i + 1);
+    }
+    writeFileSync(f.secretFile, SECRET + "-17", { mode: 0o600 });
+    await refused(f.headers({ audience: s.audience }), "issuer_busy");
+    assert.equal(f.issuer.requests.length, 16);
+    f.issuer.resume();
+    assert.ok((await Promise.allSettled(promises)).every(r => r.status === "rejected"));
+    assert.equal(f.issuer.posts().length, 0);
+    assert.ok(await f.headers({ audience: s.audience }));
+    assert.equal(f.issuer.posts().length, 1);
+  } finally { await f.close(); }
+});
+
+test("legacy Jocasta canonical JSON ordering and digest remain pinned", () => {
+  const p = policyOf("/etc/chaldea/reporter.secret"), e = p.enrollments!.reporter!;
+  const expected = '{"form":"app_password","issuer":"https://auth.example.test/application/o/jocasta/","tokenUrl":"https://auth.example.test/application/o/token/","jwksUrl":"https://auth.example.test/application/o/jocasta/jwks/","clientId":"jocasta-client-id","username":"chaldea-laptop-reporter","scope":"jocasta.read","resource":"https://jocasta.example.test/mcp","project":"projectA","maxTokenSeconds":300,"secretFile":"/etc/chaldea/reporter.secret"}';
+  assert.equal(JSON.stringify(e), expected);
+  assert.equal(enrollmentDigest(e), createHash("sha256").update(expected).digest("hex"));
+  assert.equal(JSON.stringify(p.presets.reporter!.services),
+    '[{"audience":"jocasta","grants":[{"resource":"project:projectA","actions":["get","history","list","search"]}]}]');
+});
+
+test("new signed JWTs refuse duplicate JSON names before caching", async () => {
+  const f = await fixture("typed-duplicate"), s = serviceCases[0]!;
+  try {
+    f.ref.policy = servicePolicy(f, s); await start(f);
+    const claims = f.issuer.claims({ omit: ["jocasta_projects"], claims: {
+      aud: "https://ov.mcp.ryzhkov.dev/mcp", scope: s.scope, ov_namespaces: s.audience === "ov" ? s.ov_namespaces : [],
+    } });
+    const bytes = Buffer.from(JSON.stringify(claims).replace('"scope":"ov.read"', '"scope":"foreign","scope":"ov.read"'));
+    f.issuer.onToken = async () => f.issuer.wrap(await new CompactSign(bytes).setProtectedHeader({ alg: "RS256", kid: "k1" }).sign(f.issuer.privateKey));
+    await refused(f.headers({ audience: "ov" }), "token_invalid");
+    assert.equal(f.issuer.posts().length, 1);
+  } finally { await f.close(); }
 });

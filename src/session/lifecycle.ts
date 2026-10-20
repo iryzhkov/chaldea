@@ -7,8 +7,8 @@ import { backoff } from "../retry.ts";
 import type { WakeStore, Item, SessionRecord } from "../wake/store.ts";
 import type { WaitT3, WaitSnapshot } from "../t3/waits.ts";
 import { completion, LIVE } from "../waits/completion.ts";
-import { validateAdmission, type RunAdmission } from "../access/run-lease.ts";
-import { AUDIENCES, type Grant } from "../access/token.ts";
+import { validateAdmission, type RunAdmission } from "./service-grant.ts";
+import { SERVICE_AUDIENCES, type SessionServiceGrant } from "./service-grant.ts";
 import { SessionRefusal, presetHash, type SessionPolicy } from "./policy.ts";
 import { admit, destination, startInput, withinCeiling } from "./admit.ts";
 import { checkResult } from "./result.ts";
@@ -28,7 +28,7 @@ export interface SessionHooks {
   boundary?: ((name: string, item: string) => void) | undefined; report?: ((event: string) => void) | undefined;
 }
 export type IssueDecision =
-  | { ok: true; sessionId: string; runId: string; threadId: string; profile: string; project: string; audience: string; grants: Grant[];
+  | { ok: true; sessionId: string; runId: string; threadId: string; profile: string; project: string; audience: string; service: SessionServiceGrant;
       expiresAt: number; presetHash: string }
   | { ok: false; refusal: string };
 export interface SessionStatus {
@@ -291,7 +291,7 @@ export class SessionLifecycle {
     const refuse = (refusal: string) => ({ decision: { ok: false, refusal } as IssueDecision, policy });
     try { policy = this.options.policy(); } catch { return refuse("session_policy_unavailable"); }
     if (!policy) return refuse("sessions_disabled");
-    if (!(AUDIENCES as readonly string[]).includes(audience)) return refuse("invalid_audience");
+    if (!(SERVICE_AUDIENCES as readonly string[]).includes(audience)) return refuse("invalid_audience");
     const s = this.store.presetHeld(presetId);
     if (!s) return refuse("no_active_run");
     const item = this.store.get(s.item);
@@ -303,12 +303,13 @@ export class SessionLifecycle {
     if (presetHash(current) !== s.preset_hash) return refuse("preset_changed");
     const admission = JSON.parse(s.admission) as RunAdmission;
     try { validateAdmission(admission, Math.floor(now / 1000)); } catch { return refuse("run_expired"); }
+    if (admission.runId !== s.item || admission.expiresAt * 1000 !== item.deadline) return refuse("session_changed");
     // The unchanged preset must still fit a current ceiling; unrelated policy edits do not matter.
     if (!withinCeiling(policy, current, admission)) return refuse("preset_exceeds_ceiling");
     const service = admission.services.find(x => x.audience === audience);
     if (!service) return refuse("audience_not_admitted");
     return { policy, decision: { ok: true, sessionId: s.item, runId: admission.runId, threadId: s.thread_id, profile: admission.profile,
-      project: admission.project, audience, grants: structuredClone(service.grants), expiresAt: admission.expiresAt, presetHash: s.preset_hash } };
+      project: admission.project, audience, service: structuredClone(service), expiresAt: admission.expiresAt, presetHash: s.preset_hash } };
   }
   status(id: string): SessionStatus {
     const item = this.store.get(id);

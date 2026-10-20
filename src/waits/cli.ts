@@ -23,11 +23,11 @@ chaldea decision ask --thread ID --question TEXT --option TEXT --option TEXT
 chaldea decision answer ID --answer TEXT
 chaldea decision status ID
 chaldea mcp [--config PATH]
-chaldea session headers --preset NAME --audience jocasta [--config PATH]
+chaldea session headers --preset NAME --audience jocasta|ov|homelab|ha [--config PATH]
 All commands accept --config PATH. Registration commits immediately. Retry the same request-id and arguments.
 Defaults only skip or defer the dependent action. They never grant approval or permission.
 `;
-const SESSION_USAGE="chaldea session headers --preset NAME --audience jocasta [--config PATH]\n";
+const SESSION_USAGE="chaldea session headers --preset NAME --audience jocasta|ov|homelab|ha [--config PATH]\n";
 const BEARER=/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 /**
  * Native credential helper: stdout is exactly {"Authorization":"Bearer ..."} and a

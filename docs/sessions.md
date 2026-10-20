@@ -102,8 +102,9 @@ The service applies these rules before any launch:
   project, every grant a subset, no longer duration and no wider
   destinations. Equal and narrower presets pass. Broader ones get
   `preset_exceeds_ceiling`.
-- Only read-only Jocasta actions are supported. Anything else gets
-  `unsupported_audience` or `unsupported_grant`.
+- Admit read-only Jocasta legacy grants or one closed OV, homelab or HA service
+  with an exactly matching enrollment. Generic legacy service grants remain
+  parseable in ceilings but cannot authorize a typed service.
 - `delegate` must be `false`. Otherwise the start gets
   `delegation_unsupported`.
 - An unknown preset gets `unknown_preset`. With no policy configured, every
@@ -116,8 +117,8 @@ The service applies these rules before any launch:
 - A preset whose previous session still holds its slot gets `preset_busy`.
   At most four slots are held at once.
 
-The pure checks reuse `validateAdmission` and `narrowing` from
-`src/access/run-lease.ts`. `RunLeases`, `HostIssuer` and `renew` are not used.
+The pure session checks live in `src/session/service-grant.ts`. The separate
+access-JWT codec, `RunLeases`, `HostIssuer` and their EdDSA wire are unchanged.
 
 ### Trust boundary
 
@@ -230,7 +231,7 @@ a token; only the native header helper below uses it.
 ## Native header helper
 
 When the policy has an enrollment for a preset, the wait service can acquire
-short-lived Jocasta tokens for that preset's active session. It uses the
+short-lived service tokens for that preset's active session. It uses the
 existing service and socket. There is no new server, queue, store, key, lease
 or issuer. The Akasha producer helper is unchanged.
 
@@ -246,7 +247,8 @@ stderr holds one fixed refusal code and the exit status is 1. Nothing else is
 printed: no receipts, tracing, service text or token bytes.
 
 The command calls the private IPC method `chaldea_session_headers`, whose input
-is exactly `{preset, audience: "jocasta"}`. Unknown fields are refused. The
+is exactly `{preset, audience}`, with `audience` one of `jocasta`, `ov`,
+`homelab` or `ha`. Unknown fields are refused. The
 method is never an MCP tool. MCP neither lists it nor forwards it, with or
 without a session policy. IPC errors are fixed codes only, never response
 bodies, headers, secrets or tokens.
@@ -254,8 +256,8 @@ bodies, headers, secrets or tokens.
 ### Enrollment
 
 `enrollments` is an optional top-level policy map keyed by preset ID. Without
-it, sessions, waits and the gate behave exactly as before. An entry has
-exactly these keys:
+it, legacy sessions and waits behave as before. New services require enrollment.
+A legacy Jocasta entry keeps exactly these keys and its normalized digest:
 
 - `form`: only `app_password`. This is one ordinary host×profile Authentik
   service account with an app password. The client-secret fallback is not
@@ -329,6 +331,72 @@ Refusal codes: the gate's codes above, plus `invalid_request`,
 `token_claims_invalid`, `token_outlives_run`, `token_expired`,
 `session_changed`, `sessions_unavailable` and `headers_unavailable`. The CLI
 adds `config_unavailable`, `service_unavailable` and `invalid_response`.
+
+
+### Closed service enrollments
+
+A new preset has exactly one service. Use the same flat grant in its `services`
+list, admitting ceiling and enrollment. The enrollment has `form:app_password`,
+`issuer`, `tokenUrl`, `jwksUrl`, `clientId`, `username`, `resource`,
+`maxTokenSeconds:300`, `secretFile`, and the following service fields:
+
+| audience | scope | required explicit arrays | fixed resource |
+| --- | --- | --- | --- |
+| ov | ov.read | ov_namespaces | https://ov.mcp.ryzhkov.dev/mcp |
+| homelab | homelab.read | homelab_services, homelab_hosts | https://homelab.mcp.ryzhkov.dev/mcp |
+| ha | ha.read, ha.control, or either combined order | ha_entities, ha_actions | https://ha.mcp.ryzhkov.dev/mcp |
+
+No `project` appears in these enrollments or signed service grants.
+`preset.project` remains the local admission/accounting domain and must match
+one whole ceiling. `projectId` remains the actual reporter T3 project;
+`destinations` names allowed caller projects.
+
+OV roots number 1..16, each at most 1024 ASCII characters, with grammar
+`viking://resources/(segment/)*segment`. Segment characters are
+`A-Za-z0-9_@+.,=-`; dot segments, escaping, wildcards, repeated/trailing
+slashes, duplicates and overlapping roots are refused. Ceiling roots contain
+equal roots or descendants at a slash boundary. Homelab lists each contain
+0..128 unique IDs matching `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`; explicit empty
+lists grant nothing. Both components must fit the same ceiling.
+
+HA entities number 1..64, are at most 112 characters, and match
+`(light|switch|sensor|binary_sensor)\\.[a-z0-9_]{1,96}`. Actions number 1..3,
+with exact unique values `state.read`, `light.control`, `switch.control`.
+Reads require `ha.read`; control actions require `ha.control`. Scope,
+entities and actions must each fit the same ceiling. Initial rollout remains
+`ha.read` with `state.read`. Control needs explicit protected operator grants
+and separate live registry/control qualification; this helper adds no actions.
+
+Enrollment and preset scopes and arrays must match exactly, including literal
+scope order and array order. Issuer is canonical HTTPS ending in `/`; JWKS
+equals issuer plus `jwks/`, and token URL equals issuer origin plus
+`/application/o/token/`. New presets use distinct secret paths and ordinary
+accounts at an Authentik origin. Different services also use distinct issuers
+and client IDs. Presets of the same service may share a provider.
+
+The POST requests the enrollment's full scope without a resource/audience
+override. New JWTs require a scalar exact resource audience and deep-equal
+signed grant arrays. Missing, null, duplicate, expanded, reordered and known
+foreign-service grants are refused. Only HA's two combined scope orders are
+equivalent on the signed wire. Subject is bounded but need not equal username.
+Homelab and HA allow 10 seconds of skew and require optional `nbf < exp`;
+OV allows 30 seconds for future `iat`. All retain the 300-second lifetime,
+run deadline, and 30-second release margin. Jocasta's audience representation,
+scope/project checks and normalized serialization are unchanged.
+
+The cache identity includes every service discriminator and grant as well as
+the existing run, enrollment and secret identities. At most 16 entries/flights
+are held. Policy, JWT, JWKS and token-response limits remain 64 KiB, 8192 bytes,
+64 KiB and 32 KiB; JWKS has at most 16 keys. Grant maxima do not guarantee a
+combination fits these byte limits. Oversize refuses without truncation.
+The rendered public policy must fit before activation; fleet preflight remains
+authoritative.
+
+Native provider bindings must separately configure each fixed endpoint,
+preset and audience through the supported credential-helper mechanism.
+Fleet socket routing alone does not install HTTP MCP bindings. Synthetic
+fixtures qualify local release behavior only. Real helper acquisition,
+renewal, cancellation and endpoint acceptance remain deployment work.
 
 ### Residual risks
 
