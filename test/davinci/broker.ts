@@ -90,7 +90,7 @@ export async function broker(root: string,runtime=false) {
   }
   async function expiry(kind:Kind,short:boolean) {
     const nc=await connect({servers:url,user:"fixture-admin",pass:"synthetic-only",reconnect:false});
-    try {await (await jetstreamManager(nc)).streams.update(STREAM[kind],{max_age:short?100e6:3600e9,duplicate_window:short?50e6:1e9});}
+    try {await (await jetstreamManager(nc)).streams.update(STREAM[kind],{max_age:short?1e9:3600e9,duplicate_window:short?100e6:1e9});}
     finally {await nc.close();}
   }
   return {client,publish,take,ack,inspect,expiry,runtimeConfig(who:keyof typeof keys) {
