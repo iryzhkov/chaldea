@@ -30,13 +30,14 @@ export function launchPayload(sessionId: string, threadId: string, preset: Sessi
 export interface ResultProjection {
   thread: { id: string };
   runs: ReadonlyArray<{ id: string; threadId: string; rootNodeId: string | null }>;
+  nodes?: ReadonlyArray<{ id: string; threadId: string; runId: string | null; kind: string; rootNodeId: string; parentNodeId: string | null }>;
   turnItems: ReadonlyArray<{ type: string; id: string; threadId: string; runId: string | null; nodeId: string | null;
     ordinal: number; streaming?: boolean; text?: string }>;
 }
 /**
- * The final non-streaming assistant message of the run's ROOT node. Native
- * child nodes may share the run ID, so the node binding is required; a missing
- * or still-streaming item is reported, never replaced by another message.
+ * The final non-streaming assistant message owned by the run root. Official
+ * T3 stores text on an assistant item node directly under that root. Native
+ * child nodes may share the run ID, so their ancestry must never qualify.
  */
 export function finalAssistant(p: ResultProjection, threadId: string, runId: string): ResultRead {
   if (p.thread.id !== threadId) return { kind: "ambiguous", detail: "thread_mismatch" };
@@ -44,8 +45,14 @@ export function finalAssistant(p: ResultProjection, threadId: string, runId: str
   if (!run) return { kind: "missing" };
   if (run.threadId !== threadId) return { kind: "ambiguous", detail: "run_thread_mismatch" };
   if (!run.rootNodeId) return { kind: "ambiguous", detail: "root_node_unknown" };
+  const owns = (nodeId: string | null): boolean => {
+    if (nodeId === run.rootNodeId) return true;
+    const node = p.nodes?.find(n => n.id === nodeId);
+    return node !== undefined && node.threadId === threadId && node.runId === runId &&
+      node.kind === "assistant_message" && node.rootNodeId === run.rootNodeId && node.parentNodeId === run.rootNodeId;
+  };
   const last = p.turnItems.filter(i => i.type === "assistant_message" && i.threadId === threadId && i.runId === runId &&
-    i.nodeId === run.rootNodeId).toSorted((a, b) => a.ordinal - b.ordinal).at(-1);
+    owns(i.nodeId)).toSorted((a, b) => a.ordinal - b.ordinal).at(-1);
   if (!last || typeof last.text !== "string") return { kind: "missing" };
   if (last.streaming !== false) return { kind: "ambiguous", detail: "streaming" };
   return { kind: "found", text: last.text, itemId: last.id };

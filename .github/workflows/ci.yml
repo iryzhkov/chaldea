@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [unit, akasha, e2e-1, e2e-2, e2e-3, messaging, python-vectors]
+        lane: [unit, akasha, e2e-1, e2e-2, e2e-3, messaging, davinci, python-vectors]
     env:
       CHALDEA_REQUIRE_E2E: "1"
     steps:
@@ -65,6 +65,9 @@ jobs:
             e2e-1|e2e-2|e2e-3) python3 scripts/ci/e2e-groups.py "$CI_LANE" ;;
             messaging)
               sudo -- env -i PATH="$PATH" /bin/sh test/message/run.sh
+              ;;
+            davinci)
+              sudo -- env -i PATH="$PATH" CHALDEA_DAVINCI_SCRATCH=/root/.cache/da-vinci-artifacts-messaging-ci /bin/sh test/davinci/run.sh
               ;;
             python-vectors)
               python3 --version
