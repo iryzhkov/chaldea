@@ -76,6 +76,7 @@ export class WaitEngine {
     if (this.fatal) throw new Error("Watcher needs attention");
     return this.sessions.start(value);
   }
+  sessionLookup(value: unknown): SessionStatus | null { return this.sessions.lookup(value); }
   sessionStatus(id: string): SessionStatus { return this.sessions.status(id); }
   cancelSession(id: string): SessionStatus { const status=this.sessions.cancel(id); this.poke(); return status; }
   reconcileSession(id: string): Promise<SessionStatus> { return this.sessions.reconcileNow(id); }

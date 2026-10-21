@@ -311,6 +311,14 @@ export class SessionLifecycle {
     return { policy, decision: { ok: true, sessionId: s.item, runId: admission.runId, threadId: s.thread_id, profile: admission.profile,
       project: admission.project, audience, service: structuredClone(service), expiresAt: admission.expiresAt, presetHash: s.preset_hash } };
   }
+  /** Read an original request without admitting work, including after its replay window. */
+  lookup(value: unknown): SessionStatus | null {
+    const requestId = (value as {requestId?: unknown} | null)?.requestId;
+    const at = typeof requestId === "string" ? Number(requestId.slice(0,13)) : 0;
+    const {input,hash} = startInput(value,at);
+    const row = this.store.sessionRequest(input.requestId,hash);
+    return row ? this.status(row.id) : null;
+  }
   status(id: string): SessionStatus {
     const item = this.store.get(id);
     if (item.kind !== "session") throw new Error("Not a session");

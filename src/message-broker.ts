@@ -18,17 +18,17 @@ function subject(v:unknown,prefix:string):string {
 export function publicKey(v:unknown):string {
   const s=field(v,56);requireMessage(/^U[A-Z2-7]{55}$/.test(s),"message_public_key");return s;
 }
-export function brokerConfig(v:unknown):BrokerConfig {
+export function brokerConfig(v:unknown,inboxNamespace="_INBOX_message"):BrokerConfig {
   const b=object(v,["url","account","seedFile","publicKey","inboxPrefix","commandStream","receiptStream"]);
   const u=new URL(field(b.url,2048)),account=token(b.account);
   requireMessage(!["CHALDEA","SYS"].includes(account)&&!u.username&&!u.password&&!u.search&&!u.hash&&u.pathname==="/","message_broker_account_url");
   requireMessage(["wss:","tls:"].includes(u.protocol)||(u.protocol==="nats:"&&["127.0.0.1","[::1]"].includes(u.hostname)),"message_broker_tls");
   const result={url:u.href,account,seedFile:path(b.seedFile),publicKey:publicKey(b.publicKey),
-    inboxPrefix:subject(b.inboxPrefix,"_INBOX_message"),commandStream:token(b.commandStream),receiptStream:token(b.receiptStream)};
+    inboxPrefix:subject(b.inboxPrefix,inboxNamespace),commandStream:token(b.commandStream),receiptStream:token(b.receiptStream)};
   requireMessage(result.commandStream!==result.receiptStream,"message_stream_binding");return result;
 }
-export function mapping(v:Record<string,unknown>):Mapping {
-  return {commandSubject:subject(v.commandSubject,"chaldea.message.command"),receiptSubject:subject(v.receiptSubject,"chaldea.message.receipt"),
+export function mapping(v:Record<string,unknown>,commandNamespace="chaldea.message.command",receiptNamespace="chaldea.message.receipt"):Mapping {
+  return {commandSubject:subject(v.commandSubject,commandNamespace),receiptSubject:subject(v.receiptSubject,receiptNamespace),
     commandConsumer:token(v.commandConsumer),receiptConsumer:token(v.receiptConsumer)};
 }
 export function distinctMappings(values:Mapping[]):void {

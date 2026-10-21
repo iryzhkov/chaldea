@@ -96,6 +96,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
         // Session results are plain status objects, never decorated as wait items.
         case "chaldea_session_start":result=await engine.startSession(input);break;
         case "chaldea_session_status":result=engine.sessionStatus(text(input.id,"id"));break;
+        case "chaldea_session_lookup":result=engine.sessionLookup(input);break;
         default:throw new Error("Unknown method");
       }
       if (result && typeof result === "object" && "kind" in result && "id" in result) {
