@@ -9,8 +9,12 @@ supported credential helper/issuance. This source does not authorize activation.
 ## Contract and policies
 
 One protected definition binds worker, T3 environment, authority epoch, preset hash and
-published source commit. The preset hash covers the existing fixed profile/project/model/
-options/prompt/inputs/grants. The worker reloads that root-owned policy immediately before
+published report-target commit. Definition.source names the source being reported on,
+not the Chaldea worker build. The protected preset supplies the actual prompt/ref; its
+hash covers the existing fixed profile/project/model/options/prompt/inputs/grants.
+Before activation, review that definition.source matches that preset's target, whether
+expressed as a structured ref or fixed prompt. Qualify the immutable worker release and
+configuration hashes separately. The worker reloads that root-owned policy immediately before
 admission and requires the same hash. FATE-selected model/options belong in the qualified
 protected preset. Webhooks and broker deliveries cannot select execution choices.
 
@@ -63,7 +67,7 @@ Common required fields:
 - role: coordinator or worker.
 - database and logFile: separate absolute local private paths per role.
 - definition: id, worker, environment, epoch, preset, presetHash (64 lowercase hex),
-  source (40 lowercase hex published commit), notBefore (epoch milliseconds), utc (HH:MM),
+  source (40 lowercase hex published report-target commit), notBefore (epoch milliseconds), utc (HH:MM),
   enabled (initially false).
 - broker: url (TLS/WSS origin with trailing slash, or literal loopback NATS for fixtures), account DAVINCI, seedFile,
   publicKey, inboxPrefix beginning _INBOX_davinci., commandStream and receiptStream.
