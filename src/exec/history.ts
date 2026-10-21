@@ -24,6 +24,7 @@ export function summary(entry: Intent) {
     'Host: ' + entry.host, 'Started: ' + entry.started, 'Ended: ' + (entry.ended ?? 'unknown'),
     'Log: ' + (entry.logPath ?? 'unavailable') + (entry.logTruncated ? ' (truncated at 64 MiB)' : '') + (entry.outputSyncFailed ? ' (local output sync failed)' : ''),
     'Artifacts: ' + (entry.artifactPaths?.join(', ') || 'none'),
+    ...(entry.blob ? ['Artifact custody: ' + entry.blob.state] : []),
   ].join('\n') + '\n';
 }
 async function write(data: string | Buffer) {

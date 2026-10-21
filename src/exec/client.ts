@@ -13,6 +13,8 @@ import { cleanArtifacts, BOOT_ID } from './artifacts.ts';
 import { record, prune, DAYS, type Intent } from './journal.ts';
 import { stateDir, withStateLock } from './state.ts';
 import { openLog, cleanLogs, logPath, LOG_CAP } from './logs.ts';
+import { blobConfig, storeIdentity } from './blob.ts';
+import { publishJob, blobCommand } from './custody.ts';
 import { history, artifactTarget } from './history.ts';
 import { send, json, safePath, VERSION, CHUNK, MAX_ARTIFACT, LIMITS, type Refusal, type Request } from './protocol.ts';
 
@@ -102,6 +104,7 @@ async function configuredHosts() {
 }
 
 export async function run(args: string[]): Promise<number> {
+  if (args[1] === 'artifacts') return blobCommand(args.slice(2));
   if (['show', 'list', 'fetch'].includes(args[1] ?? '')) return history(args.slice(1));
   const options = argumentsFor(args);
   const automatic = options.host === undefined;
@@ -153,6 +156,7 @@ export async function run(args: string[]): Promise<number> {
 }
 
 async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: string }, automatic: boolean, queued?: Transport, probeFailure?: Error): Promise<number> {
+  const blob = options.artifacts.length ? blobConfig() : undefined;
   const snapshot = await manifest();
   const artifactRoot = join(snapshot.root, '.chaldea/artifacts');
   const state = stateDir();
@@ -181,7 +185,8 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
     started: new Date().toISOString(), pid: process.pid, bootId: BOOT_ID, outcome: 'uncertain',
     worktree: snapshot.root, artifactDir: join(artifactRoot, jobId),
     artifactReserve: options.artifacts.length ? MAX_ARTIFACT : 0,
-    logPath: logPath(state, jobId), requestedArtifacts: options.artifacts, artifactPaths: [] };
+    logPath: logPath(state, jobId), requestedArtifacts: options.artifacts, artifactPaths: [],
+    ...(blob ? { blob: { state: 'pending' as const, store: storeIdentity(blob) } } : {}) };
   // This fsync completes before the first possible remote side effect. Nothing
   // ever automatically retries an uncertain intent, including on a later invocation.
   let log!: Awaited<ReturnType<typeof openLog>>;
@@ -301,6 +306,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       intent.outputSyncFailed = true;
       process.stderr.write('chaldea: local output sync failed; retaining job outcome\n');
     }
+    if (intent.outcome === 'refused' && !started && !seen.size) delete intent.blob;
     intent.ended = new Date().toISOString();
     intent.logTruncated = log.truncated;
     intent.artifactPaths = [...seen].slice(0, artifactRemaining ? -1 : undefined).map(name => join(destination, name));
@@ -310,6 +316,15 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       await cleanArtifacts(journal, options.host);
       await cleanLogs(state);
     });
+    if (intent.blob && intent.outcome === 'finished' && !intent.outputSyncFailed) {
+      try {
+        await publishJob(state, jobId);
+        process.stderr.write('chaldea artifact custody confirmed for ' + jobId + '\n');
+      } catch (error) {
+        const reason = error instanceof Error && /^blob_[a-z0-9_]+$/.test(error.message) ? error.message : 'publication_failed';
+        process.stderr.write('chaldea artifact custody pending (' + reason + '); local copy retained; retry: chaldea exec artifacts publish ' + jobId + '\n');
+      }
+    }
     process.stderr.write('chaldea job ' + jobId + ' log ' + intent.logPath + '\n');
   }
 }
