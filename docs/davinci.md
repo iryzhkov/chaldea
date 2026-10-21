@@ -50,6 +50,8 @@ custody receipt is committed and its confirmation has broker custody. Coordinato
 closed outcomes until the worker confirms observing their receipt. Lost receipts remain replayable
 through retention expiry. An already-retired worker row may reconfirm that it has no local
 custody obligation, using the authenticated coordinator receipt, without recreating work.
+For a retained row, every valid current-sequence receipt durably re-arms confirmation, even
+if the previous confirmation received PubAck and expired before coordinator recovery.
 The coordinator still owns the result. Active/uncertain ownership never expires or yields capacity. Full storage
 refuses new work. Original admission time stays in webhook delivery IDs, so re-signing a
 pruned old identity cannot create a fresh admission. Clock rollback refuses mutation.

@@ -167,6 +167,25 @@ test("late terminal results retain closure-age window and never prune before coo
   } finally {s.close();c.close();dir.remove();}
 });
 
+
+test("duplicate receipt rearms confirmation after PubAck loss while the worker row remains",()=>{
+  const dir=scratchDir("davinci-confirmation-replay"),d=def(),file=join(dir.path,"c.sqlite");
+  let c=new Coordinator(file,d);const s=new WorkerJournal(join(dir.path,"w.sqlite"),d);
+  try {
+    const a=c.tick(at)!;s.accept(JSON.stringify(a),at);
+    const result=s.observe(a.id,status(a.requestId,true),"session",at);
+    const receipt=c.result(JSON.stringify(result),at);
+    s.confirm(JSON.stringify(receipt));s.published(a.id,result.seq,true,at);
+    assert.equal(s.get(a.id)!.notified_seq,result.seq);
+    c.close();c=new Coordinator(file,d); // the confirmation expired after broker PubAck, before this restart
+    s.confirm(JSON.stringify(receipt));
+    assert.equal(s.get(a.id)!.confirmed_seq,result.seq,"custody remains monotone");
+    assert.ok(s.get(a.id)!.notified_seq<result.seq,"duplicate receipt durably requests another confirmation");
+    c.confirm(JSON.stringify({...receipt,kind:"receipt-confirmed"}));
+    assert.ok(c.tick(at+86400000));
+  } finally {s.close();c.close();dir.remove();}
+});
+
 test("signed ingress supports rotation, read-only status and disabled intake; route is authenticated",async()=>{
   const dir=scratchDir("davinci-http"),d=def(),c=new Coordinator(join(dir.path,"c.sqlite"),{...d,notBefore:at-86400000});
   const old=randomBytes(32),current=randomBytes(32);

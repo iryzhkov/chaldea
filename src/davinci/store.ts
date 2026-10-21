@@ -138,7 +138,10 @@ export class WorkerJournal extends Journal {
   confirm(bytes: string): void {
     const r=decodeReceipt(bytes),row=this.get(r.id);check(row,"davinci_unknown_receipt");
     check(r.hash===assignmentHash(JSON.parse(row.assignment) as Assignment) && r.seq<=row.seq,"davinci_receipt_binding");
-    this.db.prepare("UPDATE work SET confirmed_seq=?,sent_at=0 WHERE id=? AND confirmed_seq<?").run(r.seq,r.id,r.seq);
+    // A duplicate receipt proves the coordinator still needs a confirmation,
+    // even if a prior confirmation received PubAck and later expired in transit.
+    this.db.prepare("UPDATE work SET confirmed_seq=max(confirmed_seq,?),notified_seq=CASE WHEN seq=? THEN min(notified_seq,?-1) ELSE notified_seq END,sent_at=0 WHERE id=?")
+      .run(r.seq,r.seq,r.seq,r.id);
   }
   published(id: string,seq: number,confirmation: boolean,now: number): void {
     const row=this.get(id);check(row && (!confirmation || row.confirmed_seq>=seq),"davinci_confirmation_unobserved");
