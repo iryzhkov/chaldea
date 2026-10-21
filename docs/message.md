@@ -2,7 +2,7 @@
 
 Source implementation only. No live account, credential, broker configuration,
 service activation or fleet deployment is included. The CLI and MCP expose
-messaging only when a valid private root-controlled sender configuration exists.
+messaging only when a valid private root-owned sender configuration exists.
 
     chaldea message targets
     chaldea message send --host laptop --thread THREAD --request-id EPOCHMS:KEY --text TEXT
@@ -25,8 +25,10 @@ interrupt, restart, model override, raw RPC, callback or automatic sender retry.
 
 Both JSON files are root-owned regular single-linked files, at most 64 KiB.
 Use 0600 for a root process or 0640 with a dedicated read-only profile group;
-other access and group writes are refused. Ancestor directories, code and runtime
-must be root-controlled. Seed, target-local bearer, DB and lock are process-owner
+other access and group writes are refused. Code and runtime must be root-controlled. Configuration readers check file ownership,
+mode and link count; they do not establish root control of every ancestor. The
+sender default is under the user's XDG/home directories. Enrollment must qualify
+those path controls separately; root ownership of the JSON alone is insufficient. Seed, target-local bearer, DB and lock are process-owner
 0600; state directories are 0700. Never use operator/job credentials.
 
 Sender default: $XDG_CONFIG_HOME/chaldea/message.json, falling back to
@@ -98,7 +100,7 @@ installations need their own separately qualified service policy.
 Replace the NKEY placeholders with enrolled U-prefixed public user keys. The seed
 must match its configured public key before a connection is attempted. TLS or WSS
 is required except for literal loopback disposable NATS. The TLS connection option
-is set explicitly; a tls URL pointed at a plaintext broker is refused. Account names CHALDEA
+is set explicitly and certificate identity is pinned to the configured URL hostname/IP; a tls URL pointed at a plaintext broker is refused. Account names CHALDEA
 and SYS are refused. The account label is a root-controlled enrollment binding;
 it is not proof of server-side account membership.
 
@@ -174,7 +176,9 @@ A dispatch-capable command is ACKed only after storing an attempt result and
 receiving a PubAck for the receipt. Read-only status needs no attempt row.
 Refusals before the durable dispatch barrier publish uncertainty if possible,
 then TERM even if publication fails: no T3 effect was possible for that attempt,
-and the source journal remains uncertain. Redelivery of a stored dispatch attempt
+and the source journal remains uncertain. If TERM is lost, a later redelivery
+can be evaluated afresh; refusal before that barrier is not a durable application
+outcome. Redelivery of a stored dispatch attempt
 returns its durable result; an attempt interrupted before its result was stored
 returns uncertainty without automatic redispatch. Explicit recover/send uses a fresh transport attempt with the same
 application IDs and original bytes. Receipt publication or state write failure
@@ -233,6 +237,14 @@ Coverage includes concurrent reverse receipts, stable-ID replay/restart, interru
 state writes, lost receipts, exact grants/original-subject identity, poison/capacity,
 expiry/clock/ACL gates, reconnect/stop and independent local work during outage.
 The test account, keys and processes are deleted. No production service is used.
+
+The isolated transport fixture separately verifies positive TLS and WSS using a
+scratch trusted certificate, hostname mismatch and untrusted-certificate refusal,
+unenrolled/revoked NKey refusal, replacement acceptance and eviction of established
+TLS/WSS connections on broker authorization reload. It uses the production
+connection function and Node's trusted CA configuration, with verification enabled.
+This does not qualify the canonical reverse proxy, live certificate chain or
+operational key custody. Its redacted message-transport-proof.json records the boundary.
 
 Live TLS/WSS, broker HA, operational credential revocation/rotation, deployed
 service hardening, T3 token renewal and backup/restore remain unqualified. Account,

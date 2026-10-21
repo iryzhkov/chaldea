@@ -1,5 +1,7 @@
 // Messaging-only JetStream transport. Provisioning is external; no management APIs.
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
+import { checkServerIdentity, type PeerCertificate } from "node:tls";
 import { connect, wsconnect, nkeys, nkeyAuthenticator, headers, createInbox, type NatsConnection, type Msg } from "@nats-io/transport-node";
 import { jetstream } from "@nats-io/jetstream";
 import { readTrustedFile } from "./config/files.ts";
@@ -45,8 +47,13 @@ export async function connection(b:BrokerConfig):Promise<NatsConnection> {
     seed=Buffer.from(readTrustedFile(b.seedFile,{secret:true,maxBytes:1024}).toString("utf8").trim());
     const key=nkeys.fromSeed(Uint8Array.from(seed));
     try{requireMessage(key.getPublicKey()===b.publicKey,"message_broker_identity");}finally{key.clear();}
-    const options={servers:b.url,authenticator:nkeyAuthenticator(seed),inboxPrefix:b.inboxPrefix,reconnect:false,timeout:2000,...(b.url.startsWith("tls:")?{tls:{}}:{})};
-    return await(b.url.startsWith("wss:")?wsconnect(options):connect(options));
+    const hostname=new URL(b.url).hostname.replace(/^\[|\]$/g,"");
+    // NATS upgrades an existing socket. Pin certificate identity to the configured
+    // URL even when the library has no DNS tlsName (for example an IP literal).
+    const tls={rejectUnauthorized:true,servername:isIP(hostname)?undefined:hostname,
+      checkServerIdentity:(_name:string,cert:PeerCertificate)=>checkServerIdentity(hostname,cert)};
+    const options={servers:b.url,authenticator:nkeyAuthenticator(seed),inboxPrefix:b.inboxPrefix,reconnect:false,timeout:2000};
+    return await(b.url.startsWith("wss:")?wsconnect(options):connect({...options,...(b.url.startsWith("tls:")?{tls}:{})}));
   }catch{throw new Error("message_broker_unavailable");}
   finally{seed?.fill(0);}
 }
