@@ -345,6 +345,29 @@ list, admitting ceiling and enrollment. The enrollment has `form:app_password`,
 | ov | ov.read | ov_namespaces | https://ov.mcp.ryzhkov.dev/mcp |
 | homelab | homelab.read | homelab_services, homelab_hosts | https://homelab.mcp.ryzhkov.dev/mcp |
 | ha | ha.read, ha.control, or either combined order | ha_entities, ha_actions | https://ha.mcp.ryzhkov.dev/mcp |
+| holonet | holonet.read only | holonet_server, holonet_libraries, holonet_catalog_users, holonet_history_users, holonet_target_users, holonet_actions, holonet_namespace | https://media.mcp.ryzhkov.dev/mcp |
+
+HoloNet is initially one fixed server, one library and one catalog user,
+catalog.read only, explicit empty history/target arrays and a fixed namespace.
+The operator must qualify the IDs as TV and Movies before activation. No
+UserData, playlist/home/collection writes or history follows from this profile.
+The grant codec refuses widening; changing server/user/library/namespace is
+not a subset. Enrollment equality and existing cache identity bind every field;
+same-subject token renewal, rotation, canceled/outdated runs and in-flight
+policy changes use the maintained helper gates. Headers remain native-only,
+never MCP tools, public reports or model output.
+
+The profile matches the accepted server's scalar media audience, RS256,
+300-second lifetime, 30-second skew, ASCII subject1..128 without whitespace,
+canonical required grant keys, 4096-byte payload, 8192-byte token and bounded
+public RSA JWKS. Alias/unknown HoloNet fields, foreign service grants and
+nonempty history/target grants are refused before caching. The helper retains
+its stricter minimum remaining token lifetime and end-to-end acquisition budget.
+The existing integer-only scanner also requires optional numeric payload metadata
+to use nonnegative integer JSON spelling; decimal/exponent coercion is refused.
+Synthetic signed-token/renewal/race results do not qualify real issuer,
+protected runtime UID, native-client acquisition or deployment. No installation,
+enrollment or credential change is part of adding this codec.
 
 No `project` appears in these enrollments or signed service grants.
 `preset.project` remains the local admission/accounting domain and must match
