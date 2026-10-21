@@ -665,18 +665,39 @@ const serviceCases: Service[] = [
   { audience: "ov", scope: "ov.read", ov_namespaces: ["viking://resources/team/reports", "viking://resources/other"] },
   { audience: "homelab", scope: "homelab.read", homelab_services: ["dns"], homelab_hosts: ["host-a"] },
   { audience: "ha", scope: "ha.read", ha_entities: ["sensor.qualified_example"], ha_actions: ["state.read"] },
+  JSON.parse(readFileSync(new URL("../fixtures/holonet-catalog.json", import.meta.url), "utf8")) as Service,
 ];
 function servicePolicy(f: Fixture, s: Service): SessionPolicy {
   const { project: _project, ...common } = enrollment(f.secretFile);
   return policyOf(f.secretFile, { presets: { reporter: preset({ services: [s] }) },
     ceilings: [{ ...CEILING, services: [s] }], enrollments: { reporter: { ...common, ...s,
-      resource: "https://" + s.audience + ".mcp.ryzhkov.dev/mcp" } } });
+      resource: "https://" + (s.audience === "holonet" ? "media" : s.audience) + ".mcp.ryzhkov.dev/mcp" } } });
 }
 function signedService(f: Fixture, s: Service, options: SignOptions = {}): Promise<Reply> {
   const { audience, ...claims } = s;
   return f.issuer.reply({ ...options, omit: [...(Object.hasOwn(options.claims ?? {}, "jocasta_projects") ? [] : ["jocasta_projects"]), ...options.omit ?? []],
-    claims: { ...claims, aud: "https://" + audience + ".mcp.ryzhkov.dev/mcp", sub: "same-subject", ...options.claims } });
+    claims: { ...claims, aud: "https://" + (audience === "holonet" ? "media" : audience) + ".mcp.ryzhkov.dev/mcp", sub: "same-subject", ...options.claims } });
 }
+test("holonet: public JWKS bounds match the resource before any token request", async () => {
+  const f = await fixture("holonet-jwks"), s = serviceCases.find(s => s.audience === "holonet")!;
+  try {
+    f.ref.policy = servicePolicy(f, s); await start(f);
+    f.issuer.onToken = () => signedService(f, s);
+    const key = f.issuer.jwk;
+    for (const keys of [
+      [{ ...key, d: "synthetic-private-field" }], [key, key],
+      Array.from({ length: 9 }, (_, i) => ({ ...key, kid: "k" + i })),
+      [{ ...key, key_ops: ["sign"] }], [{ ...key, n: "AQ" }], [{ ...key, e: "Ag" }],
+      [{ ...key, alg: "RS512" }], [{ ...key, use: "enc" }],
+    ]) {
+      f.issuer.onJwks = () => ({ body: JSON.stringify({ keys }) });
+      await refused(f.headers({ audience: "holonet" }), "jwks_unavailable");
+      assert.equal(f.issuer.posts().length, 0);
+    }
+    f.issuer.onJwks = () => ({ body: JSON.stringify({ keys: [key] }) });
+    assert.ok(await f.headers({ audience: "holonet" }));
+  } finally { await f.close(); }
+});
 for (const s of serviceCases) {
   test(s.audience + ": signed exact grants, selected scope and cache identity; same subject never retains wider grants", async () => {
     const f = await fixture("typed-" + s.audience), audience = s.audience;
@@ -685,17 +706,17 @@ for (const s of serviceCases) {
       const run = await start(f);
       // The absent secret makes the gate ordering observable.
       unlinkSync(f.secretFile);
-      for (const wrong of ["jocasta", "ov", "homelab", "ha"].filter(a => a !== audience))
+      for (const wrong of ["jocasta", "ov", "homelab", "ha", "holonet"].filter(a => a !== audience))
         await refused(f.headers({ audience: wrong }), "audience_not_admitted");
       assert.equal(f.issuer.requests.length, 0); resetSecret(f);
       const first = await f.headers({ audience });
       assert.deepEqual(await f.headers({ audience }), first); assert.equal(f.issuer.posts().length, 1);
       const form = new URLSearchParams(f.issuer.posts()[0]!.body);
       assert.equal(form.get("scope"), s.scope); assert.equal(form.has("audience"), false); assert.equal(form.has("resource"), false);
-      const grantField = s.audience === "ov" ? "ov_namespaces" : s.audience === "homelab" ? "homelab_hosts" : "ha_entities";
+      const grantField = s.audience === "ov" ? "ov_namespaces" : s.audience === "homelab" ? "homelab_hosts" : s.audience === "holonet" ? "holonet_catalog_users" : "ha_entities";
       f.clock.offset = 275_000;
       f.issuer.onToken = () => signedService(f, s, { claims: { [grantField]: s.audience === "ov" ? ["viking://resources/foreign"] :
-        s.audience === "homelab" ? ["host-b"] : ["sensor.other"] } });
+        s.audience === "homelab" ? ["host-b"] : s.audience === "holonet" ? ["c".repeat(32)] : ["sensor.other"] } });
       await refused(f.headers({ audience }), "token_claims_invalid");
       f.issuer.onToken = () => signedService(f, s);
       const renewed = await f.headers({ audience }); assert.notDeepEqual(renewed, first);
@@ -713,10 +734,10 @@ for (const s of serviceCases) {
     const f = await fixture("typed-claims-" + s.audience), audience = s.audience;
     try {
       f.ref.policy = servicePolicy(f, s); await start(f);
-      const field = audience === "ov" ? "ov_namespaces" : audience === "homelab" ? "homelab_hosts" : "ha_entities";
+      const field = audience === "ov" ? "ov_namespaces" : audience === "homelab" ? "homelab_hosts" : s.audience === "holonet" ? "holonet_catalog_users" : "ha_entities";
       const values = (s as unknown as Record<string, string[]>)[field]!;
       const bad: SignOptions[] = [
-        { claims: { aud: ["https://" + audience + ".mcp.ryzhkov.dev/mcp"] } },
+        { claims: { aud: ["https://" + (audience === "holonet" ? "media" : audience) + ".mcp.ryzhkov.dev/mcp"] } },
         { claims: { aud: "https://other.mcp.ryzhkov.dev/mcp" } }, { claims: { iss: "https://wrong.test/" } },
         { claims: { scope: s.scope + " " + s.scope } }, { claims: { scope: s.scope + " " } },
         { claims: { scope: s.scope + " foreign.read" } }, { omit: ["scope"] }, { omit: [field] },
@@ -724,13 +745,21 @@ for (const s of serviceCases) {
         { claims: { [field]: [...values, "extra"] } }, { claims: { [field]: ["*"] } },
         { claims: { sub: "" } }, { claims: { sub: "x".repeat(257) } }, { omit: ["sub"] },
         { omit: ["iat"] }, { omit: ["exp"] }, { claims: { nbf: null } },
-        { iat: Math.floor(f.now() / 1000) + (audience === "ov" ? 60 : 30), exp: Math.floor(f.now() / 1000) + 300 },
+        { iat: Math.floor(f.now() / 1000) + (audience === "ov" || audience === "holonet" ? 60 : 30), exp: Math.floor(f.now() / 1000) + 300 },
         { iat: Math.floor(f.now() / 1000), exp: Math.floor(f.now() / 1000) + 301 }, { header: { jku: "https://evil.test/" } }, { header: { b64: true } }, { header: { kid: "" } },
         { header: { kid: "x".repeat(129) } },
         { claims: { jocasta_projects: ["projectA"] } }, { claims: { grants: [] } },
         ...["ov_namespaces", "homelab_services", "homelab_hosts", "ha_entities", "ha_actions"]
           .filter(k => !Object.hasOwn(s, k)).map(k => ({ claims: { [k]: [] } })),
       ];
+      if (audience === "holonet") bad.push(
+        { claims: { sub: "with space" } }, { claims: { sub: "x".repeat(129) } },
+        { claims: { holonet_history_users: ["b".repeat(32)] } }, { claims: { holonet_target_users: ["b".repeat(32)] } },
+        { claims: { holonet_actions: ["userdata.read"] } }, { claims: { holonet_namespace: "other" } },
+        { claims: { holonet_extra: [] } }, { claims: { Holonet_server: "a".repeat(32) } },
+        { claims: { holonet_ſerver: "a".repeat(32) } }, { claims: { Scope: "holonet.read" } },
+        { claims: { nbf: Math.floor(f.now() / 1000) - 1 } }, { header: { typ: "x".repeat(33) } },
+      );
       if (audience !== "ov") bad.push({ claims: { nbf: Math.floor(f.now() / 1000) + 300 } });
       if (audience !== "homelab") bad.push({ claims: { sub: "bad\u0001subject" } });
       if (audience === "ha") bad.push({ claims: { sub: "bad\u007fsubject" } });
@@ -770,6 +799,7 @@ for (const s of serviceCases) {
             assert.ok("audience" in e);
             if (e.audience === "ov") e.ov_namespaces = ["viking://resources/changed"];
             else if (e.audience === "homelab") e.homelab_hosts = ["changed"];
+            else if (e.audience === "holonet") e.holonet_catalog_users = ["c".repeat(32)];
             else e.ha_entities = ["sensor.changed"];
           }
           f.issuer.resume();
