@@ -19,6 +19,7 @@ import uuid
 from image import prepare_binary
 from protocol import AGE, cleanup, retrieve
 from exec_client import prove as prove_exec_client
+from retention import prove as prove_retention
 
 BOOTSTRAP_COMMIT = "730491fb9d63ba3e788011a00b15495d8bb53dd9"
 BOOTSTRAP_BLOB = "61e2e824fb749fb31631eea7a80a8d2d95045bc6"
@@ -140,15 +141,16 @@ def main():
             "layout": {"zone": "fixture", "capacity": 1024 * MIB},
             "buckets": [{"name": name, "max_size": MIB, "max_objects": 16,
                          "expire_days": 14, "abort_multipart_days": 1}
-                        for name in ("artifact-a", "artifact-b", "artifact-c")],
+                        for name in ("artifact-a", "artifact-b", "artifact-c", "artifact-d")],
             "keys": [
                 {"name": "fixture-ops", "buckets": {name: ["read", "write", "owner"]
-                                                    for name in ("artifact-a", "artifact-b", "artifact-c")}},
+                                                    for name in ("artifact-a", "artifact-b", "artifact-c", "artifact-d")}},
                 {"name": "writer-a", "buckets": {"artifact-a": ["write"]}},
                 {"name": "reader-a", "buckets": {"artifact-a": ["read"]}},
                 {"name": "other-b", "buckets": {"artifact-b": ["read", "write"]}},
                 {"name": "publisher-c", "buckets": {"artifact-c": ["read", "write"]}},
                 {"name": "reader-c", "buckets": {"artifact-c": ["read"]}},
+                {"name": "cleaner-d", "buckets": {"artifact-d": ["read", "write"]}},
             ],
             "lifecycle_key": "fixture-ops",
         }
@@ -303,6 +305,7 @@ def main():
         refused(lambda: retrieve(fresh, "artifact-a", identity), "manifest_missing")
         assert cleanup(ops, "artifact-a", accepted_at + AGE + 60) == {"objects": 0, "uploads": 0}
         report["trustedCleanupAfterLifecycleMutation"] = cleaned
+        report["boundedRetention"] = prove_retention(home, endpoint, client("cleaner-d"))
         report["execClient"] = prove_exec_client(home, endpoint, client("publisher-c"), client("reader-c"), garage)
         report["passed"] = True
         report["decisionA"] = "open: protected cleanup deployment, pending-part physical bounds, dedicated mount and live SSH custody still require qualification"

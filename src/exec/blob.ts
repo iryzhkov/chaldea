@@ -50,6 +50,11 @@ export class BlobStore {
     this.access = key.accessKeyId; this.secret = key.secretAccessKey;
   }
   async request(method: 'GET' | 'PUT', key: string, bytes: Buffer = Buffer.alloc(0), query: Record<string, string> = {}, cap = MAX_ARTIFACT) {
+    const response = await this.exchange(method, key, bytes, query, cap, 15_000, true);
+    if (response.status !== 200) throw new Error('blob_http_' + response.status);
+    return response.body;
+  }
+  async exchange(method: 'GET' | 'PUT' | 'DELETE', key: string, bytes: Buffer = Buffer.alloc(0), query: Record<string, string> = {}, cap = MAX_ARTIFACT, timeoutMs = 15_000, requireOK = false) {
     const c = this.config;
     const path = '/' + [c.bucket, ...key.split('/').filter(Boolean)].map(encode).join('/');
     const search = Object.entries(query).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => encode(k) + '=' + encode(v)).join('&');
@@ -64,9 +69,9 @@ export class BlobStore {
       authorization: 'AWS4-HMAC-SHA256 Credential=' + this.access + '/' + scope + ', SignedHeaders=' + names + ', Signature=' + signature };
     const response = await fetch(c.endpoint + path + (search ? '?' + search : ''), {
       method, headers, ...(method === 'PUT' ? { body: new Uint8Array(bytes) } : {}),
-      signal: AbortSignal.timeout(15_000), redirect: 'error',
+      signal: AbortSignal.timeout(timeoutMs), redirect: 'error',
     });
-    if (response.status !== 200) { await response.body?.cancel(); throw new Error('blob_http_' + response.status); }
+    if (requireOK && response.status !== 200) { await response.body?.cancel(); throw new Error('blob_http_' + response.status); }
     const chunks: Buffer[] = []; let size = 0;
     try {
       for await (const chunk of response.body ?? []) {
@@ -74,7 +79,7 @@ export class BlobStore {
         chunks.push(Buffer.from(chunk));
       }
     } catch (error) { await response.body?.cancel().catch(() => {}); throw error; }
-    return Buffer.concat(chunks);
+    return { status: response.status, body: Buffer.concat(chunks) };
   }
   async manifest(id: string) {
     jobId(id);
