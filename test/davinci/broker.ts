@@ -8,11 +8,13 @@ import { join } from "node:path";
 import { connect, nkeys, nkeyAuthenticator, createInbox, type NatsConnection, type Msg } from "@nats-io/transport-node";
 import { jetstream, jetstreamManager, AckPolicy, StorageType, RetentionPolicy, DiscardPolicy } from "@nats-io/jetstream";
 const STREAM = { command: "PLACEMENT_COMMANDS", result: "PLACEMENT_RESULTS" } as const;
-const SUBJECT = { command: "davinci.assignment.worker_a", result: "davinci.result.worker_a" } as const;
+const PROOF_SUBJECT = { command: "davinci.assignment.worker_a", result: "davinci.result.worker_a" } as const;
 const CONSUMER = { command: "worker_a", result: "coordinator" } as const;
 type Kind = keyof typeof STREAM;
 const next = (kind: Kind) => "$JS.API.CONSUMER.MSG.NEXT." + STREAM[kind] + "." + CONSUMER[kind];
-export async function broker(root: string) {
+export async function broker(root: string,runtime=false) {
+  const SUBJECT=runtime?{command:"chaldea.davinci.assignment.worker_a",result:"chaldea.davinci.result.worker_a"}:PROOF_SUBJECT;
+  const inbox=runtime?"_INBOX_davinci":"_INBOX_dv";
   assert.ok(process.env.NATS_SERVER, "pinned isolated NATS required");
   const listener = createServer(); listener.listen(0, "127.0.0.1"); await once(listener, "listening");
   const port = (listener.address() as {port:number}).port;
@@ -22,10 +24,10 @@ export async function broker(root: string) {
   const consume = (kind: Kind) => [next(kind), "$JS.ACK." + STREAM[kind] + "." + CONSUMER[kind] + ".>"];
   writeFileSync(config, JSON.stringify({ host: "127.0.0.1", port,
     jetstream: { store_dir: join(root, "placement-broker"), max_file_store: 8*1024*1024, max_memory_store: 1024*1024 },
-    accounts: { PLACEMENT: { jetstream: "enabled", users: [
+    accounts: { [runtime?"DAVINCI":"PLACEMENT"]: { jetstream: "enabled", users: [
       { user: "fixture-admin", password: "synthetic-only" },
-      { nkey: keys.coordinator.getPublicKey(), permissions: { publish: [SUBJECT.command, ...consume("result")], subscribe: ["_INBOX_dv.coordinator.>"] } },
-      { nkey: keys.worker.getPublicKey(), permissions: { publish: [SUBJECT.result, ...consume("command")], subscribe: ["_INBOX_dv.worker.>"] } },
+      { nkey: keys.coordinator.getPublicKey(), permissions: { publish: [SUBJECT.command, ...consume("result")], subscribe: [inbox+".coordinator.>"] } },
+      { nkey: keys.worker.getPublicKey(), permissions: { publish: [SUBJECT.result, ...consume("command")], subscribe: [inbox+".worker.>"] } },
     ] } },
   }), {mode:0o600});
   let server: ChildProcess | undefined, errors = "";
@@ -56,7 +58,7 @@ export async function broker(root: string) {
   }
   async function client(who: keyof typeof keys) {
     const nc = await connect({servers:url,authenticator:nkeyAuthenticator(keys[who].getSeed()),
-      inboxPrefix:"_INBOX_dv."+who,reconnect:false,timeout:1000});
+      inboxPrefix:inbox+"."+who,reconnect:false,timeout:1000});
     clients.add(nc); return nc;
   }
   async function publish(nc:NatsConnection,kind:Kind,bytes:string) {
@@ -64,7 +66,7 @@ export async function broker(root: string) {
     assert.equal(ack.stream,STREAM[kind]);
   }
   async function take(nc:NatsConnection,kind:Kind):Promise<Msg> {
-    const sub = nc.subscribe(createInbox("_INBOX_dv." + (kind === "command" ? "worker" : "coordinator")),{max:1,timeout:5000});
+    const sub = nc.subscribe(createInbox(inbox+"." + (kind === "command" ? "worker" : "coordinator")),{max:1,timeout:5000});
     try {
       nc.publish(next(kind),JSON.stringify({batch:1,expires:1e9}),{reply:sub.getSubject()});
       for await (const m of sub) {
@@ -79,6 +81,13 @@ export async function broker(root: string) {
     assert.ok(reply && reply.startsWith("$JS.ACK."+STREAM[kind]+"."+CONSUMER[kind]+"."));
     nc.publish(reply,"+ACK");await nc.flush();
   }
-  return {client,publish,take,ack,async restart(){await stop();await start();},
+  return {client,publish,take,ack,runtimeConfig(who:keyof typeof keys) {
+    const seedFile=join(root,who+".seed");
+    writeFileSync(seedFile,keys[who].getSeed(),{mode:0o600});
+    return {broker:{url:url+"/",account:"DAVINCI",seedFile,publicKey:keys[who].getPublicKey(),
+      inboxPrefix:inbox+"."+who,commandStream:STREAM.command,receiptStream:STREAM.result},
+      mapping:{commandSubject:SUBJECT.command,receiptSubject:SUBJECT.result,
+        commandConsumer:CONSUMER.command,receiptConsumer:CONSUMER.result}};
+  },async restart(){await stop();await start();},
     async close(){await stop();keys.coordinator.clear();keys.worker.clear();}};
 }

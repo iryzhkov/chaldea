@@ -91,6 +91,7 @@ for (const interrupt of [false, true]) test(`signed occurrence survives reply lo
     assert.equal((await post(BODY + " ")).code, 409);
     const a: Assignment = JSON.parse(coordinator.row("delivery-1")!.assignment);
     const input = { threadId: caller, requestId: a.requestId, preset: a.preset };
+    assert.equal(engine!.sessionLookup(input),null,"lookup never admits an absent request");
     await assert.rejects(engine!.startSession({ ...input, prompt: "arbitrary command" }), /unsupported_reduction/);
     const bytes = JSON.stringify(a);
     await assert.rejects(bus.publish(receiver, "command", bytes)); // worker has no assignment-publish authority
@@ -102,6 +103,7 @@ for (const interrupt of [false, true]) test(`signed occurrence survives reply lo
       throw new Error("fixture: admission reply lost before worker recorded its handle");
     } }), /admission reply lost/);
     assert.equal(launches, 1);
+    assert.equal(engine!.sessionLookup(input)!.sessionId,first.sessionId,"lookup recovers lost admission reply");
     await engine!.stop(); store!.close(); engine = undefined; store = undefined;
     await watcher.close(); watcher = undefined;
     if (interrupt) {
@@ -115,6 +117,7 @@ for (const interrupt of [false, true]) test(`signed occurrence survives reply lo
     // Original unacked command survives a real broker process restart.
     const redelivery = await bus.take(receiver, "command");
     assert.equal(redelivery.string(), bytes);
+    assert.equal(engine!.sessionLookup(input)!.sessionId,first.sessionId,"lookup survives service reopen");
     const replay = await worker.accept(redelivery.string(), engine!);
     await bus.ack(receiver, "command", redelivery);
     await assert.rejects(worker.accept(JSON.stringify({ ...a, preset: "operator" }), engine!), /assignment_binding/);
