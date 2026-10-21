@@ -211,6 +211,19 @@ def main():
         assert writer.request("PUT", conflict_path, conflict_bytes)[0] == 200
         refused(lambda: retrieve(fresh, "artifact-a", identity), "manifest_conflict")
         assert ops.request("DELETE", conflict_path)[0] == 204
+        # Valid content hashes must not disguise a wrong identity or caller path.
+        assert ops.request("DELETE", manifest_path)[0] == 204
+        for invalid, reason in [
+            (dict(manifest, jobId=str(uuid.uuid4())), "manifest_binding"),
+            (dict(manifest, principal="b"), "manifest_binding"),
+            (dict(manifest, artifacts=[dict(manifest["artifacts"][0], path="../escape")]), "artifact_binding"),
+        ]:
+            invalid_bytes = json.dumps(invalid, sort_keys=True).encode()
+            invalid_path = "artifact-a/v1/" + identity + "/manifests/" + hashlib.sha256(invalid_bytes).hexdigest() + ".json"
+            assert writer.request("PUT", invalid_path, invalid_bytes)[0] == 200
+            refused(lambda: retrieve(fresh, "artifact-a", identity), reason)
+            assert ops.request("DELETE", invalid_path)[0] == 204
+        assert writer.request("PUT", manifest_path, manifest_bytes)[0] == 200
         assert retrieve(fresh, "artifact-a", identity) == payload
         report["manifestIntegrityConflictAndExpiry"] = True
         report["custodyAfterProducerDeletion"] = {"jobId": identity, "sha256": sha, "size": len(retrieved)}
