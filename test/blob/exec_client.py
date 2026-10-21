@@ -34,6 +34,12 @@ def launch(request,workspace,config):
     return ["/usr/bin/env","-i","PATH="+os.environ["PATH"],"HOME="+str(scratch),"TMPDIR="+str(temp),
             "/bin/sh","-c",'cd "$1"; shift; exec "$@"',"job",str(workspace),*request["argv"]],marker
 s["execute"].__globals__.update(prepare_launch=launch,launched=lambda path:True,job_signal=lambda *args:None)
+if os.environ.get("DROP_RESULT") == "1":
+    original_send=s["send"]
+    def drop_result(kind,*args):
+        if kind=="X": raise BrokenPipeError("injected final result loss")
+        return original_send(kind,*args)
+    s["main"].__globals__["send"]=drop_result
 sys.argv=["server","--config",str(root/"host.json")]
 s["main"]()
 ''')
@@ -58,24 +64,26 @@ s["main"]()
     configure(client_home, publisher)
     node = shutil.which("node")
     assert node is not None
-    def command(target, *args, cwd=work, expected=0):
+    def command(target, *args, cwd=work, expected=0, extra=None):
         env = dict(os.environ, HOME=str(target), TMPDIR=str(base / "tmp"),
                    PATH=str(tools) + ":" + os.environ["PATH"],
                    CHALDEA_STATE_DIR=str(state), CHALDEA_SSH_CONFIG=str(base / "ssh.conf"))
         for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
             env.pop(name, None)
+        env.update(extra or {})
         result = subprocess.run([node, str(repo / "bin/chaldea"), "exec", *args],
                                 cwd=cwd, env=env, capture_output=True, timeout=90)
         assert result.returncode == expected, "production exec/client command failed: " + str(result.returncode) + ": " + result.stderr.decode(errors="replace")[-4096:]
         return result
 
-    def produce(exit_code=0):
+    def produce(exit_code=0, drop_result=False):
         result = command(client_home, "--host", "test", "--no-queue", "--artifact", "out/report.txt",
                 "--", sys.executable, "-c",
                 'import os,pathlib; h=pathlib.Path(os.environ["HOME"]); assert h.name==".fixture-home"; '
                 'assert not (h/".config/chaldea/garage-key.json").exists(); '
                 'pathlib.Path("out").mkdir(); pathlib.Path("out/report.txt").write_bytes(b"representative artifact\\n"); '
-                '__import__("sys").exit(' + str(exit_code) + ')', expected=exit_code)
+                '__import__("sys").exit(' + str(exit_code) + ')', expected=255 if drop_result else exit_code,
+                extra={"DROP_RESULT": "1"} if drop_result else None)
         entries = [json.loads(p.read_text()) for p in (state / "journal").glob("*.json")]
         return dict(sorted(entries, key=lambda e: e["started"])[-1], fixtureStderr=result.stderr.decode(errors="replace")[-4096:])
 
@@ -165,7 +173,28 @@ s["main"]()
     command(client_home, "artifacts", "publish", preempted["jobId"], expected=255)
     command(client_home, "fetch", preempted["jobId"])
     command(client_home, "artifacts", "publish", preempted["jobId"])
+    # Lose X after complete artifact delivery, then fault the host's retention
+    # copy. Recovery must preserve the only good completed client copy.
+    lost_result = produce(7, drop_result=True)
+    assert lost_result["outcome"] == "uncertain" and not lost_result["blob"].get("draft")
+    assert len(lost_result["artifactPaths"]) == 1
+    assert Path(lost_result["artifactPaths"][0]).read_bytes() == payload
+    retained_dir = base / "jobs/.retained" / lost_result["jobId"]
+    metadata_path = retained_dir / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    for artifact in metadata["artifacts"]:
+        (retained_dir / ("artifact-" + str(artifact["index"]))).unlink()
+    metadata["artifacts"] = []
+    metadata["artifactErrors"].append({"path": "out/report.txt", "reason": "unavailable regular file"})
+    metadata_path.write_text(json.dumps(metadata))
+    command(client_home, "fetch", lost_result["jobId"])
+    local = json.loads((state / "journal" / (lost_result["jobId"] + ".json")).read_text())
+    assert local["artifactPaths"] == lost_result["artifactPaths"] and local["blob"]["state"] == "pending"
+    command(client_home, "artifacts", "publish", lost_result["jobId"])
+    command(fresh, "artifacts", "fetch", lost_result["jobId"], "--output", str(fresh / "local-only"), cwd=fresh)
+    assert (fresh / "local-only/out/report.txt").read_bytes() == payload
     return {"ordinaryExec": True, "hostWorkspaceDeleted": True, "freshReadOnlyFetch": True,
             "explicitUnavailable": True, "outageRetainsLocalCopy": True, "sameDraftRetry": True,
             "publishThenRecoveryReconfirms": True, "preemptedRequiresRecovery": True, "incompleteRecoveryBlocksPublication": True,
+            "lostResultIncompleteHostRetentionPreservesLocal": True,
             "jobId": completed["jobId"], "recoveredJobId": pending["jobId"]}

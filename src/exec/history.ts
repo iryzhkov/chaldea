@@ -170,6 +170,14 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     if (!complete || (await exit) !== 0) throw new Error(timedOut ? 'fetch timed out' : 'connection lost during fetch; local outcome unchanged');
     if (artifact) { await artifact.sync(); await artifact.close(); artifact = undefined; }
     await log!.close(); log = undefined;
+    const retained = new Set(seen);
+    if (entry.blob) for (const path of entry.artifactPaths ?? []) {
+      const name = path.slice(destination.length + 1); safePath(name);
+      if (path !== join(destination, name) || !requested.includes(name)) throw new Error('invalid prior artifact receipt');
+      // Retention capture can omit a file already delivered to this client.
+      // Keep every completed local receipt in the next publication set.
+      retained.add(name);
+    }
     // Persist the recovery barrier before replacing any local file. A crash or
     // partial rename cannot leave new bytes covered by an old confirmation.
     entry.artifactRecoveryPending = true;
@@ -184,7 +192,7 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     entry.started = new Date(meta.started * 1000).toISOString(); entry.ended = new Date(meta.ended * 1000).toISOString();
     entry.logPath = path; entry.logTruncated = meta.logTruncated === true; entry.outputSyncFailed = false;
     if (meta.recoveryDegraded === true) await write('Host recovery storage was degraded; output or artifacts may be incomplete.\n');
-    entry.artifactPaths = [...seen].map(name => join(destination, name));
+    entry.artifactPaths = [...retained].map(name => join(destination, name));
     entry.artifactRecoveryComplete = true;
     delete entry.artifactRecoveryPending;
     // Recovery may change the artifact set. Retain the frozen manifest and
