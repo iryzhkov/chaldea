@@ -67,7 +67,7 @@ jobs:
               sudo -- env -i PATH="$PATH" /bin/sh test/message/run.sh
               ;;
             davinci)
-              sudo -- env -i PATH="$PATH" /bin/sh test/davinci/run.sh
+              sudo -- env -i PATH="$PATH" CHALDEA_DAVINCI_SCRATCH=/root/.cache/da-vinci-artifacts-messaging-ci /bin/sh test/davinci/run.sh
               ;;
             python-vectors)
               python3 --version
