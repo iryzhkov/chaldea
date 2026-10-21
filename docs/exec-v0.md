@@ -57,6 +57,9 @@ The companion role is in
 enrollment and firewall changes require operator review; this client provisions
 nothing. See that repository's `docs/job-host.md` for per-host apply commands.
 
+Optional trusted-client blob publication and fresh-context retrieval are described in
+[artifact custody](blob-artifacts.md). The SSH execution/recovery protocol stays unchanged.
+
 ## Protocol (version 1, forced command chaldea-exec-v0)
 
 1. Every frame is one uppercase ASCII type, a four-byte big-endian length, then bytes; maximum frame size is 1 MiB. Server sends H JSON with version 1; client checks it before upload.

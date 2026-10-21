@@ -10,6 +10,7 @@ Defaults work without XDG variables; setting them intentionally relocates the co
 | Waits service, waits/decision CLI, MCP | `$XDG_CONFIG_HOME/chaldea/waits.json` | Yes |
 | Quota observer and status | `$XDG_CONFIG_HOME/chaldea/quota.json` | No |
 | Exec client, including show/list/fetch | `$XDG_CONFIG_HOME/chaldea/exec.json` | No |
+| Opt-in exec artifact custody | `$XDG_CONFIG_HOME/chaldea/blob.json` | No; see [artifact custody](blob-artifacts.md) |
 | Akasha gateway | `$XDG_CONFIG_HOME/chaldea/akasha.json` | Yes |
 | Collector and in-process event publishers | `$XDG_CONFIG_HOME/chaldea/events.json` | No |
 | T3 restart/recovery support | `$XDG_CONFIG_HOME/chaldea/restart.json` | No |

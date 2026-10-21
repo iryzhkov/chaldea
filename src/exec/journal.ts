@@ -1,10 +1,10 @@
 import * as fs from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { atomicWrite, syncDirectory } from '../fs/atomic.ts';
 import { removeArtifacts, active as liveIntent } from './artifacts.ts';
-import { removeLog } from './logs.ts';
+import { removeLog, validJobId } from './logs.ts';
 
-export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; logPath?: string; logTruncated?: boolean; outputSyncFailed?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[] };
+export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; logPath?: string; logTruncated?: boolean; outputSyncFailed?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[]; artifactRecoveryComplete?: boolean; artifactRecoveryPending?: boolean; blob?: { state: 'pending' | 'confirmed'; store: string; draft?: string; manifestKey?: string } };
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 
@@ -29,14 +29,15 @@ export async function prune(dir: string, age = DAYS, keep = KEEP) {
   for (const entry of files) {
     try {
       const value: Intent = JSON.parse(await fs.readFile(entry.path, 'utf8'));
-      if (liveIntent(value)) active.add(entry.path);
+      if (liveIntent(value) || value.blob?.state === 'pending') active.add(entry.path);
     } catch { /* stale partial journal update */ }
   }
   retained = active.size;
   for (const entry of files) {
     if (active.has(entry.path)) continue;
     if (retained >= keep || entry.stat.mtimeMs < Date.now() - age) {
-      try { const value = JSON.parse(await fs.readFile(entry.path, 'utf8')); await removeArtifacts(value); await removeLog(dir, value); } catch (e: any) { if (e instanceof SyntaxError) { /* partial update */ } else throw e; }
+      try { const value = JSON.parse(await fs.readFile(entry.path, 'utf8')); await removeArtifacts(value); await removeLog(dir, value);
+        if (validJobId(value.jobId)) await fs.rm(join(dirname(dir), 'publication', value.jobId), { recursive: true, force: true }); } catch (e: any) { if (e instanceof SyntaxError) { /* partial update */ } else throw e; }
       await fs.unlink(entry.path);
     }
     else retained++;

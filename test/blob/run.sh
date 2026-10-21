@@ -11,4 +11,5 @@ test ! -e "$job_root/.blob-image"
 mkdir -p "$HOME" "$TMPDIR"
 trap 'rm -rf "$job_root/.blob-image"' EXIT
 printf '%s\n' '{"passed":false,"proof":"garage-custody"}' > blob-custody-proof.json
+node --version
 python3 -B test/blob/garage.py

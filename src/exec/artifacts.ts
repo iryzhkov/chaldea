@@ -26,6 +26,7 @@ async function parents(path: string) {
   }
 }
 export async function removeArtifacts(entry: Intent) {
+  if (entry.blob?.state === 'pending') throw new Error('artifact custody pending; local copy protected');
   const path = artifactLocation(entry); if (!path) return;
   await parents(path);
   await fs.rm(path, { recursive: true, force: true });
@@ -48,16 +49,16 @@ export async function cleanArtifacts(journal: string, host: string, incoming = 0
     if (entry.host.toLowerCase() !== host.toLowerCase()) continue;
     const path = artifactLocation(entry); if (!path) continue;
     await parents(path);
-    if (!active(entry) && Date.parse(entry.started) < now - ARTIFACT_DAYS) await removeArtifacts(entry);
+    if (!active(entry) && entry.blob?.state !== 'pending' && Date.parse(entry.started) < now - ARTIFACT_DAYS) await removeArtifacts(entry);
     else entries.push({ entry, bytes: active(entry) ?
       Math.max(await size(path), entry.artifactReserve ?? MAX_ARTIFACT) : await size(path) });
   }
   let total = entries.reduce((sum, row) => sum + row.bytes, 0);
   for (const row of entries.sort((a, b) => Date.parse(a.entry.started) - Date.parse(b.entry.started))) {
     if (total + incoming <= cap) break;
-    if (active(row.entry)) continue;
+    if (active(row.entry) || row.entry.blob?.state === 'pending') continue;
     await removeArtifacts(row.entry); total -= row.bytes;
   }
-  if (total + incoming > cap) throw new Error('per-host artifact cap reached; active artifacts protected');
+  if (total + incoming > cap) throw new Error('per-host artifact cap reached; active artifacts protected; pending custody also protected');
   return total;
 }
