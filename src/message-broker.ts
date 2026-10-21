@@ -52,8 +52,8 @@ export async function connection(b:BrokerConfig):Promise<NatsConnection> {
     // URL even when the library has no DNS tlsName (for example an IP literal).
     const tls={rejectUnauthorized:true,servername:isIP(hostname)?undefined:hostname,
       checkServerIdentity:(_name:string,cert:PeerCertificate)=>checkServerIdentity(hostname,cert)};
-    const options={servers:b.url,authenticator:nkeyAuthenticator(seed),inboxPrefix:b.inboxPrefix,reconnect:false,timeout:2000,...(b.url.startsWith("tls:")?{tls}:{})};
-    return await(b.url.startsWith("wss:")?wsconnect(options):connect(options));
+    const options={servers:b.url,authenticator:nkeyAuthenticator(seed),inboxPrefix:b.inboxPrefix,reconnect:false,timeout:2000};
+    return await(b.url.startsWith("wss:")?wsconnect(options):connect({...options,...(b.url.startsWith("tls:")?{tls}:{})}));
   }catch{throw new Error("message_broker_unavailable");}
   finally{seed?.fill(0);}
 }
