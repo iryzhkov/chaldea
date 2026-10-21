@@ -69,19 +69,36 @@ function aborted(signal: AbortSignal): Promise<never> {
     else signal.addEventListener("abort", () => reject(refusal("timeout")), { once: true });
   });
 }
-function json(bytes: Uint8Array): Record<string, unknown> | null {
+function json(bytes: Uint8Array, integersOnly = false): Record<string, unknown> | null {
   try {
-    const v = strictJson(bytes);
+    const v = strictJson(bytes, integersOnly);
     return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : null;
   } catch { return null; }
 }
 /** Public RSA signing keys only; private members, other types and other algorithms are dropped. */
-function signingKeys(v: Record<string, unknown> | null): JWK[] {
+function signingKeys(v: Record<string, unknown> | null, holonet = false): JWK[] {
   if (!v || !Array.isArray(v.keys) || v.keys.length < 1 || v.keys.length > MAX_KEYS) throw refusal("jwks_unavailable");
+  if (holonet && v.keys.length > 8) throw refusal("jwks_unavailable");
   const out: JWK[] = [];
+  const seen = new Set<string>();
   for (const k of v.keys as unknown[]) {
     if (!k || typeof k !== "object" || Array.isArray(k)) throw refusal("jwks_unavailable");
     const j = k as Record<string, unknown>;
+    if (holonet) {
+      if (["d", "p", "q", "dp", "dq", "qi", "oth"].some(key => Object.hasOwn(j, key)) ||
+        j.kty !== "RSA" || (j.alg !== undefined && j.alg !== "RS256") || (j.use !== undefined && j.use !== "sig") ||
+        typeof j.kid !== "string" || !j.kid || Buffer.byteLength(j.kid) > 128 || seen.has(j.kid) ||
+        (j.key_ops !== undefined && (!Array.isArray(j.key_ops) ||
+          (j.key_ops.length !== 0 && (j.key_ops.length !== 1 || j.key_ops[0] !== "verify"))))) throw refusal("jwks_unavailable");
+      seen.add(j.kid);
+      if (typeof j.n !== "string" || typeof j.e !== "string" || j.n.length > 1024 || j.e.length > 8) throw refusal("jwks_unavailable");
+      const n = Buffer.from(j.n, "base64url"), e = Buffer.from(j.e, "base64url");
+      if (!n.length || !e.length || n.toString("base64url") !== j.n || e.toString("base64url") !== j.e ||
+        e.length > 4) throw refusal("jwks_unavailable");
+      const modulus = BigInt("0x" + n.toString("hex")), exponent = Number(BigInt("0x" + e.toString("hex")));
+      if (modulus % 2n !== 1n || modulus.toString(2).length < 2048 || modulus.toString(2).length > 4096 ||
+        exponent < 3 || exponent > 2147483647 || exponent % 2 !== 1) throw refusal("jwks_unavailable");
+    }
     if (j.kty !== "RSA" || (j.use !== undefined && j.use !== "sig") || (j.alg !== undefined && j.alg !== "RS256")) continue;
     if (typeof j.n !== "string" || typeof j.e !== "string" || j.n.length > 2048 || j.e.length > 16) throw refusal("jwks_unavailable");
     if (j.kid !== undefined && (typeof j.kid !== "string" || j.kid.length > 256)) throw refusal("jwks_unavailable");
@@ -183,7 +200,7 @@ export class SessionCredentials {
   private async mint(preset: string, id: Identity, flight: Flight): Promise<Minted> {
     const signal = AbortSignal.timeout(FETCH_BUDGET_MS), e = id.enrollment;
     const keys = signingKeys(json(await this.fetch(e.jwksUrl, { method: "GET", headers: { Accept: "application/json" }, signal },
-      MAX_JWKS_BODY, "jwks_unavailable")));
+      MAX_JWKS_BODY, "jwks_unavailable")), "audience" in e && e.audience === "holonet");
     // A run cancelled or changed while the keys loaded never causes a token request.
     this.recheck(preset, id, flight);
     const body = new URLSearchParams({ grant_type: "client_credentials", client_id: e.clientId, username: e.username,
@@ -223,13 +240,16 @@ export class SessionCredentials {
   }
   private async verify(token: string, keys: JWK[], id: Identity): Promise<number> {
     const e = id.enrollment, decision = id.decision, now = this.clock(), at = seconds(now);
-    const typed = "audience" in e, skew = typed && e.audience !== "ov" ? 10 : MAX_SKEW_SECONDS;
+    const typed = "audience" in e, skew = typed && e.audience === "holonet" ? 30 : typed && e.audience !== "ov" ? 10 : MAX_SKEW_SECONDS;
     if (typed) {
       // jose parses JSON after signature verification; reject duplicate names first as well.
       try {
-        for (const part of token.split(".").slice(0, 2)) {
+        if (e.audience === "holonet" && (Buffer.byteLength(token) > 8192 ||
+          Buffer.from(token.split(".")[1] ?? "", "base64url").length > 4096 ||
+          Buffer.from(token.split(".")[0] ?? "", "base64url").length > 2048)) throw new Error();
+        for (const [index, part] of token.split(".").slice(0, 2).entries()) {
           const bytes = Buffer.from(part, "base64url");
-          if (bytes.toString("base64url") !== part || !json(bytes)) throw new Error();
+          if (bytes.toString("base64url") !== part || !json(bytes, e.audience === "holonet" && index === 1)) throw new Error();
         }
       } catch { throw refusal("token_invalid"); }
     }
@@ -242,6 +262,8 @@ export class SessionCredentials {
         Object.hasOwn(header, "b64")) throw refusal("token_invalid");
       if (e.audience === "ha" ? /[\x00-\x1f\x7f]/.test(header.kid) :
         Object.keys(header).some(k => !["alg", "kid", "typ"].includes(k))) throw refusal("token_invalid");
+      if (e.audience === "holonet" && header.typ !== undefined &&
+        (typeof header.typ !== "string" || Buffer.byteLength(header.typ) > 32)) throw refusal("token_invalid");
       if (e.audience === "ov" && (!/^[A-Za-z0-9_.-]{1,128}$/.test(header.kid) ||
         (header.typ !== undefined && !["JWT", "at+jwt"].includes(header.typ)))) throw refusal("token_invalid");
     }
@@ -250,6 +272,8 @@ export class SessionCredentials {
       ({ payload: c } = await jwtVerify(token, createLocalJWKSet({ keys }), { algorithms: ["RS256"], issuer: e.issuer,
         clockTolerance: skew, currentDate: new Date(now) }));
     } catch { throw refusal("token_invalid"); }
+    if (typed && e.audience === "holonet" && (typeof c.sub !== "string" || c.sub.length < 1 || c.sub.length > 128 || /[^\x21-\x7e]/.test(c.sub) ||
+      (c.nbf !== undefined && (!integer(c.nbf) || !integer(c.iat) || c.nbf < c.iat)))) throw refusal("token_claims_invalid");
     if (typed && e.audience === "ov" && Object.keys(c).length > 32) throw refusal("token_claims_invalid");
     const aud = !typed && Array.isArray(c.aud) && c.aud.length === 1 ? c.aud[0] : c.aud;
     if (aud !== e.resource || typeof c.sub !== "string" || !c.sub || (typed && e.audience === "ov" ? [...c.sub].length : c.sub.length) > 256) throw refusal("token_claims_invalid");

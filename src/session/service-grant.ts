@@ -5,15 +5,21 @@ import type { TokenGrant } from "../access/issuer.ts";
 
 export type LegacyServiceGrant = Pick<TokenGrant, "audience" | "grants">;
 export type HaScope = "ha.read" | "ha.control" | "ha.read ha.control" | "ha.control ha.read";
+export interface HolonetGrant {
+  audience: "holonet"; scope: "holonet.read"; holonet_server: string; holonet_libraries: string[];
+  holonet_catalog_users: string[]; holonet_history_users: []; holonet_target_users: [];
+  holonet_actions: ["catalog.read"]; holonet_namespace: string;
+}
 export type NewServiceGrant =
+  | HolonetGrant
   | { audience: "ov"; scope: "ov.read"; ov_namespaces: string[] }
   | { audience: "homelab"; scope: "homelab.read"; homelab_services: string[]; homelab_hosts: string[] }
   | { audience: "ha"; scope: HaScope; ha_entities: string[]; ha_actions: Array<"state.read" | "light.control" | "switch.control"> };
 export type SessionServiceGrant = LegacyServiceGrant | NewServiceGrant;
-export const SERVICE_AUDIENCES = ["jocasta", "ov", "homelab", "ha"] as const;
+export const SERVICE_AUDIENCES = ["jocasta", "ov", "homelab", "ha", "holonet"] as const;
 export type ServiceAudience = typeof SERVICE_AUDIENCES[number];
-export const RESOURCES = { ov: "https://ov.mcp.ryzhkov.dev/mcp", homelab: "https://homelab.mcp.ryzhkov.dev/mcp", ha: "https://ha.mcp.ryzhkov.dev/mcp" } as const;
-const FIELDS = { ov: ["ov_namespaces"], homelab: ["homelab_services", "homelab_hosts"], ha: ["ha_entities", "ha_actions"] } as const;
+export const RESOURCES = { holonet: "https://media.mcp.ryzhkov.dev/mcp", ov: "https://ov.mcp.ryzhkov.dev/mcp", homelab: "https://homelab.mcp.ryzhkov.dev/mcp", ha: "https://ha.mcp.ryzhkov.dev/mcp" } as const;
+const FIELDS = { holonet: ["holonet_server", "holonet_libraries", "holonet_catalog_users", "holonet_history_users", "holonet_target_users", "holonet_actions", "holonet_namespace"], ov: ["ov_namespaces"], homelab: ["homelab_services", "homelab_hosts"], ha: ["ha_entities", "ha_actions"] } as const;
 const HA_SCOPES: readonly string[] = ["ha.read", "ha.control", "ha.read ha.control", "ha.control ha.read"];
 export const READ_ONLY_ACTIONS: readonly string[] = ["get", "history", "list", "search"];
 export function isNew(s: SessionServiceGrant): s is NewServiceGrant { return !("grants" in s); }
@@ -39,6 +45,19 @@ export function parseServiceGrant(value: unknown): SessionServiceGrant {
     return { audience: s.audience, grants: structuredClone(s.grants) };
   }
   exact(s, grantKeys(s.audience));
+  if (s.audience === "holonet") {
+    const hex = (v: unknown): v is string => typeof v === "string" && v.length === 32 && !/[^0-9a-f]/.test(v);
+    requireAccess(s.scope === "holonet.read" && hex(s.holonet_server) &&
+      typeof s.holonet_namespace === "string" && s.holonet_namespace.length <= 32 &&
+      /^[a-z]/.test(s.holonet_namespace) && !/[^a-z0-9-]/.test(s.holonet_namespace), "invalid_service_scope");
+    const libraries = list(s.holonet_libraries, 1, 1, v => /^[1-9][0-9]{0,18}$/.test(v) && BigInt(v) <= 9223372036854775807n && BigInt(v).toString() === v);
+    const users = list(s.holonet_catalog_users, 1, 1, hex);
+    list(s.holonet_history_users, 0, 0, hex); list(s.holonet_target_users, 0, 0, hex);
+    list(s.holonet_actions, 1, 1, v => v === "catalog.read");
+    return { audience: "holonet", scope: "holonet.read", holonet_server: s.holonet_server,
+      holonet_libraries: libraries, holonet_catalog_users: users, holonet_history_users: [], holonet_target_users: [],
+      holonet_actions: ["catalog.read"], holonet_namespace: s.holonet_namespace };
+  }
   if (s.audience === "ov") {
     requireAccess(s.scope === "ov.read", "invalid_service_scope");
     const roots = list(s.ov_namespaces, 1, 16, root);
@@ -68,6 +87,7 @@ export function serviceSubset(s: SessionServiceGrant, c: SessionServiceGrant): b
   if (s.audience !== c.audience || isNew(s) !== isNew(c)) return false;
   if (!isNew(s) && !isNew(c)) return subset(s.grants, c.grants);
   if (!isNew(s) || !isNew(c)) return false;
+  if (s.audience === "holonet" && c.audience === "holonet") return isDeepStrictEqual(s, c);
   if (s.audience === "ov" && c.audience === "ov") return s.ov_namespaces.every(r => c.ov_namespaces.some(o => contains(o, r)));
   const included = (a: string[], b: string[]) => a.every(v => b.includes(v));
   if (s.audience === "homelab" && c.audience === "homelab")
@@ -91,6 +111,13 @@ export function narrowing(next: RunAdmission, old: RunAdmission): boolean {
 }
 /** Signed arrays equal the full admitted grant, including order. Never intersect or sort. */
 export function claimsEqual(c: Record<string, unknown>, service: NewServiceGrant): boolean {
+  // Match the server's canonical claim-key boundary, including Unicode simple-fold aliases.
+  if (service.audience === "holonet") {
+    const canonical = ["iss", "aud", "sub", "iat", "exp", "nbf", "scope", ...FIELDS.holonet];
+    const fold = (key: string) => key.toLowerCase().replaceAll("\u017f", "s");
+    if (Object.keys(c).some(key => canonical.some(k => key !== k && fold(key) === k) ||
+      (fold(key).startsWith("holonet_") && !(FIELDS.holonet as readonly string[]).includes(key)))) return false;
+  }
   const own = FIELDS[service.audience];
   const foreign = ["jocasta_projects", "grants", "project", "source", ...Object.values(FIELDS).flat().filter(k => !(own as readonly string[]).includes(k))];
   if (foreign.some(k => Object.hasOwn(c, k))) return false;
