@@ -4,11 +4,13 @@ import { createServer } from "node:http";
 import { createServer as reserve } from "node:net";
 import { once } from "node:events";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { broker } from "./broker.ts";
 import { run } from "../../src/davinci/service.ts";
-import { signature, BODY } from "../../src/davinci/protocol.ts";
+import { WorkerJournal } from "../../src/davinci/store.ts";
+import { signature, BODY, definition } from "../../src/davinci/protocol.ts";
 import { presetHash, loadSessionPolicy } from "../../src/session/policy.ts";
 import { scratchDir } from "../helpers/scratch.ts";
 import type { SessionStatus } from "../../src/session/lifecycle.ts";
@@ -75,10 +77,22 @@ test("production loops survive broker outage and worker/coordinator reopen; one 
       const r=await call("POST","/webhook",BODY);if(r.status!==202)return null;return (await r.json() as {id:string}).id;
     });
     await until("one uncertain native start",async()=>starts===1?true:null);
-    ws.abort();await wr; // worker journal survives, native session still parked
+    cs.abort();await cr;ws.abort();await wr; // native session still parked
+    const journal=new WorkerJournal(worker.database,definition(d));
+    const saved=journal.status(id);journal.close();
+    assert.ok(saved.result);
     await bus.restart();
+    // Both discard-new streams have capacity one and are full. Neither side may
+    // let its rejected output publish prevent consuming the input that drains it.
+    assert.equal(await bus.inspect("command",JSON.stringify(saved.assignment)),1);
+    assert.equal(await bus.inspect("result",JSON.stringify(saved.result)),1);
+    cs=new AbortController();cr=run(cp,cs.signal);cr.catch(e=>errors.push(e));
+    await until("coordinator reads while assignment stream full",async()=>{
+      const r=await call("GET","/jobs/"+id);if(r.status!==200)return null;
+      const x=await r.json() as {result:unknown};return x.result?true:null;
+    });
+    assert.equal(await bus.inspect("command"),1);
     ws=new AbortController();wr=run(wp,ws.signal);wr.catch(e=>errors.push(e));
-    cs.abort();await cr;cs=new AbortController();cr=run(cp,cs.signal);cr.catch(e=>errors.push(e));
     await until("recovered parked observation",async()=>{
       const r=await call("GET","/jobs/"+id);if(r.status!==200)return null;
       const x=await r.json() as {result:{status:SessionStatus|null}|null};
@@ -93,9 +107,16 @@ test("production loops survive broker outage and worker/coordinator reopen; one 
       return x.result?.closed?x:null;
     });
     assert.equal(final.result!.status.result,"Done.");assert.equal(starts,1);assert.ok(lookups>=2);
+    await until("application custody receipt committed at worker",async()=>{
+      const db=new DatabaseSync(worker.database,{readOnly:true});
+      try {
+        const row=db.prepare("SELECT seq,confirmed_seq FROM work WHERE id=?").get(id)!;
+        return row.seq===row.confirmed_seq?true:null;
+      } finally {db.close();}
+    });
     assert.deepEqual(errors,[]);
     writeFileSync("davinci-runtime.json",JSON.stringify({passed:true,proof:"production-loops-with-admission-fixture",
-      id,starts,lookups,brokerRestart:true,workerRestart:true,coordinatorRestart:true,result:final.result})+"\n");
+      id,starts,lookups,brokerRestart:true,workerRestart:true,coordinatorRestart:true,bothStreamsFull:true,applicationReceipt:true,result:final.result})+"\n");
   } catch(error) {
     assert.deepEqual(errors,[],"service startup/cycle failure");throw error;
   } finally {

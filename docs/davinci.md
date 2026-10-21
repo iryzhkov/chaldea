@@ -25,7 +25,9 @@ the original read-only lookup finds its session.
 
 Schedule and webhook work use the same assignment path, one fixed worker and stable request
 IDs. Each side commits ownership before its next effect. Broker PubAck is transport custody,
-not application success. Result ACK follows coordinator journal commit. Monotone observation
+not application success. A bound monotone result receipt travels back on the assignment subject
+after coordinator journal commit. Worker terminal pruning requires that application receipt;
+transport PubAck alone is insufficient. Result ACK follows coordinator journal commit and receipt publication. Monotone observation
 sequences prevent reordered results replacing newer state. Results buffer locally during
 broker outage. Admission owns native continuations, children, questions, quota pauses and
 occupancy. Da Vinci copies those status/outcome fields without treating a completed provider
@@ -34,11 +36,15 @@ turn as completion, answering approvals or moving uncertain work.
 Private IPC adds only chaldea_session_lookup with the existing exact input
 {threadId,requestId,preset}. It reads the matching durable request even after replay age,
 returning status or null without admission or an active preset. Changed payloads conflict.
-Past the assignment deadline the worker only observes.
+Past the assignment deadline the worker only observes, including an assignment first delivered
+after outage. It records that delivery, looks up the original request without admission and
+returns expired only when it has no prior ambiguous attempt and no native session. Fresh clock
+checks after lookup and immediately before admission prevent an awaited read crossing the deadline.
 
 Journals have a local flock owner, SQLite WAL/FULL, 512 rows and a 31 MiB database-page bound.
 Each cycle checkpoints WAL; refused checkpoints defer effects. No NFS journal. Closed rows
-retain 14 days; active/uncertain ownership never expires or yields capacity. Full storage
+retain 14 days from closure; workers retain terminal outcomes until the coordinator application
+custody receipt is committed as well. Active/uncertain ownership never expires or yields capacity. Full storage
 refuses new work. Original admission time stays in webhook delivery IDs, so re-signing a
 pruned old identity cannot create a fresh admission. Clock rollback refuses mutation.
 

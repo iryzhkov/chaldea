@@ -42,6 +42,14 @@ export function decodeAssignment(bytes: string, d: Definition): Assignment {
     a.expires===Number(a.at)+WINDOW && a.requestId===a.at+":davinci-"+a.id, "davinci_assignment_binding");
   return {version:1,id:String(a.id),definition:String(a.definition),at:Number(a.at),expires:Number(a.expires),requestId:String(a.requestId)};
 }
+export interface ResultReceipt { version:1; kind:"result-receipt"; id:string; hash:string; seq:number }
+export function decodeReceipt(bytes: string): ResultReceipt {
+  check(Buffer.byteLength(bytes)<=512,"davinci_receipt_size");
+  const r=object(JSON.parse(bytes),["version","kind","id","hash","seq"]);
+  check(r.version===1 && r.kind==="result-receipt" && /^[a-f0-9]{64}$/.test(field(r.id)) &&
+    /^[a-f0-9]{64}$/.test(field(r.hash)) && Number.isSafeInteger(r.seq) && Number(r.seq)>0,"davinci_receipt");
+  return r as unknown as ResultReceipt;
+}
 export function decodeResult(bytes: string): Result {
   check(Buffer.byteLength(bytes)<=16384, "davinci_result_size");
   const r=object(JSON.parse(bytes), ["version","id","hash","seq","closed","status","disposition"]);

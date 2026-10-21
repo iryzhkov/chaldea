@@ -84,16 +84,19 @@ export async function run(file: string,signal?: AbortSignal): Promise<void> {
         // Local T3 observation/recovery does not wait for a broker connection.
         if(worker)for(const row of store.active())await worker.recover(row.id,Date.now());
         nc=await connection(c.broker);
-        if(store instanceof Coordinator) {
-          for(const row of store.active().filter(r=>!r.result).slice(0,8))
-            await publish(nc,c.broker,c.mapping,Buffer.from(row.assignment),randomUUID());
-        } else {
-          for(const row of store.rows().filter(r=>r.result && now-r.sent_at>=30_000)
-            .sort((a,b)=>a.sent_at-b.sent_at).slice(0,8)) {
-            await publish(nc,c.broker,c.mapping,Buffer.from(row.result!),randomUUID(),true);
-            store.db.prepare("UPDATE work SET sent_at=? WHERE id=? AND seq=?").run(now,row.id,row.seq);
+        // Output pressure must not prevent input consumption needed to drain it.
+        try {
+          if(store instanceof Coordinator) {
+            for(const row of store.active().filter(r=>!r.result).slice(0,1))
+              await publish(nc,c.broker,c.mapping,Buffer.from(row.assignment),randomUUID());
+          } else {
+            for(const row of store.rows().filter(r=>r.result && r.confirmed_seq<r.seq && now-r.sent_at>=30_000)
+              .sort((a,b)=>a.sent_at-b.sent_at).slice(0,1)) {
+              await publish(nc,c.broker,c.mapping,Buffer.from(row.result!),randomUUID(),true);
+              store.db.prepare("UPDATE work SET sent_at=? WHERE id=? AND seq=?").run(now,row.id,row.seq);
+            }
           }
-        }
+        } catch {report("davinci_publication_retained");}
         const receipt=store instanceof Coordinator;
         const m=await pull(nc,c.broker,c.mapping,stop.signal,receipt);
         if(m) {
@@ -101,11 +104,18 @@ export async function run(file: string,signal?: AbortSignal): Promise<void> {
           try {
             check(m.subject===(receipt?c.mapping.receiptSubject:c.mapping.commandSubject),"davinci_subject");
             const bytes=new TextDecoder("utf-8",{fatal:true}).decode(m.data);
-            if(store instanceof Coordinator)store.result(bytes);
-            else {
+            if(store instanceof Coordinator) {
+              const receipt=store.result(bytes);
+              // Application custody receipt follows durable coordinator commit.
+              // Failed publication leaves the result unacked for replay.
+              await publish(nc,c.broker,c.mapping,Buffer.from(JSON.stringify(receipt)),randomUUID());
+            } else {
               fresh(); // revoked/rebound configuration cannot authorize intake
-              const row=(store as WorkerJournal).accept(bytes,Date.now());
-              await worker!.recover(row.id,Date.now());
+              if(JSON.parse(bytes).kind==="result-receipt") (store as WorkerJournal).confirm(bytes);
+              else {
+                const row=(store as WorkerJournal).accept(bytes,Date.now());
+                await worker!.recover(row.id,Date.now());
+              }
             }
             committed=true;
           } catch {report("davinci_delivery_retained");}

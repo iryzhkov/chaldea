@@ -118,6 +118,45 @@ test("result sequence ignores reorder, conflicts reject, finite capacity protect
     assert.throws(()=>s.accept(JSON.stringify(assignment(d,"fresh",at+RETENTION+1)),at+RETENTION+1),/worker_busy|capacity/);
   } finally {s.close();c.close();dir.remove();}
 });
+
+test("lookup completing across admission deadline never starts; expired first delivery clears overlap",async()=>{
+  const dir=scratchDir("davinci-deadline-boundary"),d=def(),c=new Coordinator(join(dir.path,"c.sqlite"),d),
+    s=new WorkerJournal(join(dir.path,"w.sqlite"),d);
+  let clock=at+WINDOW-1,starts=0;
+  try {
+    const a=c.tick(at)!;s.accept(JSON.stringify(a),clock);
+    const w=new Worker(s,"caller",{lookup:async()=>{clock=at+WINDOW+1;return null;},
+      status:async()=>{throw Error("absent");},start:async()=>{starts++;return status(a.requestId);}},()=>{},()=>clock);
+    const expired=await w.recover(a.id,at+WINDOW-1);
+    assert.equal(expired.disposition,"expired");assert.equal(starts,0);
+    c.result(JSON.stringify(expired),clock);
+    assert.ok(c.tick(at+86400000),"deadline produces a committed outcome and permits next occurrence");
+    const later=new WorkerJournal(join(dir.path,"late.sqlite"),d);
+    try {
+      later.accept(JSON.stringify(a),at+WINDOW+10);
+      const never=new Worker(later,"caller",{lookup:async()=>null,status:async()=>status(a.requestId),
+        start:async()=>{starts++;return status(a.requestId);}},()=>{throw Error("must not qualify expired work");},()=>at+WINDOW+10);
+      assert.equal((await never.recover(a.id,at+WINDOW+10)).disposition,"expired");
+      assert.equal(starts,0);
+    } finally {later.close();}
+  } finally {s.close();c.close();dir.remove();}
+});
+test("late terminal results retain closure-age window and never prune before coordinator custody receipt",()=>{
+  const dir=scratchDir("davinci-terminal-custody"),d=def(),c=new Coordinator(join(dir.path,"c.sqlite"),d),
+    s=new WorkerJournal(join(dir.path,"w.sqlite"),d);
+  try {
+    const a=c.tick(at)!;s.accept(JSON.stringify(a),at);
+    const closedAt=at+RETENTION+1000;
+    const result=s.observe(a.id,status(a.requestId,true),"session",closedAt);
+    s.maintain(closedAt+1);assert.ok(s.get(a.id),"old occurrence does not delete newly obtained result");
+    s.maintain(closedAt+RETENTION+1);assert.ok(s.get(a.id),"unconfirmed terminal custody is protected even when old");
+    const receipt=c.result(JSON.stringify(result),closedAt);
+    assert.throws(()=>s.confirm(JSON.stringify({...receipt,hash:"0".repeat(64)})),/receipt_binding/);
+    s.confirm(JSON.stringify(receipt));s.confirm(JSON.stringify(receipt));
+    s.maintain(closedAt+RETENTION+2);assert.equal(s.get(a.id),undefined);
+  } finally {s.close();c.close();dir.remove();}
+});
+
 test("signed ingress supports rotation, read-only status and disabled intake; route is authenticated",async()=>{
   const dir=scratchDir("davinci-http"),d=def(),c=new Coordinator(join(dir.path,"c.sqlite"),{...d,notBefore:at-86400000});
   const old=randomBytes(32),current=randomBytes(32);

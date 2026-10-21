@@ -51,7 +51,7 @@ export async function broker(root: string,runtime=false) {
   const admin = await start(), manager = await jetstreamManager(admin);
   for (const kind of ["command","result"] as const) {
     await manager.streams.add({ name: STREAM[kind], subjects:[SUBJECT[kind]], storage:StorageType.File,
-      retention:RetentionPolicy.Workqueue, discard:DiscardPolicy.New, max_bytes:1024*1024,max_msgs:32,
+      retention:RetentionPolicy.Workqueue, discard:DiscardPolicy.New, max_bytes:1024*1024,max_msgs:runtime?1:32,
       max_msg_size:8192,max_age:3600e9,max_consumers:1,num_replicas:1,duplicate_window:1e9 });
     await manager.consumers.add(STREAM[kind], { durable_name:CONSUMER[kind],filter_subject:SUBJECT[kind],
       ack_policy:AckPolicy.Explicit,ack_wait:300e6,max_deliver:8,max_ack_pending:1,max_waiting:2,max_batch:1,max_expires:1e9 });
@@ -81,7 +81,14 @@ export async function broker(root: string,runtime=false) {
     assert.ok(reply && reply.startsWith("$JS.ACK."+STREAM[kind]+"."+CONSUMER[kind]+"."));
     nc.publish(reply,"+ACK");await nc.flush();
   }
-  return {client,publish,take,ack,runtimeConfig(who:keyof typeof keys) {
+  async function inspect(kind:Kind,bytes?:string) {
+    const nc=await connect({servers:url,user:"fixture-admin",pass:"synthetic-only",reconnect:false});
+    try {
+      if(bytes!==undefined)await publish(nc,kind,bytes);
+      return (await (await jetstreamManager(nc)).streams.info(STREAM[kind])).state.messages;
+    } finally {await nc.close();}
+  }
+  return {client,publish,take,ack,inspect,runtimeConfig(who:keyof typeof keys) {
     const seedFile=join(root,who+".seed");
     writeFileSync(seedFile,keys[who].getSeed(),{mode:0o600});
     return {broker:{url:url+"/",account:"DAVINCI",seedFile,publicKey:keys[who].getPublicKey(),

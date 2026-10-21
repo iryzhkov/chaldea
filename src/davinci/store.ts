@@ -4,26 +4,27 @@ import { dirname } from "node:path";
 import { openDb, tx, meta } from "../store/sqlite.ts";
 import { ownDatabase } from "../wake/owner.ts";
 import { requireMessage as check } from "../message.ts";
-import { assignment, assignmentHash, binding, decodeAssignment, decodeResult, BODY, WINDOW, RETENTION,
-  type Assignment, type Definition, type Result } from "./protocol.ts";
+import { assignment, assignmentHash, binding, decodeAssignment, decodeResult, decodeReceipt, BODY, WINDOW, RETENTION,
+  type Assignment, type Definition, type Result, type ResultReceipt } from "./protocol.ts";
 
 export interface Row {
   id: string; at: number; assignment: string; session: string | null; attempted: number;
-  result: string | null; seq: number; closed: number; sent_at: number;
+  result: string | null; seq: number; closed: number; sent_at: number; closed_at: number | null; confirmed_seq: number;
 }
 export class Journal {
   readonly db!: ReturnType<typeof openDb>;
   readonly definition: Definition;
   private readonly release: () => void;
+  private readonly role: "coordinator" | "worker";
   constructor(path: string, role: "coordinator" | "worker", d: Definition) {
     mkdirSync(dirname(path),{recursive:true,mode:0o700});
     this.release=ownDatabase(path);
-    this.definition=d;
+    this.definition=d;this.role=role;
     try {
       this.db=openDb(path,"PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA max_page_count=7936; PRAGMA journal_size_limit=0");
       chmodSync(path,0o600);
       this.db.exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)");
-      this.db.exec("CREATE TABLE IF NOT EXISTS work(id TEXT PRIMARY KEY,at INTEGER NOT NULL,assignment TEXT NOT NULL,session TEXT,attempted INTEGER NOT NULL DEFAULT 0,result TEXT,seq INTEGER NOT NULL DEFAULT 0,closed INTEGER NOT NULL DEFAULT 0,sent_at INTEGER NOT NULL DEFAULT 0)");
+      this.db.exec("CREATE TABLE IF NOT EXISTS work(id TEXT PRIMARY KEY,at INTEGER NOT NULL,assignment TEXT NOT NULL,session TEXT,attempted INTEGER NOT NULL DEFAULT 0,result TEXT,seq INTEGER NOT NULL DEFAULT 0,closed INTEGER NOT NULL DEFAULT 0,sent_at INTEGER NOT NULL DEFAULT 0,closed_at INTEGER,confirmed_seq INTEGER NOT NULL DEFAULT 0)");
       tx(this.db,()=>{
         const m=meta(this.db,"meta","key"), value=role+"\n"+binding(d);
         check(m.get("binding")===undefined || m.get("binding")===value,"davinci_journal_binding");
@@ -45,7 +46,8 @@ export class Journal {
     const m=meta(this.db,"meta","key"), old=Number(m.get("clock")??0);
     check(now>=old,"davinci_clock_rollback"); m.put("clock",String(now));
     // Never evict active/uncertain ownership; admission refuses when full.
-    this.db.prepare("DELETE FROM work WHERE closed=1 AND at<?").run(now-RETENTION);
+    this.db.prepare("DELETE FROM work WHERE closed=1 AND closed_at<? AND (?=1 OR confirmed_seq>=seq)")
+      .run(now-RETENTION,Number(this.role==="coordinator"));
   }
   protected insert(a: Assignment): Row {
     check(Number(this.db.prepare("SELECT count(*) AS n FROM work").get()!.n)<512,"davinci_capacity");
@@ -97,17 +99,19 @@ export class Coordinator extends Journal {
     });
   }
   scheduleStatus() { const m=meta(this.db,"meta","key");return {cursor:m.get("cursor")??null,lastSkip:m.get("lastSkip")??null}; }
-  result(bytes: string): void {
+  result(bytes: string,now=Date.now()): ResultReceipt {
     const r=decodeResult(bytes),row=this.get(r.id);check(row,"davinci_unknown_result");
     const a=JSON.parse(row.assignment) as Assignment;
     check(r.hash===assignmentHash(a),"davinci_result_binding");
     if(r.status)check(r.status.requestId===a.requestId && r.status.preset===this.definition.preset &&
       (!row.session || row.session===r.status.sessionId),"davinci_session_binding");
-    if(r.seq<row.seq)return; // stale/reordered observation
-    if(r.seq===row.seq) {check(row.result===bytes,"davinci_result_conflict");return;}
+    const receipt:ResultReceipt={version:1,kind:"result-receipt",id:r.id,hash:r.hash,seq:r.seq};
+    if(r.seq<row.seq)return receipt; // stale/reordered observation
+    if(r.seq===row.seq) {check(row.result===bytes,"davinci_result_conflict");return receipt;}
     check(!row.closed,"davinci_terminal_result_changed");
-    this.db.prepare("UPDATE work SET result=?,seq=?,closed=?,session=?,sent_at=0 WHERE id=?")
-      .run(bytes,r.seq,Number(r.closed),r.status?.sessionId??null,r.id);
+    this.db.prepare("UPDATE work SET result=?,seq=?,closed=?,session=?,sent_at=0,closed_at=? WHERE id=?")
+      .run(bytes,r.seq,Number(r.closed),r.status?.sessionId??null,r.closed?now:null,r.id);
+    return receipt;
   }
 }
 export class WorkerJournal extends Journal {
@@ -118,13 +122,18 @@ export class WorkerJournal extends Journal {
       this.clock(now);
       const old=this.get(a.id);
       if(old) {check(old.assignment===JSON.stringify(a),"davinci_assignment_conflict");return old;}
-      check(a.at<=now+30_000 && now<a.expires,"davinci_assignment_expired");
+      check(a.at<=now+30_000,"davinci_assignment_future");
       check(this.active().length===0,"davinci_worker_busy");
       return this.insert(a);
     });
   }
   attempted(id: string): void { this.db.prepare("UPDATE work SET attempted=1 WHERE id=?").run(id); }
-  observe(id: string,status: Result["status"],disposition: Result["disposition"]): Result {
+  confirm(bytes: string): void {
+    const r=decodeReceipt(bytes),row=this.get(r.id);check(row,"davinci_unknown_receipt");
+    check(r.hash===assignmentHash(JSON.parse(row.assignment) as Assignment) && r.seq<=row.seq,"davinci_receipt_binding");
+    this.db.prepare("UPDATE work SET confirmed_seq=max(confirmed_seq,?) WHERE id=?").run(r.seq,r.id);
+  }
+  observe(id: string,status: Result["status"],disposition: Result["disposition"],now=Date.now()): Result {
     const row=this.get(id);check(row,"davinci_unknown_job");
     const a=JSON.parse(row.assignment) as Assignment;
     if(status)check(status.requestId===a.requestId && status.preset===this.definition.preset &&
@@ -135,8 +144,8 @@ export class WorkerJournal extends Journal {
     if(previous && JSON.stringify({...r,seq:0})===JSON.stringify({...previous,seq:0}))return previous;
     check(!row.closed,"davinci_closed");
     const bytes=JSON.stringify(r);decodeResult(bytes);
-    this.db.prepare("UPDATE work SET result=?,seq=?,closed=?,session=?,sent_at=0 WHERE id=?")
-      .run(bytes,r.seq,Number(r.closed),status?.sessionId??row.session,id);
+    this.db.prepare("UPDATE work SET result=?,seq=?,closed=?,session=?,sent_at=0,closed_at=? WHERE id=?")
+      .run(bytes,r.seq,Number(r.closed),status?.sessionId??row.session,r.closed?now:null,id);
     return r;
   }
 }

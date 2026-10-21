@@ -12,8 +12,9 @@ export class Worker {
   private readonly caller: string;
   private readonly admission: Admission;
   private readonly qualify: () => void;
-  constructor(store: WorkerJournal,caller: string,admission: Admission,qualify: () => void) {
-    this.store=store;this.caller=caller;this.admission=admission;this.qualify=qualify;
+  private readonly clock: () => number;
+  constructor(store: WorkerJournal,caller: string,admission: Admission,qualify: () => void,clock:()=>number=Date.now) {
+    this.store=store;this.caller=caller;this.admission=admission;this.qualify=qualify;this.clock=clock;
   }
   async recover(id: string,now: number): Promise<Result> {
     const row=this.store.get(id)!;
@@ -24,18 +25,22 @@ export class Worker {
       // Lookup is read-only: an expired lost answer must never become a new admission.
       let status=row.session ? await this.admission.status(row.session) : await this.admission.lookup(input);
       if(!status) {
-        if(now>=a.expires)return this.store.observe(id,null,row.attempted?"uncertain":"expired");
+        const expired=()=>Math.max(now,this.clock())>=a.expires;
+        const deadline=()=>this.store.observe(id,null,row.attempted?"uncertain":"expired",Math.max(now,this.clock()));
+        if(expired())return deadline();
         this.qualify(); // current protected preset/pin, immediately before every admission
+        if(expired())return deadline();
         this.store.attempted(id);
+        if(expired())return deadline(); // durable intent write may itself cross the boundary
         status=await this.admission.start(input);
       }
-      return this.store.observe(id,status,"session");
+      return this.store.observe(id,status,"session",Math.max(now,this.clock()));
     } catch {
       // Includes storage/RPC/authority failure after a possibly committed effect.
       // Do not claim failure, free the slot, or move the assignment elsewhere.
       const current=this.store.get(id)!;
       if(current.session && current.result)return JSON.parse(current.result) as Result;
-      return this.store.observe(id,null,"uncertain");
+      return this.store.observe(id,null,"uncertain",Math.max(now,this.clock()));
     }
   }
 }
