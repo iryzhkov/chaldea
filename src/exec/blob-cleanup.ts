@@ -30,8 +30,11 @@ function requestSize(method: string, bucket: string, path: string, query: Record
 // Deliberately restricted S3 XML, with no DTD, comments, CDATA, attributes on
 // members, mixed content or namespace aliases. Unknown fields refuse below.
 function xml(bytes: Buffer, rootName: string): Node {
-  const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-    .replace(/^<\?xml version="1.0"(?: encoding="UTF-8")?\?>\s*/, '').trim();
+  const decoded = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  // XML 1.0 Char and S productions, before normalization can hide invalid input.
+  if (/[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\u{10000}-\u{10ffff}]/u.test(decoded)) fail('xml');
+  const source = decoded.replace(/^<\?xml version="1.0"(?: encoding="UTF-8")?\?>[ \t\r\n]*/, '')
+    .replace(/^[ \t\r\n]+|[ \t\r\n]+$/g, '');
   const stack: Node[] = [], roots: Node[] = [];
   for (const token of source.match(/<[^>]*>|[^<]+/g) ?? []) {
     if (token.startsWith('</')) {
@@ -44,14 +47,14 @@ function xml(bytes: Buffer, rootName: string): Node {
       (stack.length ? stack[stack.length - 1]!.children : roots).push(node);
       if (!match![2]) stack.push(node);
     } else {
-      if (!stack.length) { if (token.trim()) fail('xml'); continue; }
+      if (!stack.length) { if (/[^ \t\r\n]/.test(token)) fail('xml'); continue; }
       stack[stack.length - 1]!.text += token;
     }
   }
   if (stack.length || roots.length !== 1 || roots[0]!.name !== rootName || source.includes('<!') ||
       source.includes('<?') || !source.endsWith('</' + rootName + '>')) fail('xml');
   function validate(node: Node) {
-    if (node.text.includes(']]>') || (node.children.length && node.text.trim()) ||
+    if (node.text.includes(']]>') || (node.children.length && /[^ \t\r\n]/.test(node.text)) ||
         /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(node.text) ||
         /&(?!(?:amp|lt|gt|quot|apos);)/.test(node.text)) fail('xml');
     node.children.forEach(validate);
@@ -60,7 +63,7 @@ function xml(bytes: Buffer, rootName: string): Node {
   return roots[0]!;
 }
 function fields(node: Node, allowed: string[], repeated = '') {
-  if (node.text.trim()) fail('xml_mixed');
+  if (/[^ \t\r\n]/.test(node.text)) fail('xml_mixed');
   const seen = new Set<string>();
   for (const child of node.children) {
     if (!allowed.includes(child.name) || (seen.has(child.name) && child.name !== repeated)) fail('xml_field');

@@ -124,6 +124,32 @@ test('forbidden XML character-data terminator refuses before object deletion or 
   assert.equal((await cleanupBlobs(escaped.store, policy, clock)).attempted, 4);
 });
 
+test('XML 1.0 character ranges reject invalid listing text before effects and preserve valid boundaries', async () => {
+  for (const code of [0xfffe, 0xffff, 0, 1, 8, 0xb, 0xc, 0xe, 0x1f]) {
+    for (const member of ['Contents', 'Upload']) {
+      const f = fixture();
+      f.setTransform(s => s.replace('</' + member + '>',
+        '<StorageClass>' + String.fromCodePoint(code) + '</StorageClass></' + member + '>'));
+      await refuses(f, /xml/);
+    }
+  }
+  // Validate before trimming, which would otherwise hide forbidden whitespace.
+  const outside = fixture();
+  outside.setTransform(s => '\u000b' + s);
+  await refuses(outside, /xml/);
+  for (const transform of [
+    (s: string) => '\u00a0' + s,
+    (s: string) => s.replace('<Upload>', '<Upload>\u00a0'),
+  ]) {
+    const mixed = fixture(); mixed.setTransform(transform); await refuses(mixed, /xml/);
+  }
+  const legal = fixture();
+  const boundaries = [9, 10, 13, 0x20, 0xd7ff, 0xe000, 0xfffd, 0x10000, 0x10ffff];
+  legal.setTransform(s => s.replace('</Upload>',
+    '<StorageClass>' + String.fromCodePoint(...boundaries) + '</StorageClass></Upload>'));
+  assert.equal((await cleanupBlobs(legal.store, policy, clock)).attempted, 4);
+});
+
 test('duplicate rows and nonprogress continuation tokens refuse', async () => {
   const duplicate = fixture();
   duplicate.replaceObjects([{ key: objectKey, body: object(objectKey, 2) }, { key: objectKey, body: object(objectKey, 2) }]);
