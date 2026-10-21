@@ -20,7 +20,13 @@ export interface NativeRequest {
   capability: "live" | "message" | "not_resumable"; created: number;
   questions: ReadonlyArray<NativeQuestion>;
 }
+export interface ExternalWakeGuard {
+  version:1; projectId:string; lastStopCommandId:string|null; invalidationCommandId:string|null;
+}
 export interface WaitSnapshot {
+  /** Present only when the server advertises atomic admission and both histories are known. */
+  externalWakeGuard?:ExternalWakeGuard;
+  settlementOrigin?:"automatic"|"manual"|null;
   id: string; project: string; archived: boolean; deleted: boolean; settled: boolean;
   runs: WaitRun[];
   pendingRuns: Array<string | null>;
@@ -37,8 +43,12 @@ export interface WaitT3 {
   respond?(payload: string): Promise<boolean>;
 }
 const iso = (v: DateTime.Utc | null | undefined) => v == null ? null : DateTime.formatIso(v);
-export function waitSnapshot(p: OrchestrationV2ThreadProjection): WaitSnapshot {
+export function waitSnapshot(p: OrchestrationV2ThreadProjection, guardVersion?:1): WaitSnapshot {
   return {
+    ...(guardVersion===1 && p.thread.lastStopCommandId!==undefined && p.thread.externalWakeInvalidationCommandId!==undefined
+      ? {externalWakeGuard:{version:1 as const,projectId:p.thread.projectId,lastStopCommandId:p.thread.lastStopCommandId,
+          invalidationCommandId:p.thread.externalWakeInvalidationCommandId}} : {}),
+    ...(p.thread.settlementOrigin===undefined?{}:{settlementOrigin:p.thread.settlementOrigin}),
     id:p.thread.id,project:p.thread.projectId,archived:p.thread.archivedAt !== null,
     deleted:p.thread.deletedAt !== null,settled:p.thread.settledOverride === "settled",
     runs:p.runs.map(r => {
@@ -65,9 +75,9 @@ export function waitSnapshot(p: OrchestrationV2ThreadProjection): WaitSnapshot {
   };
 }
 /** A projection error alone is never evidence of deletion. */
-export function readProjection(client: WsClient, id: string) {
+export function readProjection(client: WsClient, id: string, guardVersion?:1) {
   return client["orchestration.getThreadProjection"]({threadId:id} as never).pipe(
-    Effect.map(waitSnapshot),
+    Effect.map(p=>waitSnapshot(p,guardVersion)),
     Effect.catchTag("OrchestrationV2GetThreadProjectionError", original =>
       client["orchestration.subscribeShell"]({}).pipe(Stream.take(1),Stream.runCollect,Effect.flatMap(items => {
         const first=items[0];
@@ -124,38 +134,39 @@ export function nativeProjection(client:WsClient,threadId:string,snapshot:WaitSn
 }
 export function createWaitT3(options: () => ConnectOptions, expectedEnvironment: string,
   tracked:(threadId:string)=>readonly TrackedNative[]=()=>[]): WaitT3 {
-  const checked = async (): Promise<ConnectOptions> => {
+  const checked = async () => {
     const opts = options();
-    const environment = await withClient(opts,c => c["server.getConfig"]({}).pipe(Effect.map(c => String(c.environment.environmentId))));
-    if (environment !== expectedEnvironment) throw new Error("T3 environment mismatch; work remains parked");
-    return opts;
+    const config = await withClient(opts,c => c["server.getConfig"]({}));
+    if (String(config.environment.environmentId) !== expectedEnvironment) throw new Error("T3 environment mismatch; work remains parked");
+    return {opts,guardVersion:config.externalWakeGuardVersion};
   };
   return {
     async environment() {
       await checked(); return expectedEnvironment;
     },
     async snapshot(id,nativeRequestId) {
-      return withClient(await checked(), c => readProjection(c,id).pipe(Effect.flatMap(p=>nativeProjection(c,id,p,tracked(id),nativeRequestId))));
+      const {opts,guardVersion}=await checked();
+      return withClient(opts, c => readProjection(c,id,guardVersion).pipe(Effect.flatMap(p=>nativeProjection(c,id,p,tracked(id),nativeRequestId))));
     },
     async observe(id, signal, onSnapshot) {
-      const opts = await checked();
+      const {opts,guardVersion} = await checked();
       await withClient({...opts,signal},c => c["orchestration.subscribeThread"]({
         threadId:id,requestCompletionMarker:true,
         // Control arrays retain pinned runs; timeline rows can be bounded.
       } as never).pipe(Stream.runForEach(item => {
-        if (item.kind === "snapshot") return nativeProjection(c,id,waitSnapshot(item.projection),tracked(id)).pipe(
+        if (item.kind === "snapshot") return nativeProjection(c,id,waitSnapshot(item.projection,guardVersion),tracked(id)).pipe(
           Effect.tap(p=>Effect.sync(()=>onSnapshot(p,item.snapshotSequence))),Effect.asVoid);
         if (item.kind === "event" && (/^(thread|run|subagent|runtime-request)\./.test(item.event.type) ||
           (item.event.type === "turn-item.updated" && ["error","user_input_request"].includes(item.event.payload.type))))
-          return readProjection(c,id).pipe(Effect.flatMap(p=>nativeProjection(c,id,p,tracked(id))),
+          return readProjection(c,id,guardVersion).pipe(Effect.flatMap(p=>nativeProjection(c,id,p,tracked(id))),
             Effect.tap(p => Effect.sync(() => onSnapshot(p,item.sequence))), Effect.asVoid);
         return Effect.void;
       }), Effect.catchTag("OrchestrationV2GetThreadProjectionError", () =>
-        readProjection(c,id).pipe(Effect.flatMap(p=>nativeProjection(c,id,p,tracked(id))),Effect.tap(p=>Effect.sync(()=>onSnapshot(p,0))),Effect.asVoid))));
+        readProjection(c,id,guardVersion).pipe(Effect.flatMap(p=>nativeProjection(c,id,p,tracked(id))),Effect.tap(p=>Effect.sync(()=>onSnapshot(p,0))),Effect.asVoid))));
     },
-    async respond(payload) { return respondChaldeaDecision(await checked(),payload); },
+    async respond(payload) { return respondChaldeaDecision((await checked()).opts,payload); },
     async dispatch(payload) {
-      await dispatchChaldeaWake(await checked(), payload);
+      await dispatchChaldeaWake((await checked()).opts, payload, expectedEnvironment);
     },
   };
 }

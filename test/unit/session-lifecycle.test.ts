@@ -614,6 +614,7 @@ test("result bounds: exact bytes, pointer-only wake within 4096, oversize and in
 
 test("disabled sessions leave waits and decisions unchanged and refuse starts", async () => {
   const dir = scratchDir("session-disabled"), t3 = new FakeT3();
+  t3.put({...t3.get("caller"),externalWakeGuard:{version:1,projectId:"caller-project",lastStopCommandId:null,invalidationCommandId:null}});
   const store = new WakeStore(join(dir.path, "waits.sqlite"), "env"), engine = new WaitEngine(store, t3.waits, {});
   try {
     engine.start();

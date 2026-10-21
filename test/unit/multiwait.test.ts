@@ -15,6 +15,7 @@ import { chmodSync, readFileSync, statSync, symlinkSync, writeFileSync } from "n
 
 // Capture one test epoch; explicit clock arguments stay deterministic without aging past retention.
 const now=Date.now();
+const guard={version:1 as const,projectId:"project",lastStopCommandId:null,invalidationCommandId:null};
 const iso=(n:number)=>new Date(n).toISOString();
 function fixture(){
   const dir=scratchDir("multiwait"),path=join(dir.path,"db");
@@ -24,7 +25,7 @@ function fixture(){
 }
 function add(store:WakeStore,key:string,parent="parent",target?:string){
   return store.register(store.prepare("wait",{threadId:parent,requestId:now+":"+key,
-    condition:target?{kind:"thread",threadId:target}:{kind:"time",at:iso(now+86_400_000)}},now),"project",target?"run":null,now);
+    condition:target?{kind:"thread",threadId:target}:{kind:"time",at:iso(now+86_400_000)}},now),"project",target?"run":null,now,[],null,null,guard);
 }
 test("eight active waits, retry at capacity, optional server keys and independent decision rules",()=>{
   const f=fixture();
@@ -187,7 +188,7 @@ test("decision retry keeps its own timer while a wait on the same parent is in f
   t.mock.method(Deadlines.prototype,"arm",(at:number|undefined)=>{armed.push(at);});
   const t3:WaitT3={
     async environment(){return "env";},
-    async snapshot(id){await gate.promise;return {id,project:"project",archived:false,deleted:false,settled:false,runs:[],pendingRuns:[],children:[]};},
+    async snapshot(id){await gate.promise;return {id,project:"project",archived:false,deleted:false,settled:false,runs:[],pendingRuns:[],children:[],externalWakeGuard:guard};},
     async observe(_id,signal){if(!signal.aborted)await new Promise<void>(r=>signal.addEventListener("abort",()=>r(),{once:true}));},
     async dispatch(){},
   };
@@ -222,7 +223,7 @@ test("cancellation before batching and rejection/orphan dispositions apply to ea
 });
 test("engine joins waits resolved during async preflight, serializes one thread and drains from events", {timeout:10_000},async()=>{
   const dir=scratchDir("multi-engine"),store=new WakeStore(join(dir.path,"db"),"env");
-  const snapshot=(id:string):WaitSnapshot=>({id,project:"project",archived:false,deleted:false,settled:false,runs:[],pendingRuns:[],children:[]});
+  const snapshot=(id:string):WaitSnapshot=>({id,project:"project",archived:false,deleted:false,settled:false,runs:[],pendingRuns:[],children:[],externalWakeGuard:guard});
   const gate=Promise.withResolvers<void>(),preflight=Promise.withResolvers<void>();
   const firstSend=Promise.withResolvers<void>(),release=Promise.withResolvers<void>(),done=Promise.withResolvers<void>();
   const payloads:string[]=[];let engine:WaitEngine;

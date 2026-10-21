@@ -478,10 +478,21 @@ budget and do not depend on an agent model being available.
 ## Deliberate gaps and later slices
 
 Native preparation/tracking is implemented; Chaldea\'s own inbox remains a
-provider fallback. Auto-settlement hold/restore is still omitted. A long wait
-can be automatically settled by T3; computed auto-settlement does **not**
-suppress its wake. Only explicit `settledOverride:"settled"`, archive or deletion
-parks delivery. Chaldea does not hold/restore auto-settlement preferences.
+provider fallback. Auto-settlement hold/restore is still omitted. External waits
+require a server advertising `externalWakeGuardVersion:1`, known Stop history
+and known external-wake invalidation history. Official T3 v0.1.0 does not meet
+this contract. Missing capability or history refuses new registrations.
+
+A wait may survive settlement only when the server proves its origin is
+automatic. Manual or unknown settlement, archive, deletion and cancellation
+remain terminal. Registration persists the lifecycle tokens; retries and restart
+keep them. Stop, manual settlement and archive/delete invalidate old wakes even
+after a later resume. The server checks the guard under its command lock and
+discards queued guarded wakes at explicit lifecycle boundaries. A receipt proves
+admission, not provider execution. Previously orphaned waits and registrations
+from before guard capture are never given fresh authority. Native decisions and
+sessions keep their existing settlement rules. Chaldea does not hold or restore
+auto-settlement preferences.
 
 GitHub/URL/service/feed sources, cron, scheduled sessions, LAN webhook ingress,
 cross-host waits/broker, fleet deployment remain
@@ -494,8 +505,14 @@ source-run identity T3 does not retain cannot be guessed into a pinned cohort.
 export TMPDIR="$HOME/.cache/chaldea-scratch/step5-build"
 export CHALDEA_TEST_SCRATCH="$TMPDIR"
 npm run typecheck
-CHALDEA_T3_BIN="$HOME/.t3/runtime/versions/0.1.0/t3" CHALDEA_REQUIRE_E2E=1 npm test
+CHALDEA_T3_BIN="/path/to/isolated/qualified/t3" CHALDEA_REQUIRE_E2E=1 npm test
 ```
+
+The external-wake E2E groups check refusal or skip positive delivery on official
+T3 v0.1.0, which lacks atomic admission. Positive delivery needs the qualified
+guarded build. Source-level integrated qualification uses the real engine, RPC
+adapter and orchestrator with provider execution disabled; it does not prove a
+released binary or fleet activation.
 
 Unit tests cover transaction/retry-key invariants, concurrent answer/deadline
 arbitration, the approval-labelled-default reproduction, source/self-answer

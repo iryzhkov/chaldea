@@ -673,6 +673,8 @@ export const ServerDirectEndpoint = Schema.Struct({
 export type ServerDirectEndpoint = typeof ServerDirectEndpoint.Type;
 
 export const ServerConfig = Schema.Struct({
+  /** Atomic external-wake admission and queued-wake invalidation, not just schema support. */
+  externalWakeGuardVersion: Schema.optional(Schema.Literal(1)),
   environment: ExecutionEnvironmentDescriptor,
   auth: ServerAuthDescriptor,
   cwd: TrimmedNonEmptyString,

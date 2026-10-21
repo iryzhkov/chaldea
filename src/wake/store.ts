@@ -1,5 +1,6 @@
 // Single writer, transactional journal shared by waits and decisions.
 import type { DatabaseSync } from "node:sqlite";
+import type { ExternalWakeGuard } from "../t3/waits.ts";
 import { openDb, tx, meta, migrate } from "../store/sqlite.ts";
 import { recoverOutbox } from "../store/outbox.ts";
 import { ownDatabase } from "./owner.ts";
@@ -12,6 +13,7 @@ import { sessionWake, type SessionOutcome } from "../session/result.ts";
 
 export interface Item {
   id: string; kind: "wait" | "decision" | "native" | "session"; parent: string; project: string; request_key: string; request_at: number;
+  wake_guard: string|null;
   hash: string; input: string; deadline: number; target_run: string | null; cursor: number;
   state: "parked" | "resolved" | "cancelled" | "orphaned" | "needs_attention"; disposition: string | null;
   outcome: string | null; created: number; terminal: number | null;
@@ -98,6 +100,9 @@ export class WakeStore {
         t3_project TEXT NOT NULL, payload TEXT NOT NULL, launch TEXT NOT NULL, launch_detail TEXT, root_run TEXT,
         result TEXT, result_state TEXT, result_bytes INTEGER, occupancy TEXT NOT NULL, released TEXT, released_at INTEGER);
       CREATE INDEX IF NOT EXISTS sessions_held ON sessions(occupancy,preset);`);
+    // Unknown pre-guard registrations remain unknown. Never backfill them from a later snapshot.
+    if (!(this.db.prepare("PRAGMA table_info(items)").all() as Array<{name:string}>).some(c=>c.name==="wake_guard"))
+      this.db.exec("ALTER TABLE items ADD COLUMN wake_guard TEXT");
     const env = this.meta("environment");
     if (env && env !== environment) throw new Error("Wake database belongs to another environment");
     this.db.prepare("INSERT OR IGNORE INTO meta VALUES('environment',?)").run(environment);
@@ -143,7 +148,7 @@ export class WakeStore {
     if (row && row.hash !== reg.hash) throw new Error("requestId reused with changed payload");
     return row;
   }
-  register(reg: Registration, project: string, targetRun: string | null, now = Date.now(), nativeBaseline: string[] = [], nativeQuestions:string|null=null, nativeItem:string|null=null): Item {
+  register(reg: Registration, project: string, targetRun: string | null, now = Date.now(), nativeBaseline: string[] = [], nativeQuestions:string|null=null, nativeItem:string|null=null, wakeGuard?:ExternalWakeGuard): Item {
     return this.transaction(() => {
       const existing = this.existing(reg); if (existing) return existing;
       if (reg.requestAt <= Number(this.meta("replay_fence"))) throw new Error("requestId retired by retention fence");
@@ -180,6 +185,7 @@ export class WakeStore {
       }
       this.db.prepare("INSERT INTO items(id,kind,parent,project,request_key,request_at,hash,input,deadline,target_run,state,created) VALUES(?,?,?,?,?,?,?,?,?,?,'parked',?)")
         .run(reg.id,reg.kind,reg.input.threadId,project,reg.input.requestId,reg.requestAt,reg.hash,JSON.stringify(reg.input),reg.deadline,targetRun,now);
+      if (wakeGuard) this.db.prepare("UPDATE items SET wake_guard=? WHERE id=?").run(JSON.stringify(wakeGuard),reg.id);
       if (reg.kind === "native") this.db.prepare("INSERT INTO native_decisions(item,request_id,bind_until,baseline,questions,turn_item) VALUES(?,?,?,?,?,?)")
         .run(reg.id,"runtimeRequestId" in reg.input ? reg.input.runtimeRequestId ?? null : null,
           Math.min(reg.deadline,now+10*60_000),JSON.stringify(nativeBaseline),nativeQuestions,nativeItem);
@@ -214,6 +220,7 @@ export class WakeStore {
       const text = "Chaldea wake (" + label + " " + id + "): " + summary + "\nchaldea " + label + " status " + id;
       const payload = JSON.stringify({
         type:"message.dispatch",commandId,messageId:commandId,threadId:row.parent,
+        ...(row.wake_guard===null?{}:{externalWake:JSON.parse(row.wake_guard)}),
         createdBy:"agent",creationSource:"server",attachments:[],dispatchMode:{type:"queue_after_active"},
         text,
       });
@@ -379,9 +386,9 @@ export class WakeStore {
       const item=this.get(row.item);
       if (row.channel === "wake" && item.kind === "wait" && !row.batch_id && row.attempts === 0) {
         const members=this.db.prepare(`SELECT o.* FROM outbox o JOIN items i ON i.id=o.item
-          WHERE i.kind='wait' AND i.parent=? AND i.project=? AND o.channel='wake'
+          WHERE i.kind='wait' AND i.parent=? AND i.project=? AND i.wake_guard IS ? AND o.channel='wake'
           AND o.state='pending' AND o.attempts=0 AND o.batch_id IS NULL ORDER BY o.id`)
-          .all(item.parent,item.project) as unknown as Delivery[];
+          .all(item.parent,item.project,item.wake_guard) as unknown as Delivery[];
         // Persist membership and the final wire bytes before any RPC. An attempted
         // batch is immutable, including after a lost ACK or process restart.
         let payload=row.payload;
