@@ -23,7 +23,7 @@ A pending custody record is written before dispatch. The existing client receive
 
 Publication freezes the job/principal/requested paths/actual path-size-SHA256 entries and a 14 day lifetime into the original journal before its first PUT. Objects and manifests are content addressed under v1/JOB-ID/. Every object is read back and verified, then the exact manifest is resolved and verified before custody becomes confirmed. An ambiguous reply is retried with the same frozen manifest and original UUID. Multiple manifests conflict; changed bytes are detected. The backend does not provide immutability against a writer.
 
-A publication failure prints custody pending and retains the last local files and journal. Age and cap pruning cannot evict pending custody. The existing 20 GiB per-host accounting and 1,000 journal entry admission bounds refuse new work when protected entries fill the bound. Pending publication is not retried in a background loop. After recovery:
+A publication failure prints custody pending and retains the last local files and journal. Unrecorded requested files and interrupted recovery staging block confirmation, since a dead client may have left complete or partial bytes before its journal update. Recovery preserves such staging and refuses to overwrite it; preserve and inspect these bytes with an operator before reconciliation. The client never guesses completeness or silently discards them. Age and cap pruning cannot evict pending custody. The existing 20 GiB per-host accounting and 1,000 journal entry admission bounds refuse new work when protected entries fill the bound. Pending publication is not retried in a background loop. After recovery:
 
 ```sh
 chaldea exec artifacts publish ORIGINAL-JOB-ID

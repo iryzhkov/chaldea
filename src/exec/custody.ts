@@ -50,6 +50,14 @@ export async function publishJob(state: string, id: string) {
     if (!root) throw new Error('blob_local_artifacts_missing');
     const requested = entry.requestedArtifacts ?? [];
     requested.forEach(safePath);
+    const listed = new Set(entry.artifactPaths ?? []);
+    for (const path of [join(root, '.chaldea-fetch'), ...requested.map(name => join(root, name)).filter(path => !listed.has(path))]) {
+      try { await fs.lstat(path); }
+      catch (error: any) { if (error.code === 'ENOENT') continue; throw error; }
+      // A crash may sync bytes before journaling a completed receipt. They
+      // may also be partial: never silently confirm a smaller set or guess.
+      throw new Error('blob_unreconciled_local_artifact');
+    }
     const artifacts: BlobManifest['artifacts'] = [], values = new Map<string, Buffer>();
     let total = 0;
     for (const path of entry.artifactPaths ?? []) {

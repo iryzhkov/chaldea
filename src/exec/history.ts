@@ -101,6 +101,11 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
   if (!destination || !entry.worktree) throw new Error('journal has no recovery artifact location');
   const requested = entry.requestedArtifacts ?? [];
   requested.forEach(safePath);
+  const staging = join(destination, '.chaldea-fetch');
+  if (entry.blob) {
+    try { await fs.lstat(staging); throw new Error('prior artifact recovery staging requires reconciliation'); }
+    catch (error: any) { if (error.code !== 'ENOENT') throw error; }
+  }
   await cleanLogs(state, LOG_CAP); // includes the temporary replacement log
   await cleanArtifacts(join(state, 'journal'), entry.host, MAX_ARTIFACT);
   const config = execConfig().sshConfig;
@@ -108,7 +113,7 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
   const { ssh, incoming, exit } = transport;
   const path = logPath(state, entry.jobId);
   const temporary = path + '.recovery';
-  const staging = join(destination, '.chaldea-fetch');
+  let recoveryCommitted = false;
   let log: JobLog | undefined;
   let artifact: fs.FileHandle | undefined;
   let remaining = 0, received = 0;
@@ -140,6 +145,10 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
             !Number.isFinite(meta.started) || !Number.isFinite(meta.ended) ||
             !Array.isArray(meta.artifacts) || meta.artifacts.length > requested.length) throw new Error('invalid recovery metadata');
         log = new JobLog(await fs.open(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600));
+        if (entry.blob) {
+          entry.artifactRecoveryPending = true; entry.blob.state = 'pending';
+          await record(join(state, 'journal'), entry, false);
+        }
         await artifactTarget(entry.worktree, entry.jobId, 'placeholder');
         await fs.rm(staging, { recursive: true, force: true });
         await privateDirectory(staging);
@@ -180,6 +189,7 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     }
     // Persist the recovery barrier before replacing any local file. A crash or
     // partial rename cannot leave new bytes covered by an old confirmation.
+    entry.artifactPaths = [...retained].map(name => join(destination, name));
     entry.artifactRecoveryPending = true;
     if (entry.blob) entry.blob.state = 'pending';
     await record(join(state, 'journal'), entry, false);
@@ -199,6 +209,7 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     // protect local bytes until publication verifies this recovered set too.
     if (entry.blob) entry.blob.state = 'pending';
     await record(join(state, 'journal'), entry, false);
+    recoveryCommitted = true;
     await write(summary(entry));
     for (const error of meta.artifactErrors ?? []) await write('Artifact unavailable: ' + String(error.path) + '\n');
     process.stderr.write('chaldea job ' + entry.jobId + ' log ' + path + '\n');
@@ -209,6 +220,6 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     if (artifact) await artifact.close();
     if (log) await log.close();
     await fs.unlink(temporary).catch((e: any) => { if (e.code !== 'ENOENT') throw e; });
-    if (stagingPrepared) await fs.rm(staging, { recursive: true, force: true });
+    if (stagingPrepared && (recoveryCommitted || !entry.blob)) await fs.rm(staging, { recursive: true, force: true });
   }
 }

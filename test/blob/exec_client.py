@@ -173,28 +173,68 @@ s["main"]()
     command(client_home, "artifacts", "publish", preempted["jobId"], expected=255)
     command(client_home, "fetch", preempted["jobId"])
     command(client_home, "artifacts", "publish", preempted["jobId"])
+    # Interrupted staging is never erased by a subsequent fetch/publication.
+    stage = Path(completed_recovery["artifactDir"]) / ".chaldea-fetch"
+    (stage / "out").mkdir(parents=True)
+    (stage / "out/report.txt").write_bytes(payload)
+    interrupted = json.loads(path.read_text())
+    interrupted["artifactRecoveryPending"] = True
+    interrupted["blob"]["state"] = "pending"
+    path.write_text(json.dumps(interrupted))
+    command(client_home, "fetch", preempted["jobId"], expected=255)
+    command(client_home, "artifacts", "publish", preempted["jobId"], expected=255)
+    assert (stage / "out/report.txt").read_bytes() == payload
+    # Fixture-only reconciliation: this staged duplicate equals both the
+    # confirmed object and completed local file, so its removal loses no copy.
+    assert Path(interrupted["artifactPaths"][0]).read_bytes() == payload
+    shutil.rmtree(stage)
+    command(client_home, "fetch", preempted["jobId"])
+    command(client_home, "artifacts", "publish", preempted["jobId"])
+
+    def omit_retained(identity):
+        retained_dir = base / "jobs/.retained" / identity
+        metadata_path = retained_dir / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        for artifact in metadata["artifacts"]:
+            (retained_dir / ("artifact-" + str(artifact["index"]))).unlink()
+        metadata["artifacts"] = []
+        metadata["artifactErrors"].append({"path": "out/report.txt", "reason": "unavailable regular file"})
+        metadata_path.write_text(json.dumps(metadata))
+
     # Lose X after complete artifact delivery, then fault the host's retention
     # copy. Recovery must preserve the only good completed client copy.
     lost_result = produce(7, drop_result=True)
     assert lost_result["outcome"] == "uncertain" and not lost_result["blob"].get("draft")
     assert len(lost_result["artifactPaths"]) == 1
     assert Path(lost_result["artifactPaths"][0]).read_bytes() == payload
-    retained_dir = base / "jobs/.retained" / lost_result["jobId"]
-    metadata_path = retained_dir / "metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    for artifact in metadata["artifacts"]:
-        (retained_dir / ("artifact-" + str(artifact["index"]))).unlink()
-    metadata["artifacts"] = []
-    metadata["artifactErrors"].append({"path": "out/report.txt", "reason": "unavailable regular file"})
-    metadata_path.write_text(json.dumps(metadata))
+    omit_retained(lost_result["jobId"])
     command(client_home, "fetch", lost_result["jobId"])
     local = json.loads((state / "journal" / (lost_result["jobId"] + ".json")).read_text())
     assert local["artifactPaths"] == lost_result["artifactPaths"] and local["blob"]["state"] == "pending"
     command(client_home, "artifacts", "publish", lost_result["jobId"])
     command(fresh, "artifacts", "fetch", lost_result["jobId"], "--output", str(fresh / "local-only"), cwd=fresh)
     assert (fresh / "local-only/out/report.txt").read_bytes() == payload
+    # Crash before the completed client receipt itself was journaled.
+    # Completeness is unknown: preserve bytes and refuse empty confirmation.
+    unrecorded = produce(7, drop_result=True)
+    original = Path(unrecorded["artifactPaths"][0])
+    journal_path = state / "journal" / (unrecorded["jobId"] + ".json")
+    unrecorded.pop("fixtureStderr")
+    unrecorded["artifactPaths"] = []
+    journal_path.write_text(json.dumps(unrecorded))
+    omit_retained(unrecorded["jobId"])
+    command(client_home, "fetch", unrecorded["jobId"])
+    command(client_home, "artifacts", "publish", unrecorded["jobId"], expected=255)
+    unresolved = json.loads(journal_path.read_text())
+    assert unresolved["blob"]["state"] == "pending" and not unresolved["blob"].get("draft")
+    unresolved["started"] = "2000-01-01T00:00:00Z"
+    journal_path.write_text(json.dumps(unresolved))
+    os.utime(journal_path, (0, 0))
+    command(client_home, "list")
+    assert journal_path.exists() and original.read_bytes() == payload
     return {"ordinaryExec": True, "hostWorkspaceDeleted": True, "freshReadOnlyFetch": True,
             "explicitUnavailable": True, "outageRetainsLocalCopy": True, "sameDraftRetry": True,
             "publishThenRecoveryReconfirms": True, "preemptedRequiresRecovery": True, "incompleteRecoveryBlocksPublication": True,
             "lostResultIncompleteHostRetentionPreservesLocal": True,
+            "unrecordedClientBytesBlockConfirmation": True, "interruptedStagePreserved": True,
             "jobId": completed["jobId"], "recoveredJobId": pending["jobId"]}
