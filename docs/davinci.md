@@ -27,7 +27,9 @@ Schedule and webhook work use the same assignment path, one fixed worker and sta
 IDs. Each side commits ownership before its next effect. Broker PubAck is transport custody,
 not application success. A bound monotone result receipt travels back on the assignment subject
 after coordinator journal commit. Worker terminal pruning requires that application receipt;
-transport PubAck alone is insufficient. Result ACK follows coordinator journal commit and receipt publication. Monotone observation
+transport PubAck alone is insufficient. Result ACK follows durable coordinator commit, which
+also persists the pending custody receipt. The existing journal replays receipts before any
+assignment retransmission. A full command stream therefore cannot hold result-stream capacity. Monotone observation
 sequences prevent reordered results replacing newer state. Results buffer locally during
 broker outage. Admission owns native continuations, children, questions, quota pauses and
 occupancy. Da Vinci copies those status/outcome fields without treating a completed provider
@@ -44,7 +46,11 @@ checks after lookup and immediately before admission prevent an awaited read cro
 Journals have a local flock owner, SQLite WAL/FULL, 512 rows and a 31 MiB database-page bound.
 Each cycle checkpoints WAL; refused checkpoints defer effects. No NFS journal. Closed rows
 retain 14 days from closure; workers retain terminal outcomes until the coordinator application
-custody receipt is committed as well. Active/uncertain ownership never expires or yields capacity. Full storage
+custody receipt is committed and its confirmation has broker custody. Coordinators retain
+closed outcomes until the worker confirms observing their receipt. Lost receipts remain replayable
+through retention expiry. An already-retired worker row may reconfirm that it has no local
+custody obligation, using the authenticated coordinator receipt, without recreating work.
+The coordinator still owns the result. Active/uncertain ownership never expires or yields capacity. Full storage
 refuses new work. Original admission time stays in webhook delivery IDs, so re-signing a
 pruned old identity cannot create a fresh admission. Clock rollback refuses mutation.
 

@@ -9,7 +9,7 @@ import { assignment, assignmentHash, binding, decodeAssignment, decodeResult, de
 
 export interface Row {
   id: string; at: number; assignment: string; session: string | null; attempted: number;
-  result: string | null; seq: number; closed: number; sent_at: number; closed_at: number | null; confirmed_seq: number;
+  result: string | null; seq: number; closed: number; sent_at: number; closed_at: number | null; confirmed_seq: number; notified_seq: number;
 }
 export class Journal {
   readonly db!: ReturnType<typeof openDb>;
@@ -24,7 +24,7 @@ export class Journal {
       this.db=openDb(path,"PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA max_page_count=7936; PRAGMA journal_size_limit=0");
       chmodSync(path,0o600);
       this.db.exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)");
-      this.db.exec("CREATE TABLE IF NOT EXISTS work(id TEXT PRIMARY KEY,at INTEGER NOT NULL,assignment TEXT NOT NULL,session TEXT,attempted INTEGER NOT NULL DEFAULT 0,result TEXT,seq INTEGER NOT NULL DEFAULT 0,closed INTEGER NOT NULL DEFAULT 0,sent_at INTEGER NOT NULL DEFAULT 0,closed_at INTEGER,confirmed_seq INTEGER NOT NULL DEFAULT 0)");
+      this.db.exec("CREATE TABLE IF NOT EXISTS work(id TEXT PRIMARY KEY,at INTEGER NOT NULL,assignment TEXT NOT NULL,session TEXT,attempted INTEGER NOT NULL DEFAULT 0,result TEXT,seq INTEGER NOT NULL DEFAULT 0,closed INTEGER NOT NULL DEFAULT 0,sent_at INTEGER NOT NULL DEFAULT 0,closed_at INTEGER,confirmed_seq INTEGER NOT NULL DEFAULT 0,notified_seq INTEGER NOT NULL DEFAULT 0)");
       tx(this.db,()=>{
         const m=meta(this.db,"meta","key"), value=role+"\n"+binding(d);
         check(m.get("binding")===undefined || m.get("binding")===value,"davinci_journal_binding");
@@ -46,7 +46,7 @@ export class Journal {
     const m=meta(this.db,"meta","key"), old=Number(m.get("clock")??0);
     check(now>=old,"davinci_clock_rollback"); m.put("clock",String(now));
     // Never evict active/uncertain ownership; admission refuses when full.
-    this.db.prepare("DELETE FROM work WHERE closed=1 AND closed_at<? AND (?=1 OR confirmed_seq>=seq)")
+    this.db.prepare("DELETE FROM work WHERE closed=1 AND closed_at<? AND confirmed_seq>=seq AND (?=1 OR notified_seq>=seq)")
       .run(now-RETENTION,Number(this.role==="coordinator"));
   }
   protected insert(a: Assignment): Row {
@@ -99,6 +99,13 @@ export class Coordinator extends Journal {
     });
   }
   scheduleStatus() { const m=meta(this.db,"meta","key");return {cursor:m.get("cursor")??null,lastSkip:m.get("lastSkip")??null}; }
+  /** Worker already holds our custody receipt; only now may its outcome expire. */
+  confirm(bytes: string): void {
+    const r=decodeReceipt(bytes,"receipt-confirmed"),row=this.get(r.id);
+    if(!row)return; // harmless confirmation replay after completed retention
+    check(r.hash===assignmentHash(JSON.parse(row.assignment) as Assignment) && r.seq<=row.seq,"davinci_confirmation_binding");
+    this.db.prepare("UPDATE work SET confirmed_seq=max(confirmed_seq,?) WHERE id=?").run(r.seq,r.id);
+  }
   result(bytes: string,now=Date.now()): ResultReceipt {
     const r=decodeResult(bytes),row=this.get(r.id);check(row,"davinci_unknown_result");
     const a=JSON.parse(row.assignment) as Assignment;
@@ -131,7 +138,12 @@ export class WorkerJournal extends Journal {
   confirm(bytes: string): void {
     const r=decodeReceipt(bytes),row=this.get(r.id);check(row,"davinci_unknown_receipt");
     check(r.hash===assignmentHash(JSON.parse(row.assignment) as Assignment) && r.seq<=row.seq,"davinci_receipt_binding");
-    this.db.prepare("UPDATE work SET confirmed_seq=max(confirmed_seq,?) WHERE id=?").run(r.seq,r.id);
+    this.db.prepare("UPDATE work SET confirmed_seq=?,sent_at=0 WHERE id=? AND confirmed_seq<?").run(r.seq,r.id,r.seq);
+  }
+  published(id: string,seq: number,confirmation: boolean,now: number): void {
+    const row=this.get(id);check(row && (!confirmation || row.confirmed_seq>=seq),"davinci_confirmation_unobserved");
+    this.db.prepare("UPDATE work SET sent_at=?,notified_seq=max(notified_seq,?) WHERE id=? AND seq=?")
+      .run(now,confirmation?seq:0,id,seq);
   }
   observe(id: string,status: Result["status"],disposition: Result["disposition"],now=Date.now()): Result {
     const row=this.get(id);check(row,"davinci_unknown_job");

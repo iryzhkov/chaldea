@@ -19,7 +19,7 @@ async function until<T>(label:string,read:()=>Promise<T | null>,ms=45000):Promis
   while(Date.now()<end) {try {const r=await read();if(r!==null)return r;} catch {} await new Promise(r=>setTimeout(r,100));}
   throw Error("fixture timeout: "+label);
 }
-test("production loops survive broker outage and worker/coordinator reopen; one fixed admission and result", {timeout:150000},async()=>{
+test("production loops survive broker outage and worker/coordinator reopen; two occurrences drain full streams", {timeout:150000},async()=>{
   writeFileSync("davinci-runtime.json",JSON.stringify({passed:false})+"\n");
   const dir=scratchDir("davinci-service"),bus=await broker(dir.path,true);
   const key=randomBytes(32),keyFile=join(dir.path,"webhook.key"),policyFile=join(dir.path,"policy.json"),
@@ -34,22 +34,24 @@ test("production loops survive broker outage and worker/coordinator reopen; one 
     ceilings:[{project:"source-report",services,maxSeconds:600,destinations:["fixed-project"]}]}),{mode:0o644});
   const d={id:"source-status",worker:"agent-a",environment:"fixture",epoch:"generation-1",preset:"reporter",
     presetHash:presetHash(loadSessionPolicy(policyFile,"fixture").presets.reporter!),source:"b".repeat(40),
-    notBefore:Date.now()-1000,utc:"00:00",enabled:true};
+    notBefore:Date.now()-1000,utc:new Date(Date.now()+3600000).toISOString().slice(11,16),enabled:true};
   let session:SessionStatus|null=null,starts=0,lookups=0;
+  const sessions=new Map<string,SessionStatus>();
   const ipc=createServer(async(req,res)=>{
     let bytes="";for await(const p of req)bytes+=p.toString();
     const {method,input}=JSON.parse(bytes);
     let value:SessionStatus|null;
-    if(method==="chaldea_session_lookup") {lookups++;value=session;}
+    if(method==="chaldea_session_lookup") {lookups++;value=session?.requestId===input.requestId?session:sessions.get(input.requestId)??null;}
     else if(method==="chaldea_session_start") {
       starts++;assert.deepEqual(Object.keys(input).sort(),["preset","requestId","threadId"]);
       assert.equal(input.threadId,caller);assert.equal(input.preset,"reporter");
-      session={sessionId:"fixed-session",requestId:input.requestId,preset:"reporter",threadId:"fixed-thread",runId:"fixed-run",
+      if(session)sessions.set(session.requestId,session);
+      session={sessionId:"fixed-session-"+starts,requestId:input.requestId,preset:"reporter",threadId:"fixed-thread-"+starts,runId:"fixed-run-"+starts,
         state:"parked",disposition:null,launch:"accepted",deadline:new Date(Date.now()+600000).toISOString(),
         outcome:null,result:null,resultState:null,resultBytes:null,occupancy:"held",released:null,delivery:[]};
       // Admission committed, worker never gets the handle in this answer.
       req.socket.destroy();return;
-    } else {assert.equal(method,"chaldea_session_status");value=session;}
+    } else {assert.equal(method,"chaldea_session_status");value=session?.sessionId===input.id?session:[...sessions.values()].find(s=>s.sessionId===input.id)??null;}
     res.writeHead(200,{"Content-Type":"application/json"});res.end(JSON.stringify(value));
   });
   ipc.listen(socket);await once(ipc,"listening");
@@ -65,9 +67,9 @@ test("production loops survive broker outage and worker/coordinator reopen; one 
   let cs=new AbortController(),ws=new AbortController(),cr=run(cp,cs.signal),wr=run(wp,ws.signal);
   const errors:unknown[]=[];cr.catch(e=>errors.push(e));wr.catch(e=>errors.push(e));
   const stamp=String(Date.now()),delivery=stamp+":runtime";
-  const call=async(method:string,path:string,body="")=>{
+  const call=async(method:string,path:string,body="",postTime=stamp,postDelivery=delivery)=>{
     // Repeated webhook retries keep exactly the original delivery and timestamp.
-    const time=method==="POST"?stamp:String(Date.now()),id=method==="POST"?delivery:time+":status";
+    const time=method==="POST"?postTime:String(Date.now()),id=method==="POST"?postDelivery:time+":status";
     return fetch("http://127.0.0.1:"+port+path,{method,headers:{"davinci-key":"current","davinci-delivery":id,
       "davinci-time":time,"davinci-signature":signature(key,"current",id,time,method+" "+path+"\n"+body)},
       ...(method==="POST"?{body}:{})});
@@ -96,27 +98,62 @@ test("production loops survive broker outage and worker/coordinator reopen; one 
     await until("recovered parked observation",async()=>{
       const r=await call("GET","/jobs/"+id);if(r.status!==200)return null;
       const x=await r.json() as {result:{status:SessionStatus|null}|null};
-      return x.result?.status?.sessionId==="fixed-session"?x:null;
+      return x.result?.status?.sessionId==="fixed-session-1"?x:null;
     });
     assert.equal(starts,1);
+    ws.abort();await wr;
     session={...session!,state:"resolved",occupancy:"released",released:"observed",result:"Done.",resultBytes:5,
       resultState:"stored",outcome:{reason:"succeeded"}};
-    const final=await until("terminal result commit",async()=>{
+    // Controlled crash boundary: A's terminal local commit precedes publication,
+    // and its coordinator receipt cannot publish into the full command stream.
+    const endingJournal=new WorkerJournal(worker.database,definition(d));
+    const ending=endingJournal.observe(id,session,"session",Date.now());endingJournal.close();
+    await until("first terminal publication slot",async()=>(await bus.inspect("result"))===0?true:null);
+    if((await bus.inspect("command"))===0)await bus.inspect("command",JSON.stringify(saved.assignment));
+    await bus.inspect("result",JSON.stringify(ending));
+    await until("first terminal result durable before receipt",async()=>{
       const r=await call("GET","/jobs/"+id);if(r.status!==200)return null;
+      const x=await r.json() as {result:{closed:boolean}|null};return x.result?.closed?true:null;
+    });
+    const secondTime=String(Date.now()),secondDelivery=secondTime+":runtime-two";
+    const secondReply=await call("POST","/webhook",BODY,secondTime,secondDelivery);
+    assert.equal(secondReply.status,202);
+    const secondId=(await secondReply.json() as {id:string}).id;
+    assert.notEqual(secondId,id);assert.equal(await bus.inspect("command"),1);
+    ws=new AbortController();wr=run(wp,ws.signal);wr.catch(e=>errors.push(e));
+    await until("second original admission after receipt drainage",async()=>starts===2?true:null);
+    session={...session!,state:"resolved",occupancy:"released",released:"observed",result:"Second.",resultBytes:7,
+      resultState:"stored",outcome:{reason:"succeeded"}};
+    const final=await until("second terminal result commit",async()=>{
+      const r=await call("GET","/jobs/"+secondId);if(r.status!==200)return null;
       const x=await r.json() as {result:{closed:boolean;status:SessionStatus}|null};
       return x.result?.closed?x:null;
     });
-    assert.equal(final.result!.status.result,"Done.");assert.equal(starts,1);assert.ok(lookups>=2);
+    assert.equal(final.result!.status.result,"Second.");assert.equal(starts,2);assert.ok(lookups>=3);
     await until("application custody receipt committed at worker",async()=>{
       const db=new DatabaseSync(worker.database,{readOnly:true});
       try {
-        const row=db.prepare("SELECT seq,confirmed_seq FROM work WHERE id=?").get(id)!;
-        return row.seq===row.confirmed_seq?true:null;
+        const rows=[id,secondId].map(key=>db.prepare("SELECT seq,confirmed_seq,notified_seq FROM work WHERE id=?").get(key)!);
+        return rows.every(row=>row.seq===row.confirmed_seq && row.seq===row.notified_seq)?true:null;
       } finally {db.close();}
     });
+    await until("worker receipt confirmation committed at coordinator",async()=>{
+      const db=new DatabaseSync(coordinator.database,{readOnly:true});
+      try {
+        const rows=[id,secondId].map(key=>db.prepare("SELECT seq,confirmed_seq FROM work WHERE id=?").get(key)!);
+        return rows.every(row=>row.seq===row.confirmed_seq)?true:null;
+      } finally {db.close();}
+    });
+    await until("result stream drained",async()=>(await bus.inspect("result"))===0?true:null);
+    await bus.inspect("result",JSON.stringify({...final.result,id:"0".repeat(64)}));
+    await until("stale unknown result terminated without blocking intake",async()=>(await bus.inspect("result"))===0?true:null);
+    await bus.inspect("command",JSON.stringify({version:1,kind:"result-receipt",id:"f".repeat(64),hash:"e".repeat(64),seq:1}));
+    await until("retired worker receipt reconfirmed without new work",async()=>
+      (await bus.inspect("command"))===0 && (await bus.inspect("result"))===0?true:null);
+    assert.equal(starts,2);
     assert.deepEqual(errors,[]);
     writeFileSync("davinci-runtime.json",JSON.stringify({passed:true,proof:"production-loops-with-admission-fixture",
-      id,starts,lookups,brokerRestart:true,workerRestart:true,coordinatorRestart:true,bothStreamsFull:true,applicationReceipt:true,result:final.result})+"\n");
+      id,secondId,occurrences:2,starts,lookups,receiptPriority:true,lateTerminalPublication:true,brokerRestart:true,workerRestart:true,coordinatorRestart:true,bothStreamsFull:true,applicationReceipt:true,receiptConfirmation:true,staleResultDrained:true,retiredReceiptConfirmed:true,result:final.result})+"\n");
   } catch(error) {
     assert.deepEqual(errors,[],"service startup/cycle failure");throw error;
   } finally {

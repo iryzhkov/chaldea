@@ -11,7 +11,7 @@ import { connection, publish, pull, acknowledge } from "../message-broker.ts";
 import { requireMessage as check } from "../message.ts";
 import type { SessionStatus } from "../session/lifecycle.ts";
 import { load, same, type Config } from "./config.ts";
-import { authenticate } from "./protocol.ts";
+import { authenticate, decodeReceipt, type Result } from "./protocol.ts";
 import { Coordinator, WorkerJournal } from "./store.ts";
 import { Worker } from "./worker.ts";
 
@@ -87,13 +87,25 @@ export async function run(file: string,signal?: AbortSignal): Promise<void> {
         // Output pressure must not prevent input consumption needed to drain it.
         try {
           if(store instanceof Coordinator) {
-            for(const row of store.active().filter(r=>!r.result).slice(0,1))
-              await publish(nc,c.broker,c.mapping,Buffer.from(row.assignment),randomUUID());
-          } else {
-            for(const row of store.rows().filter(r=>r.result && r.confirmed_seq<r.seq && now-r.sent_at>=30_000)
-              .sort((a,b)=>a.sent_at-b.sent_at).slice(0,1)) {
-              await publish(nc,c.broker,c.mapping,Buffer.from(row.result!),randomUUID(),true);
+            const pending=store.rows().filter(r=>r.result && r.confirmed_seq<r.seq)
+              .sort((a,b)=>a.sent_at-b.sent_at);
+            const row=pending[0];
+            if(row) {
+              const r=JSON.parse(row.result!) as Result;
+              const receipt={version:1,kind:"result-receipt",id:r.id,hash:r.hash,seq:r.seq};
+              await publish(nc,c.broker,c.mapping,Buffer.from(JSON.stringify(receipt)),randomUUID());
               store.db.prepare("UPDATE work SET sent_at=? WHERE id=? AND seq=?").run(now,row.id,row.seq);
+            } else {
+              for(const row of store.active().filter(r=>!r.result).slice(0,1))
+                await publish(nc,c.broker,c.mapping,Buffer.from(row.assignment),randomUUID());
+            }
+          } else {
+            for(const row of store.rows().filter(r=>r.result && (r.confirmed_seq<r.seq || r.notified_seq<r.seq) && now-r.sent_at>=30_000)
+              .sort((a,b)=>a.sent_at-b.sent_at).slice(0,1)) {
+              const confirmation=row.confirmed_seq>=row.seq,r=JSON.parse(row.result!) as Result;
+              const message=confirmation?{version:1,kind:"receipt-confirmed",id:r.id,hash:r.hash,seq:r.seq}:r;
+              await publish(nc,c.broker,c.mapping,Buffer.from(JSON.stringify(message)),randomUUID(),true);
+              (store as WorkerJournal).published(row.id,row.seq,confirmation,now);
             }
           }
         } catch {report("davinci_publication_retained");}
@@ -104,21 +116,36 @@ export async function run(file: string,signal?: AbortSignal): Promise<void> {
           try {
             check(m.subject===(receipt?c.mapping.receiptSubject:c.mapping.commandSubject),"davinci_subject");
             const bytes=new TextDecoder("utf-8",{fatal:true}).decode(m.data);
-            if(store instanceof Coordinator) {
-              const receipt=store.result(bytes);
-              // Application custody receipt follows durable coordinator commit.
-              // Failed publication leaves the result unacked for replay.
-              await publish(nc,c.broker,c.mapping,Buffer.from(JSON.stringify(receipt)),randomUUID());
+            if(store instanceof Coordinator && JSON.parse(bytes).kind==="receipt-confirmed")store.confirm(bytes);
+            else if(store instanceof Coordinator) {
+              // The result row is also a durable pending custody receipt. ACK
+              // frees result capacity even when the command stream is full.
+              // Outbound receipts take priority over assignment retransmission.
+              store.result(bytes);
             } else {
               fresh(); // revoked/rebound configuration cannot authorize intake
-              if(JSON.parse(bytes).kind==="result-receipt") (store as WorkerJournal).confirm(bytes);
-              else {
+              if(JSON.parse(bytes).kind==="result-receipt") {
+                const r=decodeReceipt(bytes);
+                if(store.get(r.id)) (store as WorkerJournal).confirm(bytes);
+                else {
+                  // A retired closed row has no remaining local custody obligation.
+                  // The coordinator still owns the result. Reconfirm without creating
+                  // work; its durable receipt retries if this reply is lost.
+                  await publish(nc,c.broker,c.mapping,Buffer.from(JSON.stringify({...r,kind:"receipt-confirmed"})),randomUUID(),true);
+                }
+              } else {
                 const row=(store as WorkerJournal).accept(bytes,Date.now());
                 await worker!.recover(row.id,Date.now());
               }
             }
             committed=true;
-          } catch {report("davinci_delivery_retained");}
+          } catch(error) {
+            if(error instanceof Error && ["davinci_unknown_result","davinci_unknown_receipt"].includes(error.message)) {
+              // Completed retention can leave a broker replay after local pruning.
+              // Terminate transport only; never invent an application custody receipt.
+              acknowledge(nc,c.broker,c.mapping,m,receipt,true);await nc.flush();
+            } else report("davinci_delivery_retained");
+          }
           // ACK only after durable local ownership/result. Failed deliveries expire
           // in the bounded broker; their originating journals retain recovery state.
           if(committed) {acknowledge(nc,c.broker,c.mapping,m,receipt);await nc.flush();}

@@ -55,9 +55,9 @@ test("lost admission answer, worker reopen and original readonly lookup produce 
   }};
   try {
     s.accept(JSON.stringify(a),at);
-    let worker=new Worker(s,"caller",admission,()=>{});
+    let worker=new Worker(s,"caller",admission,()=>{},()=>at);
     assert.equal((await worker.recover(a.id,at)).disposition,"uncertain");
-    s.close();s=new WorkerJournal(file,d);worker=new Worker(s,"caller",admission,()=>{});
+    s.close();s=new WorkerJournal(file,d);worker=new Worker(s,"caller",admission,()=>{},()=>at);
     const r=await worker.recover(a.id,at+WINDOW+1);
     assert.equal(r.status!.sessionId,"fixed-session");assert.equal(r.closed,false);assert.equal(starts,1);
     assert.throws(()=>s.accept(JSON.stringify(assignment(d,"other",at+WINDOW+1)),at+WINDOW+1),/worker_busy/);
@@ -72,14 +72,14 @@ test("expired uncertain intake cannot retry or free capacity; expiry before atte
   const api={lookup:async()=>null,status:async()=>{throw Error("offline");},start:async()=>{starts++;throw Error("lost");}};
   try {
     s.accept(JSON.stringify(a),at);
-    const w=new Worker(s,"caller",api,()=>{});
+    const w=new Worker(s,"caller",api,()=>{},()=>at);
     await w.recover(a.id,at);
     assert.equal((await w.recover(a.id,at+WINDOW)).disposition,"uncertain");assert.equal(starts,1);
     assert.equal(s.active().length,1);
     const other=new WorkerJournal(join(dir.path,"unused.sqlite"),d);
     try {
       other.accept(JSON.stringify(a),at);
-      const noStart=new Worker(other,"caller",api,()=>{throw Error("must not qualify");});
+      const noStart=new Worker(other,"caller",api,()=>{throw Error("must not qualify");},()=>at);
       assert.equal((await noStart.recover(a.id,at+WINDOW)).disposition,"expired");
       assert.equal(starts,1);
     } finally {other.close();}
@@ -91,7 +91,7 @@ test("revoked authority refuses before effect; stale epoch and restored journal 
   try {
     s.accept(JSON.stringify(a),at);
     const w=new Worker(s,"caller",{lookup:async()=>null,status:async()=>status(a.requestId),start:async()=>{starts++;return status(a.requestId);}},
-      ()=>{throw Error("revoked");});
+      ()=>{throw Error("revoked");},()=>at);
     assert.equal((await w.recover(a.id,at)).disposition,"uncertain");assert.equal(starts,0);
     assert.throws(()=>s.accept(JSON.stringify(assignment({...d,epoch:"old"},"two",at)),at),/assignment_binding/);
     s.maintain(at);copyFileSync(file,join(dir.path,"backup.sqlite"));
@@ -104,10 +104,11 @@ test("result sequence ignores reorder, conflicts reject, finite capacity protect
     s=new WorkerJournal(join(dir.path,"w.sqlite"),d);
   try {
     const a=c.tick(at)!;s.accept(JSON.stringify(a),at);
-    const first=s.observe(a.id,status(a.requestId),"session"),last=s.observe(a.id,status(a.requestId,true),"session");
-    c.result(JSON.stringify(last));c.result(JSON.stringify(first));c.result(JSON.stringify(last));
+    const first=s.observe(a.id,status(a.requestId),"session",at),last=s.observe(a.id,status(a.requestId,true),"session",at);
+    const receipt=c.result(JSON.stringify(last),at);c.result(JSON.stringify(first),at);c.result(JSON.stringify(last),at);
     assert.equal(c.status(a.id).result!.closed,true);
-    assert.throws(()=>c.result(JSON.stringify({...last,status:{...last.status!,result:"changed"}})),/conflict/);
+    assert.throws(()=>c.result(JSON.stringify({...last,status:{...last.status!,result:"changed"}}),at),/conflict/);
+    c.confirm(JSON.stringify({...receipt,kind:"receipt-confirmed"}));
     c.maintain(at+RETENTION+1);assert.equal(c.rows().length,0);
     assert.throws(()=>c.webhook(at+":old",BODY,at+RETENTION+1),/fixed_webhook/);
     // Populate the finite journal with unresolved ownership, using valid bounded assignments.
@@ -150,10 +151,19 @@ test("late terminal results retain closure-age window and never prune before coo
     const result=s.observe(a.id,status(a.requestId,true),"session",closedAt);
     s.maintain(closedAt+1);assert.ok(s.get(a.id),"old occurrence does not delete newly obtained result");
     s.maintain(closedAt+RETENTION+1);assert.ok(s.get(a.id),"unconfirmed terminal custody is protected even when old");
-    const receipt=c.result(JSON.stringify(result),closedAt);
+    c.result(JSON.stringify(result),closedAt); // lose the coordinator receipt while the worker is offline
+    c.maintain(closedAt+RETENTION+1);
+    assert.ok(c.get(a.id),"coordinator retains receipt evidence until worker confirms it");
+    const receipt=c.result(JSON.stringify(result),closedAt+RETENTION+1);
     assert.throws(()=>s.confirm(JSON.stringify({...receipt,hash:"0".repeat(64)})),/receipt_binding/);
     s.confirm(JSON.stringify(receipt));s.confirm(JSON.stringify(receipt));
-    s.maintain(closedAt+RETENTION+2);assert.equal(s.get(a.id),undefined);
+    s.maintain(closedAt+RETENTION+2);assert.ok(s.get(a.id),"worker retains the receipt confirmation until broker custody");
+    s.published(a.id,receipt.seq,true,closedAt+RETENTION+2);
+    const confirmation=JSON.stringify({...receipt,kind:"receipt-confirmed"});
+    c.confirm(confirmation);
+    c.maintain(closedAt+RETENTION+2);assert.equal(c.get(a.id),undefined);
+    c.confirm(confirmation); // duplicate after pruning is harmless and transport-ackable
+    s.maintain(closedAt+RETENTION+3);assert.equal(s.get(a.id),undefined);
   } finally {s.close();c.close();dir.remove();}
 });
 
@@ -181,7 +191,7 @@ test("signed ingress supports rotation, read-only status and disabled intake; ro
     config={...config,keys:{next:newFile},definition:{...config.definition,enabled:false}};
     assert.equal((await send("GET","/jobs/"+id)).status,403);
     assert.equal((await send("GET","/jobs/"+id,"next",current)).status,200);
-    assert.equal((await send("POST","/webhook","next",current,BODY)).status,403);
+    assert.equal((await send("POST","/webhook","next",current,BODY,String(Number(originalTime)+1))).status,403);
     const stamp=String(Date.now()),delivery=stamp+":replay";
     const signed=signature(current,"next",delivery,stamp,"POST /webhook\n"+BODY);
     assert.throws(()=>authenticate(current,"next",delivery,stamp,"GET /schedule\n",signed,Date.now()),/refused/);
