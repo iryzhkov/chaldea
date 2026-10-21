@@ -363,6 +363,8 @@ canonical required grant keys, 4096-byte payload, 8192-byte token and bounded
 public RSA JWKS. Alias/unknown HoloNet fields, foreign service grants and
 nonempty history/target grants are refused before caching. The helper retains
 its stricter minimum remaining token lifetime and end-to-end acquisition budget.
+The existing integer-only scanner also requires optional numeric payload metadata
+to use nonnegative integer JSON spelling; decimal/exponent coercion is refused.
 Synthetic signed-token/renewal/race results do not qualify real issuer,
 protected runtime UID, native-client acquisition or deployment. No installation,
 enrollment or credential change is part of adding this codec.
