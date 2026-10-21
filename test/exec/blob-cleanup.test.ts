@@ -112,6 +112,18 @@ test('malformed XML, wrong bucket/prefix/echo, duplicate fields, invalid rows an
   }
 });
 
+test('forbidden XML character-data terminator refuses before object deletion or multipart abort', async () => {
+  for (const member of ['Contents', 'Upload']) {
+    const f = fixture();
+    f.setTransform(s => s.replace('</' + member + '>', '<StorageClass>]]></StorageClass></' + member + '>'));
+    await refuses(f, /xml/);
+  }
+  // The equivalent escaped text is legal XML character data.
+  const escaped = fixture();
+  escaped.setTransform(s => s.replace('</Upload>', '<StorageClass>]]&gt;</StorageClass></Upload>'));
+  assert.equal((await cleanupBlobs(escaped.store, policy, clock)).attempted, 4);
+});
+
 test('duplicate rows and nonprogress continuation tokens refuse', async () => {
   const duplicate = fixture();
   duplicate.replaceObjects([{ key: objectKey, body: object(objectKey, 2) }, { key: objectKey, body: object(objectKey, 2) }]);

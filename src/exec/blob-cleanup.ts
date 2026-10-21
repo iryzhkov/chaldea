@@ -51,7 +51,7 @@ function xml(bytes: Buffer, rootName: string): Node {
   if (stack.length || roots.length !== 1 || roots[0]!.name !== rootName || source.includes('<!') ||
       source.includes('<?') || !source.endsWith('</' + rootName + '>')) fail('xml');
   function validate(node: Node) {
-    if ((node.children.length && node.text.trim()) ||
+    if (node.text.includes(']]>') || (node.children.length && node.text.trim()) ||
         /[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(node.text) ||
         /&(?!(?:amp|lt|gt|quot|apos);)/.test(node.text)) fail('xml');
     node.children.forEach(validate);
