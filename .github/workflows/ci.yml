@@ -15,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [unit, akasha, e2e-1, e2e-2, e2e-3, messaging, davinci, python-vectors]
+        lane: [unit, akasha, e2e-1, e2e-2, e2e-3, messaging, davinci, blob, python-vectors]
     env:
       CHALDEA_REQUIRE_E2E: "1"
     steps:
@@ -69,6 +69,7 @@ jobs:
             davinci)
               sudo -- env -i PATH="$PATH" CHALDEA_DAVINCI_SCRATCH=/root/.cache/da-vinci-artifacts-messaging-ci /bin/sh test/davinci/run.sh
               ;;
+            blob) /bin/sh test/blob/run.sh ;;
             python-vectors)
               python3 --version
               python3 -c 'import sys; assert sys.version_info[:2] == (3, 13), "Python 3.13 is required"'
