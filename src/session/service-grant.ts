@@ -46,10 +46,11 @@ export function parseServiceGrant(value: unknown): SessionServiceGrant {
   }
   exact(s, grantKeys(s.audience));
   if (s.audience === "holonet") {
-    const hex = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{32}$/.test(v);
+    const hex = (v: unknown): v is string => typeof v === "string" && v.length === 32 && !/[^0-9a-f]/.test(v);
     requireAccess(s.scope === "holonet.read" && hex(s.holonet_server) &&
-      typeof s.holonet_namespace === "string" && /^[a-z][a-z0-9-]{0,31}$/.test(s.holonet_namespace), "invalid_service_scope");
-    const libraries = list(s.holonet_libraries, 1, 1, v => /^[1-9][0-9]{0,18}$/.test(v) && BigInt(v) <= 9223372036854775807n);
+      typeof s.holonet_namespace === "string" && s.holonet_namespace.length <= 32 &&
+      /^[a-z]/.test(s.holonet_namespace) && !/[^a-z0-9-]/.test(s.holonet_namespace), "invalid_service_scope");
+    const libraries = list(s.holonet_libraries, 1, 1, v => /^[1-9][0-9]{0,18}$/.test(v) && BigInt(v) <= 9223372036854775807n && BigInt(v).toString() === v);
     const users = list(s.holonet_catalog_users, 1, 1, hex);
     list(s.holonet_history_users, 0, 0, hex); list(s.holonet_target_users, 0, 0, hex);
     list(s.holonet_actions, 1, 1, v => v === "catalog.read");

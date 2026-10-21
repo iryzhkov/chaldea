@@ -272,7 +272,7 @@ export class SessionCredentials {
       ({ payload: c } = await jwtVerify(token, createLocalJWKSet({ keys }), { algorithms: ["RS256"], issuer: e.issuer,
         clockTolerance: skew, currentDate: new Date(now) }));
     } catch { throw refusal("token_invalid"); }
-    if (typed && e.audience === "holonet" && (typeof c.sub !== "string" || !/^[\x21-\x7e]{1,128}$/.test(c.sub) ||
+    if (typed && e.audience === "holonet" && (typeof c.sub !== "string" || c.sub.length < 1 || c.sub.length > 128 || /[^\x21-\x7e]/.test(c.sub) ||
       (c.nbf !== undefined && (!integer(c.nbf) || !integer(c.iat) || c.nbf < c.iat)))) throw refusal("token_claims_invalid");
     if (typed && e.audience === "ov" && Object.keys(c).length > 32) throw refusal("token_claims_invalid");
     const aud = !typed && Array.isArray(c.aud) && c.aud.length === 1 ? c.aud[0] : c.aud;

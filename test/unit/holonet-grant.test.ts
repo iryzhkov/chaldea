@@ -28,7 +28,8 @@ test("HoloNet closed grant codec binds server, user, library, namespace and cata
     { holonet_libraries: ["123", "456"] }, { holonet_libraries: ["01"] },
     { holonet_libraries: ["9223372036854775808"] }, { holonet_catalog_users: [] },
     { holonet_server: "A".repeat(32) }, { holonet_namespace: "Upper" },
-    { holonet_extra: [] },
+    { holonet_extra: [] }, { holonet_namespace: "synthetic\n" },
+    { holonet_server: "a".repeat(32) + "\n" }, { holonet_libraries: ["123\n"] },
   ]) assert.throws(() => parseServiceGrant({ ...golden, ...patch }));
   for (const key of Object.keys(golden)) {
     const absent = { ...golden } as Record<string, unknown>;

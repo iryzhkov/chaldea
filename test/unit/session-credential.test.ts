@@ -753,7 +753,7 @@ for (const s of serviceCases) {
           .filter(k => !Object.hasOwn(s, k)).map(k => ({ claims: { [k]: [] } })),
       ];
       if (audience === "holonet") bad.push(
-        { claims: { sub: "with space" } }, { claims: { sub: "x".repeat(129) } },
+        { claims: { sub: "with space" } }, { claims: { sub: "newline\n" } }, { claims: { sub: "x".repeat(129) } },
         { claims: { holonet_history_users: ["b".repeat(32)] } }, { claims: { holonet_target_users: ["b".repeat(32)] } },
         { claims: { holonet_actions: ["userdata.read"] } }, { claims: { holonet_namespace: "other" } },
         { claims: { holonet_extra: [] } }, { claims: { Holonet_server: "a".repeat(32) } },
