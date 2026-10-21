@@ -879,6 +879,30 @@ test("legacy Jocasta canonical JSON ordering and digest remain pinned", () => {
     '[{"audience":"jocasta","grants":[{"resource":"project:projectA","actions":["get","history","list","search"]}]}]');
 });
 
+test("holonet: signed raw noninteger time lexemes are refused before caching", async () => {
+  const f = await fixture("holonet-time-lexemes"), s = serviceCases.find(s => s.audience === "holonet")!;
+  try {
+    f.ref.policy = servicePolicy(f, s); await start(f);
+    const { audience: _audience, ...grant } = s;
+    const at = Math.floor(f.now() / 1000);
+    const claims = f.issuer.claims({ omit: ["jocasta_projects"], claims: {
+      ...grant, aud: "https://media.mcp.ryzhkov.dev/mcp", nbf: at,
+    } });
+    for (const field of ["iat", "exp", "nbf"]) {
+      const integer = claims[field] as number;
+      for (const lexeme of [integer + ".0", integer + "e0"]) {
+        const raw = JSON.stringify(claims).replace('"' + field + '":' + integer, '"' + field + '":' + lexeme);
+        assert.notEqual(raw, JSON.stringify(claims));
+        const bytes = Buffer.from(raw);
+        f.issuer.onToken = async () => f.issuer.wrap(await new CompactSign(bytes).setProtectedHeader({ alg: "RS256", kid: "k1" }).sign(f.issuer.privateKey));
+        await refused(f.headers({ audience: "holonet" }), "token_invalid");
+      }
+    }
+    f.issuer.onToken = () => signedService(f, s);
+    assert.ok(await f.headers({ audience: "holonet" }));
+  } finally { await f.close(); }
+});
+
 test("new signed JWTs refuse duplicate JSON names before caching", async () => {
   const f = await fixture("typed-duplicate"), s = serviceCases[0]!;
   try {

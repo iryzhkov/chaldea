@@ -69,9 +69,9 @@ function aborted(signal: AbortSignal): Promise<never> {
     else signal.addEventListener("abort", () => reject(refusal("timeout")), { once: true });
   });
 }
-function json(bytes: Uint8Array): Record<string, unknown> | null {
+function json(bytes: Uint8Array, integersOnly = false): Record<string, unknown> | null {
   try {
-    const v = strictJson(bytes);
+    const v = strictJson(bytes, integersOnly);
     return v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : null;
   } catch { return null; }
 }
@@ -247,9 +247,9 @@ export class SessionCredentials {
         if (e.audience === "holonet" && (Buffer.byteLength(token) > 8192 ||
           Buffer.from(token.split(".")[1] ?? "", "base64url").length > 4096 ||
           Buffer.from(token.split(".")[0] ?? "", "base64url").length > 2048)) throw new Error();
-        for (const part of token.split(".").slice(0, 2)) {
+        for (const [index, part] of token.split(".").slice(0, 2).entries()) {
           const bytes = Buffer.from(part, "base64url");
-          if (bytes.toString("base64url") !== part || !json(bytes)) throw new Error();
+          if (bytes.toString("base64url") !== part || !json(bytes, e.audience === "holonet" && index === 1)) throw new Error();
         }
       } catch { throw refusal("token_invalid"); }
     }
