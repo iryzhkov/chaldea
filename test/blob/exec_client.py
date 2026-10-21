@@ -58,7 +58,7 @@ s["main"]()
     configure(client_home, publisher)
     node = shutil.which("node")
     assert node is not None
-    def command(target, *args, cwd=work):
+    def command(target, *args, cwd=work, expected=0):
         env = dict(os.environ, HOME=str(target), TMPDIR=str(base / "tmp"),
                    PATH=str(tools) + ":" + os.environ["PATH"],
                    CHALDEA_STATE_DIR=str(state), CHALDEA_SSH_CONFIG=str(base / "ssh.conf"))
@@ -66,15 +66,16 @@ s["main"]()
             env.pop(name, None)
         result = subprocess.run([node, str(repo / "bin/chaldea"), "exec", *args],
                                 cwd=cwd, env=env, capture_output=True, timeout=90)
-        assert result.returncode == 0, "production exec/client command failed: " + str(result.returncode) + ": " + result.stderr.decode(errors="replace")[-4096:]
+        assert result.returncode == expected, "production exec/client command failed: " + str(result.returncode) + ": " + result.stderr.decode(errors="replace")[-4096:]
         return result
 
-    def produce():
+    def produce(exit_code=0):
         result = command(client_home, "--host", "test", "--no-queue", "--artifact", "out/report.txt",
                 "--", sys.executable, "-c",
                 'import os,pathlib; h=pathlib.Path(os.environ["HOME"]); assert h.name==".fixture-home"; '
                 'assert not (h/".config/chaldea/garage-key.json").exists(); '
-                'pathlib.Path("out").mkdir(); pathlib.Path("out/report.txt").write_bytes(b"representative artifact\\n")')
+                'pathlib.Path("out").mkdir(); pathlib.Path("out/report.txt").write_bytes(b"representative artifact\\n"); '
+                '__import__("sys").exit(' + str(exit_code) + ')', expected=exit_code)
         entries = [json.loads(p.read_text()) for p in (state / "journal").glob("*.json")]
         return dict(sorted(entries, key=lambda e: e["started"])[-1], fixtureStderr=result.stderr.decode(errors="replace")[-4096:])
 
@@ -123,6 +124,48 @@ s["main"]()
     assert recovered["blob"]["state"] == "confirmed"
     assert hashlib.sha256(draft.encode()).hexdigest() + ".json" in recovered["blob"]["manifestKey"]
     command(client_home, "artifacts", "publish", pending["jobId"])
+
+    # Publish -> recovery: the host retains failed-job output. A confirmed
+    # publication cannot remain confirmed across a later recovery write.
+    retained = produce(7)
+    old_key = retained["blob"]["manifestKey"]
+    command(client_home, "fetch", retained["jobId"])
+    path = state / "journal" / (retained["jobId"] + ".json")
+    after_fetch = json.loads(path.read_text())
+    assert after_fetch["blob"]["state"] == "pending" and after_fetch["artifactRecoveryComplete"]
+    assert after_fetch["blob"]["draft"] and not after_fetch.get("artifactRecoveryPending")
+    command(client_home, "artifacts", "publish", retained["jobId"])
+    assert json.loads(path.read_text())["blob"]["manifestKey"] == old_key
+
+    # Preempted receipt before artifact delivery (fault injected locally):
+    # reject premature publication; recover original retained host bytes first.
+    garage.stop()
+    preempted = produce(7)
+    path = state / "journal" / (preempted["jobId"] + ".json")
+    preempted.pop("fixtureStderr")
+    preempted["outcome"], preempted["artifactPaths"] = "preempted", []
+    preempted["blob"].pop("draft")
+    path.write_text(json.dumps(preempted))
+    shutil.rmtree(Path(preempted["artifactDir"]))
+    garage.start()
+    command(client_home, "artifacts", "publish", preempted["jobId"], expected=255)
+    assert json.loads(path.read_text())["blob"]["state"] == "pending"
+    command(client_home, "fetch", preempted["jobId"])
+    command(client_home, "artifacts", "publish", preempted["jobId"])
+    completed_recovery = json.loads(path.read_text())
+    assert completed_recovery["blob"]["state"] == "confirmed" and len(completed_recovery["artifactPaths"]) == 1
+    command(fresh, "artifacts", "fetch", preempted["jobId"], "--output", str(fresh / "preempted"), cwd=fresh)
+    assert (fresh / "preempted/out/report.txt").read_bytes() == payload
+
+    # Crash barrier before local recovery replacement: publication must wait
+    # for a complete host fetch even if the earlier execution was finished.
+    completed_recovery["artifactRecoveryPending"] = True
+    completed_recovery["blob"]["state"] = "pending"
+    path.write_text(json.dumps(completed_recovery))
+    command(client_home, "artifacts", "publish", preempted["jobId"], expected=255)
+    command(client_home, "fetch", preempted["jobId"])
+    command(client_home, "artifacts", "publish", preempted["jobId"])
     return {"ordinaryExec": True, "hostWorkspaceDeleted": True, "freshReadOnlyFetch": True,
             "explicitUnavailable": True, "outageRetainsLocalCopy": True, "sameDraftRetry": True,
+            "publishThenRecoveryReconfirms": True, "preemptedRequiresRecovery": True, "incompleteRecoveryBlocksPublication": True,
             "jobId": completed["jobId"], "recoveredJobId": pending["jobId"]}

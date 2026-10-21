@@ -4,7 +4,7 @@ import { atomicWrite, syncDirectory } from '../fs/atomic.ts';
 import { removeArtifacts, active as liveIntent } from './artifacts.ts';
 import { removeLog, validJobId } from './logs.ts';
 
-export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; logPath?: string; logTruncated?: boolean; outputSyncFailed?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[]; blob?: { state: 'pending' | 'confirmed'; store: string; draft?: string; manifestKey?: string } };
+export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; logPath?: string; logTruncated?: boolean; outputSyncFailed?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[]; artifactRecoveryComplete?: boolean; artifactRecoveryPending?: boolean; blob?: { state: 'pending' | 'confirmed'; store: string; draft?: string; manifestKey?: string } };
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 

@@ -43,8 +43,9 @@ export async function publishJob(state: string, id: string) {
   return withStateLock(join(state, 'publication', id), async () => {
     const entry = await entryFor(state, id), config = blobConfig();
     if (!config || !entry.blob || entry.blob.store !== storeIdentity(config)) throw new Error('blob_store_binding');
+    if (entry.artifactRecoveryPending) throw new Error('blob_recovery_incomplete');
     if (entry.blob.state === 'confirmed') return entry.blob.manifestKey;
-    if (active(entry) || !['finished', 'preempted'].includes(entry.outcome) || entry.outputSyncFailed) throw new Error('blob_job_not_ready');
+    if (active(entry) || (entry.outcome !== 'finished' && !entry.artifactRecoveryComplete) || entry.outputSyncFailed) throw new Error('blob_job_not_ready');
     const root = artifactLocation(entry);
     if (!root) throw new Error('blob_local_artifacts_missing');
     const requested = entry.requestedArtifacts ?? [];
@@ -84,7 +85,7 @@ export async function publishJob(state: string, id: string) {
     await store.request('PUT', key, body);
     const confirmed = await store.manifest(id);
     if (confirmed.key !== key || !confirmed.body.equals(body)) throw new Error('blob_custody_manifest_conflict');
-    entry.blob = { state: 'confirmed', store: entry.blob.store, manifestKey: key };
+    entry.blob = { state: 'confirmed', store: entry.blob.store, manifestKey: key, draft: body.toString('utf8') };
     await withStateLock(state, () => record(join(state, 'journal'), entry, false));
     return key;
   });

@@ -37,6 +37,15 @@ export async function history(args: string[]): Promise<number> {
     throw new Error('usage: chaldea exec list | show JOB-ID [--full] | fetch JOB-ID');
   }
   const state = stateDir();
+  if (command === 'fetch') {
+    if (!id || !validJobId(id)) throw new Error('invalid job id');
+    // Match publication's job-lock -> accounting-lock order. Reload only after
+    // both locks, so neither path can replace the other's newer journal state.
+    return withStateLock(join(state, 'publication', id), () => withStateLock(state, async () => {
+      await prune(join(state, 'journal')); await cleanLogs(state);
+      return fetchJob(state, await entryFor(state, id));
+    }));
+  }
   return withStateLock(state, async () => {
     const journal = join(state, 'journal');
     await prune(journal);
@@ -51,7 +60,6 @@ export async function history(args: string[]): Promise<number> {
       return 0;
     }
     const entry = await entryFor(state, id!);
-    if (command === 'fetch') return fetchJob(state, entry);
     await write(summary(entry));
     if (!entry.logPath) { await write('Log unavailable for this older journal entry.\n'); return 0; }
     const path = logPath(state, entry.jobId);
@@ -162,6 +170,11 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     if (!complete || (await exit) !== 0) throw new Error(timedOut ? 'fetch timed out' : 'connection lost during fetch; local outcome unchanged');
     if (artifact) { await artifact.sync(); await artifact.close(); artifact = undefined; }
     await log!.close(); log = undefined;
+    // Persist the recovery barrier before replacing any local file. A crash or
+    // partial rename cannot leave new bytes covered by an old confirmation.
+    entry.artifactRecoveryPending = true;
+    if (entry.blob) entry.blob.state = 'pending';
+    await record(join(state, 'journal'), entry, false);
     for (const name of seen) {
       const target = await artifactTarget(entry.worktree, entry.jobId, name);
       await fs.rename(join(staging, name), target);
@@ -172,6 +185,11 @@ async function fetchJob(state: string, entry: Intent): Promise<number> {
     entry.logPath = path; entry.logTruncated = meta.logTruncated === true; entry.outputSyncFailed = false;
     if (meta.recoveryDegraded === true) await write('Host recovery storage was degraded; output or artifacts may be incomplete.\n');
     entry.artifactPaths = [...seen].map(name => join(destination, name));
+    entry.artifactRecoveryComplete = true;
+    delete entry.artifactRecoveryPending;
+    // Recovery may change the artifact set. Retain the frozen manifest and
+    // protect local bytes until publication verifies this recovered set too.
+    if (entry.blob) entry.blob.state = 'pending';
     await record(join(state, 'journal'), entry, false);
     await write(summary(entry));
     for (const error of meta.artifactErrors ?? []) await write('Artifact unavailable: ' + String(error.path) + '\n');
