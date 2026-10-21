@@ -9,6 +9,7 @@ import { scratchDir } from "../helpers/scratch.ts";
 import { testSocketPath } from "../helpers/socket.ts";
 import { ShellWatcher, waitFor, writePrivateFile } from "../helpers/e2e.ts";
 import { withClient } from "../../src/t3/adapter.ts";
+import { createWaitT3 } from "../../src/t3/waits.ts";
 import { startWaitService, callService } from "../../src/waits/service.ts";
 import { WakeStore, type Item } from "../../src/wake/store.ts";
 import type { WaitConfig } from "../../src/waits/config.ts";
@@ -22,11 +23,15 @@ test("eight waits share one durable T3 message across crashes before send and af
   let watcher:ShellWatcher|undefined,service:Awaited<ReturnType<typeof startWaitService>>|undefined;
   try{
     const token=t3.issueToken(["orchestration:read","orchestration:operate"]);
-    const environment=await withClient({serverUrl:t3.serverUrl,token},c=>c["server.getConfig"]({}).pipe(Effect.map(c=>String(c.environment.environmentId))));
+    const serverConfig=await withClient({serverUrl:t3.serverUrl,token},c=>c["server.getConfig"]({}));
+    const environment=String(serverConfig.environment.environmentId);
+    if(serverConfig.externalWakeGuardVersion!==1){t.skip("Combined external-wake delivery requires guarded T3; old-server refusal is checked in waits.e2e.test.ts");return;}
     watcher=new ShellWatcher(t3.serverUrl,token);
     const parent=await waitFor("bootstrap parent",()=>watcher!.firstThreadId(),30_000);
     const projection=()=>withClient({serverUrl:t3.serverUrl,token},c=>c["orchestration.getThreadProjection"]({threadId:parent} as never));
     const project=(await projection()).thread.projectId;
+    const guard=(await createWaitT3(()=>({serverUrl:t3.serverUrl,token}),environment).snapshot(parent))?.externalWakeGuard;
+    assert.ok(guard,"fresh fixture parent has known lifecycle history");
     for(const boundary of ["before_send","after_send"]){
       await t.test(boundary,async()=>{
         const root=join(dir.path,boundary);mkdirSync(root);
@@ -40,7 +45,7 @@ test("eight waits share one durable T3 message across crashes before send and af
         const now=Date.now();
         const rows=Array.from({length:8},(_,i)=>store.register(store.prepare("wait",{
           threadId:parent,requestId:now+":"+boundary+i,...(i===7?{}:{description:"Collect result "+i}),condition:{kind:"time",at:new Date(now).toISOString()},
-        }),project,null));
+        }),project,null,now,[],null,null,guard));
         for(const [i,row] of rows.entries())store.resolve(row.id,{reason:i%2?"timeout":"time"});
         store.close();
         const child=spawn(process.execPath,[resolve("test/helpers/waits-process.ts"),path,boundary],{stdio:["ignore","pipe","pipe"]});

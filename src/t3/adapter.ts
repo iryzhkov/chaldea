@@ -507,9 +507,14 @@ export async function respondChaldeaDecision(options: ConnectOptions, payload: s
 }
 export async function dispatchChaldeaWake(options: ConnectOptions, payload: string, expectedEnvironment?: string): Promise<void> {
   const accepted = await withClient(options, client => Effect.gen(function* () {
-    if (expectedEnvironment !== undefined) {
+    const command=JSON.parse(payload);
+    if (expectedEnvironment !== undefined || command.externalWake !== undefined) {
       const config = yield* client["server.getConfig"]({});
-      if (String(config.environment.environmentId) !== expectedEnvironment) return yield* Effect.fail(new Error("message_environment"));
+      if (expectedEnvironment !== undefined && String(config.environment.environmentId) !== expectedEnvironment)
+        return yield* Effect.fail(new Error("message_environment"));
+      // Schema acceptance is insufficient: older servers silently drop unknown fields.
+      if (command.externalWake !== undefined && config.externalWakeGuardVersion !== 1)
+        return "unsupported_guard" as const;
     }
     return yield* client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
       Effect.map(() => true),
@@ -517,6 +522,7 @@ export async function dispatchChaldeaWake(options: ConnectOptions, payload: stri
         /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
           ? Effect.succeed(false) : Effect.fail(error)));
   }));
+  if (accepted === "unsupported_guard") throw new ProtocolIncompatibleError("T3 external wake admission guard is unsupported");
   if (!accepted) throw new WakeRejectedError("T3 durably rejected this wake; operator attention required");
 }
 

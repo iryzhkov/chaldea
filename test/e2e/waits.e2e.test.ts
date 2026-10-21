@@ -9,6 +9,8 @@ import { scratchDir } from "../helpers/scratch.ts";
 import { testSocketPath } from "../helpers/socket.ts";
 import { ShellWatcher, waitFor,dispatchMessage,writePrivateFile,sleep,runCli } from "../helpers/e2e.ts";
 import { withClient } from "../../src/t3/adapter.ts";
+import { createWaitT3 } from "../../src/t3/waits.ts";
+import { WaitEngine } from "../../src/waits/engine.ts";
 import { startWaitService,callService } from "../../src/waits/service.ts";
 import { WakeStore, type Item } from "../../src/wake/store.ts";
 import type { WaitConfig } from "../../src/waits/config.ts";
@@ -38,9 +40,23 @@ test("durable waits and provider-independent decision inbox on disposable T3", {
   let childService:Awaited<ReturnType<typeof processService>>|undefined;
   try{
     const token=t3.issueToken(["orchestration:read","orchestration:operate"]);
-    const environment=await withClient({serverUrl:t3.serverUrl,token},c=>c["server.getConfig"]({}).pipe(Effect.map(c=>String(c.environment.environmentId))));
+    const serverConfig=await withClient({serverUrl:t3.serverUrl,token},c=>c["server.getConfig"]({}));
+    const environment=String(serverConfig.environment.environmentId);
     watcher=new ShellWatcher(t3.serverUrl,token);
     const parent=await waitFor("bootstrap parent",()=>watcher!.firstThreadId(),30_000);
+    if(serverConfig.externalWakeGuardVersion!==1){
+      await t.test("unqualified server refuses new external waits without sending a wake",async()=>{
+        const store=new WakeStore(join(dir.path,"unsupported.sqlite"),environment);
+        const engine=new WaitEngine(store,createWaitT3(()=>({serverUrl:t3.serverUrl,token}),environment));
+        try{
+          await assert.rejects(engine.register("wait",{threadId:parent,requestId:key(),
+            condition:{kind:"time",at:iso(Date.now()-1)}}),/guard|history|unsupported/i);
+          assert.equal(store.active().length,0);assert.equal(store.deliveries().length,0);
+        }finally{await engine.stop();store.close();}
+      });
+      t.diagnostic("Positive external-wake delivery cases require the separately qualified guarded T3 build; official v0.1.0 supplies refusal evidence only.");
+      return;
+    }
     const snapshot=()=>withClient({serverUrl:t3.serverUrl,token},c=>c["orchestration.getThreadProjection"]({threadId:parent} as never));
     const wakeCount=async(id:string)=>(await snapshot()).messages.filter(m=>["chaldea-wait:"+id+":wake","chaldea-decision:"+id+":wake"].includes(m.id)).length;
     const config:WaitConfig={environment,t3BaseDir:t3.baseDir,tokenFile:join(dir.path,"t3-token"),database:join(dir.path,"state/wakes.sqlite"),

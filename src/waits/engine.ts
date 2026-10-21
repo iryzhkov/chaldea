@@ -17,6 +17,18 @@ export interface EngineOptions {
   /** Fixed-preset sessions; absent means disabled and existing behavior is unchanged. */
   sessions?: SessionOptions;
 }
+/** Auto-settlement authority belongs only to a registered external wait. */
+function parentInactive(item:Item,parent:WaitSnapshot):boolean {
+  const external=item.kind==="wait" || item.kind==="decision";
+  const guard=parent.externalWakeGuard;
+  if(external){
+    if(!guard || item.wake_guard===null)return true;
+    const registered=JSON.parse(item.wake_guard) as NonNullable<WaitSnapshot["externalWakeGuard"]>;
+    if(registered.version!==guard.version || registered.projectId!==guard.projectId ||
+      registered.lastStopCommandId!==guard.lastStopCommandId || registered.invalidationCommandId!==guard.invalidationCommandId)return true;
+  }
+  return parent.settled && !(item.kind==="wait" && parent.settlementOrigin==="automatic");
+}
 export class WaitEngine {
   readonly store: WakeStore;
   readonly t3: WaitT3;
@@ -101,7 +113,9 @@ export class WaitEngine {
     const existing = this.store.existing(reg); if (existing) return existing;
     await this.t3.environment();
     const parent = await this.t3.snapshot(reg.input.threadId);
-    if (!parent || parent.deleted || parent.archived || parent.settled) throw new Error("Caller thread is absent, archived or settled on this T3");
+    if (!parent || parent.deleted || parent.archived || (parent.settled &&
+      !(kind==="wait" && parent.settlementOrigin==="automatic"))) throw new Error("Caller thread is absent, archived or settled on this T3");
+    if (!parent.externalWakeGuard) throw new Error("T3 external wake guard or lifecycle history is unsupported");
     let pinned: string|null=null;
     if ("condition" in reg.input && reg.input.condition.kind === "thread") {
       const target = await this.t3.snapshot(reg.input.condition.threadId);
@@ -109,7 +123,7 @@ export class WaitEngine {
       pinned = reg.input.condition.runId ?? target.runs.toSorted((a,b) => b.ordinal-a.ordinal)[0]?.id ?? null;
       if (!pinned || !target.runs.some(r => r.id === pinned)) throw new Error("Target has no accepted run to pin");
     }
-    const row = this.store.register(reg,parent.project,pinned);
+    const row = this.store.register(reg,parent.project,pinned,Date.now(),[],null,null,parent.externalWakeGuard);
     this.options.boundary?.("registered",row.id);
     this.poke();
     return row;
@@ -184,7 +198,7 @@ export class WaitEngine {
       for (const item of this.store.active()) {
         if (this.snapshots.has(item.parent)) {
           const p=this.snapshots.get(item.parent);
-          if (!p || p.deleted || p.project !== item.project || p.archived || p.settled) {
+          if (!p || p.deleted || p.project !== item.project || p.archived || parentInactive(item,p)) {
             this.store.orphan(item.id,!p || p.deleted ? "parent_deleted" : "parent_inactive"); continue;
           }
         }
@@ -277,7 +291,7 @@ export class WaitEngine {
     try {
       const item=this.store.get(delivery.item);
       const parent=await this.t3.snapshot(item.parent);
-      if (!parent || parent.deleted || parent.project !== item.project || parent.archived || parent.settled) {
+      if (!parent || parent.deleted || parent.project !== item.project || parent.archived || parentInactive(item,parent)) {
         this.persistDelivery(delivery.id,() => this.store.orphan(item.id,!parent || parent.deleted ? "parent_deleted" : "parent_inactive")); return;
       }
       if(delivery.channel==="native" && !this.native.beforeSend(item,delivery,parent))return;

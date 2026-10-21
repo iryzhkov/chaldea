@@ -401,6 +401,17 @@ export const OrchestrationV2AppThread = Schema.Struct({
   settledAt: Schema.NullOr(Schema.DateTimeUtc).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  /** Server-owned origin of the current settlement. Missing/null is unknown; never infer automatic. */
+  settlementOrigin: Schema.optional(Schema.NullOr(Schema.Literals(["automatic", "manual"]))),
+  /**
+   * Durable cancellation boundary for external dependencies. Every accepted thread.stop or
+   * run.interrupt with holdQueue changes this opaque token, even on an idle thread.
+   * Capture at registration and require equality before delivery, including after resume.
+   * Null means no Stop since creation; omission means unknown history, never assume null.
+   */
+  lastStopCommandId: Schema.optional(Schema.NullOr(CommandId)),
+  /** Last explicit Stop, manual settlement, archive or delete; omitted history is unknown. */
+  externalWakeInvalidationCommandId: Schema.optional(Schema.NullOr(CommandId)),
   unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -540,7 +551,17 @@ export type OrchestrationV2ThreadLaunchWorkspaceStrategy =
 /** Failure code on the error item a failed workspace preparation leaves. */
 export const ORCHESTRATION_V2_WORKSPACE_PREPARATION_FAILURE_CODE = "workspace_preparation_failed";
 
+/** Admission fence captured when an external dependency is registered, never refreshed on retry. */
+const ExternalWakeGuard = Schema.Struct({
+  version: Schema.Literal(1),
+  projectId: ProjectId,
+  lastStopCommandId: Schema.NullOr(CommandId),
+  invalidationCommandId: Schema.NullOr(CommandId),
+});
+
 export const OrchestrationV2Run = Schema.Struct({
+  /** Queued external wakes are discarded by explicit lifecycle boundaries. */
+  externalWake: Schema.optional(ExternalWakeGuard),
   id: RunId,
   threadId: ThreadId,
   ordinal: PositiveInt,
@@ -2003,6 +2024,17 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   archivedAt: Schema.NullOr(Schema.DateTimeUtc),
   settledOverride: Schema.NullOr(Schema.Literals(["settled", "active"])),
   settledAt: Schema.NullOr(Schema.DateTimeUtc),
+  /** Server-owned origin of the current settlement. Missing/null is unknown; never infer automatic. */
+  settlementOrigin: Schema.optional(Schema.NullOr(Schema.Literals(["automatic", "manual"]))),
+  /**
+   * Durable cancellation boundary for external dependencies. Every accepted thread.stop or
+   * run.interrupt with holdQueue changes this opaque token, even on an idle thread.
+   * Capture at registration and require equality before delivery, including after resume.
+   * Null means no Stop since creation; omission means unknown history, never assume null.
+   */
+  lastStopCommandId: Schema.optional(Schema.NullOr(CommandId)),
+  /** Last explicit Stop, manual settlement, archive or delete; omitted history is unknown. */
+  externalWakeInvalidationCommandId: Schema.optional(Schema.NullOr(CommandId)),
   unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
@@ -2946,6 +2978,8 @@ export const OrchestrationV2Command = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("message.dispatch"),
+    /** Requires server.getConfig externalWakeGuardVersion=1; old servers may ignore this field. */
+    externalWake: Schema.optional(ExternalWakeGuard),
     notification: Schema.optional(OrchestrationV2Notification),
     ...OrchestrationV2CreationFields,
     scheduledTaskId: Schema.optional(ScheduledTaskId),

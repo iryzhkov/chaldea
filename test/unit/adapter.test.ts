@@ -14,7 +14,40 @@ import {
   connectShell,
   socketUrl,
   respondChaldeaDecision,
+  dispatchChaldeaWake,
 } from "../../src/t3/adapter.ts";
+
+const guardedConfig = {
+  environment:{environmentId:"fixture",label:"Fixture",platform:{os:"linux",arch:"x64"},
+    serverVersion:"fixture",capabilities:{repositoryIdentity:false}},
+  auth:{policy:"loopback-browser",bootstrapMethods:[],sessionMethods:[],sessionCookieName:"fixture"},
+  cwd:"/fixture",keybindingsConfigPath:"/fixture/keys",keybindings:[],issues:[],providers:[],availableEditors:[],
+  observability:{logsDirectoryPath:"/fixture/logs",localTracingEnabled:false,otlpTracesEnabled:false,otlpMetricsEnabled:false},
+  settings:{},
+};
+test("external wake adapter requires advertised admission support and preserves guard bytes on the real RPC wire",async()=>{
+  const server=createServer(),wss=new WebSocketServer({server});
+  let supported=false;const seen:unknown[]=[];
+  wss.on("connection",socket=>socket.on("message",data=>{
+    const req=JSON.parse(String(data));if(req._tag!=="Request")return;
+    const value=req.tag==="server.getConfig"
+      ? {...guardedConfig,...(supported?{externalWakeGuardVersion:1}:{})}
+      : (seen.push(req.payload),{sequence:1});
+    socket.send(JSON.stringify({_tag:"Exit",requestId:req.id,exit:{_tag:"Success",value}}));
+  }));
+  const command={type:"message.dispatch",commandId:"guarded:wake",messageId:"guarded:wake",threadId:"parent",
+    text:"Wake",createdBy:"agent",creationSource:"server",attachments:[],dispatchMode:{type:"queue_after_active"},
+    externalWake:{version:1,projectId:"project",lastStopCommandId:null,invalidationCommandId:null}};
+  try{
+    const serverUrl=await listen(server),options={serverUrl,token:"fixture-token",signal:AbortSignal.timeout(5000)};
+    await assert.rejects(dispatchChaldeaWake(options,JSON.stringify(command),"fixture"),ProtocolIncompatibleError);
+    assert.equal(seen.length,0);
+    supported=true;
+    await dispatchChaldeaWake(options,JSON.stringify(command),"fixture");
+    await dispatchChaldeaWake(options,JSON.stringify(command),"fixture");
+    assert.deepEqual(seen,[command,command]);
+  }finally{for(const socket of wss.clients)socket.terminate();wss.close();server.close();}
+});
 
 async function listen(server: Server): Promise<string> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));

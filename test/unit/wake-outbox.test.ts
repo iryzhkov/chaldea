@@ -12,11 +12,12 @@ import { privateFile } from "../../src/waits/config.ts";
 import { Deadlines } from "../../src/waits/deadlines.ts";
 import { scratchDir } from "../helpers/scratch.ts";
 import type { WaitT3, WaitSnapshot } from "../../src/t3/waits.ts";
+const guard={version:1 as const,projectId:"project",lastStopCommandId:null,invalidationCommandId:null};
 const iso=(n:number)=>new Date(n).toISOString();
 const sleep=(ms:number)=>new Promise(r=>setTimeout(r,ms));
 async function until(probe:()=>boolean){const end=Date.now()+5000;while(!probe()){if(Date.now()>end)throw new Error("Timed out");await sleep(10);}}
 function fake(){
-  let parent:WaitSnapshot|null={id:"parent",project:"project",archived:false,deleted:false,settled:false,runs:[],pendingRuns:[],children:[]};
+  let parent:WaitSnapshot|null={id:"parent",project:"project",archived:false,deleted:false,settled:false,runs:[],pendingRuns:[],children:[],externalWakeGuard:guard};
   const payloads:string[]=[];const committed=new Set<string>();
   let ackLost=true;
   const port:WaitT3={
@@ -145,7 +146,7 @@ test("recovered ambiguous wake cannot be cancelled as if it never reached T3",()
   let store=new WakeStore(path,"test-env");
   try{
     const reg=store.prepare("wait",{threadId:"parent",requestId:Date.now()+":uncertain",condition:{kind:"time",at:iso(Date.now()-1)}});
-    const row=store.register(reg,"project",null);store.resolve(row.id,{reason:"time"});
+    const row=store.register(reg,"project",null,Date.now(),[],null,null,guard);store.resolve(row.id,{reason:"time"});
     store.claim(store.deliveries()[0]!.id);store.close();store=new WakeStore(path,"test-env");
     assert.equal(store.cancel(row.id).delivery,"uncertain_in_flight");
     assert.equal(store.get(row.id).state,"resolved");
@@ -170,7 +171,7 @@ test("external SQLite reader backs off once and recovers an overdue deadline, in
   const events:string[]=[];let engine:WaitEngine|undefined;
   try{
     const reg=store.prepare("wait",{threadId:"parent",requestId:Date.now()+":reader",condition:{kind:"time",at:iso(Date.now()+100)}});
-    const row=store.register(reg,"project",null);
+    const row=store.register(reg,"project",null,Date.now(),[],null,null,guard);
     reader=new DatabaseSync(path,{readOnly:true});reader.exec("BEGIN");reader.prepare("SELECT * FROM items").all();
     // Pin a previous WAL generation exactly as an external reader does.
     store.db.prepare("UPDATE meta SET value='1' WHERE key='replay_fence'").run();
