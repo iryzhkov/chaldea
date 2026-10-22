@@ -40,7 +40,7 @@ function run(id: string, message: string, ordinal = 1): WaitRun {
   return { id, ordinal, status: "running", started: new Date(Date.now() + ordinal).toISOString(), workStarted: null,
     restartOf: null, failure: null, root: "node-root-" + id, message };
 }
-type TurnItem = { type: string; id: string; threadId: string; runId: string | null; nodeId: string | null; ordinal: number; streaming?: boolean; text?: string };
+type TurnItem = { type: string; id: string; threadId: string; runId: string | null; nodeId: string | null; ordinal: number; status?: string; streaming?: boolean; text?: string };
 class FakeT3 {
   mode: "accept" | "hang" | "lost" | "lost_absent" | "reject" | "offline" = "accept";
   threads = new Map<string, WaitSnapshot>();
@@ -60,7 +60,7 @@ class FakeT3 {
   say(threadId: string, text: string, options: { node?: string; index?: number; streaming?: boolean } = {}) {
     const r = this.get(threadId).runs[options.index ?? 0]!, list = this.items.get(threadId) ?? [];
     list.push({ type: "assistant_message", id: "item-" + list.length, threadId, runId: r.id, nodeId: options.node ?? r.root,
-      ordinal: list.length, streaming: options.streaming ?? false, text });
+      ordinal: list.length, status: "completed", streaming: options.streaming ?? false, text });
     this.items.set(threadId, list);
   }
   waits: WaitT3 = {
@@ -90,7 +90,9 @@ class FakeT3 {
     },
     result: async (threadId, runId) => {
       const s = this.get(threadId);
-      return finalAssistant({ thread: { id: threadId }, runs: s.runs.map(r => ({ id: r.id, threadId, rootNodeId: r.root })),
+      return finalAssistant({ thread: { id: threadId }, runs: s.runs.map(r => ({ id: r.id, threadId, rootNodeId: r.root, status: r.status })),
+        nodes: s.runs.map(r => ({ id: r.root!, threadId, runId: r.id, rootNodeId: r.root!, parentNodeId: null,
+          kind: "root_turn", status: r.status })),
         turnItems: this.items.get(threadId) ?? [] }, threadId, runId);
     },
   };
@@ -610,6 +612,43 @@ test("result bounds: exact bytes, pointer-only wake within 4096, oversize and in
       }
     }
   } finally { await f.close(); }
+});
+
+test("official child item point read produces an exact bounded result or explicit oversize and one correlated wake", async () => {
+  for (const text of ["é".repeat(1024), "x".repeat(2411)]) {
+    const f = fixture("official-result");
+    try {
+      const s = await start(f);
+      const { readFinalAssistant } = await import("../../src/session/t3.ts");
+      let reads = 0;
+      f.t3.sessions.result = async (threadId, runId) => {
+        const root = f.t3.get(threadId).runs[0]!.root!;
+        const item = { type: "assistant_message", id: "official-item", threadId, runId, nodeId: "assistant",
+          ordinal: 39, streaming: false, status: "completed", text };
+        return readFinalAssistant({ thread: { id: threadId }, runs: [{ id: runId, threadId, rootNodeId: root, status: "completed" }],
+          nodes: [{ id: root, threadId, runId, rootNodeId: root, parentNodeId: null, kind: "root_turn", status: "completed" },
+            { id: "assistant", threadId, runId, rootNodeId: root, parentNodeId: root, kind: "assistant_message", status: "completed" }],
+          turnItems: [item] }, threadId, runId, async (thread, id) => {
+          reads++; assert.equal(thread, threadId); assert.equal(id, item.id); return item;
+        });
+      };
+      complete(f, s.threadId);
+      await until(() => f.engine.sessionStatus(s.sessionId).state === "resolved");
+      await until(() => f.t3.wakes.length === 1);
+      const status = f.engine.sessionStatus(s.sessionId), oversize = Buffer.byteLength(text) === 2411;
+      assert.equal(status.result, oversize ? null : text);
+      assert.equal(status.resultBytes, Buffer.byteLength(text));
+      assert.equal((status.outcome as { reason: string }).reason, oversize ? "result_oversize" : "succeeded");
+      const payload = JSON.parse(f.t3.wakes[0]!);
+      assert.equal(payload.commandId, "chaldea-session:" + s.sessionId + ":wake");
+      assert.equal(payload.threadId, "caller");
+      assert.ok(payload.text.includes(s.threadId)); assert.ok(payload.text.includes("run-1"));
+      if (oversize) assert.match(payload.text, /exceeds 2048/);
+      else assert.ok(payload.text.includes(text) || (status.outcome as { wake: string }).wake === "result_in_status");
+      await f.restart();
+      assert.equal(f.t3.wakes.length, 1); assert.equal(reads, 1);
+    } finally { await f.close(); }
+  }
 });
 
 test("disabled sessions leave waits and decisions unchanged and refuse starts", async () => {
