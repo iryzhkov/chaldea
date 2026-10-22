@@ -90,9 +90,10 @@ test("result text is exact or refused, and the full escaped wake respects 4096 b
 
 test("final result is the root node's last non-streaming assistant message of that run", () => {
   const item = (id: string, runId: string, nodeId: string, text: string, streaming = false, ordinal = 0) =>
-    ({ type: "assistant_message", id, threadId: "t", runId, nodeId, ordinal, streaming, text });
-  const p = (items: ReturnType<typeof item>[]) => ({ thread: { id: "t" }, runs: [{ id: "r1", threadId: "t", rootNodeId: "root" },
-    { id: "r2", threadId: "t", rootNodeId: "root2" }], turnItems: items });
+    ({ type: "assistant_message", id, threadId: "t", runId, nodeId, ordinal, status: "completed", streaming, text });
+  const p = (items: ReturnType<typeof item>[]) => ({ thread: { id: "t" }, runs: [{ id: "r1", threadId: "t", rootNodeId: "root", status: "completed" },
+    { id: "r2", threadId: "t", rootNodeId: "root2", status: "completed" }], nodes: [{ id: "root", threadId: "t", runId: "r1", rootNodeId: "root", parentNodeId: null,
+      kind: "root_turn", status: "completed" }], turnItems: items });
   assert.deepEqual(finalAssistant(p([item("a", "r1", "root", "one", false, 1), item("b", "r1", "root", "two", false, 2),
     item("c", "r1", "child", "child", false, 3), item("d", "r2", "root2", "other run", false, 4)]), "t", "r1"), { kind: "found", text: "two", itemId: "b" });
   assert.deepEqual(finalAssistant(p([item("c", "r1", "child", "child")]), "t", "r1"), { kind: "missing" });

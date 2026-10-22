@@ -114,7 +114,7 @@ class Issuer {
 }
 
 // --- fake official T3 (launch, projection, observation and wake) ---
-type TurnItem = { type: string; id: string; threadId: string; runId: string | null; nodeId: string | null; ordinal: number; streaming?: boolean; text?: string };
+type TurnItem = { type: string; id: string; threadId: string; runId: string | null; nodeId: string | null; ordinal: number; status?: string; streaming?: boolean; text?: string };
 function thread(id: string, project: string): WaitSnapshot {
   return { id, project, archived: false, deleted: false, settled: false, runs: [], pendingRuns: [], children: [], lineage: { parent: null, root: id } };
 }
@@ -134,7 +134,7 @@ class FakeT3 {
   get(id: string): WaitSnapshot { const s = this.threads.get(id); if (!s) throw new Error("fake thread " + id); return s; }
   finish(threadId: string) {
     const s = this.get(threadId), r = s.runs[0]!;
-    this.items.set(threadId, [{ type: "assistant_message", id: "item-0", threadId, runId: r.id, nodeId: r.root, ordinal: 0, streaming: false, text: "done" }]);
+    this.items.set(threadId, [{ type: "assistant_message", id: "item-0", threadId, runId: r.id, nodeId: r.root, ordinal: 0, status: "completed", streaming: false, text: "done" }]);
     this.put({ ...s, runs: s.runs.map(x => ({ ...x, status: "completed" })) });
   }
   waits: WaitT3 = {
@@ -158,7 +158,9 @@ class FakeT3 {
     },
     result: async (threadId, runId) => {
       const s = this.get(threadId);
-      return finalAssistant({ thread: { id: threadId }, runs: s.runs.map(r => ({ id: r.id, threadId, rootNodeId: r.root })),
+      return finalAssistant({ thread: { id: threadId }, runs: s.runs.map(r => ({ id: r.id, threadId, rootNodeId: r.root, status: r.status })),
+        nodes: s.runs.map(r => ({ id: r.root!, threadId, runId: r.id, rootNodeId: r.root!, parentNodeId: null,
+          kind: "root_turn", status: r.status })),
         turnItems: this.items.get(threadId) ?? [] }, threadId, runId);
     },
   };
