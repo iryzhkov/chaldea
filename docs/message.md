@@ -1,5 +1,21 @@
 # Existing-thread messaging over NATS
 
+## Roadmap status
+
+New bridge enrollment and rollout are deferred pending a qualified upstream T3
+replacement. Retain the existing source, releases, installed behavior and security
+boundaries while that replacement is evaluated. This document describes the
+retained implementation; its configuration examples are not rollout instructions.
+
+Before retirement, pin a compatible released T3 version and qualify remote
+launch/read/send, correlated final results and parent delivery, Stop/cancel with
+queues and descendants, restart/disconnect recovery, duplicate/retry handling,
+expiry/revocation and mode ceilings. Protected profiles also require service and
+resource ACL and credential evidence. Migrate CLI, MCP and service consumers before
+removing this path. An open upstream PR is not a released or installed replacement.
+
+## Retained implementation
+
 Source implementation only. No live account, credential, broker configuration,
 service activation or fleet deployment is included. The CLI and MCP expose
 messaging only when a valid private root-owned sender configuration exists.
