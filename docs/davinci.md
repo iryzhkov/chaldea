@@ -1,5 +1,21 @@
 # Da Vinci runtime (disabled source)
 
+## Roadmap status
+
+Full scheduler/worker deployment is paused. Further duplicate basic recurring
+schedules, webhooks and generic T3 thread-control or task-lifecycle expansion are
+cut from the roadmap. Retain merged source, releases, installed behavior and exact
+qualification evidence; finish safe closeout of any in-flight operation without
+starting new rollout work.
+
+Future work is limited to demonstrated protected-admission, automated-placement
+or locally owned durable-intake gaps. Such a gap does not justify another full
+scheduler. Native replacement acceptance and consumer migration must precede
+retirement; see [the replacement gate](message.md#roadmap-status). Durable blob and
+restricted SSH artifact work remains independent of this paused deployment.
+
+## Retained implementation
+
 Run an explicitly configured instance with chaldea davinci serve --config
 /etc/chaldea/davinci-coordinator.json, or its worker configuration. There is no implicit
 config, enrollment, installation or enabled definition. The coordinator has no T3/provider
