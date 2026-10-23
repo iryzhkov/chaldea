@@ -209,6 +209,59 @@ then replay available NATS sequences. Never restore old authorization history or
 restart a missing access database. Actual host allocation/free-space checks and
 backup schedule/restore probes belong to approved rollout.
 
+## Receipt index bootstrap and controlled offline apply
+
+Receipt queries use covering indices on `(state,expires)` and
+`(profile,project,source)`. Startup validates any existing names and reserves space
+only for missing indices. It sums their actual UTF-8 key bytes plus 256 bytes per
+record per missing index, adds roots/schema and existing pointer-map/freelist
+headroom, explicitly includes WAL frame/header bytes, then applies the existing
+4x main/WAL guards and fixed guard headroom. Every free page is charged as a possible
+freelist trunk, without assuming dense packing. Arithmetic must remain safe.
+Startup rechecks under the write lock before DDL. SQLite's
+[file format](https://www.sqlite.org/fileformat2.html) defines the page/record,
+freelist, pointer-map and WAL structures used by this conservative reservation.
+A blocked checkpoint, inadequate main space or unproven WAL capacity refuses startup
+before either index is created. Large legacy databases may conservatively refuse
+even at the default 4 GiB main / 64 MiB WAL limits. Automatic checkpoints cannot
+reclaim an uncommitted index build. Already indexed databases pay no build reservation.
+
+A refusal requires a separately reviewed operator procedure, first validated on
+a representative consistent copy. This PR does not authorize live operation or
+a binary upgrade. The proposed homelab acceptance retains the host010 binary.
+
+1. Stop/quiesce Akasha and all other database writers/readers as needed. Run SQLite
+   as the service user, preserving private directory/file ownership and modes.
+   Make and verify a consistent SQLite backup including committed WAL content.
+   Preserve the executable and configuration for rollback.
+2. Set `TMPDIR` and `SQLITE_TMPDIR` to private disk-backed scratch. Check actual
+   disk free space for the backup, SQLite sorter temporary files, main growth and
+   the whole uncommitted WAL. Check the configured main and WAL limits separately.
+   Measure both builds inside their transaction on the copy; an after-close WAL
+   size is insufficient. Include extra write cost and startup outage in acceptance.
+3. Require a successful `PRAGMA wal_checkpoint(TRUNCATE)` before apply. Keep
+   `journal_mode=WAL` and `synchronous=FULL`. In `BEGIN IMMEDIATE`, apply only
+   missing definitions below, then `COMMIT`. First inspect `sqlite_schema`,
+   `PRAGMA index_list(receipts)` and `PRAGMA index_xinfo(NAME)` for existing names.
+   Require ordinary, nonunique, nonpartial indices on receipts, exactly these
+   ordered keys, ascending with BINARY collation. A name alone is insufficient;
+   stop on a mismatch rather than using `IF NOT EXISTS` to hide it.
+
+   ```sql
+   CREATE INDEX receipts_state_expiry ON receipts(state,expires);
+   CREATE INDEX receipts_status_scope ON receipts(profile,project,source);
+   ```
+
+4. Record the WAL size after each CREATE before commit and immediately after
+   commit, with automatic checkpointing disabled for the measurement. Refuse an
+   apply whose validated peak plus headroom cannot fit the approved WAL budget.
+   Checkpoint again after commit, verify integrity, unchanged receipt content,
+   quotas/cursors/allocator and `user_version=1`, and covering query plans.
+   Resume the retained service and verify pending delivery and scoped status
+   counts. Do not run `ANALYZE`, reset data or access/trust state, change retention,
+   or relax journal/synchronous policy. The additive indices preserve version-1
+   rollback; never restore stale access/trust state with an event-store backup.
+
 ## Migration and rollout gates
 
 `import --snapshot FILE` reads an operator-produced consistent read-only feedd
