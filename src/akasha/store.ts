@@ -18,6 +18,11 @@ export const OPERATIONS_PAIRS=[
 export const DAY = 86400;
 export const DEFAULT_BUDGET = { main: 4 * 1024 ** 3, wal: 64 * 1024 ** 2, outbox: 128 * 1024 ** 2, quarantine: 16 * 1024 ** 2 };
 export interface Budget { main: number; wal: number; outbox: number; quarantine: number }
+const RECEIPT_INDICES = [
+  { name: "receipts_state_expiry", columns: ["state", "expires"], bytes: "length(CAST(state AS BLOB))+8" },
+  { name: "receipts_status_scope", columns: ["profile", "project", "source"],
+    bytes: "length(CAST(profile AS BLOB))+length(CAST(project AS BLOB))+length(CAST(source AS BLOB))" },
+] as const;
 export interface Receipt {
   event_id: string; request_hash: string; envelope_hash: string; state: "pending" | "visible" | "tombstone" | "quarantined";
   feed_id: number | null; issuer: string; profile: string; project: string; source: string; host: string; expires: number;
@@ -129,11 +134,56 @@ export class EventStore {
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=0;");
       this.db.exec("PRAGMA max_page_count=" + Math.floor(this.budget.main / 4096));
       migrate(this.db, [() => {}]);
+      // Add query indices on both initialization and reopen. Keep version 1 so
+      // the previous runtime can reopen the same receipts database for rollback.
+      this.bootstrapReceiptIndices();
     } catch (e) { this.db.close(); throw e; }
     this.outbox = new Outbox(sqliteOutbox(this.db, {
       table: "outbox", key: "event_id", columns: ["event_id", "envelope", "bytes"],
       encode: (p: Pending) => [p.event_id, p.envelope, p.bytes], decode: r => r as unknown as Pending,
     }), "resend");
+  }
+  private receiptIndexBuild() {
+    const missing = RECEIPT_INDICES.filter(index => {
+      const schema = this.db.prepare("SELECT type,tbl_name FROM sqlite_schema WHERE name=? COLLATE NOCASE").get(index.name);
+      if (!schema) return true;
+      const listed = this.db.prepare("PRAGMA index_list(receipts)").all().find(r => String(r.name).toLowerCase() === index.name);
+      const keys = this.db.prepare("PRAGMA index_xinfo(" + index.name + ")").all().filter(r => r.key === 1);
+      ensure(schema.type === "index" && schema.tbl_name === "receipts" && listed?.unique === 0 && listed.partial === 0 &&
+        keys.length === index.columns.length && keys.every((r, i) =>
+          r.name === index.columns[i] && r.desc === 0 && r.coll === "BINARY"), "invalid_receipt_index", 503);
+      return false;
+    });
+    if (!missing.length) return { missing, estimate: 0 };
+    // Count UTF-8 bytes, not JS characters. 256 bytes per record per index covers
+    // record/varint/rowid/cell headers and overflow tail slack. The existing 4x
+    // guards then cover B-tree packing/splits and overflow pages. Reserve
+    // roots/schema and pointer maps; charge every free page as a possible trunk
+    // rather than assuming the existing freelist is densely packed.
+    const bytes = this.scalar("SELECT coalesce(sum(" + missing.map(i => "(" + i.bytes + "+256)").join("+") + "),0) FROM receipts");
+    const pageBytes = bytes + 8192 * missing.length +
+      4096 * (this.scalar("PRAGMA freelist_count") + Math.ceil(this.scalar("PRAGMA page_count") / 512));
+    // WAL has a 32-byte header and 24 bytes per page frame, before fixed guard headroom.
+    const estimate = pageBytes + Math.ceil(pageBytes / 4096) * 24 + 32;
+    ensure(Number.isSafeInteger(bytes) && bytes >= 0 && Number.isSafeInteger(estimate) &&
+      estimate <= Math.floor((Number.MAX_SAFE_INTEGER - 256 * 1024) / 4), "receipt_index_capacity", 503);
+    return { missing, estimate };
+  }
+  private bootstrapReceiptIndices(): void {
+    const { missing, estimate } = this.receiptIndexBuild();
+    if (!missing.length) return; // A populated, already indexed DB pays no build reservation.
+    this.capacity(estimate);
+    this.transaction(() => {
+      // BEGIN IMMEDIATE excludes writers. Recheck after waiting for the lock so
+      // a concurrent append/schema change cannot invalidate the preflight bound.
+      const locked = this.receiptIndexBuild();
+      if (!locked.missing.length) return;
+      this.capacity(locked.estimate);
+      ensure(locked.estimate <= estimate &&
+        this.walBytes() + locked.estimate * 4 + 128 * 1024 < this.budget.wal, "wal_capacity", 503);
+      for (const index of locked.missing)
+        this.db.exec("CREATE INDEX " + index.name + " ON receipts(" + index.columns.join(",") + ")");
+    }, estimate);
   }
   get(name: string): string | undefined { return meta(this.db).get(name); }
   put(name: string, value: string): void { meta(this.db).put(name, value); }
