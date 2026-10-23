@@ -1,6 +1,117 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { timesyncdHealth, sampleClock } from "../../src/access/maintenance.ts";
+import { readFileSync, writeFileSync, existsSync, symlinkSync, chmodSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { join } from "node:path";
+import { scratchDir } from "../helpers/scratch.ts";
+test("ignored replies retain only recent accepted evidence across sampler invocations", () => {
+  const scratch = scratchDir("timesyncd-cache");
+  try {
+    const cache = join(scratch.path, "accepted.json");
+    const at = Math.floor(Date.now() / 1000);
+    let message = report(0.002, 0, 0.08, at), sync = "b true";
+    const run = (program: string, args: string[]) => {
+      if (program.endsWith("systemctl")) return "active";
+      if (args.at(-1) === "NTPSynchronized") return sync;
+      if (args.at(-1) === "NTPMessage") return message;
+      return "t 2048000000";
+    };
+    assert.equal(sampleClock(run, cache).healthy, true);
+    const accepted = readFileSync(cache, "utf8");
+    // A discarded spike must not replace the last accepted offset or renew its lifetime.
+    message = report(1000, 0, 0.08, at).replace(" false ", " true ").replace(" 5 100", " 6 100");
+    const fallback = sampleClock(run, cache);
+    assert.equal(fallback.healthy, true);
+    assert.ok(Math.abs(fallback.offsetSeconds - 0.002) < 0.000001);
+    assert.equal(readFileSync(cache, "utf8"), accepted);
+    assert.equal(sampleClock(run, join(scratch.path, "missing")).healthy, false);
+    sync = "b false";
+    assert.equal(sampleClock(run, cache).healthy, false);
+    sync = "b true";
+    const saved = JSON.parse(accepted);
+    for (const patch of [
+      { report: report(0.002, 3601, 0.08, at) },
+      { bootId: "different-boot" },
+      { report: report(0.002, 0, 0.08, at).replace(" 5 100", " 7 100") },
+      { monotonicSeconds: 1e15 },
+      { sampledAt: at + 60 },
+      { sampledAt: at - 60 },
+      { report: message },
+    ]) {
+      writeFileSync(cache, JSON.stringify({ ...saved, ...patch }));
+      assert.equal(sampleClock(run, cache).healthy, false, JSON.stringify(patch));
+    }
+    writeFileSync(cache, accepted);
+    message = "unknown NTP layout";
+    assert.equal(sampleClock(run, cache).healthy, false);
+    // A newly accepted but inaccurate measurement also fails closed.
+    message = report(1000, 0, 0.08, at);
+    assert.equal(sampleClock(run, cache).healthy, false);
+    message = message.replace(" false ", " true ").replace(" 5 100", " 6 100");
+    assert.equal(sampleClock(run, cache).healthy, false);
+  } finally { scratch.remove(); }
+});
+test("expired evidence cannot revive after a small backward wall correction", t => {
+  const scratch = scratchDir("timesyncd-expiry");
+  const at = Math.floor(Date.now() / 1000);
+  let wall = at * 1000;
+  t.mock.method(Date, "now", () => wall);
+  try {
+    const cache = join(scratch.path, "accepted.json");
+    let message = report(0.002, 191, 0.08, at);
+    const run = (program: string, args: string[]) => {
+      if (program.endsWith("systemctl")) return "active";
+      if (args.at(-1) === "NTPSynchronized") return "b true";
+      if (args.at(-1) === "NTPMessage") return message;
+      return "t 64000000";
+    };
+    assert.equal(sampleClock(run, cache).healthy, true);
+    message = message.replace(" false ", " true ").replace(" 5 100", " 6 100");
+    assert.equal(sampleClock(run, cache).healthy, true);
+    wall += 3000;
+    assert.equal(sampleClock(run, cache).healthy, false);
+    assert.equal(existsSync(cache), false);
+    wall -= 2000;
+    assert.equal(sampleClock(run, cache).healthy, false);
+  } finally { scratch.remove(); }
+});
+test("accepted evidence crosses Node processes and rejects unsafe cache files", () => {
+  const scratch = scratchDir("timesyncd-process");
+  try {
+    const cache = join(scratch.path, "accepted.json");
+    const at = Math.floor(Date.now() / 1000);
+    const code = `
+      import { sampleClock } from ${JSON.stringify(new URL("../../src/access/maintenance.ts", import.meta.url).href)};
+      const run = (program, args) => program.endsWith("systemctl") ? "active" :
+        args.at(-1) === "NTPSynchronized" ? "b true" :
+        args.at(-1) === "NTPMessage" ? process.argv[2] : "t 64000000";
+      console.log(JSON.stringify(sampleClock(run, process.argv[1])));
+    `;
+    const sample = (message: string) => JSON.parse(execFileSync(process.execPath,
+      ["--input-type=module", "-e", code, cache, message], { encoding: "utf8" }));
+    const accepted = report(0.002, 0, 0.08, at);
+    const ignored = report(1000, 0, 0.08, at).replace(" false ", " true ").replace(" 5 100", " 6 100");
+    assert.equal(sample(accepted).healthy, true);
+    for (let i = 0; i < 3; i++) assert.equal(sample(ignored).healthy, true);
+    chmodSync(cache, 0o666);
+    assert.equal(sample(ignored).healthy, false);
+    assert.equal(sample(accepted).healthy, true);
+    const target = join(scratch.path, "target");
+    writeFileSync(target, readFileSync(cache));
+    // atomic replacement replaces an existing link safely; fallback never reads it.
+    const link = join(scratch.path, "link");
+    symlinkSync(target, link);
+    const run = (program: string, args: string[]) => program.endsWith("systemctl") ? "active" :
+      args.at(-1) === "NTPSynchronized" ? "b true" :
+      args.at(-1) === "NTPMessage" ? ignored : "t 64000000";
+    assert.equal(sampleClock(run, link).healthy, false);
+    assert.equal(existsSync(target), true);
+    assert.equal(sample(report(1000, 0, 0.08, at)).healthy, false);
+    assert.equal(existsSync(cache), false);
+    assert.equal(sample(ignored).healthy, false);
+  } finally { scratch.remove(); }
+});
 const now = 1792252800;
 function report(offset = 0.002, age = 0, trip = 0.08, at = now): string {
   const dest = (at - age) * 1e6, origin = dest - (trip + 0.02) * 1e6;

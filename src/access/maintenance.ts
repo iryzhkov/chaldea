@@ -108,21 +108,60 @@ export function timesyncdHealth(synchronized: string, report: string, poll: stri
 const clockCommand = (program: string, args: string[]): string =>
   execFileSync(program, args, { encoding: "utf8", timeout: 1000, maxBuffer: 8192,
     env: { ...process.env, LC_ALL: "C" }, stdio: ["ignore", "pipe", "pipe"] });
-export function sampleClock(run: (program: string, args: string[]) => string = clockCommand): Health {
+/** Cache only accepted timesyncd evidence. One-shot systemd invocations share it
+ * under /run; ignored packets never replace the evidence or renew its lifetime. */
+export function sampleClock(run: (program: string, args: string[]) => string = clockCommand,
+  cachePath?: string): Health {
   const now = Math.floor(Date.now() / 1000), bad = { healthy: false, offsetSeconds: 0, checked_at: now };
   try {
     const active = run("/usr/bin/systemctl", ["show", "systemd-timesyncd.service", "--property=ActiveState", "--value"]).trim();
-    if (active === "inactive") return sampleChrony(() =>
-      run("/usr/bin/chronyc", ["-n", "-h", "/run/chrony/chronyd.sock", "tracking"]));
-    if (active !== "active") return bad;
+    if (active !== "active") {
+      if (cachePath) { try { unlinkSync(cachePath); } catch {} }
+      return active === "inactive" ? sampleChrony(() =>
+        run("/usr/bin/chronyc", ["-n", "-h", "/run/chrony/chronyd.sock", "tracking"])) : bad;
+    }
     const property = (service: string, iface: string, name: string) =>
       run("/usr/bin/busctl", ["--system", "--no-pager", "get-property", service,
         "/" + service.replaceAll(".", "/"), iface, name]);
-    return timesyncdHealth(
-      property("org.freedesktop.timedate1", "org.freedesktop.timedate1", "NTPSynchronized"),
-      property("org.freedesktop.timesync1", "org.freedesktop.timesync1.Manager", "NTPMessage"),
-      property("org.freedesktop.timesync1", "org.freedesktop.timesync1.Manager", "PollIntervalUSec"), now);
-  } catch { return bad; }
+    const synchronized = property("org.freedesktop.timedate1", "org.freedesktop.timedate1", "NTPSynchronized");
+    const report = property("org.freedesktop.timesync1", "org.freedesktop.timesync1.Manager", "NTPMessage");
+    const poll = property("org.freedesktop.timesync1", "org.freedesktop.timesync1.Manager", "PollIntervalUSec");
+    requireAccess(/^t [1-9][0-9]*$/.test(poll.trim()), "unknown_poll");
+    const bootId = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    const monotonicSeconds = Number(process.hrtime.bigint()) / 1e9;
+    if (cachePath && synchronized.trim() === "b true" &&
+      /^\(uuuuittayttttbtt\)(?: -?[0-9]+){16} true(?: [0-9]+){2}$/.test(report.trim())) {
+      const cached = object(strictJson(trustedBytes(cachePath, 8192)));
+      exact(cached, ["bootId", "monotonicSeconds", "sampledAt", "report", "poll"]);
+      requireAccess(cached.bootId === bootId && typeof cached.monotonicSeconds === "number" &&
+        Number.isFinite(cached.monotonicSeconds) && cached.monotonicSeconds >= 0 &&
+        cached.monotonicSeconds <= monotonicSeconds &&
+        Number.isSafeInteger(cached.sampledAt) && (cached.sampledAt as number) <= now &&
+        Math.abs((now - (cached.sampledAt as number)) -
+          (monotonicSeconds - cached.monotonicSeconds)) <= 30 &&
+        typeof cached.report === "string" && typeof cached.poll === "string", "invalid_clock_evidence");
+      requireAccess(Number(report.trim().split(/\s+/)[18]) >
+        Number(cached.report.trim().split(/\s+/)[18]), "clock_evidence_packet_order");
+      // Reapply the original accepted-packet accuracy and freshness limits,
+      // including the one-hour ceiling, against its original NTP timestamp.
+      const health = timesyncdHealth(synchronized, cached.report, cached.poll, now);
+      if (!health.healthy) unlinkSync(cachePath);
+      return health;
+    }
+    const health = timesyncdHealth(synchronized, report, poll, now);
+    if (cachePath) {
+      if (health.healthy) atomicPublicFile(cachePath, JSON.stringify({
+        bootId, monotonicSeconds, sampledAt: now, report, poll,
+      }) + "\n");
+      else unlinkSync(cachePath);
+    }
+    return health;
+  } catch {
+    // Unknown status, a stopped daemon, or new unhealthy evidence cannot
+    // establish clock health. Never fall back after a failed status query.
+    if (cachePath) { try { unlinkSync(cachePath); } catch {} }
+    return bad;
+  }
 }
 
 export async function installBundle(store: TrustStore, envelope: string, output: string): Promise<TrustBundle> {
@@ -145,7 +184,7 @@ Grants file: JSON array of operator-owned TrustedKey records (public keys only).
 Sign on omarchy-pc only; private deployment key must never be on a run host.
 State initialization is explicit and exclusive. Never reset/restore high-water state.
 `;
-export async function maintenanceCli(args: readonly string[], healthSample: () => Health = sampleClock): Promise<number> {
+export async function maintenanceCli(args: readonly string[], healthSample?: () => Health): Promise<number> {
   let state: AccessState | undefined;
   try {
     process.umask(0o077);
@@ -162,7 +201,9 @@ export async function maintenanceCli(args: readonly string[], healthSample: () =
     };
     const command = positionals[0];
     if (command === "clock-health") {
-      const health = healthSample(); atomicPublicFile(required("output"), JSON.stringify(health) + "\n");
+      const output = required("output");
+      const health = healthSample ? healthSample() : sampleClock(clockCommand, output + ".timesyncd");
+      atomicPublicFile(output, JSON.stringify(health) + "\n");
       return health.healthy ? 0 : 1;
     }
     requireAccess(["initialize-state", "install-bundle", "sign-bundle"].includes(command!), "usage");
