@@ -26,8 +26,9 @@ S3 client retrieves the artifact by UUID without a producer path. Selected denia
 check writer read, reader write and another principal's read of the artifact.
 Synthetic credentials remain in private scratch or memory and are never printed.
 
-This experiment omits stopped data-plus-metadata restore, multipart, lifecycle
-mutation and retention cases already covered by the existing fixture. It adds no
+The default experiment omits stopped restore. The explicit `--stopped-restore`
+extension below adds that proof using local metadata and actual NAS data. Both
+modes omit multipart, lifecycle mutation and retention cases. This adds no
 production client path, retention service, continuous fencing or physical cap.
 
 ## Preconditions for a later authorized run
@@ -144,6 +145,68 @@ NAS access or fallible scratch setup, and updates that report on handled failure
 If local identity/path validation itself fails, only a redacted failure JSON goes
 to stdout. The program never writes a report into a colliding namespace.
 
+## Optional stopped restore
+
+Append `--stopped-restore` to the invocation above. The concrete operator command,
+after the same source/host/commit checks and fresh run-name selection, is:
+
+```sh
+env HOME="$local_run/.blob-image/home" TMPDIR="$local_run/.blob-image/tmp" \
+  python3 -B "$repo/test/blob/nas_canary.py" \
+  --execute-disposable-nas-canary --stopped-restore \
+  --local-run "$local_run" --nas-run "$nas_run" --expected-data-owner 977:988
+```
+
+This reuses the fixture's stopped consistent metadata+data copy sequence, with
+originals preserved. It uploads only the same initial artifact and manifest.
+After original custody succeeds, it captures bucket/key state, stops and awaits
+the original exact Popen handle, and copies the stopped pair into new private
+`$local_run/stopped-backup/{meta,data}`. This backup, its pair manifest and RPC
+secret are LOCAL. The original Garage metadata, binary, logs, config, credentials,
+producer and TMPDIR also stay local.
+
+Restored metadata/config/secret/logs live in a new local
+`$local_run/restored-home`. Restored DATA alone lives in the new NAS child
+`$nas_run-restored`. All destinations must be absent. No NAS metadata, NAS backup,
+new mount, network change or production credential protocol is involved.
+The original stopped DATA and metadata remain until the restored instance proves
+the original UUID and known bytes, exact content-addressed manifest, equal bucket
+and key state, writer-read/reader-write/other-principal-read denials. Restoration
+never runs bootstrap, creates keys or reuploads objects. The metadata copy retains
+the durable node identity and synthetic S3 keys; the local RPC secret is preserved
+through the existing Garage constructor. It uses fresh loopback ports.
+
+Copies reject symlinks, hardlinks, wrong ownership, nonprivate modes and submounts.
+Each tree has limits of 4096 entries, 512 MiB allocated and 2 TiB logical bytes;
+each copy/verification pass reads at most 512 MiB. Fixed 64 KiB chunk hashes bind
+logical size and nonzero chunk offsets/bytes. SEEK_DATA/SEEK_HOLE preserves sparse
+LMDB files without expanding their holes. If sparse seek is unavailable, a file
+must fit the remaining read bound or the attempt refuses. Source, local backup
+and restored tree manifests must match. Pair manifests remain in private local
+backup on failure; the sanitized report records their SHA256 and the original UUID.
+These software limits do not reserve disk, enforce the 2 TB operational budget or
+prove a hard cap. The share is still assumed unquotaed.
+
+The attempt remains bounded to 300 seconds. Restore mode allows 45 seconds for
+final stop/report handling, versus the default 30, because two exact owned handles
+can each require terminate/wait/kill/wait, up to 15 seconds apiece. Software alarms
+cannot fence blocked NFS syscalls. There is no retry loop.
+
+Every created cleanup root has its creation device/inode and owner recorded.
+Success stops both instances, checks all cleanup roots, then removes the original,
+restored and backup trees while retaining report.json. A preverification failure
+preserves originals and any partial backup/restore, attempts both exact stops,
+and records the precise restore stage with `verified: false` and `passed: false`.
+A cleanup failure after verified custody can leave partially removed trees;
+`nasRemoved` and the restore cleanup fields describe completed removals.
+No partial or uncertain attempt is a pass.
+
+For recovery, reconcile BOTH reported PID/start-tick/config identities. The default
+cleanup snippet below is only for default-mode reports; it now refuses restore
+reports. The parent/operator must inspect the recorded restore roots and pair
+manifest and authorize cleanup of those exact identities after both processes are
+confirmed stopped. Never discard a remaining recoverable pair merely to retry.
+
 ## Bounds and side effects
 
 The input is one fixed 36-byte artifact and one small manifest. The disposable
@@ -155,13 +218,15 @@ The OCI verifier bounds registry responses and the compressed layer/executable a
 overhead. Finite input and logical object quotas do not prove a physical cap.
 
 The Python attempt has a 300-second alarm and subprocess/request timeouts. Final
-process shutdown/log reporting gets another 30-second alarm. Interrupt or TERM
+process shutdown/log reporting gets another 30-second alarm, or 45 in restore mode.
+Interrupt or TERM
 enters failure handling. Linux/NFS blocking syscalls, power loss, SIGKILL and host
 failure can prevent a timely report or cleanup. These are software deadlines, not
 a guaranteed wall-clock IO fence. Do not create NAS outages, unmount anything,
 disrupt networks or use private mount/network namespaces to test them.
 
-Only the new local directory and the new NAS child are created or deleted.
+Default mode creates only the new local directory and the new NAS child.
+Restore mode also creates the separately named new NAS child described above.
 A small temporary permission probe is created inside the new NAS child, checked
 and removed before Garage starts. The root of the mounted export is never chmoded,
 chowned or recursively cleaned. Registry requests and loopback sockets are the only
@@ -242,6 +307,7 @@ sys.path.insert(0, str(Path(sys.argv[1]) / "test/blob"))
 import nas_canary as c
 local = c.plain_path(sys.argv[2])
 r = json.loads((local / "report.json").read_text())
+c.require("restore" not in r, "restore_requires_both_processes_and_recorded_roots")
 c.require(r["localRun"] == str(local), "report_path_binding")
 c.require(local.name.startswith("garage-canary-"), "namespace_required")
 data = c.plain_path(r["nasRun"])
@@ -269,10 +335,15 @@ The selected check command is deliberately separate from all default suites:
 
 ```sh
 chaldea exec --host agent-a --artifact nas-canary-check.json -- \
-  sh test/blob/nas-canary-check.sh
+  sh test/blob/nas-canary-check.sh --restore-only
 ```
 
-The runner initializes a failure artifact before setup, asserts a disposable
+The restore-only selection checks stop-before-copy, retained originals until verified
+restored custody, copied durable identity, UUID/manifest bytes, bucket/key state,
+principal denials, success cleanup and failure preservation. It checks sparse-file
+copying and unsafe path/owner/mode/submount/copy-bound refusals. It runs no full
+baseline, lifecycle or multipart proof. Omit `--restore-only` to run the preexisting
+stand-ins too. The runner initializes a failure artifact before setup, asserts a disposable
 HOME/TMPDIR in the job's disk-backed snapshot, and uses local files plus fake
 Garage/S3 adapters. It checks new path/mount/ownership guards, the existing Garage
 constructor's default and separate-data configuration, actual UUID protocol reuse,

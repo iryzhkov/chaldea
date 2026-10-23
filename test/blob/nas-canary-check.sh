@@ -30,4 +30,4 @@ test ! -L "$job_root/.nas-canary-check"
 mkdir "$job_root/.nas-canary-check"
 mkdir "$HOME" "$TMPDIR"
 trap 'rm -rf "$job_root/.nas-canary-check"' EXIT
-timeout 60s python3 -B test/blob/nas_canary_checks.py
+timeout 60s python3 -B test/blob/nas_canary_checks.py "$@"
