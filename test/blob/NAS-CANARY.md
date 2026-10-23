@@ -32,10 +32,10 @@ production client path, retention service, continuous fencing or physical cap.
 
 ## Preconditions for a later authorized run
 
-- Use the one approved operator host, as the ordinary UID 1000/GID 1000 operator,
-  without sudo, setuid identity or a root primary group. The code accepts an
-  ordinary nonroot operator and records the actual effective IDs.
-- `/home/igor/.cache` must already exist on local ext4, xfs, btrfs or zfs, owned by
+- Use **homelab**, as **iryzhkov**, the observed ordinary UID 1000/GID 1000
+  operator with passwd home `/home/iryzhkov`. Use no sudo, setuid identity or root
+  primary group. The code records the actual effective IDs.
+- `/home/iryzhkov/.cache` must already exist on local ext4, xfs, btrfs or zfs, owned by
   that operator UID and primary GID, with no group/other write bit. Every path
   component must be free of symlinks. No root-managed `/srv/swarm` path is used.
 - `/mnt/nas/ml` must already be the mountpoint for exactly
@@ -51,7 +51,10 @@ production client path, retention service, continuous fencing or physical cap.
   It never assumes process UID equals file UID, changes ownership, or infers the
   server's exact squash policy. The shared root's 988:988/0770 remains untouched.
 - Python 3, a POSIX shell, Linux procfs and an amd64 host capable of running the
-  verified Garage executable are required. Registry HTTPS must be reachable.
+  verified Garage executable are required. Git is required for source staging.
+  Registry HTTPS must be directly reachable, including registry auth and layer
+  redirects. The global no-proxy opener also applies to OCI acquisition; ambient
+  registry proxies are bypassed.
   Two temporary loopback ports must be available. No production credentials,
   external Garage endpoint, service restart or daemon is involved.
 - The operator must have headroom for OCI download/extraction, Garage metadata and
@@ -59,20 +62,73 @@ production client path, retention service, continuous fencing or physical cap.
   an operational budget, not a hard ceiling or a proven available-space guarantee.
   Exact console quota/squash labels do not gate this disposable experiment.
 
+The fresh actual NAS metadata receipt is
+`jocasta:fa28312054d802a4e0dbfb78eea4689f@3`. It records the exact share,
+`soft/vers=3/sec=sys` mount and the distinct mapped ownership above.
 Prior operator IO wrote, fsynced, renamed, directory-fsynced, reopened and read 4 MiB,
 then removed it. That is context only. It does not qualify deployed service identity
 or server stable storage, and the canary does not repeat that accepted source proof.
 
 ## Exact proposed command
 
-Run only after the separate approval described above. The named checkout is the
-review checkout; the parent may substitute its accepted, pinned checkout path.
-Do not precreate either namespace or the new HOME/TMPDIR.
+Run only after the separate approval described above. The parent's review checkout
+under `/home/igor` is on another machine and does not exist on homelab. The parent
+must supply the full accepted commit as `CANARY_ACCEPTED_COMMIT` and approve an
+absolute, NEW source staging path under `/home/iryzhkov/.cache` as
+`CANARY_APPROVED_SOURCE`. Neither value has a default.
+
+Stage the reviewed source explicitly. On the parent source machine, from the
+accepted checkout, create a self-contained local Git bundle at an approved private
+output path. This does not push or contact a Git server:
 
 ```sh
-repo=/home/igor/.cache/roadmap-successor-037c2780/blob-nas-canary
+accepted_commit=${CANARY_ACCEPTED_COMMIT:?full accepted commit required}
+test "$(git rev-parse HEAD)" = "$accepted_commit"
+test -z "$(git status --porcelain --untracked-files=all)"
+git bundle create "${CANARY_BUNDLE_OUTPUT:?new private bundle path required}" HEAD
+```
+
+The parent/operator transfers that bundle through a separately approved existing
+file-transfer channel to a private disk path on homelab and supplies that path as
+`CANARY_SOURCE_BUNDLE`. No transfer, credential enrollment or installation is
+implicit in this packet. With Git already installed, stage on **homelab** as
+**iryzhkov** using only the transferred local file:
+
+```sh
+set -eu
+test "$(hostname -s)" = homelab
+test "$(id -un)" = iryzhkov
+test "$(id -u):$(id -g)" = 1000:1000
+repo=${CANARY_APPROVED_SOURCE:?approved absolute source staging path required}
+accepted_commit=${CANARY_ACCEPTED_COMMIT:?full accepted commit required}
+bundle=${CANARY_SOURCE_BUNDLE:?approved transferred local bundle path required}
+case "$repo" in /home/iryzhkov/.cache/*) ;; *) exit 1;; esac
+case "$bundle" in /home/iryzhkov/.cache/*) ;; *) exit 1;; esac
+test -f "$bundle"
+test ! -e "$repo"
+test ! -L "$repo"
+git clone --no-checkout -- "$bundle" "$repo"
+git -C "$repo" checkout --detach "$accepted_commit"
+```
+
+Then run the following on **homelab** as **iryzhkov**. The source path and full
+accepted commit must be the parent-approved values, never a moving branch.
+Do not precreate either run namespace or the new HOME/TMPDIR.
+
+```sh
+set -eu
+test "$(hostname -s)" = homelab
+test "$(id -un)" = iryzhkov
+test "$(id -u):$(id -g)" = 1000:1000
+repo=${CANARY_APPROVED_SOURCE:?approved staged source path required}
+accepted_commit=${CANARY_ACCEPTED_COMMIT:?full accepted commit required}
+test "${#accepted_commit}" = 40
+case "$accepted_commit" in *[!0-9a-f]*) exit 1;; esac
+test "$(git -C "$repo" rev-parse --show-toplevel)" = "$repo"
+test "$(git -C "$repo" rev-parse HEAD)" = "$accepted_commit"
+test -z "$(git -C "$repo" status --porcelain --untracked-files=all)"
 run="garage-canary-$(python3 -c 'import uuid; print(uuid.uuid4())')"
-local_run="/home/igor/.cache/$run"
+local_run="/home/iryzhkov/.cache/$run"
 nas_run="/mnt/nas/ml/$run"
 env HOME="$local_run/.blob-image/home" TMPDIR="$local_run/.blob-image/tmp" \
   python3 -B "$repo/test/blob/nas_canary.py" \
@@ -110,7 +166,8 @@ A small temporary permission probe is created inside the new NAS child, checked
 and removed before Garage starts. The root of the mounted export is never chmoded,
 chowned or recursively cleaned. Registry requests and loopback sockets are the only
 network activity initiated by the code; existing NFS client IO uses the mount.
-Ambient proxy configuration is bypassed so S3 credentials stay on loopback.
+Ambient proxy configuration is bypassed globally so S3 credentials stay on loopback.
+This also requires direct registry HTTPS during executable acquisition.
 
 Garage uses metadata_fsync and data_fsync. A successful run shows API custody and
 retrieval under the current mount behavior. It proves neither NFS server stable
@@ -132,11 +189,18 @@ HOME/TMPDIR, leaving only the local report namespace. Cleanup checks the origina
 device/inode identity, ownership, regular files/directories, single-link files,
 absence of symlinks/submounts, and bounded tree size before using Python's
 symlink-resistant rmtree. It never traverses or deletes the shared root.
+The private HOME identity is captured at creation and checked before cleanup;
+a replacement is refused, even if its ownership matches.
 No cleanup is attempted on a colliding path.
 
 On failure, it still attempts exact owned process termination, preserves data,
 metadata, producer if custody was not verified, binary, config and private logs,
-and emits the failure report. A cleanup failure can leave a partially removed
+and emits the failure report. The report persists UUID, artifact SHA256, byte
+count and upload progress before producer deletion. It records confirmed custody,
+the deletion phase, completed producer deletion and fresh-client creation/retrieval
+phases as they happen. A failed fresh client leaves the UUID and confirmed custody
+in the report, with `freshClientByUUID: false` and `passed: false`. Data and metadata
+remain available for recovery. A cleanup failure can leave a partially removed
 owned tree; `nasRemoved` records completed data removal. Raw logs and RPC secrets
 remain restricted to private scratch. Share only report.json, not the raw files.
 
@@ -157,6 +221,19 @@ Set `local_run` to the recorded original path, never a shared root. The report m
 be the original trusted report. Read/copy its sanitized contents before deleting it.
 
 ```sh
+set -eu
+test "$(hostname -s)" = homelab
+test "$(id -un)" = iryzhkov
+test "$(id -u):$(id -g)" = 1000:1000
+repo=${CANARY_APPROVED_SOURCE:?approved original staged source path required}
+accepted_commit=${CANARY_ACCEPTED_COMMIT:?full original accepted commit required}
+test "${#accepted_commit}" = 40
+case "$accepted_commit" in *[!0-9a-f]*) exit 1;; esac
+test "$(git -C "$repo" rev-parse --show-toplevel)" = "$repo"
+test "$(git -C "$repo" rev-parse HEAD)" = "$accepted_commit"
+test -z "$(git -C "$repo" status --porcelain --untracked-files=all)"
+: "${local_run:?original /home/iryzhkov/.cache/garage-canary-* path required}"
+case "$local_run" in /home/iryzhkov/.cache/garage-canary-*) ;; *) exit 1;; esac
 python3 -B - "$repo" "$local_run" <<'PY'
 import json
 from pathlib import Path
@@ -199,8 +276,12 @@ The runner initializes a failure artifact before setup, asserts a disposable
 HOME/TMPDIR in the job's disk-backed snapshot, and uses local files plus fake
 Garage/S3 adapters. It checks new path/mount/ownership guards, the existing Garage
 constructor's default and separate-data configuration, actual UUID protocol reuse,
-producer preservation on failed upload, process-stop handling, failure artifacts,
-safe cleanup and log redaction. It downloads no image, starts no Garage server and
+producer preservation on failed upload, persisted recovery reports on failed fresh
+client creation/retrieval, process-stop handling, failure artifacts, refusal to
+clean a replaced private HOME, safe cleanup and log redaction. The returned artifact
+includes a SHA256 `sourceInputs.files` manifest of the actual canary, runner,
+imported helpers, pinned bootstrap and operator packet from the job snapshot.
+The parent can compare those hashes with the accepted commit's Git blob bytes. It downloads no image, starts no Garage server and
 touches no NAS. These checks cannot supply NAS proof.
 
 Accepted existing OCI/bootstrap/custody proofs are not rerun. Remaining gates are

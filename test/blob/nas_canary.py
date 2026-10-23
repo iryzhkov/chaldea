@@ -136,7 +136,7 @@ def preflight(args):
     return local, data, home, temp, (uid, gid), mapped
 
 
-def custody(garage, module, home):
+def custody(garage, module, home, save_progress):
     endpoint = "http://127.0.0.1:" + str(garage.s3)
     spec = {
         "layout": {"zone": "nas-canary", "capacity": 1024 * 1024 * 1024},
@@ -178,19 +178,34 @@ def custody(garage, module, home):
                 "artifacts": [{"path": "report.txt", "sha256": sha, "size": len(payload)}]}
     body = json.dumps(manifest, sort_keys=True).encode()
     manifest_key = prefix + "manifests/" + hashlib.sha256(body).hexdigest() + ".json"
+    progress = {"jobId": job, "sha256": sha, "bytes": len(payload),
+                "objects": 2, "uploadedObjects": 0,
+                "custodyBeforeProducerDeletion": False, "producerDeleted": False,
+                "freshClientByUUID": False, "selectedPrincipalDenials": False}
+
+    def record(phase, **updates):
+        progress.update(phase=phase, **updates)
+        save_progress(dict(progress))
+
+    record("artifact-upload")
     require(writer.request("PUT", key, payload)[0] == 200, "artifact_put")
+    record("manifest-upload", uploadedObjects=1)
     require(writer.request("PUT", manifest_key, body)[0] == 200, "manifest_put")
+    record("principal-denials", uploadedObjects=2)
     require(writer.request("GET", key)[0] == 403 and
             reader.request("PUT", key, b"denied")[0] == 403 and
             other.request("GET", key)[0] == 403, "principal_denial")
-    # Verify the same UUID protocol before deleting the sole producer.
+    record("custody-verification", selectedPrincipalDenials=True)
+    # Persist verified custody and the UUID before deleting the sole producer.
     require(retrieve(reader, "artifact-a", job) == payload, "custody_before_delete")
+    record("producer-deletion", custodyBeforeProducerDeletion=True)
     remove_owned(producer, producer_id, owner(home))
-    require(retrieve(client("reader-a"), "artifact-a", job) == payload,
-            "fresh_client_retrieval")
-    return {"jobId": job, "sha256": sha, "bytes": len(payload), "objects": 2,
-            "custodyBeforeProducerDeletion": True, "freshClientByUUID": True,
-            "selectedPrincipalDenials": True}
+    record("fresh-client-creation", producerDeleted=True)
+    fresh = client("reader-a")
+    record("fresh-client-retrieval")
+    require(retrieve(fresh, "artifact-a", job) == payload, "fresh_client_retrieval")
+    record("complete", freshClientByUUID=True)
+    return progress
 
 
 def redacted_log(home):
@@ -219,7 +234,7 @@ def run(args):
               "bootstrapCommit": BOOTSTRAP_COMMIT, "bootstrapBlob": BOOTSTRAP_BLOB}
     garage, report_path = None, None
     local = data = home = None
-    local_id = data_id = None
+    local_id = data_id = home_id = None
     previous = signal.signal(signal.SIGALRM, deadline)
     old_int = signal.signal(signal.SIGTERM, deadline)
     signal.alarm(MAX_SECONDS)
@@ -244,6 +259,8 @@ def run(args):
         require(os.access(MOUNT, os.W_OK | os.X_OK), "nas_permission")
         report["stage"] = "scratch-setup"
         home.mkdir(parents=True, mode=0o700)
+        home_id = fingerprint(home)
+        report["privateHomeIdentity"] = list(home_id)
         temp.mkdir(mode=0o700)
         require(owner(home) == local_owner and owner(temp) == local_owner, "scratch_owner")
         for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
@@ -284,16 +301,22 @@ def run(args):
         report["processStartTicks"] = Path(f"/proc/{process.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
         report["stage"] = "custody"
         report_path.write_text(json.dumps(report, indent=2) + "\n")
-        report["custody"] = custody(garage, bootstrap(home), home)
+        def save_custody(progress):
+            report["custody"] = progress
+            require(fingerprint(local) == local_id, "local_namespace_changed")
+            report_path.write_text(json.dumps(report, indent=2) + "\n")
+
+        custody(garage, bootstrap(home), home, save_custody)
         report["stage"] = "stopping"
         garage.stop()
         report["processStopped"] = True
         report["logs"] = redacted_log(home)
         report["stage"] = "cleanup"
+        require(fingerprint(home) == home_id, "namespace_changed")
         nas_mount(data)
         remove_owned(data, data_id, mapped)
         report["nasRemoved"] = True
-        remove_owned(home, fingerprint(home), local_owner)
+        remove_owned(home, home_id, local_owner)
         temp.rmdir()
         home.parent.rmdir()
         report["cleanup"] = "owned-data-and-private-scratch-removed-report-retained"

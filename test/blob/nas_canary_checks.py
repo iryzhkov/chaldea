@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Callable, ClassVar
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -152,6 +153,8 @@ class CustodyStandIn:
     clients: list[str] = []
     producer = Path(".")
     fail_put = False
+    fresh_failure: ClassVar[str | None] = None
+    fresh_checks: ClassVar[list[Callable[[], None]]] = []
 
     def __init__(self, _module, _endpoint, access, _secret):
         self.access = access
@@ -159,8 +162,14 @@ class CustodyStandIn:
         if access == "reader-a" and self.clients.count(access) == 2:
             if self.producer.exists():
                 raise AssertionError("producer still exists in fresh client context")
+            for check in self.fresh_checks:
+                check()
+            if self.fresh_failure == "creation":
+                raise RuntimeError("scratch-only-synthetic-do-not-output")
 
     def request(self, method, path, body=b""):
+        if self.access == "reader-a" and self.clients.count(self.access) == 2 and self.fresh_failure == "retrieval":
+            return 503, b"scratch-only-synthetic-do-not-output"
         if self.access == "other-b" or method == "GET" and self.access == "writer-a" or (
                 method == "PUT" and self.access == "reader-a"):
             return 403, b""
@@ -183,10 +192,13 @@ class CustodyStandIn:
 
 
 class CustodyChecks(LocalChecks):
-    def standin(self):
+    @staticmethod
+    def standin(root):
         CustodyStandIn.objects, CustodyStandIn.clients = {}, []
-        CustodyStandIn.producer = self.root / "producer"
+        CustodyStandIn.producer = root / "producer"
         CustodyStandIn.fail_put = False
+        CustodyStandIn.fresh_failure = None
+        CustodyStandIn.fresh_checks = []
         names = ["writer-a", "reader-a", "other-b"]
         def api(endpoint, _payload=None):
             if endpoint == "ListKeys":
@@ -201,24 +213,24 @@ class CustodyChecks(LocalChecks):
         return API(), module
 
     def test_custody_uses_uuid_protocol_and_deletes_only_after_verification(self):
-        garage, module = self.standin()
+        garage, module = self.standin(self.root)
         with patch.object(canary, "S3", CustodyStandIn):
-            report = canary.custody(garage, module, self.root)
+            report = canary.custody(garage, module, self.root, lambda _progress: None)
         self.assertTrue(report["freshClientByUUID"])
         self.assertEqual(len(CustodyStandIn.objects), 2)
         self.assertFalse((self.root / "producer").exists())
 
     def test_failed_upload_preserves_producer(self):
-        garage, module = self.standin()
+        garage, module = self.standin(self.root)
         CustodyStandIn.fail_put = True
         with patch.object(canary, "S3", CustodyStandIn):
             with self.assertRaisesRegex(canary.Refusal, "artifact_put"):
-                canary.custody(garage, module, self.root)
+                canary.custody(garage, module, self.root, lambda _progress: None)
         self.assertEqual((self.root / "producer/report.txt").read_bytes(), canary.PAYLOAD)
 
 
 class LifecycleChecks(LocalChecks):
-    def invoke(self, *, fail_stage=None, wrong_mapping=False):
+    def invoke(self, *, fail_stage=None, wrong_mapping=False, fresh_failure=None):
         local = self.root / "garage-canary-test"
         data = self.root / "nas" / local.name
         data.parent.mkdir()
@@ -228,11 +240,29 @@ class LifecycleChecks(LocalChecks):
         args = SimpleNamespace()
         captured = io.StringIO()
         stopped = []
+        custody_api, custody_module = CustodyChecks.standin(self.root)
+        CustodyStandIn.producer = home / "producer"
+        CustodyStandIn.fresh_failure = fresh_failure
+
+        def check_persisted_custody():
+            saved = json.loads((local / "report.json").read_text())["custody"]
+            self.assertTrue(saved["custodyBeforeProducerDeletion"])
+            self.assertTrue(saved["producerDeleted"])
+            self.assertFalse(saved["freshClientByUUID"])
+            self.assertEqual(saved["phase"], "fresh-client-creation")
+            self.assertEqual(saved["uploadedObjects"], 2)
+
+        CustodyStandIn.fresh_checks = [check_persisted_custody]
         class FakeGarage:
+            s3 = custody_api.s3
             process = SimpleNamespace(pid=os.getpid())
             def __init__(self, _binary, _home, *, data_dir):
                 if data_dir != data:
                     raise AssertionError("wrong data dir")
+                (home / "meta").mkdir()
+                (home / "meta/state").write_bytes(b"retained metadata")
+            def __call__(self, *args):
+                return custody_api(*args)
             def start(self):
                 if fail_stage == "start":
                     raise RuntimeError("scratch-only-synthetic-do-not-output")
@@ -248,6 +278,18 @@ class LifecycleChecks(LocalChecks):
             if fail_stage == "mount":
                 raise canary.Refusal("unexpected_nfs_mount")
             return {"standIn": True}
+        remove_owned = canary.remove_owned
+
+        def checked_remove(path, identity, expected_owner):
+            if path == home / "producer":
+                saved = json.loads((local / "report.json").read_text())["custody"]
+                self.assertEqual(saved["phase"], "producer-deletion")
+                self.assertTrue(saved["custodyBeforeProducerDeletion"])
+                self.assertFalse(saved["producerDeleted"])
+                self.assertTrue(path.exists())
+                self.assertEqual(saved["uploadedObjects"], 2)
+            remove_owned(path, identity, expected_owner)
+
         original_cwd, original_umask = Path.cwd(), os.umask(0o077)
         self.addCleanup(os.umask, original_umask)
         self.addCleanup(os.chdir, original_cwd)
@@ -258,12 +300,20 @@ class LifecycleChecks(LocalChecks):
             stack.enter_context(patch.object(canary, "MOUNT", data.parent))
             stack.enter_context(patch.object(canary, "prepare_binary", return_value=(home / "garage", {"standIn": True})))
             stack.enter_context(patch.object(canary, "Garage", FakeGarage))
-            stack.enter_context(patch.object(canary, "bootstrap", return_value=object()))
+            stack.enter_context(patch.object(canary, "remove_owned", side_effect=checked_remove))
+            stack.enter_context(patch.object(canary, "bootstrap", return_value=custody_module))
             def prove(*_args):
                 if fail_stage == "custody":
                     raise RuntimeError("scratch-only-synthetic-do-not-output")
-                return {"standIn": True}
-            stack.enter_context(patch.object(canary, "custody", side_effect=prove))
+                if fail_stage == "home-replaced":
+                    home.rename(home.with_name("original-home"))
+                    home.mkdir()
+                    (home / "replacement").write_bytes(b"preserve replacement")
+                _args[-1]({"standIn": True})
+            if fresh_failure:
+                stack.enter_context(patch.object(canary, "S3", CustodyStandIn))
+            else:
+                stack.enter_context(patch.object(canary, "custody", side_effect=prove))
             stack.enter_context(contextlib.redirect_stdout(captured))
             status = canary.run(args)
         output = captured.getvalue()
@@ -316,6 +366,48 @@ class LifecycleChecks(LocalChecks):
         self.assertTrue(data.exists() and home.exists())
         self.assertTrue(stopped)
 
+    def test_failed_fresh_client_preserves_recovery_report_objects_and_metadata(self):
+        for failure in ("creation", "retrieval"):
+            with self.subTest(failure=failure):
+                prior = self.root
+                self.root = prior / failure
+                self.root.mkdir()
+                status, report, data, home, stopped = self.invoke(fresh_failure=failure)
+                self.root = prior
+                self.assertEqual(status, 1)
+                self.assertFalse(report["passed"])
+                self.assertTrue(report["processStopped"])
+                custody = report["custody"]
+                self.assertTrue(custody["custodyBeforeProducerDeletion"])
+                self.assertTrue(custody["producerDeleted"])
+                self.assertFalse(custody["freshClientByUUID"])
+                self.assertEqual(custody["phase"], "fresh-client-" + failure)
+                self.assertEqual(custody["bytes"], len(canary.PAYLOAD))
+                self.assertEqual(custody["sha256"], canary.hashlib.sha256(canary.PAYLOAD).hexdigest())
+                self.assertEqual(str(canary.uuid.UUID(custody["jobId"])), custody["jobId"])
+                self.assertFalse((home / "producer").exists())
+                self.assertEqual((home / "meta/state").read_bytes(), b"retained metadata")
+                self.assertTrue(data.exists() and stopped)
+                self.assertEqual(len(CustodyStandIn.objects), 2)
+                self.assertTrue(all("/" + custody["jobId"] + "/" in key
+                                    for key in CustodyStandIn.objects))
+                # The same UUID still recovers the sole artifact after the failure.
+                CustodyStandIn.fresh_failure = None
+                CustodyStandIn.fresh_checks = []
+                reader = CustodyStandIn(None, None, "reader-a", "scratch-only-synthetic")
+                self.assertEqual(canary.retrieve(reader, "artifact-a", custody["jobId"]), canary.PAYLOAD)
+
+    def test_replaced_private_home_refuses_cleanup_using_creation_identity(self):
+        status, report, data, home, stopped = self.invoke(fail_stage="home-replaced")
+        self.assertEqual(status, 1)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["refusal"], "namespace_changed")
+        self.assertTrue(stopped and data.exists())
+        self.assertNotEqual(tuple(report["privateHomeIdentity"]), canary.fingerprint(home))
+        self.assertEqual((home / "replacement").read_bytes(), b"preserve replacement")
+        self.assertEqual((home.with_name("original-home") / "meta/state").read_bytes(),
+                         b"retained metadata")
+
     def test_redacted_logs_contain_no_raw_lines(self):
         (self.root / "garage.log").write_bytes(b"ERROR secretAccessKey=synthetic-private\nWARN other\n")
         result = canary.redacted_log(self.root)
@@ -333,8 +425,9 @@ if __name__ == "__main__":
         # Inherited checks need only run once.
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
-    Path("nas-canary-check.json").write_text(json.dumps({
-        "passed": result.wasSuccessful(), "proof": "new-canary-local-stand-ins",
-        "checks": result.testsRun, "nasProof": False, "imageAcquisitionRerun": False,
-    }, indent=2) + "\n")
+    artifact = Path("nas-canary-check.json")
+    report = json.loads(artifact.read_text())
+    report.update(passed=result.wasSuccessful(), checks=result.testsRun,
+                  imageAcquisitionRerun=False)
+    artifact.write_text(json.dumps(report, indent=2) + "\n")
     raise SystemExit(0 if result.wasSuccessful() else 1)
