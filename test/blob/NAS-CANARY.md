@@ -62,11 +62,11 @@ production client path, retention service, continuous fencing or physical cap.
   an operational budget, not a hard ceiling or a proven available-space guarantee.
   Exact console quota/squash labels do not gate this disposable experiment.
 
-The fresh actual NAS metadata receipt is
-`jocasta:fa28312054d802a4e0dbfb78eea4689f@3`. It records the exact share,
-`soft/vers=3/sec=sys` mount and the distinct mapped ownership above.
-Prior operator IO wrote, fsynced, renamed, directory-fsynced, reopened and read 4 MiB,
-then removed it. That is context only. It does not qualify deployed service identity
+The NAS metadata receipt `jocasta:fa28312054d802a4e0dbfb78eea4689f@3`
+records the exact share and `soft/vers=3/sec=sys` mount. The later direct canary
+receipt `jocasta:39409c7a6a66ef15b07711c86d191521@1` records the distinct
+mapped ownership above and the successful 4 MiB operator IO: write, file fsync,
+rename, directory fsync, reopen/read and complete cleanup. That is context only. It does not qualify deployed service identity
 or server stable storage, and the canary does not repeat that accepted source proof.
 
 ## Exact proposed command
