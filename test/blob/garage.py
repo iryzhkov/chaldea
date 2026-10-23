@@ -50,14 +50,14 @@ def ports():
 
 
 class Garage:
-    def __init__(self, binary, home):
+    def __init__(self, binary, home, *, data_dir=None):
         self.binary, self.home = binary, home
         self.rpc, self.s3 = ports()
         self.config = home / "garage.toml"
         self.secret = home / "rpc.secret"
         self.secret.write_text(os.urandom(32).hex())
         self.secret.chmod(0o600)
-        self.meta, self.data = home / "meta", home / "data"
+        self.meta, self.data = home / "meta", home / "data" if data_dir is None else data_dir
         self.config.write_text(
             f'metadata_dir = "{self.meta}"\ndata_dir = "{self.data}"\n'
             'db_engine = "lmdb"\nmetadata_fsync = true\ndata_fsync = true\n'
