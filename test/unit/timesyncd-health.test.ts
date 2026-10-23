@@ -1,6 +1,54 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { timesyncdHealth, sampleClock } from "../../src/access/maintenance.ts";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { scratchDir } from "../helpers/scratch.ts";
+test("ignored replies retain only recent accepted evidence across sampler invocations", () => {
+  const scratch = scratchDir("timesyncd-cache");
+  try {
+    const cache = join(scratch.path, "accepted.json");
+    const at = Math.floor(Date.now() / 1000);
+    let message = report(0.002, 0, 0.08, at), sync = "b true";
+    const run = (program: string, args: string[]) => {
+      if (program.endsWith("systemctl")) return "active";
+      if (args.at(-1) === "NTPSynchronized") return sync;
+      if (args.at(-1) === "NTPMessage") return message;
+      return "t 2048000000";
+    };
+    assert.equal(sampleClock(run, cache).healthy, true);
+    const accepted = readFileSync(cache, "utf8");
+    // A discarded spike must not replace the last accepted offset or renew its lifetime.
+    message = report(1000, 0, 0.08, at).replace(" false ", " true ");
+    const fallback = sampleClock(run, cache);
+    assert.equal(fallback.healthy, true);
+    assert.ok(Math.abs(fallback.offsetSeconds - 0.002) < 0.000001);
+    assert.equal(readFileSync(cache, "utf8"), accepted);
+    assert.equal(sampleClock(run, join(scratch.path, "missing")).healthy, false);
+    sync = "b false";
+    assert.equal(sampleClock(run, cache).healthy, false);
+    sync = "b true";
+    const saved = JSON.parse(accepted);
+    for (const patch of [
+      { report: report(0.002, 3601, 0.08, at) },
+      { bootId: "different-boot" },
+      { monotonicSeconds: 1e15 },
+      { sampledAt: at + 60 },
+      { report: message },
+    ]) {
+      writeFileSync(cache, JSON.stringify({ ...saved, ...patch }));
+      assert.equal(sampleClock(run, cache).healthy, false, JSON.stringify(patch));
+    }
+    writeFileSync(cache, accepted);
+    message = "unknown NTP layout";
+    assert.equal(sampleClock(run, cache).healthy, false);
+    // A newly accepted but inaccurate measurement also fails closed.
+    message = report(1000, 0, 0.08, at);
+    assert.equal(sampleClock(run, cache).healthy, false);
+    message = message.replace(" false ", " true ");
+    assert.equal(sampleClock(run, cache).healthy, false);
+  } finally { scratch.remove(); }
+});
 const now = 1792252800;
 function report(offset = 0.002, age = 0, trip = 0.08, at = now): string {
   const dest = (at - age) * 1e6, origin = dest - (trip + 0.02) * 1e6;
