@@ -15,6 +15,8 @@ import xml.etree.ElementTree as ET
 import nas_canary as canary
 from garage import Garage
 
+RESTORE_MEASUREMENTS = {}
+
 
 class LocalChecks(unittest.TestCase):
     def setUp(self):
@@ -415,19 +417,292 @@ class LifecycleChecks(LocalChecks):
         self.assertNotIn("synthetic-private", json.dumps(result))
 
 
+
+class RestoreCopyChecks(LocalChecks):
+    def tree(self):
+        path = self.root / "tree"
+        path.mkdir(mode=0o700)
+        (path / "file").write_bytes(b"known bytes")
+        (path / "file").chmod(0o600)
+        return path
+
+    def inspect(self, path, **kwargs):
+        with patch.object(canary, "mount_for", return_value={"type": "ext4", "target": "/"}):
+            return canary.stopped_tree(path, canary.fingerprint(path), canary.owner(path),
+                                       nas=False, **kwargs)
+
+    def test_sparse_lmdb_copy_preserves_holes_size_and_bytes(self):
+        source = self.tree()
+        sparse = source / "lmdb"
+        with sparse.open("wb") as stream:
+            stream.write(b"node identity")
+            stream.seek(1024**3 - 32)
+            stream.write(b"durable tail")
+        sparse.chmod(0o600)
+        copied = self.root / "copy"
+        identities = []
+        with patch.object(canary, "COPY_ALLOCATED", 1024 * 1024):
+            manifest = self.inspect(source, destination=copied, created=lambda p: identities.append(canary.fingerprint(p)))
+            self.assertEqual(manifest, self.inspect(copied))
+        self.assertEqual(sparse.stat().st_size, (copied / "lmdb").stat().st_size)
+        self.assertLess((copied / "lmdb").stat().st_blocks * 512, 1024 * 1024)
+        with (copied / "lmdb").open("rb") as stream:
+            self.assertEqual(stream.read(13), b"node identity")
+            stream.seek(1024**3 - 32)
+            self.assertEqual(stream.read(), b"durable tail")
+        self.assertEqual(identities, [canary.fingerprint(copied)])
+        RESTORE_MEASUREMENTS.update(sparseLogicalBytes=sparse.stat().st_size,
+                                    sparseCopiedAllocatedBytes=(copied / "lmdb").stat().st_blocks * 512,
+                                    sparseReadLimitBytes=1024 * 1024)
+
+    def test_copy_refuses_symlinks_hardlinks_owner_mode_submount_and_bounds(self):
+        source = self.tree()
+        target = self.root / "absent"
+        for kind in ("symlink", "hardlink", "owner", "mode", "submount", "entries", "allocated", "logical"):
+            with self.subTest(kind=kind), contextlib.ExitStack() as stack:
+                if kind == "symlink":
+                    (source / "bad").symlink_to(source / "file")
+                if kind == "hardlink":
+                    os.link(source / "file", source / "bad")
+                if kind == "owner":
+                    stack.enter_context(patch.object(canary, "checked_tree", wraps=canary.checked_tree))
+                    with self.assertRaises(canary.Refusal):
+                        canary.stopped_tree(source, canary.fingerprint(source), (999999, 999999), nas=False)
+                    continue
+                if kind == "mode":
+                    (source / "file").chmod(0o644)
+                for name, value in (("entries", "COPY_ENTRIES"), ("allocated", "COPY_ALLOCATED"),
+                                    ("logical", "COPY_LOGICAL")):
+                    if kind == name:
+                        stack.enter_context(patch.object(canary, value, 1))
+                if kind == "submount":
+                    stack.enter_context(patch.object(canary, "mount_for", side_effect=lambda p: {
+                        "type": "ext4", "target": str(p) if p.name == "file" else "/"}))
+                    with self.assertRaisesRegex(canary.Refusal, "submount"):
+                        canary.stopped_tree(source, canary.fingerprint(source), canary.owner(source), nas=False)
+                else:
+                    with self.assertRaises(canary.Refusal):
+                        self.inspect(source, destination=target, created=lambda _p: None)
+                self.assertFalse(target.exists())
+                if kind in ("symlink", "hardlink"):
+                    (source / "bad").unlink()
+                (source / "file").chmod(0o600)
+
+    def test_unreadable_tree_is_refused_without_a_partial_copy(self):
+        source = self.tree()
+        target = self.root / "absent"
+        def unreadable(_path, **kwargs):
+            kwargs["onerror"](PermissionError("unreadable"))
+        with patch.object(canary.os, "walk", side_effect=unreadable):
+            with self.assertRaisesRegex(canary.Refusal, "tree_unreadable"):
+                self.inspect(source, destination=target, created=lambda _p: None)
+        self.assertFalse(target.exists())
+
+    def test_existing_destination_and_sparse_seek_fallback_are_bounded(self):
+        source = self.tree()
+        target = self.root / "existing"
+        target.mkdir()
+        with self.assertRaisesRegex(canary.Refusal, "restore_destination_exists"):
+            self.inspect(source, destination=target, created=lambda _p: None)
+        import errno
+        with patch.object(canary.os, "lseek", side_effect=OSError(errno.EINVAL, "unsupported")):
+            self.assertTrue(self.inspect(source))
+            with (source / "file").open("wb") as stream:
+                stream.truncate(canary.COPY_ALLOCATED + 1)
+            with self.assertRaisesRegex(canary.Refusal, "sparse_seek_required"):
+                self.inspect(source)
+
+
+class RestoreChecks(LocalChecks):
+    def invoke_restore(self, failure=None):
+        local = self.root / "garage-canary-restore"
+        data = self.root / "nas" / local.name
+        data.parent.mkdir(mode=0o700)
+        home, temp = local / ".blob-image/home", local / ".blob-image/tmp"
+        restored_data = data.with_name(data.name + "-restored")
+        actual = canary.owner(self.root)
+        events, instances, copies = [], [], []
+        _, module = CustodyChecks.standin(home)
+        convergences = []
+        def converge(*_args):
+            convergences.append(True)
+            self.assertEqual(len(convergences), 1, "restore must never bootstrap")
+        module.converge = converge
+        names = ("writer-a", "reader-a", "other-b")
+        class Process:
+            pid = os.getpid()
+            stopped = False
+            def poll(self):
+                return 0 if self.stopped else None
+        class FakeGarage(Garage):
+            def __init__(self, binary, new_home, **kwargs):
+                super().__init__(binary, new_home, **kwargs)
+                instances.append(self)
+            def __call__(self, endpoint, _payload=None):
+                if endpoint == "ListBuckets":
+                    return json.loads((self.meta / "buckets").read_text())
+                if endpoint == "ListKeys":
+                    return json.loads((self.meta / "keys").read_text())
+                return {"secretAccessKey": "scratch-only-synthetic"}
+            def start(self):
+                is_restore = self.home != home
+                self.process = Process()
+                if not is_restore:
+                    self.meta.mkdir(mode=0o700)
+                    (self.meta / "buckets").write_text(json.dumps([{"id": "durable-bucket", "name": "artifact-a"}]))
+                    (self.meta / "keys").write_text(json.dumps([{"name": n, "id": n} for n in names]))
+                    (self.meta / "node-id").write_bytes(b"durable node identity")
+                    if failure == "collision":
+                        restored_data.mkdir(mode=0o700)
+                        (restored_data / "keep").write_bytes(b"unowned collision")
+                else:
+                    events.append("restored-start")
+                    self_outer.assertTrue(data.exists() and (home / "meta").exists())
+                    self_outer.assertEqual((self.meta / "node-id").read_bytes(), b"durable node identity")
+                    self_outer.assertEqual(self.secret.read_bytes(), instances[0].secret.read_bytes())
+                    if failure == "start":
+                        raise RuntimeError("scratch-only-synthetic-do-not-output")
+                    objects = json.loads((self.data / "objects").read_text())
+                    CustodyStandIn.objects = {k: bytes.fromhex(v) for k, v in objects.items()}
+                    if failure == "bytes":
+                        key = next(k for k in CustodyStandIn.objects if "/objects/" in k)
+                        CustodyStandIn.objects[key] = b"corrupt"
+                    if failure == "state":
+                        (self.meta / "buckets").write_text("[]")
+            def stop(self):
+                if self.process is not None:
+                    events.append("original-stop" if self.home == home else "restored-stop")
+                    if (failure == "stop" and self.home == home or
+                            failure == "restored-stop" and self.home != home):
+                        raise RuntimeError("scratch-only-synthetic-do-not-output")
+                    if self.home == home:
+                        (self.data / "objects").write_text(json.dumps({
+                            k: v.hex() for k, v in CustodyStandIn.objects.items()}))
+                    self.process.stopped = True
+                    self.process = None
+        self_outer = self
+        original_tree, original_remove = canary.stopped_tree, canary.remove_owned
+        def tree(path, *args, **kwargs):
+            self.assertIsNone(instances[0].process, "all copying follows confirmed stop")
+            if kwargs.get("destination") is not None:
+                copies.append(str(path))
+                events.append("copy")
+                if failure == "copy":
+                    raise canary.Refusal("injected_copy_failure")
+            result = original_tree(path, *args, **kwargs)
+            if failure == "pair-mismatch" and kwargs.get("destination") == local / "restored-home/meta":
+                (local / "restored-home/meta/node-id").write_bytes(b"wrong durable identity")
+            return result
+        def remove(path, *args):
+            if path != home / "producer":
+                saved = json.loads((local / "report.json").read_text())
+                self.assertTrue(saved["restore"]["verified"])
+                self.assertTrue(saved["restore"]["sameUUIDBytes"])
+                self.assertTrue(all(item.process is None for item in instances))
+                if failure == "cleanup":
+                    events.append("cleanup-attempt")
+                    raise canary.Refusal("injected_cleanup_refusal")
+                events.append("cleanup")
+            return original_remove(path, *args)
+        original_owner = canary.owner
+        def observed_owner(path):
+            return (999999, 999999) if failure == "mapped" and path == restored_data else original_owner(path)
+        original_request = CustodyStandIn.request
+        def request(client, method, path, body=b""):
+            if failure == "denial" and len(instances) == 2 and client.access == "other-b":
+                return 200, canary.PAYLOAD
+            return original_request(client, method, path, body)
+        captured = io.StringIO()
+        cwd, mask = Path.cwd(), os.umask(0o077)
+        self.addCleanup(os.chdir, cwd)
+        self.addCleanup(os.umask, mask)
+        with contextlib.ExitStack() as stack:
+            for name, value in {
+                "preflight": lambda _a: (local, data, home, temp, actual, actual),
+                "nas_mount": lambda p: {"type": "nfs", "target": str(data.parent)},
+                "mount_for": lambda p: {"type": "nfs", "target": str(data.parent)} if data.parent in p.parents
+                                      else {"type": "ext4", "target": "/"},
+                "prepare_binary": lambda: (home / "garage", {"standIn": True}),
+                "bootstrap": lambda _h: module, "Garage": FakeGarage, "S3": CustodyStandIn,
+                "stopped_tree": tree, "remove_owned": remove, "MOUNT": data.parent, "owner": observed_owner,
+            }.items():
+                stack.enter_context(patch.object(canary, name, value))
+            stack.enter_context(patch.object(CustodyStandIn, "request", request))
+            stack.enter_context(contextlib.redirect_stdout(captured))
+            status = canary.run(SimpleNamespace(stopped_restore=True))
+        output = captured.getvalue()
+        self.assertNotIn("scratch-only-synthetic", output)
+        report = json.loads(output)
+        self.assertEqual(report, json.loads((local / "report.json").read_text()))
+        return status, report, local, data, home, restored_data, events, copies, instances
+
+    def test_stopped_pair_restores_uuid_manifest_state_denials_then_cleans(self):
+        status, report, local, data, home, restored, events, copies, instances = self.invoke_restore()
+        self.assertEqual(status, 0, report)
+        self.assertTrue(report["passed"] and report["restore"]["verified"])
+        self.assertEqual(report["custody"]["jobId"], report["restore"]["jobId"])
+        self.assertEqual(len(copies), 4)
+        self.assertLess(events.index("original-stop"), events.index("copy"))
+        self.assertLess(events.index("restored-stop"), events.index("cleanup"))
+        self.assertFalse(any(p.exists() for p in (data, home, restored, local / "stopped-backup",
+                                                  local / "restored-home")))
+        self.assertTrue(all(g.process is None for g in instances))
+
+    def test_stop_copy_start_byte_state_denial_failures_preserve_recoverable_pair(self):
+        for failure in ("stop", "copy", "start", "bytes", "state", "denial", "collision",
+                        "mapped", "pair-mismatch", "restored-stop", "cleanup"):
+            with self.subTest(failure=failure):
+                prior = self.root
+                self.root = prior / failure
+                self.root.mkdir(mode=0o700)
+                status, report, local, data, home, restored, events, copies, instances = self.invoke_restore(failure)
+                self.root = prior
+                self.assertEqual(status, 1)
+                self.assertFalse(report["passed"])
+                self.assertEqual(report["restore"]["verified"], failure in ("restored-stop", "cleanup"))
+                self.assertTrue(data.exists() and (home / "meta").exists())
+                self.assertEqual(report["restore"]["jobId"], report["custody"]["jobId"])
+                self.assertNotIn("cleanup", events)
+                if failure == "stop":
+                    self.assertEqual(copies, [])
+                    self.assertFalse(report["processStopped"])
+                elif failure == "restored-stop":
+                    self.assertFalse(report["restore"]["processStopped"])
+                    self.assertTrue(report["processStopped"])
+                    self.assertIn("pid", report["restore"])
+                    self.assertIn("processStartTicks", report["restore"])
+                else:
+                    self.assertTrue(all(g.process is None for g in instances))
+                if failure == "collision":
+                    self.assertEqual((restored / "keep").read_bytes(), b"unowned collision")
+                if failure in ("start", "bytes", "state", "denial", "mapped", "pair-mismatch",
+                               "restored-stop", "cleanup"):
+                    self.assertTrue((local / "stopped-backup/pair.json").exists())
+                    self.assertTrue(report["restore"]["pairManifestSHA256"])
+                    self.assertTrue((local / "stopped-backup/data").exists())
+        RESTORE_MEASUREMENTS["injectedFailureCases"] = 11
+
+
 if __name__ == "__main__":
     job = Path.cwd()
     assert Path(os.environ["HOME"]) == job / ".nas-canary-check/home"
     assert Path(os.environ["TMPDIR"]) == job / ".nas-canary-check/tmp"
     assert not str(job).startswith("/tmp/")
     suite = unittest.TestSuite()
-    for cls in (LocalChecks, CustodyChecks, LifecycleChecks):
+    import sys
+    classes = (RestoreCopyChecks, RestoreChecks) if "--restore-only" in sys.argv else (
+        LocalChecks, CustodyChecks, LifecycleChecks, RestoreCopyChecks, RestoreChecks)
+    for cls in classes:
         # Inherited checks need only run once.
         suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
+    if "--restore-only" in sys.argv:
+        suite.addTest(LocalChecks("test_garage_config_seam_preserves_default"))
+        suite.addTest(CustodyChecks("test_custody_uses_uuid_protocol_and_deletes_only_after_verification"))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     artifact = Path("nas-canary-check.json")
     report = json.loads(artifact.read_text())
     report.update(passed=result.wasSuccessful(), checks=result.testsRun,
-                  imageAcquisitionRerun=False)
+                  selection="restore-only" if "--restore-only" in sys.argv else "all-stand-ins",
+                  restoreMeasurements=RESTORE_MEASUREMENTS, imageAcquisitionRerun=False)
     artifact.write_text(json.dumps(report, indent=2) + "\n")
     raise SystemExit(0 if result.wasSuccessful() else 1)

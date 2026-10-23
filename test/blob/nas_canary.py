@@ -1,5 +1,6 @@
 """Explicit single-host NAS experiment. Never imported by a default test runner."""
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -85,13 +86,19 @@ def owner(path):
     return value.st_uid, value.st_gid
 
 
+def unreadable_tree(_error):
+    raise Refusal("tree_unreadable")
+
+
 def checked_tree(path, identity, expected_owner):
     no_links(path)
     require(fingerprint(path) == identity, "namespace_changed")
     count, allocated = 0, 0
-    for root, dirs, files in os.walk(path, followlinks=False):
+    mount = mount_for(path)
+    for root, dirs, files in os.walk(path, followlinks=False, onerror=unreadable_tree):
         for entry in [Path(root)] + [Path(root) / name for name in dirs + files]:
             value = entry.lstat()
+            require(mount_for(entry) == mount, "cleanup_submount")
             require(value.st_dev == identity[0] and
                     (value.st_uid, value.st_gid) == expected_owner and
                     (stat.S_ISDIR(value.st_mode) or
@@ -180,6 +187,7 @@ def custody(garage, module, home, save_progress):
     manifest_key = prefix + "manifests/" + hashlib.sha256(body).hexdigest() + ".json"
     progress = {"jobId": job, "sha256": sha, "bytes": len(payload),
                 "objects": 2, "uploadedObjects": 0,
+                "manifestKey": manifest_key, "manifestSHA256": hashlib.sha256(body).hexdigest(),
                 "custodyBeforeProducerDeletion": False, "producerDeleted": False,
                 "freshClientByUUID": False, "selectedPrincipalDenials": False}
 
@@ -208,6 +216,248 @@ def custody(garage, module, home, save_progress):
     return progress
 
 
+# Bounds apply per stopped tree and per read/copy pass, not to the filesystem.
+COPY_ENTRIES = 4096
+COPY_ALLOCATED = 512 * 1024 * 1024
+COPY_LOGICAL = 2 * 1024**4
+COPY_CHUNK = 64 * 1024
+
+
+def stop_owned(garage):
+    process = garage.process
+    garage.stop()  # Popen handle only; terminate, wait, kill and wait.
+    require(garage.process is None and
+            (process is None or process.poll() is not None), "stop_unconfirmed")
+
+
+def file_stamp(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def sparse_file(source, target, budget):
+    """Hash fixed nonzero chunks and logical size, retaining holes on disk."""
+    size = os.fstat(source.fileno()).st_size
+    digest = hashlib.sha256(str(size).encode() + b"\0")
+    offset = 0
+    while offset < size:
+        try:
+            start = os.lseek(source.fileno(), offset, os.SEEK_DATA)
+            end = os.lseek(source.fileno(), start, os.SEEK_HOLE)
+        except OSError as error:
+            if error.errno == errno.ENXIO:
+                break
+            require(error.errno in (errno.EINVAL, errno.ENOTSUP), "sparse_seek_failed")
+            # Unsupported sparse seek is safe only within the remaining read bound.
+            require(size - offset <= COPY_ALLOCATED - budget[0], "sparse_seek_required")
+            start, end = offset, size
+        require(offset <= start < end <= size, "sparse_extent")
+        position = start // COPY_CHUNK * COPY_CHUNK
+        while position < end:
+            amount = min(COPY_CHUNK, size - position)
+            budget[0] += amount
+            require(budget[0] <= COPY_ALLOCATED, "copy_read_bound")
+            source.seek(position)
+            block = source.read(amount)
+            require(len(block) == amount, "copy_short_read")
+            if any(block):
+                digest.update(position.to_bytes(8, "big"))
+                digest.update(hashlib.sha256(block).digest())
+                if target is not None:
+                    target.seek(position)
+                    target.write(block)
+            position += amount
+        offset = position
+    if target is not None:
+        target.truncate(size)
+        target.flush()
+        os.fsync(target.fileno())
+    return digest.hexdigest()
+
+
+def stopped_tree(path, identity, expected_owner, *, nas, destination=None, created=None):
+    """Inspect/copy only this trusted private stopped tree, never follow links."""
+    checked_tree(path, identity, expected_owner)
+    row = nas_mount(path) if nas else mount_for(path)
+    require(nas or row["type"] in LOCAL_TYPES, "local_disk_required")
+    entries, logical, allocated, budget = [], 0, 0, [0]
+    # Complete inspection precedes creation of a copy.
+    for root, dirs, files in os.walk(path, followlinks=False, onerror=unreadable_tree):
+        dirs.sort()
+        for entry in [Path(root)] + [Path(root) / name for name in sorted(files)]:
+            value = entry.lstat()
+            require(mount_for(entry) == row, "copy_submount")
+            mode = stat.S_IMODE(value.st_mode)
+            require(mode & 0o077 == 0 and mode & 0o400, "copy_private_mode")
+            logical += value.st_size if stat.S_ISREG(value.st_mode) else 0
+            allocated += value.st_blocks * 512
+            entries.append((entry, value, mode))
+            require(len(entries) <= COPY_ENTRIES and allocated <= COPY_ALLOCATED and
+                    logical <= COPY_LOGICAL, "copy_tree_bound")
+    if destination is not None:
+        no_links(destination)
+        require(not destination.exists(), "restore_destination_exists")
+        destination.mkdir(mode=0o700)
+        assert created is not None
+        created(destination)  # Record identity immediately, including partial copies.
+    manifest = []
+    for entry, value, mode in entries:
+        relative = entry.relative_to(path)
+        output = destination / relative if destination is not None else None
+        record = {"path": str(relative), "mode": mode, "directory": stat.S_ISDIR(value.st_mode)}
+        if record["directory"]:
+            if output is not None and relative != Path("."):
+                output.mkdir(mode=mode)
+        else:
+            record["size"] = value.st_size
+            with entry.open("rb") as source:
+                require(file_stamp(os.fstat(source.fileno())) == file_stamp(value), "copy_source_changed")
+                if output is None:
+                    record["sha256"] = sparse_file(source, None, budget)
+                else:
+                    with output.open("xb") as target:
+                        record["sha256"] = sparse_file(source, target, budget)
+                    output.chmod(mode)
+                require(file_stamp(entry.lstat()) == file_stamp(value), "copy_source_changed")
+        manifest.append(record)
+    checked_tree(path, identity, expected_owner)
+    if destination is not None:
+        for record in reversed(manifest):
+            if record["directory"]:
+                descriptor = os.open(destination / record["path"], os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+    return manifest
+
+
+def restore_client(garage, module, name):
+    key = next(key for key in garage("ListKeys") if key["name"] == name)
+    info = garage("GetKeyInfo", {"id": key["id"], "showSecretKey": True})
+    return S3(module, "http://127.0.0.1:" + str(garage.s3), key["id"], info["secretAccessKey"])
+
+
+def stopped_restore(garage, module, binary, local, data, home, local_owner, mapped,
+                    report, save, state):
+    """Same stopped pair as garage.py, with originals retained and metadata local."""
+    proof = report["restore"] = {"stage": "before-stop", "verified": False,
+                                "originalsRetained": True}
+    backup, restored_home = local / "stopped-backup", local / "restored-home"
+    restored_data = data.with_name(data.name + "-restored")
+    require(restored_data.parent == MOUNT and restored_data != data, "namespace_required")
+    proof.update(backupPath=str(backup), homePath=str(restored_home),
+                 dataPath=str(restored_data), jobId=report["custody"]["jobId"])
+    def phase(name):
+        proof["stage"] = name
+        save()
+    def remember(path, expected_owner, nas=False):
+        identity = fingerprint(path)
+        state["roots"].append((path, identity, expected_owner, nas))
+        proof.setdefault("roots", []).append({"path": str(path), "identity": list(identity),
+                                             "owner": list(expected_owner), "nas": nas,
+                                             "observedOwner": list(owner(path)),
+                                             "mode": stat.S_IMODE(path.stat().st_mode)})
+        save()
+        require(nas_mount(path) if nas else mount_for(path) == mount_for(local), "copy_submount")
+        require(owner(path) == expected_owner and
+                stat.S_IMODE(path.stat().st_mode) == 0o700, "restore_root_owner_mode")
+    for path in (backup, restored_home, restored_data):
+        no_links(path)
+        require(not path.exists(), "restore_destination_exists")
+    nas_mount(restored_data)
+    require(mount_for(home) == mount_for(local) == mount_for(garage.meta), "copy_submount")
+    before = garage("ListBuckets")
+    keys = garage("ListKeys")
+    phase("stopping-original")
+    stop_owned(garage)
+    report["processStopped"] = True
+    phase("backup")
+    backup.mkdir(mode=0o700)
+    remember(backup, local_owner)
+    pair = {}
+    def save_pair(complete=False):
+        body = json.dumps({"complete": complete, "jobId": proof["jobId"], "trees": pair},
+                          sort_keys=True).encode()
+        with (backup / "pair.json").open("wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        proof["pairManifestSHA256"] = hashlib.sha256(body).hexdigest()
+        proof["pairComplete"] = complete
+        save()
+    save_pair()
+    for name, source, expected, nas in (
+            ("meta", garage.meta, local_owner, False), ("data", data, mapped, True)):
+        phase("backup-" + name)
+        target = backup / name
+        pair[name] = stopped_tree(source, fingerprint(source), expected, nas=nas,
+                                 destination=target, created=lambda p: remember(p, local_owner))
+        require(stopped_tree(target, fingerprint(target), local_owner, nas=False) == pair[name],
+                "backup_pair_mismatch")
+        save_pair()
+    # The durable node identity and synthetic S3 keys are in meta. Preserve the
+    # existing RPC secret too, locally, without introducing a credential protocol.
+    secret = garage.secret
+    require(owner(secret) == local_owner and secret.lstat().st_nlink == 1 and
+            stat.S_ISREG(secret.lstat().st_mode) and
+            stat.S_IMODE(secret.stat().st_mode) == 0o600, "rpc_secret_mode")
+    no_links(secret)
+    require(secret.stat().st_size == 64, "rpc_secret_format")
+    rpc = secret.read_bytes()
+    require(len(rpc) == 64 and re.fullmatch(b"[0-9a-f]{64}", rpc), "rpc_secret_format")
+    with (backup / "rpc.secret").open("xb") as stream:
+        stream.write(rpc)
+        stream.flush()
+        os.fsync(stream.fileno())
+    save_pair(complete=True)
+    phase("pair-verified")
+    # A fresh local HOME/config/log, a fresh NAS DATA child. No source deletion.
+    restored_home.mkdir(mode=0o700)
+    remember(restored_home, local_owner)
+    restored = state["garage"] = Garage(binary, restored_home, data_dir=restored_data)
+    restored.secret.write_bytes((backup / "rpc.secret").read_bytes())
+    for name, target, expected, nas in (
+            ("meta", restored.meta, local_owner, False), ("data", restored_data, mapped, True)):
+        phase("restore-" + name)
+        require(stopped_tree(backup / name, fingerprint(backup / name), local_owner, nas=False,
+                             destination=target,
+                             created=lambda p, e=expected, n=nas: remember(p, e, n)) == pair[name],
+                "restore_pair_mismatch")
+        require(stopped_tree(target, fingerprint(target), expected, nas=nas) == pair[name],
+                "restore_pair_mismatch")
+    phase("starting-restored")
+    restored.start()
+    process = restored.process
+    if process is None:
+        raise Refusal("owned_process_missing")
+    proof["pid"] = process.pid
+    proof["processStartTicks"] = Path(f"/proc/{process.pid}/stat").read_text().rsplit(
+        ")", 1)[1].split()[19]
+    phase("restored-custody")
+    require(restored("ListBuckets") == before and restored("ListKeys") == keys, "restored_state")
+    job = report["custody"]["jobId"]
+    reader = restore_client(restored, module, "reader-a")
+    require(retrieve(reader, "artifact-a", job) == PAYLOAD, "restored_uuid_bytes")
+    key = "artifact-a/v1/" + job + "/objects/" + report["custody"]["sha256"]
+    require(restore_client(restored, module, "other-b").request("GET", key)[0] == 403 and
+            restore_client(restored, module, "writer-a").request("GET", key)[0] == 403 and
+            reader.request("PUT", key, b"denied")[0] == 403, "restored_principal_denial")
+    # Compare the exact original content-addressed manifest as well as UUID bytes.
+    manifest_prefix = "artifact-a/v1/" + job + "/manifests/"
+    require(report["custody"]["manifestKey"].startswith(manifest_prefix), "manifest_binding")
+    status, body = reader.request("GET", report["custody"]["manifestKey"])
+    require(status == 200 and hashlib.sha256(body).hexdigest() ==
+            report["custody"]["manifestSHA256"], "restored_manifest")
+    proof.update(verified=True, bucketStateEqual=True, keyStateEqual=True,
+                 sameUUIDBytes=True, sameManifest=True, selectedPrincipalDenials=True)
+    phase("stopping-restored")
+    stop_owned(restored)
+    proof["processStopped"] = True
+    proof["logs"] = redacted_log(restored_home)
+    phase("verified")
+
+
 def redacted_log(home):
     # No raw log lines or arbitrary exception messages leave private scratch.
     path = home / "garage.log"
@@ -232,9 +482,11 @@ def run(args):
               "productionEnabled": False, "hardCapProven": False,
               "stableStorageProven": False, "imageDigest": IMAGE,
               "bootstrapCommit": BOOTSTRAP_COMMIT, "bootstrapBlob": BOOTSTRAP_BLOB}
+    restore_mode = getattr(args, "stopped_restore", False)
+    restore_state = {"garage": None, "roots": []}
     garage, report_path = None, None
     local = data = home = None
-    local_id = data_id = home_id = None
+    local_id = data_id = home_id = temp_id = image_id = None
     previous = signal.signal(signal.SIGALRM, deadline)
     old_int = signal.signal(signal.SIGTERM, deadline)
     signal.alarm(MAX_SECONDS)
@@ -260,8 +512,12 @@ def run(args):
         report["stage"] = "scratch-setup"
         home.mkdir(parents=True, mode=0o700)
         home_id = fingerprint(home)
+        image_id = fingerprint(home.parent)
+        report["imageRootIdentity"] = list(image_id)
         report["privateHomeIdentity"] = list(home_id)
         temp.mkdir(mode=0o700)
+        temp_id = fingerprint(temp)
+        report["tempIdentity"] = list(temp_id)
         require(owner(home) == local_owner and owner(temp) == local_owner, "scratch_owner")
         for name in ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
                      "XDG_RUNTIME_DIR", "SSH_AUTH_SOCK"):
@@ -306,17 +562,55 @@ def run(args):
             require(fingerprint(local) == local_id, "local_namespace_changed")
             report_path.write_text(json.dumps(report, indent=2) + "\n")
 
-        custody(garage, bootstrap(home), home, save_custody)
+        module = bootstrap(home)
+        custody(garage, module, home, save_custody)
+        if restore_mode:
+            report["stage"] = "stopped-restore"
+            def save_restore():
+                require(fingerprint(local) == local_id and fingerprint(home) == home_id and
+                        fingerprint(data) == data_id, "namespace_changed")
+                report_path.write_text(json.dumps(report, indent=2) + "\n")
+            stopped_restore(garage, module, binary, local, data, home, local_owner, mapped,
+                            report, save_restore, restore_state)
         report["stage"] = "stopping"
         garage.stop()
         report["processStopped"] = True
         report["logs"] = redacted_log(home)
         report["stage"] = "cleanup"
         require(fingerprint(home) == home_id, "namespace_changed")
+        if restore_mode:
+            require(report["restore"]["verified"], "restored_custody_required")
+            # Inspect every cleanup root before deleting any original or copy.
+            for path, identity, expected, nas in restore_state["roots"]:
+                if nas:
+                    nas_mount(path)
+                checked_tree(path, identity, expected)
+            checked_tree(data, data_id, mapped)
+            checked_tree(home, home_id, local_owner)
+            checked_tree(temp, temp_id, local_owner)
+            require(fingerprint(home.parent) == image_id, "namespace_changed")
+            report["restore"]["cleanup"] = "removing-verified-trees"
+            report_path.write_text(json.dumps(report, indent=2) + "\n")
         nas_mount(data)
         remove_owned(data, data_id, mapped)
         report["nasRemoved"] = True
+        if restore_mode:
+            report["restore"]["originalsRetained"] = False
+            report_path.write_text(json.dumps(report, indent=2) + "\n")
         remove_owned(home, home_id, local_owner)
+        if restore_mode:
+            # Child roots were fingerprinted too. Remove parent trees only once.
+            roots = restore_state["roots"]
+            for path, identity, expected, nas in roots:
+                if any(other in path.parents for other, *_ in roots):
+                    continue
+                if nas:
+                    nas_mount(path)
+                remove_owned(path, identity, expected)
+            report["restore"]["cleanup"] = "owned-restore-and-backup-removed"
+            report["restore"]["originalsRetained"] = False
+        require(fingerprint(temp) == temp_id and fingerprint(home.parent) == image_id,
+                "namespace_changed")
         temp.rmdir()
         home.parent.rmdir()
         report["cleanup"] = "owned-data-and-private-scratch-removed-report-retained"
@@ -328,7 +622,24 @@ def run(args):
         if isinstance(error, Refusal):
             report["refusal"] = str(error)
     finally:
-        signal.alarm(30)
+        signal.alarm(45 if restore_mode else 30)
+        # Each exact handle gets its own stop attempt even if the other fails.
+        restored = restore_state["garage"]
+        if restored is not None:
+            try:
+                if restored.process is not None:
+                    report["restore"]["pid"] = restored.process.pid
+                    try:
+                        report["restore"]["processStartTicks"] = Path(
+                            f"/proc/{restored.process.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+                    except OSError:
+                        report["restore"]["processStartTicksUnavailable"] = True
+                stop_owned(restored)
+                report["restore"]["processStopped"] = True
+            except BaseException as error:
+                report["passed"] = False
+                report["restore"]["processStopped"] = False
+                report["restore"]["stopFailureClass"] = type(error).__name__
         try:
             if garage is not None:
                 if garage.process is not None:
@@ -337,7 +648,10 @@ def run(args):
                         report["processStartTicks"] = Path(f"/proc/{garage.process.pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
                     except OSError:
                         report["processStartTicksUnavailable"] = True
-                garage.stop()
+                if restore_mode:
+                    stop_owned(garage)
+                else:
+                    garage.stop()
                 report["processStopped"] = True
             if home is not None and home.exists():
                 report["logs"] = redacted_log(home)
@@ -363,6 +677,8 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute-disposable-nas-canary", action="store_true", required=True)
+    parser.add_argument("--stopped-restore", action="store_true",
+                        help="also prove stopped local-metadata/NAS-data restore into fresh paths")
     parser.add_argument("--local-run", required=True)
     parser.add_argument("--nas-run", required=True)
     parser.add_argument("--expected-data-owner", required=True, help="explicit observed UID:GID, e.g. 977:988")
