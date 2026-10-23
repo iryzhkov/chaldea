@@ -1,0 +1,340 @@
+"""Selected stand-in checks for the new canary. No NAS, registry or Garage server."""
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
+import unittest
+from unittest.mock import patch
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+import nas_canary as canary
+from garage import Garage
+
+
+class LocalChecks(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ["TMPDIR"])
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+
+    def args(self):
+        cache = self.root / ".cache"
+        cache.mkdir(mode=0o700)
+        local = cache / "garage-canary-test"
+        return SimpleNamespace(local_run=str(local), nas_run=str(canary.MOUNT / local.name),
+                               expected_data_owner="977:988")
+
+    def test_paths_reject_relative_traversal_and_config_injection(self):
+        for path in ("relative", "/safe/../escape", "/safe//extra", '/safe/"bad', "/safe/line\nbreak"):
+            with self.subTest(path=path), self.assertRaises(canary.Refusal):
+                canary.plain_path(path)
+
+    def test_symlink_ancestor_refused(self):
+        (self.root / "link").symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(canary.Refusal, "symlink_path"):
+            canary.no_links(self.root / "link/new")
+
+    def test_mountinfo_selects_longest_mount_and_unescapes(self):
+        rows = ("1 0 0:1 / / rw - ext4 /dev/local rw\n"
+                "2 1 0:2 / /mnt/nas/ml rw - nfs " + canary.SOURCE + " rw,vers=3,soft,sec=sys\n"
+                "3 2 0:3 / /mnt/nas/ml/nested rw - tmpfs tmpfs rw\n")
+        with patch.object(Path, "read_text", return_value=rows):
+            self.assertEqual(canary.mount_for(Path("/mnt/nas/ml/new"))["type"], "nfs")
+            self.assertEqual(canary.mount_for(Path("/mnt/nas/ml/nested/new"))["type"], "tmpfs")
+
+    def test_wrong_source_type_mountpoint_and_options_refused(self):
+        good = {"target": str(canary.MOUNT), "source": canary.SOURCE, "type": "nfs",
+                "options": ["rw", "vers=3", "soft", "sec=sys"]}
+        variants = [dict(good, source="other:/export"), dict(good, type="nfs4"),
+                    dict(good, target="/mnt/nas"), dict(good, options=["rw", "vers=3", "hard", "sec=sys"]),
+                    dict(good, options=["rw", "vers=3", "soft", "sec=krb5"])]
+        for row in variants:
+            with self.subTest(row=row), patch.object(canary, "mount_for", return_value=row):
+                with self.assertRaisesRegex(canary.Refusal, "unexpected_nfs_mount"):
+                    canary.nas_mount(canary.MOUNT / "new")
+
+    def test_root_refused_before_filesystem_setup(self):
+        args = self.args()
+        with patch.object(canary.os, "geteuid", return_value=0):
+            with self.assertRaisesRegex(canary.Refusal, "nonroot_identity_required"):
+                canary.preflight(args)
+        self.assertFalse(Path(args.local_run).exists())
+
+    def preflight_context(self, args):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for name in ("geteuid", "getegid", "getuid", "getgid"):
+            stack.enter_context(patch.object(canary.os, name, return_value=1000))
+        stack.enter_context(patch.object(canary, "owner", return_value=(1000, 1000)))
+        stack.enter_context(patch.object(canary.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir=str(self.root))))
+        stack.enter_context(patch.object(canary, "mount_for", return_value={"type": "ext4"}))
+        stack.enter_context(patch.dict(os.environ, {"HOME": args.local_run + "/.blob-image/home",
+                                                   "TMPDIR": args.local_run + "/.blob-image/tmp"}))
+        for key in ("SUDO_UID", "SUDO_GID"):
+            stack.enter_context(patch.dict(os.environ))
+            os.environ.pop(key, None)
+        return stack
+
+    def test_local_preflight_accepts_distinct_mapping_without_touching_nas(self):
+        args = self.args()
+        self.preflight_context(args)
+        with patch.object(canary, "nas_mount", side_effect=AssertionError("premature NAS access")):
+            result = canary.preflight(args)
+        self.assertEqual(result[-2:], ((1000, 1000), (977, 988)))
+        self.assertFalse(Path(args.local_run).exists())
+
+    def test_local_collisions_unsafe_home_mapping_and_nondisk_refused(self):
+        args = self.args()
+        self.preflight_context(args)
+        with patch.dict(os.environ, {"HOME": "/home/igor"}):
+            with self.assertRaisesRegex(canary.Refusal, "asserted_scratch"):
+                canary.preflight(args)
+        with patch.object(canary, "mount_for", return_value={"type": "tmpfs"}):
+            with self.assertRaisesRegex(canary.Refusal, "local_disk_required"):
+                canary.preflight(args)
+        args.expected_data_owner = "0:988"
+        with self.assertRaisesRegex(canary.Refusal, "invalid_data_owner"):
+            canary.preflight(args)
+        args.expected_data_owner = "977:988"
+        Path(args.local_run).mkdir()
+        with self.assertRaisesRegex(canary.Refusal, "namespace_collision"):
+            canary.preflight(args)
+
+    def test_cleanup_refuses_replaced_namespace_symlink_hardlink_and_wrong_owner(self):
+        data = self.root / "data"
+        data.mkdir()
+        identity = canary.fingerprint(data)
+        expected = canary.owner(data)
+        outside = self.root / "outside"
+        outside.write_bytes(b"preserve")
+        (data / "link").symlink_to(outside)
+        with self.assertRaisesRegex(canary.Refusal, "unsafe_cleanup_entry"):
+            canary.remove_owned(data, identity, expected)
+        (data / "link").unlink()
+        os.link(outside, data / "hard")
+        with self.assertRaisesRegex(canary.Refusal, "unsafe_cleanup_entry"):
+            canary.remove_owned(data, identity, expected)
+        (data / "hard").unlink()
+        with self.assertRaisesRegex(canary.Refusal, "unsafe_cleanup_entry"):
+            canary.remove_owned(data, identity, (999999, 999999))
+        with self.assertRaisesRegex(canary.Refusal, "namespace_changed"):
+            canary.remove_owned(data, (identity[0], identity[1] + 1), expected)
+        self.assertEqual(outside.read_bytes(), b"preserve")
+
+    def test_cleanup_removes_only_private_tree(self):
+        data = self.root / "data"
+        data.mkdir()
+        (data / "file").write_bytes(b"x")
+        outside = self.root / "keep"
+        outside.write_bytes(b"preserve")
+        canary.remove_owned(data, canary.fingerprint(data), canary.owner(data))
+        self.assertFalse(data.exists())
+        self.assertEqual(outside.read_bytes(), b"preserve")
+
+    def test_garage_config_seam_preserves_default(self):
+        for name, override in (("default", None), ("separate", self.root / "nas-data")):
+            home = self.root / name
+            home.mkdir()
+            garage = Garage(Path("/unused"), home, data_dir=override)
+            self.assertEqual(garage.meta, home / "meta")
+            self.assertEqual(garage.data, home / "data" if override is None else override)
+            config = garage.config.read_text()
+            self.assertIn('data_dir = "' + str(garage.data) + '"', config)
+            self.assertIn('api_bind_addr = "127.0.0.1:', config)
+
+
+class CustodyStandIn:
+    objects: dict[str, bytes] = {}
+    clients: list[str] = []
+    producer = Path(".")
+    fail_put = False
+
+    def __init__(self, _module, _endpoint, access, _secret):
+        self.access = access
+        self.clients.append(access)
+        if access == "reader-a" and self.clients.count(access) == 2:
+            if self.producer.exists():
+                raise AssertionError("producer still exists in fresh client context")
+
+    def request(self, method, path, body=b""):
+        if self.access == "other-b" or method == "GET" and self.access == "writer-a" or (
+                method == "PUT" and self.access == "reader-a"):
+            return 403, b""
+        if method == "PUT":
+            if self.fail_put:
+                return 503, b""
+            self.objects[path] = body
+            return 200, b""
+        if "?" in path:
+            bucket, query = path.split("?", 1)
+            prefix = urllib.parse.parse_qs(query)["prefix"][0]
+            root = ET.Element("ListBucketResult")
+            ET.SubElement(root, "IsTruncated").text = "false"
+            for key in sorted(self.objects):
+                if key.startswith(bucket + "/" + prefix):
+                    row = ET.SubElement(root, "Contents")
+                    ET.SubElement(row, "Key").text = key[len(bucket) + 1:]
+            return 200, ET.tostring(root)
+        return (200, self.objects[path]) if path in self.objects else (404, b"")
+
+
+class CustodyChecks(LocalChecks):
+    def standin(self):
+        CustodyStandIn.objects, CustodyStandIn.clients = {}, []
+        CustodyStandIn.producer = self.root / "producer"
+        CustodyStandIn.fail_put = False
+        names = ["writer-a", "reader-a", "other-b"]
+        def api(endpoint, _payload=None):
+            if endpoint == "ListKeys":
+                return [{"name": name, "id": name} for name in names]
+            return {"secretAccessKey": "scratch-only-synthetic"}
+        garage = SimpleNamespace(s3=12345)
+        class API:
+            s3 = garage.s3
+            def __call__(self, *args):
+                return api(*args)
+        module = SimpleNamespace(converge=lambda *args: None, S3=object)
+        return API(), module
+
+    def test_custody_uses_uuid_protocol_and_deletes_only_after_verification(self):
+        garage, module = self.standin()
+        with patch.object(canary, "S3", CustodyStandIn):
+            report = canary.custody(garage, module, self.root)
+        self.assertTrue(report["freshClientByUUID"])
+        self.assertEqual(len(CustodyStandIn.objects), 2)
+        self.assertFalse((self.root / "producer").exists())
+
+    def test_failed_upload_preserves_producer(self):
+        garage, module = self.standin()
+        CustodyStandIn.fail_put = True
+        with patch.object(canary, "S3", CustodyStandIn):
+            with self.assertRaisesRegex(canary.Refusal, "artifact_put"):
+                canary.custody(garage, module, self.root)
+        self.assertEqual((self.root / "producer/report.txt").read_bytes(), canary.PAYLOAD)
+
+
+class LifecycleChecks(LocalChecks):
+    def invoke(self, *, fail_stage=None, wrong_mapping=False):
+        local = self.root / "garage-canary-test"
+        data = self.root / "nas" / local.name
+        data.parent.mkdir()
+        home, temp = local / ".blob-image/home", local / ".blob-image/tmp"
+        actual_owner = canary.owner(self.root)
+        mapped = (999999, 999999) if wrong_mapping else actual_owner
+        args = SimpleNamespace()
+        captured = io.StringIO()
+        stopped = []
+        class FakeGarage:
+            process = SimpleNamespace(pid=os.getpid())
+            def __init__(self, _binary, _home, *, data_dir):
+                if data_dir != data:
+                    raise AssertionError("wrong data dir")
+            def start(self):
+                if fail_stage == "start":
+                    raise RuntimeError("scratch-only-synthetic-do-not-output")
+            def stop(self):
+                stopped.append(True)
+                if fail_stage == "stop":
+                    raise RuntimeError("scratch-only-synthetic-do-not-output")
+                self.process = None
+        def mount(path):
+            # The initial failure artifact must precede even NAS preflight.
+            initial = json.loads((local / "report.json").read_text())
+            self.assertFalse(initial["passed"])
+            if fail_stage == "mount":
+                raise canary.Refusal("unexpected_nfs_mount")
+            return {"standIn": True}
+        original_cwd, original_umask = Path.cwd(), os.umask(0o077)
+        self.addCleanup(os.umask, original_umask)
+        self.addCleanup(os.chdir, original_cwd)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(canary, "preflight", return_value=(
+                local, data, home, temp, actual_owner, mapped)))
+            stack.enter_context(patch.object(canary, "nas_mount", side_effect=mount))
+            stack.enter_context(patch.object(canary, "MOUNT", data.parent))
+            stack.enter_context(patch.object(canary, "prepare_binary", return_value=(home / "garage", {"standIn": True})))
+            stack.enter_context(patch.object(canary, "Garage", FakeGarage))
+            stack.enter_context(patch.object(canary, "bootstrap", return_value=object()))
+            def prove(*_args):
+                if fail_stage == "custody":
+                    raise RuntimeError("scratch-only-synthetic-do-not-output")
+                return {"standIn": True}
+            stack.enter_context(patch.object(canary, "custody", side_effect=prove))
+            stack.enter_context(contextlib.redirect_stdout(captured))
+            status = canary.run(args)
+        output = captured.getvalue()
+        self.assertNotIn("scratch-only-synthetic", output)
+        report = json.loads(output)
+        self.assertEqual(json.loads((local / "report.json").read_text()), report)
+        return status, report, data, home, stopped
+
+    def test_success_stops_and_cleans_owned_namespaces(self):
+        status, report, data, home, stopped = self.invoke()
+        self.assertEqual(status, 0)
+        self.assertTrue(report["passed"])
+        self.assertFalse(data.exists())
+        self.assertFalse(home.exists())
+        self.assertTrue(stopped)
+
+    def test_setup_failure_has_artifact_and_no_data(self):
+        status, report, data, _home, stopped = self.invoke(fail_stage="mount")
+        self.assertEqual(status, 1)
+        self.assertEqual(report["stage"], "nas-preflight")
+        self.assertFalse(data.exists())
+        self.assertFalse(stopped)
+
+    def test_wrong_mapping_preserves_new_directory_without_starting(self):
+        status, report, data, _home, stopped = self.invoke(wrong_mapping=True)
+        self.assertEqual(status, 1)
+        self.assertEqual(report["refusal"], "data_ownership_mapping")
+        self.assertTrue(data.exists())
+        self.assertFalse(stopped)
+
+    def test_start_and_custody_failures_stop_and_preserve(self):
+        for stage in ("start", "custody"):
+            with self.subTest(stage=stage):
+                # invoke consumes its namespace, so use a separate owned subdir.
+                prior = self.root
+                self.root = prior / stage
+                self.root.mkdir()
+                status, report, data, home, stopped = self.invoke(fail_stage=stage)
+                self.root = prior
+                self.assertEqual(status, 1)
+                self.assertTrue(report["processStopped"])
+                self.assertTrue(data.exists() and home.exists())
+                self.assertTrue(stopped)
+
+    def test_uncertain_stop_preserves_originals_and_never_passes(self):
+        status, report, data, home, stopped = self.invoke(fail_stage="stop")
+        self.assertEqual(status, 1)
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["processStopped"])
+        self.assertTrue(data.exists() and home.exists())
+        self.assertTrue(stopped)
+
+    def test_redacted_logs_contain_no_raw_lines(self):
+        (self.root / "garage.log").write_bytes(b"ERROR secretAccessKey=synthetic-private\nWARN other\n")
+        result = canary.redacted_log(self.root)
+        self.assertEqual(result["errorMarkers"], 1)
+        self.assertNotIn("synthetic-private", json.dumps(result))
+
+
+if __name__ == "__main__":
+    job = Path.cwd()
+    assert Path(os.environ["HOME"]) == job / ".nas-canary-check/home"
+    assert Path(os.environ["TMPDIR"]) == job / ".nas-canary-check/tmp"
+    assert not str(job).startswith("/tmp/")
+    suite = unittest.TestSuite()
+    for cls in (LocalChecks, CustodyChecks, LifecycleChecks):
+        # Inherited checks need only run once.
+        suite.addTests(cls(name) for name in cls.__dict__ if name.startswith("test_"))
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    Path("nas-canary-check.json").write_text(json.dumps({
+        "passed": result.wasSuccessful(), "proof": "new-canary-local-stand-ins",
+        "checks": result.testsRun, "nasProof": False, "imageAcquisitionRerun": False,
+    }, indent=2) + "\n")
+    raise SystemExit(0 if result.wasSuccessful() else 1)
