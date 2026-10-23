@@ -20,7 +20,7 @@ test("ignored replies retain only recent accepted evidence across sampler invoca
     assert.equal(sampleClock(run, cache).healthy, true);
     const accepted = readFileSync(cache, "utf8");
     // A discarded spike must not replace the last accepted offset or renew its lifetime.
-    message = report(1000, 0, 0.08, at).replace(" false ", " true ");
+    message = report(1000, 0, 0.08, at).replace(" false ", " true ").replace(" 5 100", " 6 100");
     const fallback = sampleClock(run, cache);
     assert.equal(fallback.healthy, true);
     assert.ok(Math.abs(fallback.offsetSeconds - 0.002) < 0.000001);
@@ -33,8 +33,10 @@ test("ignored replies retain only recent accepted evidence across sampler invoca
     for (const patch of [
       { report: report(0.002, 3601, 0.08, at) },
       { bootId: "different-boot" },
+      { report: report(0.002, 0, 0.08, at).replace(" 5 100", " 7 100") },
       { monotonicSeconds: 1e15 },
       { sampledAt: at + 60 },
+      { sampledAt: at - 60 },
       { report: message },
     ]) {
       writeFileSync(cache, JSON.stringify({ ...saved, ...patch }));
@@ -46,7 +48,7 @@ test("ignored replies retain only recent accepted evidence across sampler invoca
     // A newly accepted but inaccurate measurement also fails closed.
     message = report(1000, 0, 0.08, at);
     assert.equal(sampleClock(run, cache).healthy, false);
-    message = message.replace(" false ", " true ");
+    message = message.replace(" false ", " true ").replace(" 5 100", " 6 100");
     assert.equal(sampleClock(run, cache).healthy, false);
   } finally { scratch.remove(); }
 });
@@ -65,7 +67,7 @@ test("expired evidence cannot revive after a small backward wall correction", t 
       return "t 64000000";
     };
     assert.equal(sampleClock(run, cache).healthy, true);
-    message = message.replace(" false ", " true ");
+    message = message.replace(" false ", " true ").replace(" 5 100", " 6 100");
     assert.equal(sampleClock(run, cache).healthy, true);
     wall += 3000;
     assert.equal(sampleClock(run, cache).healthy, false);
@@ -89,7 +91,7 @@ test("accepted evidence crosses Node processes and rejects unsafe cache files", 
     const sample = (message: string) => JSON.parse(execFileSync(process.execPath,
       ["--input-type=module", "-e", code, cache, message], { encoding: "utf8" }));
     const accepted = report(0.002, 0, 0.08, at);
-    const ignored = report(1000, 0, 0.08, at).replace(" false ", " true ");
+    const ignored = report(1000, 0, 0.08, at).replace(" false ", " true ").replace(" 5 100", " 6 100");
     assert.equal(sample(accepted).healthy, true);
     for (let i = 0; i < 3; i++) assert.equal(sample(ignored).healthy, true);
     chmodSync(cache, 0o666);

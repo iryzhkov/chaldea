@@ -140,6 +140,8 @@ export function sampleClock(run: (program: string, args: string[]) => string = c
         Math.abs((now - (cached.sampledAt as number)) -
           (monotonicSeconds - cached.monotonicSeconds)) <= 30 &&
         typeof cached.report === "string" && typeof cached.poll === "string", "invalid_clock_evidence");
+      requireAccess(Number(report.trim().split(/\s+/)[18]) >
+        Number(cached.report.trim().split(/\s+/)[18]), "clock_evidence_packet_order");
       // Reapply the original accepted-packet accuracy and freshness limits,
       // including the one-hour ceiling, against its original NTP timestamp.
       const health = timesyncdHealth(synchronized, cached.report, cached.poll, now);
