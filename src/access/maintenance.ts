@@ -142,7 +142,9 @@ export function sampleClock(run: (program: string, args: string[]) => string = c
         typeof cached.report === "string" && typeof cached.poll === "string", "invalid_clock_evidence");
       // Reapply the original accepted-packet accuracy and freshness limits,
       // including the one-hour ceiling, against its original NTP timestamp.
-      return timesyncdHealth(synchronized, cached.report, cached.poll, now);
+      const health = timesyncdHealth(synchronized, cached.report, cached.poll, now);
+      if (!health.healthy) unlinkSync(cachePath);
+      return health;
     }
     const health = timesyncdHealth(synchronized, report, poll, now);
     if (cachePath) {
