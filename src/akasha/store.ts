@@ -129,6 +129,12 @@ export class EventStore {
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=0;");
       this.db.exec("PRAGMA max_page_count=" + Math.floor(this.budget.main / 4096));
       migrate(this.db, [() => {}]);
+      // Add query indices on both initialization and reopen. Keep version 1 so
+      // the previous runtime can reopen the same receipts database for rollback.
+      this.transaction(() => this.db.exec(`
+        CREATE INDEX IF NOT EXISTS receipts_state_expiry ON receipts(state,expires);
+        CREATE INDEX IF NOT EXISTS receipts_status_scope ON receipts(profile,project,source);
+      `), 8192);
     } catch (e) { this.db.close(); throw e; }
     this.outbox = new Outbox(sqliteOutbox(this.db, {
       table: "outbox", key: "event_id", columns: ["event_id", "envelope", "bytes"],
