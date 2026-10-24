@@ -21,6 +21,32 @@ const DATA = '/mnt/nas/ml/garage-blobs';
 const CGROUP = '/sys/fs/cgroup/system.slice/' + SERVICE;
 const fail = (): never => { throw new Error('blob_maintenance_refused'); };
 const require = (value: unknown): void => { if (!value) fail(); };
+// Fixed read-only consumer of the hash-bound native producer. check() includes the
+// normal preflight gates, mount/custody checks and shared filecount policy.
+// Importing under a non-main name never runs the starter's exec path.
+const NATIVE_HEADROOM = `import hashlib, json, types
+from pathlib import Path
+import sys, tomllib
+pins = json.load(sys.stdin)
+starter = "/usr/local/libexec/garage-storage-native.py"
+raw = Path(starter).read_bytes()
+assert hashlib.sha256(raw).hexdigest() == pins["starterSHA256"]
+native = types.ModuleType("garage_maintenance_headroom")
+native.__file__ = starter
+exec(compile(raw, starter, "exec"), native.__dict__)
+def pinned(path, key, cap):
+    raw = native.trusted(path, cap)
+    native.require(hashlib.sha256(raw).hexdigest() == pins[key], "maintenance input hash mismatch")
+    return raw
+pinned("/usr/local/libexec/garage-storage-preflight.py", "preflightSHA256", 65536)
+storage = json.loads(pinned("/etc/garage/storage.json", "storageSHA256", 65536))
+garage = tomllib.loads(pinned("/mnt/docker-data/swarm/objectstore/config/garage.toml", "garageSHA256", 16384).decode())
+native.require(storage["data"]["path"] == "/mnt/nas/ml/garage-blobs"
+               and storage["metadata"]["path"] == "/mnt/docker-data/swarm/objectstore", "fixed maintenance paths required")
+print(json.dumps(native.check(storage, garage)["startup_headroom"], allow_nan=False))
+`;
+type FileHeadroom = { available_bytes: number; filecounts: 'known' | 'UNKNOWN'; available_inodes: number | null };
+type HeadroomReport = { data: FileHeadroom; metadata: FileHeadroom };
 type Permission = { read: boolean; write: boolean; owner: boolean };
 type KeyInfo = { id: string; name: string };
 type Binding = { bucket: string; bucketId: string; principal: string; publishers: string[];
@@ -168,6 +194,7 @@ export class OperatorRuntime implements MaintenanceRuntime {
   private metadata = '';
   private rpcHash = '';
   private pairHash = '';
+  headroomReport: HeadroomReport | null = null;
   constructor(config: Config, hash: string, pair: string) {
     this.config = config; this.hash = hash; this.pair = pair;
   }
@@ -193,12 +220,38 @@ export class OperatorRuntime implements MaintenanceRuntime {
       p.SendSIGKILL === 'no' && p.Restart === 'no' && p.User === '1000' && p.Group === '1000');
   }
   async headroom() {
-    for (const [path, minimum] of [[DATA, 1024 ** 3], [META, this.config.minFreeBytes],
-      [this.config.backupRoot, this.config.minFreeBytes]] as const) {
+    this.headroomReport = null;
+    this.assertService();
+    const c = this.config;
+    // Recheck protected inputs at this seam as well as in the fixed Python call.
+    for (const [path, expected, cap] of [
+      [STARTER, c.starterSHA256, 65536], [PREFLIGHT, c.preflightSHA256, 65536],
+      [STORAGE, c.storageSHA256, 65536], [CONFIG, c.garageSHA256, 16384],
+    ] as const) require(sha256(trusted(path, cap)) === expected);
+    const out = JSON.parse(command('/usr/bin/python3', ['-I', '-B', '-c', NATIVE_HEADROOM],
+      JSON.stringify({ starterSHA256: c.starterSHA256, preflightSHA256: c.preflightSHA256,
+        storageSHA256: c.storageSHA256, garageSHA256: c.garageSHA256 }), 10000, 16384));
+    require(exactKeys(out, ['data', 'metadata']));
+    for (const label of ['data', 'metadata'] as const) {
+      const row = out[label];
+      require(exactKeys(row, ['available_bytes', 'filecounts', 'available_inodes']) &&
+        Number.isSafeInteger(row.available_bytes) &&
+        row.available_bytes >= (label === 'data' ? 1024 ** 3 : c.minFreeBytes));
+      require(row.filecounts === 'known'
+        ? Number.isSafeInteger(row.available_inodes) && row.available_inodes >= c.minFreeInodes
+        : label === 'data' && row.filecounts === 'UNKNOWN' && row.available_inodes === null);
+    }
+    // Local metadata and backup retain every stronger maintenance floor.
+    for (const path of [META, c.backupRoot]) {
       const { statfsSync } = await import('node:fs');
       const fs = statfsSync(path);
-      require(fs.bavail * fs.bsize >= minimum && fs.ffree >= this.config.minFreeInodes);
+      require(Number.isSafeInteger(fs.bavail) && fs.bavail >= 0 &&
+        Number.isSafeInteger(fs.bsize) && fs.bsize > 0 &&
+        Number.isSafeInteger(fs.bavail * fs.bsize) && fs.bavail * fs.bsize >= c.minFreeBytes &&
+        Number.isSafeInteger(fs.files) && Number.isSafeInteger(fs.ffree) &&
+        fs.files >= fs.ffree && fs.ffree >= c.minFreeInodes);
     }
+    this.headroomReport = out;
   }
   async health() {
     this.assertService();
@@ -359,10 +412,10 @@ export class OperatorRuntime implements MaintenanceRuntime {
     return results;
   }
   async completed() {
-    require(this.pairHash);
+    require(this.pairHash && this.headroomReport);
     durable(join(this.pair, 'complete.json'), Buffer.from(JSON.stringify({
       version: 1, configSHA256: this.hash, node: this.before, metadata: this.metadata,
-      rpcSHA256: this.rpcHash, pairSHA256: this.pairHash,
+      rpcSHA256: this.rpcHash, pairSHA256: this.pairHash, headroom: this.headroomReport,
     })));
   }
   async resume() {
@@ -409,6 +462,7 @@ export async function operatorMain(args: string[]) {
     await maintain(runtime, args[0] as 'run' | 'resume');
     if (args[0] === 'run')
       durable(join(config.backupRoot, '.resume-permit'), Buffer.from(runtime.pair));
-    process.stdout.write(JSON.stringify({ completed: true, publication: args[0] === 'run' ? 'fenced' : 'resumed', backupId: id }) + '\n');
+    process.stdout.write(JSON.stringify({ completed: true, publication: args[0] === 'run' ? 'fenced' : 'resumed', backupId: id,
+      headroom: runtime.headroomReport }) + '\n');
   } finally { rmdirSync(lock); }
 }
