@@ -36,13 +36,14 @@ export async function refreshStatus(c:ReaderConfig,previous:StatusCache,dependen
       const response=await(dependencies.fetch??fetch)(url,{redirect:"error",headers:{authorization:"Bearer "+token},signal});
       if(response.status===410&&!reset){await response.body?.cancel();url.searchParams.delete("cursor");candidate.gap=true;reset=true;continue;}
       if(!response.ok)throw new Error("reader_unavailable");
-      const raw=await responseJson(response);
+      const raw=await responseJson(response),receivedNow=(dependencies.now??Date.now)();
+      // The producer-time query may include admissions made while this read was in flight.
       if(!raw||typeof raw!=="object"||Array.isArray(raw))throw new Error("invalid_page");
       const v=raw as Record<string,unknown>;
       if(Object.keys(v).length!==2||!Array.isArray(v.events)||v.events.length>128)throw new Error("invalid_page");
       for(const item of v.events){
         const e=validateEnvelope(item),s=validateHostSnapshot(e.data.snapshot);
-        if(e.kind!=="agent_status"||e.provenance.type!=="verified"||!c.allowedSourceIds.includes(e.source_id)||!statusIdentity(e,s)||Date.parse(e.received_at)>now||now-s.observedAt>3600_000)throw new Error("unauthorized_status");
+        if(e.kind!=="agent_status"||e.provenance.type!=="verified"||!c.allowedSourceIds.includes(e.source_id)||!statusIdentity(e,s)||Date.parse(e.received_at)>receivedNow||now-s.observedAt>3600_000)throw new Error("unauthorized_status");
         mergeStatus(candidate,s,now);
       }
       if(v.next_cursor===null){candidate.gap ||= candidate.snapshots.some(s=>s.truncated);return candidate;}

@@ -36,14 +36,33 @@ async function hostedRig(host="agent-a",operations=false){
   const appendToken=await x.token({iss:publisher.issuer,host:publisher.host,sub:publisher.profile,project:publisher.project,source:publisher.source,grants:[{resource:publisher.source,actions:["append"]}]});
   const readerToken=async(overrides:Record<string,unknown>={})=>new CompactSign(Buffer.from(JSON.stringify({v:1,iss:reader.issuer,sub:reader.profile,project:reader.project,source:reader.source,host:reader.host,aud:"akasha",run_id:"fixture",iat:N,nbf:N,exp:N+300,jti:"abcdefghijklmnopqrstuv",grants:[{resource:reader.source,actions:["read"]}],...overrides}))).setProtectedHeader({alg:"EdDSA",typ:"chaldea-run+jwt",kid:"reader"}).sign(key.privateKey);
   const readToken=await readerToken();
-  const post=(p:unknown,key="status-1",token=appendToken)=>fetch(base+"/api/v1/events",{method:"POST",headers:{authorization:"Bearer "+token,"content-type":"application/json","idempotency-key":key},body:JSON.stringify(p)});
+  // Fixture seeding blocks the same event loop as both HTTP peers. Give each
+  // request its own connection so overdue idle timers cannot race pooled reuse.
+  const fixtureFetch:typeof fetch=(input,init)=>{
+    const headers=new Headers(init?.headers);headers.set("connection","close");
+    return fetch(input,{...init,headers});
+  };
+  const post=(p:unknown,key="status-1",token=appendToken)=>fixtureFetch(base+"/api/v1/events",{method:"POST",headers:{authorization:"Bearer "+token,"content-type":"application/json","idempotency-key":key},body:JSON.stringify(p)});
   const window="?from="+new Date((N-3600)*1000).toISOString()+"&to="+new Date(N*1000).toISOString();
-  const get=(path="/api/v1/events"+window,token=readToken)=>fetch(base+path,{headers:{authorization:"Bearer "+token}});
+  const get=(path="/api/v1/events"+window,token=readToken)=>fixtureFetch(base+path,{headers:{authorization:"Bearer "+token}});
   const config:ReaderConfig={url:"https://akasha.fixture",tokenHelper:"/unused",source:"mission-control-reader",host:"omarchy-normandy",profile:"mission-control-reader",project:"chaldea",allowedSourceIds:[publisher.source_id],cacheFile:join(x.dir.path,"cache.json"),refreshMs:5000};
-  const readerFetch:typeof fetch=async(input,init)=>{const url=new URL(String(input));assert.equal(url.origin,"https://akasha.fixture");return fetch(base+url.pathname+url.search,init);};
-  return {base,x,auth,publisher,reader,config,readerFetch,readerToken,readToken,post,get,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));x.close();}};
+  const readerFetch:typeof fetch=async(input,init)=>{const url=new URL(String(input));assert.equal(url.origin,"https://akasha.fixture");return fixtureFetch(base+url.pathname+url.search,init);};
+  return {base,server,x,auth,publisher,reader,config,readerFetch,readerToken,readToken,post,get,async close(){server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));x.close();}};
 }
 
+
+test("hosted HTTP fixture reads survive synchronous seeding past the idle socket deadline",async()=>{
+  const h=await hostedRig();
+  try{
+    const responses=await Promise.all([h.get(),h.get()]);
+    for(const response of responses){assert.equal(response.status,200);await response.json();}
+    // Stay in this turn, as synchronous fixture writes do. Yielding here lets
+    // the idle timer queues run and misses the pooled connection reset.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,h.server.keepAliveTimeout+h.server.keepAliveTimeoutBuffer+100);
+    const response=await h.get();assert.equal(response.status,200);
+    assert.deepEqual(await response.json(),{events:[],next_cursor:null});
+  }finally{await h.close();}
+});
 
 test("operations authenticated projection binds five complete tuples and keeps status-only clients compatible",async()=>{
  const h=await hostedRig("agent-a",true),path="/api/v1/events?mission_control_operations=job_finished&window=48h&limit=16";

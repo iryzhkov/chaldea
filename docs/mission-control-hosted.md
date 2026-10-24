@@ -179,6 +179,9 @@ previous good cache and mark a gap. A later complete authorized traversal clears
 that transient transport gap when the current traversal has no reset, epoch
 change or clipped coverage. Intrinsic row truncation and same-epoch unknown or
 partial token evidence remain independent and do not become complete on recovery.
+Server admission time is validated against response completion, because an in-window
+producer observation may be admitted while the token helper or request is in flight.
+The fixed query window and producer observation times do not advance with receipt.
 Fetch time never replaces producer time.
 
 Run `chaldea mission-control serve --config /etc/mission-control/server.json`
