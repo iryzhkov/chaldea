@@ -25,10 +25,18 @@ type Permission = { read: boolean; write: boolean; owner: boolean };
 type KeyInfo = { id: string; name: string };
 type Binding = { bucket: string; bucketId: string; principal: string; publishers: string[];
   readers: string[]; cleanupKey: string; credentialFile: string };
+// Finite global maxima, repeated and enforced again by blob_pair.py. Capacity is checked
+// against current local space at every backup; these are not allocation or target facts.
+const TREE_MAXIMA = { maxEntries: 262144, maxAllocatedBytes: 256 * 1024 ** 3,
+  maxReadBytes: 256 * 1024 ** 3, maxLogicalBytes: 2 * 1024 ** 4 } as const;
+const MAX_BACKUP_ELAPSED_MS = 6 * 3600 * 1000;
+const LEGACY_BACKUP_ELAPSED_MS = 120000;
+type TreeLimits = Record<keyof typeof TREE_MAXIMA, number>;
+export type BackupLimits = { maxElapsedMs: number; meta: TreeLimits; data: TreeLimits };
 type Config = { version: 1; enabled: true; unitSHA256: string; starterSHA256: string;
   preflightSHA256: string; storageSHA256: string; garageSHA256: string;
   backupRoot: string; minFreeBytes: number; minFreeInodes: number;
-  limits: CleanupLimits; bindings: Binding[] };
+  backupLimits?: BackupLimits; limits: CleanupLimits; bindings: Binding[] };
 export interface MaintenanceRuntime {
   fence(): Promise<void>; verifyFence(): Promise<void>; stop(): Promise<void>;
   backup(): Promise<void>; start(): Promise<void>; health(): Promise<void>;
@@ -99,18 +107,34 @@ function command(program: string, argv: string[], input?: string, timeout = 1000
       stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8' });
   } catch { return fail(); }
 }
+const exactKeys = (value: any, keys: readonly string[]) => value !== null && typeof value === 'object' &&
+  !Array.isArray(value) && Object.keys(value).sort().join(',') === [...keys].sort().join(',');
+const within = (value: unknown, maximum: number) =>
+  Number.isSafeInteger(value) && (value as number) > 0 && (value as number) <= maximum;
+/** Protected per-tree backup limits: exact keys, positive safe integers, finite maxima. */
+export function validateBackupLimits(value: any): BackupLimits {
+  require(exactKeys(value, ['maxElapsedMs', 'meta', 'data']) && within(value.maxElapsedMs, MAX_BACKUP_ELAPSED_MS));
+  for (const name of ['meta', 'data']) {
+    const tree = value[name];
+    require(exactKeys(tree, Object.keys(TREE_MAXIMA)) &&
+      Object.entries(TREE_MAXIMA).every(([key, maximum]) => within(tree[key], maximum)));
+  }
+  return value;
+}
 function loadConfig(): { config: Config; hash: string } {
   require(process.geteuid?.() === 0);
   const raw = trusted('/etc/chaldea/blob-maintenance.json');
   const c = JSON.parse(raw.toString());
   onlyKeys(c, ['version', 'enabled', 'unitSHA256', 'starterSHA256', 'preflightSHA256', 'storageSHA256',
-    'garageSHA256', 'backupRoot', 'minFreeBytes', 'minFreeInodes', 'limits', 'bindings']);
+    'garageSHA256', 'backupRoot', 'minFreeBytes', 'minFreeInodes', 'backupLimits', 'limits', 'bindings']);
   require(c.version === 1 && c.enabled === true);
   for (const key of ['unitSHA256', 'starterSHA256', 'preflightSHA256', 'storageSHA256', 'garageSHA256'])
     require(typeof c[key] === 'string' && /^[a-f0-9]{64}$/.test(c[key]));
   require(c.backupRoot === '/mnt/docker-data/swarm/objectstore-backups' &&
     Number.isSafeInteger(c.minFreeBytes) && c.minFreeBytes >= 2 * 1024 ** 3 &&
     Number.isSafeInteger(c.minFreeInodes) && c.minFreeInodes >= 4096);
+  // Omitted keeps the legacy fixture bounds; the config hash binds limits to every receipt.
+  if (c.backupLimits !== undefined) validateBackupLimits(c.backupLimits);
   require(Array.isArray(c.bindings) && c.bindings.length > 0 && c.bindings.length <= 16);
   const buckets = new Set(), ids = new Set();
   for (const b of c.bindings) {
@@ -143,6 +167,7 @@ export class OperatorRuntime implements MaintenanceRuntime {
   private before = '';
   private metadata = '';
   private rpcHash = '';
+  private pairHash = '';
   constructor(config: Config, hash: string, pair: string) {
     this.config = config; this.hash = hash; this.pair = pair;
   }
@@ -269,13 +294,21 @@ export class OperatorRuntime implements MaintenanceRuntime {
     const p = this.properties();
     require(p.ActiveState === 'inactive' && p.MainPID === '0' && p.ControlPID === '0');
   }
-  async backup() {
-    this.stopped();
+  /** Runs the trusted pair helper under the configured limits; returns the manifest hash it wrote or verified. */
+  pairHelper(input: Record<string, unknown>) {
     const helper = fileURLToPath(new URL('./blob_pair.py', import.meta.url));
     trusted(helper);
-    const input = { meta: META, data: DATA, backup: this.pair, metadataOwner: [1000, 1000],
-      dataOwner: [977, 988], minFreeBytes: this.config.minFreeBytes, minFreeInodes: this.config.minFreeInodes };
-    command('/usr/bin/python3', ['-I', '-B', helper], JSON.stringify(input), 125000);
+    const limits = this.config.backupLimits;
+    const elapsed = limits?.maxElapsedMs ?? LEGACY_BACKUP_ELAPSED_MS;
+    const out = JSON.parse(command('/usr/bin/python3', ['-I', '-B', helper],
+      JSON.stringify(limits ? { ...input, limits } : input), elapsed + 5000));
+    require(exactKeys(out, ['pairSHA256']) && typeof out.pairSHA256 === 'string' && /^[a-f0-9]{64}$/.test(out.pairSHA256));
+    return out.pairSHA256 as string;
+  }
+  async backup() {
+    this.stopped();
+    this.pairHash = this.pairHelper({ meta: META, data: DATA, backup: this.pair, metadataOwner: [1000, 1000],
+      dataOwner: [977, 988], minFreeBytes: this.config.minFreeBytes, minFreeInodes: this.config.minFreeInodes });
     this.stopped();
     // The pair retains the exact server config and RPC secret for future offline recovery.
     const copies = [
@@ -326,25 +359,25 @@ export class OperatorRuntime implements MaintenanceRuntime {
     return results;
   }
   async completed() {
+    require(this.pairHash);
     durable(join(this.pair, 'complete.json'), Buffer.from(JSON.stringify({
       version: 1, configSHA256: this.hash, node: this.before, metadata: this.metadata,
-      rpcSHA256: this.rpcHash, pairSHA256: sha256(trusted(join(this.pair, 'pair.json'), 2 * 1024 ** 2)),
+      rpcSHA256: this.rpcHash, pairSHA256: this.pairHash,
     })));
   }
   async resume() {
     const receipt = JSON.parse(trusted(join(this.pair, 'complete.json')).toString());
     require(receipt.version === 1 && receipt.configSHA256 === this.hash && receipt.node === this.before &&
       receipt.metadata === this.metadata && receipt.rpcSHA256 === this.rpcHash &&
-      receipt.pairSHA256 === sha256(trusted(join(this.pair, 'pair.json'), 2 * 1024 ** 2)));
+      typeof receipt.pairSHA256 === 'string' && /^[a-f0-9]{64}$/.test(receipt.pairSHA256));
     require(!readdirSync(this.pair).includes('resumed.json'));
     require(sha256(trusted(join(this.pair, 'garage.toml'))) === this.config.garageSHA256 &&
       sha256(trusted(join(this.pair, 'storage.json'))) === this.config.storageSHA256 &&
       sha256(trusted(join(this.pair, 'rpc.secret'))) === this.rpcHash);
     const permit = join(this.config.backupRoot, '.resume-permit');
     require(trusted(permit).toString() === this.pair);
-    const helper = fileURLToPath(new URL('./blob_pair.py', import.meta.url));
-    trusted(helper);
-    command('/usr/bin/python3', ['-I', '-B', helper], JSON.stringify({ verify: this.pair }), 125000);
+    // Rehash under the same config-bound limits; the verified manifest bytes must be the receipt's.
+    require(this.pairHelper({ verify: this.pair }) === receipt.pairSHA256);
     // Consume before grants. A crash or later run cannot replay this permission.
     removeResumePermit(permit);
     // Caller requested this separate action. On any partial grant, refence ALL known writers.

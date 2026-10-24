@@ -42,6 +42,9 @@ The root-owned, non-writable-ancestor config is fixed at
 `/etc/chaldea/blob-maintenance.json`. Root must run an independently qualified
 Chaldea source installation, including `src/exec/blob_pair.py`, under root-owned,
 non-writable directories. The ordinary client selection/fleet pins are untouched.
+Root's PATH has no Node. A future invocation names the existing protected
+runtime explicitly, for example `PATH=/opt/chaldea/node/bin:/usr/bin:/bin`,
+without changing the global PATH or the installed runtime.
 
 The following INERT schema example deliberately refuses with enabled=false,
 null hashes and placeholder IDs. Fill actual bucket aliases/IDs, all publishers,
@@ -61,6 +64,21 @@ the 2 TB data budget remains total across artifacts and results.
   "backupRoot": "/mnt/docker-data/swarm/objectstore-backups",
   "minFreeBytes": 2147483648,
   "minFreeInodes": 4096,
+  "backupLimits": {
+    "maxElapsedMs": 3600000,
+    "meta": {
+      "maxEntries": 4096,
+      "maxAllocatedBytes": 17179869184,
+      "maxReadBytes": 18253611008,
+      "maxLogicalBytes": 2199023255552
+    },
+    "data": {
+      "maxEntries": 135168,
+      "maxAllocatedBytes": 69793218560,
+      "maxReadBytes": 68719476736,
+      "maxLogicalBytes": 68719476736
+    }
+  },
   "limits": {
     "maxRequests": 32768,
     "maxRequestBytes": 16777216,
@@ -122,23 +140,99 @@ contain keys and require root-only local custody. The command does not restore
 or provision storage. Reuse the accepted stopped-pair restore protocol for a
 separately authorized recovery.
 
-The conservative limit is 4096 entries and 512 MiB allocated/read bytes **per
-tree**, with 2 TiB logical sparse size per tree, 64 KiB copy chunks and 120 seconds
-per backup/verification. Inventory and required local headroom precede destination
-creation. Headroom requires 1 GiB worst-case pair capacity plus at least 2 GiB
-free and 12288 free inodes, while retaining every older pair. Concurrent users
-can consume that space after the check. The backup helper refuses symlinks,
-hardlinks, wrong owners/modes, nested mounts, changed inventories and mismatches.
+### Backup limits and local capacity
 
-This does not support backing up 2 TB of actual data. It conservatively refuses
-once either tree exceeds 512 MiB allocated/read. A larger local backup method and
-capacity qualification remain required before growing beyond that boundary.
-The observed 225 GB local free space cannot hold a 2 TB full local pair.
-The data 2 TB and metadata 16 GiB figures are operational budgets, with no
-physical quota, reservation or continuous enforcement. Startup requires at least
-1 GiB data space and 2 GiB metadata space, plus 4096 free inodes. Maintenance
-checks space again before cleanup/resume. Shared fullness and mount changes
-after a check remain possible.
+The selected operating model starts within verified local backup capacity. The
+backup stays on the existing local `/mnt/docker-data` filesystem beside the
+metadata; it is never moved onto the NAS or offsite.
+
+`backupLimits` in the protected config sets explicit per-tree bounds for `meta`
+and `data`: entries, allocated bytes, bytes read by the copy, and logical (sparse)
+size, plus one elapsed bound for the whole backup and again for each verification.
+Every value must be a positive safe integer at or below a finite global maximum:
+262144 entries, 256 GiB allocated or read and 2 TiB logical per tree, and six
+hours. Unknown or missing keys, booleans, fractions, zero, negative or oversized
+values refuse, in the operator and again in `blob_pair.py`. When `backupLimits`
+is omitted, the legacy fixture bounds apply unchanged: 4096 entries, 512 MiB
+allocated/read and 2 TiB logical per tree, 120 seconds. Nothing increases a
+bound silently.
+
+The example above is a reviewable first-operation proposal, not an allocation,
+a target qualification or a measured fact:
+
+- `data`: 64 GiB logical and read, the proposed actual-data operating bound.
+  65 GiB allocated covers block rounding of small files and directories.
+  135168 entries covers 65536 files of Garage's default 1 MiB blocks even when
+  all 65536 + 256 + 1 of its two-level hash directories exist (131329 entries).
+  Many small objects can hit the entry bound first.
+- `meta`: 16 GiB allocated, the existing metadata budget. 17 GiB read allows for
+  64 KiB chunk rounding around sparse database pages. 2 TiB logical covers a
+  sparse LMDB map, which is never read through its holes.
+- One hour bounds the backup, which runs while the service is stopped and
+  publication is fenced, and separately each resume verification. At the full
+  bounds that needs roughly 40 MB/s sustained across NAS reads, local writes and
+  rehashing. That throughput is unmeasured; exceeding it is a fenced refusal
+  after up to an hour of stopped service. Live qualification must measure it,
+  together with the entry count of the actual store.
+
+The proposed bounds do not support a 2 TB backup. The 2,000,000,000,000 byte
+NAS total and 16 GiB metadata figures remain operating budgets, with no physical
+quota, reservation or continuous enforcement.
+
+Each backup inventories both trees incrementally within the bounds, then
+measures the copy without reading data. Sparse seeks give the exact 64 KiB
+chunk-aligned ranges the copy will read. The required destination space is:
+
+- every read range rounded up to whole filesystem blocks;
+- for each file, a worst-case extent tree: one extent per filesystem block, every
+  leaf and index node only half full, and only four extents in the inode. The
+  copy writes each file once in ascending order, so ext4 appends and fills each
+  node but the last; the half-full charge doubles that;
+- 8 KiB per copied entry for directory blocks, directory entries and metadata;
+- the manifest bound (4096 + 512 bytes per configured entry, about 68 MiB for
+  the proposal) and 2 MiB for the operator's private sidecars.
+
+Required inodes are the copied entries plus 64. The helper compares current
+`f_bavail`/`f_favail` with that requirement plus `minFreeBytes`/`minFreeInodes`
+BEFORE creating the destination. A small tree that fits is not charged twice its
+configured maximum. Older pairs already consume the space they hold and are
+never deleted to pass. The copy may read no more than measured, and after the
+copy the destination's actual allocation must not exceed the measured
+requirement; either failure refuses. The model is derived for ext4, so the
+backup refuses on any other destination filesystem. It also assumes ext4
+without `bigalloc` (cluster size equal to block size), which `statvfs` cannot
+reveal; live qualification must confirm that read-only, for example with
+`dumpe2fs -h`. The post-copy allocation check still refuses if the assumption
+is wrong, but only after the space is consumed. Holes stay holes. If the
+source cannot report holes, the whole remaining logical size must fit the read
+bound or the measurement refuses without reading zeros.
+
+With the proposal at its full bounds the requirement is about 83 GiB for whole
+1 MiB block files and at most about 84 GiB for fully fragmented files, plus the
+2 GiB reserve. The last read-only check on 2026-10-24 saw 216,670,908,416 bytes
+available on `/mnt/docker-data`. That is point-in-time headroom on a shared
+disk, not reserved or supported capacity. Pairs are never rotated, so each
+successful run consumes space until the operator separately reconciles old pairs;
+once space runs out, backups refuse with publication fenced.
+
+The check is point-in-time. Concurrent shared consumers can still fill the disk
+after it, and no continuous admission monitor or physical cap exists. Nothing
+limits publishers to the backup bounds between runs: a store that outgrows them
+is found only by the next `run`, whose backup refuses before any copy and leaves
+publication fenced. Cleanup runs only after a backup, so recovery then needs a
+separately decided operator action.
+
+The backup helper refuses symlinks, hardlinks, wrong owners/modes, nested mounts
+(including mount points whose names the kernel escapes), changed inventories and
+mismatches. The manifest records the exact limits. Verification accepts only the
+exact canonical manifest bytes the helper writes for the recomputed trees under
+the same limits. A manifest from the earlier source (version 1), a changed
+limit, or a mutated copy refuses. The completion receipt binds the config hash,
+so changed limits also make an earlier receipt unusable for `resume`.
+
+Startup requires at least 1 GiB data space and 2 GiB metadata space, plus 4096
+free inodes. Maintenance checks space again before cleanup/resume. Shared
+fullness and mount changes after a check remain possible.
 
 Cleanup uses fixed 14-day object/manifest retention and minimum 1-day abandoned
 multipart age. Its limits above bound every bucket scan, memory, requests,
@@ -166,7 +260,8 @@ trusted administration. A backup receipt is not authority to resume production.
 
 ## Evidence and remaining qualification
 
-Owning interface: Q2 `jocasta:75988be5921944746f349a2adee821b9@26`.
+Owning interface: Q2 `jocasta:75988be5921944746f349a2adee821b9@30`; prior
+accepted source receipt `jocasta:324dce60a5770b1f85aaf050ddd2a885@2`.
 Accepted revocation/restart evidence:
 `jocasta:56e6d40d605c7a3181aef45747357087@1`. Reuse the accepted NAS custody,
 stopped restore and original-UUID SSH proofs; no broad NAS canary is repeated.
