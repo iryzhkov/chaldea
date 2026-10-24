@@ -189,10 +189,10 @@ export class EventStore {
   put(name: string, value: string): void { meta(this.db).put(name, value); }
   scalar(sql: string, ...params: SQLInputValue[]): number { return Number(Object.values(this.db.prepare(sql).get(...params)!)[0] ?? 0); }
   walBytes(): number { try { return statSync(this.path + "-wal").size; } catch { return 0; } }
-  checkpoint(): void {
+  checkpoint(vacuumPages = 64): void {
     const result = this.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
     ensure(result.busy === 0, "checkpoint_blocked", 503);
-    this.db.exec("PRAGMA incremental_vacuum(64)");
+    if (vacuumPages) this.db.exec("PRAGMA incremental_vacuum(" + vacuumPages + ")");
   }
   transaction<T>(fn: () => T, estimate = 2 * MAX_ENVELOPE): T {
     // Every write, including projection/pruning, reserves WAL space first. No long-lived read transactions.
@@ -355,32 +355,134 @@ export class EventStore {
     return this.db.prepare("SELECT f.id,f.created_at,f.host,f.source,f.severity,f.title,f.body,f.tags,f.link FROM feed_entries f JOIN events e USING(event_id) WHERE f.id=? AND " + q.sql)
       .get(id, ...q.params) as unknown as FeedRow | undefined;
   }
+  /**
+   * Prune-only page estimate. dbstat stops at the first leaf of each named tree;
+   * all B-tree leaves have the same depth. The 4x transaction guard covers sibling
+   * balancing, freelist/pointer-map writes and frame headers on those paths.
+   * Charge overflow separately, including both event and feed payload copies.
+   */
+  private pruneEstimate(changes: { table: string; rows: number; deleting?: boolean; stateOnly?: boolean }[], bytes: number, depths: Map<string, { depth: number; pages: number }[]>): number {
+    let paths = 0;
+    const pointerMaps = Math.ceil(this.scalar("PRAGMA page_count") / 512);
+    for (const { table, rows, deleting, stateOnly } of changes) {
+      if (!rows) continue;
+      const key = table + (stateOnly ? ":state" : "");
+      if (!depths.has(key)) {
+        depths.set(key, this.db.prepare("SELECT name,type FROM sqlite_schema WHERE (type='table' AND name=?) OR (type='index' AND tbl_name=?)").all(table, table).filter(object =>
+          !stateOnly || object.type === "table" ||
+          this.db.prepare("SELECT name FROM pragma_index_info(?)").all(object.name!).some(column => column.name === "state")
+        ).map(object => {
+          const leaf = this.db.prepare("SELECT path FROM dbstat WHERE name=? AND pagetype='leaf' LIMIT 1").get(object.name!);
+          ensure(leaf && typeof leaf.path === "string", "prune_page_estimate", 503);
+          // Cap the metadata walk at 65 pages. Small trees can be reserved in
+          // full; large ones use the per-row paths, without a full dbstat scan.
+          const pages = this.scalar("SELECT count(*) FROM (SELECT pageno FROM dbstat WHERE name=? LIMIT 65)", object.name!);
+          return { depth: (leaf.path as string).split("/").length - 1, pages };
+        }));
+      }
+      // A one-page tree is shared by every row in the batch.
+      for (const { depth, pages } of depths.get(key)!) {
+        const rowPaths = depth === 1 ? (deleting ? 0.25 : 1) : depth * rows;
+        // Deletions can use the whole small tree plus pointer maps and eight
+        // balancing pages. Updates can split scattered pages, so keep paths.
+        paths += deleting && pages <= 64
+          ? Math.min(rowPaths, (pages + Math.min(pages, pointerMaps) + 8) / 4)
+          : rowPaths;
+      }
+    }
+    // 4092 usable bytes on overflow pages; 1030 * 4 is one WAL frame.
+    return Math.ceil(paths * 4120 + Math.ceil(bytes / 4092) * 1030 + 8192);
+  }
+  private pruneTransaction(fn: () => void, estimate: number): void {
+    // Keep a dirty page to one WAL frame at commit, rather than letting cache
+    // pressure spill and redirty it repeatedly inside the bounded batch.
+    const spill = this.scalar("PRAGMA cache_spill");
+    this.db.exec("PRAGMA cache_spill=OFF");
+    try {
+      // Prune reserves its own vacuum below. Do not let the shared guard add
+      // an unreserved incremental_vacuum(64) while making room for this batch.
+      if (this.walBytes() + estimate * 4 + 128 * 1024 >= this.budget.wal) this.checkpoint(0);
+      ensure(this.walBytes() + estimate * 4 + 128 * 1024 < this.budget.wal, "wal_capacity", 503);
+      this.transaction(fn, estimate);
+    } finally { this.db.exec("PRAGMA cache_spill=" + spill); }
+  }
   prune(now: number, max = 100): number {
     ensure(Number.isInteger(max) && max > 0 && max <= 100, "invalid_prune_batch");
-    type Victim = { seq: number; event_id: string; bytes: number };
+    type Victim = { seq: number; event_id: string };
+    const depths = new Map<string, { depth: number; pages: number }[]>();
+    const fits = (estimate: number) => estimate * 4 + 128 * 1024 < this.budget.wal;
+    // JSON encoding overcounts escaping; repeated fields charge every receipt
+    // index key as well as the table record. Include record/varint overhead.
+    const receiptBytes = this.db.prepare(`SELECT 512+length(CAST(json_array(
+      event_id,event_id,request_hash,envelope_hash,state,state,feed_id,feed_id,
+      issuer,profile,profile,project,project,source,source,host,expires,expires,expires
+    ) AS BLOB)) AS bytes FROM receipts WHERE event_id=?`);
     // Two index-ordered selections: never CASE/OR over the whole retained table.
-    let candidates = this.db.prepare("SELECT seq,event_id,length(CAST(envelope AS BLOB)) AS bytes FROM events WHERE expiry<=? ORDER BY expiry,seq LIMIT ?")
+    let candidates = this.db.prepare("SELECT seq,event_id FROM events WHERE expiry<=? ORDER BY expiry,seq LIMIT ?")
       .all(now, max) as unknown as Victim[];
     const pressure = (this.scalar("PRAGMA page_count") - this.scalar("PRAGMA freelist_count")) * 4096 > this.budget.main * 0.85;
     if (!candidates.length && pressure) candidates = this.db.prepare(
-      "SELECT seq,event_id,length(CAST(envelope AS BLOB)) AS bytes FROM events ORDER BY received_at,seq LIMIT ?").all(max) as unknown as Victim[];
-    const victims: Victim[] = []; let bytes = 0;
-    const byteLimit = Math.min(1024 ** 2, Math.floor((this.budget.wal - 512 * 1024) / 10));
+      "SELECT seq,event_id FROM events ORDER BY received_at,seq LIMIT ?").all(max) as unknown as Victim[];
+    const eventBytes = this.db.prepare(`SELECT
+      length(CAST(envelope AS BLOB))+512+length(CAST(json_array(
+        event_id,event_id,issuer,issuer,profile,profile,project,project,project,
+        source,source,source,source,host,host,host,host,kind,kind,received_at,received_at,
+        occurred_at,occurred_at,occurred_at,expiry,expiry,session,session,tool,tool,client,client
+      ) AS BLOB)) AS bytes,
+      json_array_length(envelope,'$.tags') AS tags,
+      2*length(CAST(json_extract(envelope,'$.tags') AS BLOB))+
+        json_array_length(envelope,'$.tags')*(256+2*length(CAST(event_id AS BLOB))) AS tag_bytes
+      FROM events WHERE seq=?`);
+    const feedBytes = this.db.prepare(`SELECT length(CAST(body AS BLOB))+512+
+      length(CAST(json_array(event_id,event_id,created_at,created_at,created_at,created_at,created_at,created_at,
+        host,host,host,source,source,source,severity,severity,title,tags,link) AS BLOB)) AS bytes
+      FROM feed_entries WHERE event_id=?`);
+    const victims: Victim[] = []; let bytes = 0, tags = 0, feeds = 0, estimate = 0;
     for (const row of candidates) {
-      if (victims.length && bytes + row.bytes > byteLimit) break;
-      victims.push(row); bytes += row.bytes;
+      const event = eventBytes.get(row.seq)!;
+      const feed = feedBytes.get(row.event_id);
+      const nextBytes = bytes + Number(event.bytes) + Number(event.tag_bytes) +
+        Number(feed?.bytes ?? 0) + Number(receiptBytes.get(row.event_id)?.bytes ?? 0);
+      const nextTags = tags + Number(event.tags), nextFeeds = feeds + Number(!!feed);
+      const next = this.pruneEstimate([
+        { table: "events", rows: victims.length + 1, deleting: true }, { table: "receipts", rows: victims.length + 1, stateOnly: true },
+        { table: "feed_entries", rows: nextFeeds, deleting: true }, { table: "event_tags", rows: nextTags, deleting: true },
+        { table: "meta", rows: 1 },
+      ], nextBytes, depths);
+      if (victims.length && (!fits(next) || nextBytes > 1024 ** 2)) break;
+      victims.push(row); bytes = nextBytes; tags = nextTags; feeds = nextFeeds; estimate = next;
     }
-    if (victims.length) this.transaction(() => {
+    if (victims.length) this.pruneTransaction(() => {
       let floor = Number(this.get("floor"));
       for (const row of victims) {
         this.db.prepare("UPDATE receipts SET state='tombstone' WHERE event_id=?").run(row.event_id);
         this.db.prepare("DELETE FROM events WHERE seq=?").run(row.seq); floor = Math.max(floor, row.seq);
       }
       this.put("floor", String(floor));
-    }, bytes * 2 + 32 * 1024);
-    const deleted = this.transaction(() => this.db.prepare("DELETE FROM receipts WHERE event_id IN (SELECT event_id FROM receipts WHERE state IN ('tombstone','quarantined') AND expires<=? LIMIT ?)").run(now, max), 128 * 1024);
-    this.checkpoint();
-    return victims.length + Number(deleted.changes);
+    }, estimate);
+    const receipts = this.db.prepare("SELECT event_id FROM receipts WHERE state IN ('tombstone','quarantined') AND expires<=? LIMIT ?")
+      .all(now, max);
+    const expired: string[] = []; bytes = 0; estimate = 0;
+    // Event deletion may have changed tree depth. Refresh before receipt deletion.
+    depths.clear();
+    for (const row of receipts) {
+      const nextBytes = bytes + Number(receiptBytes.get(row.event_id!)!.bytes);
+      const next = this.pruneEstimate([{ table: "receipts", rows: expired.length + 1, deleting: true }], nextBytes, depths);
+      if (expired.length && !fits(next)) break;
+      expired.push(row.event_id as string); bytes = nextBytes; estimate = next;
+    }
+    if (expired.length) this.pruneTransaction(() => {
+      for (const id of expired) this.db.prepare("DELETE FROM receipts WHERE event_id=?").run(id);
+    }, estimate);
+    this.checkpoint(0);
+    // One vacuum step moves at most one page. Reserve its parent/freelist and
+    // every possible pointer-map page, since an internal page can have scattered
+    // children. If this does not fit, free pages remain reusable by SQLite.
+    if (this.scalar("PRAGMA freelist_count")) {
+      const vacuum = Math.ceil((Math.ceil(this.scalar("PRAGMA page_count") / 512) + 8) * 4120 / 4);
+      if (fits(vacuum)) this.pruneTransaction(() => this.db.exec("PRAGMA incremental_vacuum(1)"), vacuum);
+    }
+    return victims.length + expired.length;
   }
   recordGap(from: number, to: number): void {
     this.transaction(() => {

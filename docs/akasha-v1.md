@@ -188,6 +188,31 @@ payloads under pressure, protecting pending intents and unexpired receipts. Incr
 vacuum/free-page reuse/checkpoints reclaim space without a full vacuum copy. Receipt
 tombstones remain 180d; no retry recreates a retained tombstone.
 
+Prune reservations count the selected records' UTF-8 data, repeated index keys,
+feed/tag cascades, receipt tombstoning and floor updates. Tree depths come from
+the first `dbstat` leaf; a separate walk stops at 65 pages per tree so small
+trees can be reserved in full without scanning large retained trees. The existing
+4x WAL guard covers paths and balancing; deletion-only small-tree caps include
+pointer maps and eight balancing pages. Updates retain the per-row path charge. Overflow pages and WAL frame bytes are charged separately.
+Batches shrink below the requested maximum of 100 as needed for the configured
+WAL budget. Cache spilling is disabled during each prune transaction and restored
+afterward, including refusals. FULL synchronous mode and WAL limits are unchanged.
+
+Prune truncates WAL before a batch needs reclamation, refusing before row writes
+if a reader blocks that checkpoint. Its final checkpoint reserves one incremental
+vacuum step separately, including all possible pointer-map pages. A budget too
+small for that optional step leaves free pages available for reuse instead of
+blocking deletion. Physical file shrinkage can therefore lag logical cleanup.
+The default 64-page vacuum remains in other callers of `checkpoint()`.
+
+These are conservative estimates for the service-owned schema and documented
+single writer, not a SQLite-enforced WAL file limit. Tests measure writes, commit
+and vacuum with autocheckpoint disabled, including scattered receipt pages,
+large tagged payloads, pressure cleanup and blocked readers at the 1.25 MiB
+minimum. Other write paths retain their existing admission/projection/quarantine
+estimates; this change does not establish a new bound for those paths or qualify
+arbitrary added triggers, indexes or concurrent external writers.
+
 Feed/lifecycle/deployment/job/review/agent summaries expire after 180d from receive
 time. Tool calls expire after 90d from original occurrence, clamped to server admission for future producer timestamps. Legacy import expiry uses
 original created_at, with the same future-time clamp. Loki raw logs remain separately 30d. Cursor stores epoch/local
