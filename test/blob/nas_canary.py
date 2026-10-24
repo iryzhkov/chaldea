@@ -14,6 +14,10 @@ import subprocess
 import time
 import urllib.request
 import uuid
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src/exec"))
+from blob_pair import sparse_file as copy_sparse
 
 from garage import BOOTSTRAP_BLOB, BOOTSTRAP_COMMIT, Garage, S3, bootstrap
 from image import IMAGE, prepare_binary
@@ -236,43 +240,7 @@ def file_stamp(value):
 
 
 def sparse_file(source, target, budget):
-    """Hash fixed nonzero chunks and logical size, retaining holes on disk."""
-    size = os.fstat(source.fileno()).st_size
-    digest = hashlib.sha256(str(size).encode() + b"\0")
-    offset = 0
-    while offset < size:
-        try:
-            start = os.lseek(source.fileno(), offset, os.SEEK_DATA)
-            end = os.lseek(source.fileno(), start, os.SEEK_HOLE)
-        except OSError as error:
-            if error.errno == errno.ENXIO:
-                break
-            require(error.errno in (errno.EINVAL, errno.ENOTSUP), "sparse_seek_failed")
-            # Unsupported sparse seek is safe only within the remaining read bound.
-            require(size - offset <= COPY_ALLOCATED - budget[0], "sparse_seek_required")
-            start, end = offset, size
-        require(offset <= start < end <= size, "sparse_extent")
-        position = start // COPY_CHUNK * COPY_CHUNK
-        while position < end:
-            amount = min(COPY_CHUNK, size - position)
-            budget[0] += amount
-            require(budget[0] <= COPY_ALLOCATED, "copy_read_bound")
-            source.seek(position)
-            block = source.read(amount)
-            require(len(block) == amount, "copy_short_read")
-            if any(block):
-                digest.update(position.to_bytes(8, "big"))
-                digest.update(hashlib.sha256(block).digest())
-                if target is not None:
-                    target.seek(position)
-                    target.write(block)
-            position += amount
-        offset = position
-    if target is not None:
-        target.truncate(size)
-        target.flush()
-        os.fsync(target.fileno())
-    return digest.hexdigest()
+    return copy_sparse(source, target, budget, limit=COPY_ALLOCATED)
 
 
 def stopped_tree(path, identity, expected_owner, *, nas, destination=None, created=None):
