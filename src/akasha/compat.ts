@@ -100,7 +100,12 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
   if (scope.missionControlSources) { parts.push("expiry>?"); params.push(now); }
   // Select a bounded page of IDs once: repeating LIMIT 1 can sort the entire
   // time window for every row. No envelope or live SQLite reader crosses a yield.
-  const ids = count ? store.db.prepare("SELECT seq FROM events WHERE " + parts.join(" AND ") + " AND seq>? ORDER BY seq LIMIT ?")
+  // scopeSql has validated this reader scope and constrained kind to agent_status.
+  // Use the format-v1 kind/seq index only for its explicit status selector, so
+  // ordinary project history is skipped. Retained status history still costs work.
+  const statusIndex = scope.missionControlSources !== undefined && q.get("kind") === "agent_status"
+    ? " INDEXED BY events_kind_seq" : "";
+  const ids = count ? store.db.prepare("SELECT seq FROM events" + statusIndex + " WHERE " + parts.join(" AND ") + " AND seq>? ORDER BY seq LIMIT ?")
     .all(...params, seq, count + 1) as { seq: number }[] : [];
   const read = store.db.prepare("SELECT envelope FROM events WHERE seq=? AND " + parts.join(" AND "));
   function* rows(): Generator<Envelope> {
