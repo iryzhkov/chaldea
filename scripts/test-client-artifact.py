@@ -32,6 +32,7 @@ with tempfile.TemporaryDirectory(dir=scratch, prefix="client-smoke-") as tempora
     assert not (root / "node_modules/esbuild").exists()
     assert not (root / "node_modules/typescript").exists()
     assert (root / "src/waits/calendar.py").is_file()
+    assert (root / "src/exec/blob_pair.py").is_file()
     for arguments in (["quota", "observe", "--help"], ["wait", "--help"], ["access", "--help"], ["mcp", "--help"]):
         result = subprocess.run(["node", str(root / "bin/chaldea"), *arguments],
                                 cwd=home, text=True, capture_output=True)
@@ -39,4 +40,7 @@ with tempfile.TemporaryDirectory(dir=scratch, prefix="client-smoke-") as tempora
     result = subprocess.run(["node", str(root / "bin/chaldea"), "exec"], cwd=home,
                             text=True, capture_output=True)
     assert result.returncode == 255 and "invalid exec arguments" in result.stderr, result.stderr
+    result = subprocess.run(["node", str(root / "bin/chaldea"), "blob-maintenance"],
+                            cwd=home, text=True, capture_output=True)
+    assert result.returncode == 2 and "Blob maintenance failed" in result.stderr
 print("Client archive checksums, production dependencies and entry points passed")

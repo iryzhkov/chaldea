@@ -2,7 +2,8 @@
 if (process.argv.length === 3 && process.argv[2] === '--describe') {
   const { description } = await import('../src/describe.ts');
   process.stdout.write(JSON.stringify(description) + '\n');
-} else if (process.argv[2] === 'exec') await import('../src/exec/cli.ts');
+} else if (process.argv[2] === 'blob-maintenance') await import('../src/exec/blob-maintenance-cli.ts');
+else if (process.argv[2] === 'exec') await import('../src/exec/cli.ts');
 else {
   const { main } = await import('../src/cli.ts');
   process.exitCode = await main(process.argv.slice(2));
