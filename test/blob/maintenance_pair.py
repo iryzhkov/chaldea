@@ -124,10 +124,13 @@ class PairTests(unittest.TestCase):
         source.mkdir(mode=0o700)
         escaped = str(source / "nested").replace("\\", "\\134").replace(" ", "\\040").replace("\t", "\\011")
         mountinfo = self.root / "mountinfo"
-        mountinfo.write_text("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
-                             f"36 22 0:32 / {escaped} rw,relatime shared:1 - tmpfs tmpfs rw\n")
+        # The kernel does not escape carriage return; it must not split a record.
+        mountinfo.write_bytes(b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                              b"37 22 0:33 / /odd\rname rw - tmpfs tmpfs rw\n" +
+                              f"36 22 0:32 / {escaped} rw,relatime shared:1 - tmpfs tmpfs rw\n".encode())
         with patch.object(pair, "MOUNTINFO", str(mountinfo)):
-            self.assertEqual(pair.mount_records(), [(Path("/"), "ext4"), (source / "nested", "tmpfs")])
+            self.assertEqual(pair.mount_records(), [(Path("/"), "ext4"), (Path("/odd\rname"), "tmpfs"),
+                                                    (source / "nested", "tmpfs")])
             with self.assertRaisesRegex(ValueError, "nested mount"):
                 pair.inventory(source, self.owner, time.monotonic() + 10)
             mountinfo.write_text("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n")
@@ -218,6 +221,21 @@ class CapacityTests(unittest.TestCase):
             digest = pair.backup(self.input)
         self.assertEqual(pair.verify(self.target, self.limits), digest)
         self.assertLess((self.target / "meta/data.mdb").stat().st_blocks * 512, 1024**2)
+
+    def test_fragmented_extent_tree_is_charged_before_creation(self):
+        self.assertEqual([pair.extent_blocks(n, 4096) for n in (0, 4, 5, 170, 171)], [0, 0, 1, 1, 2])
+        # 64 GiB of 4 KiB blocks, one extent each: even FULL 340-entry nodes need 49345 leaves
+        # plus 146 index blocks. The charge assumes half-full nodes, so it is at least double.
+        blocks = 64 * 1024**3 // 4096
+        full = pair.ceil_div(blocks, 340) + pair.ceil_div(pair.ceil_div(blocks, 340), 340)
+        self.assertEqual(full, 49345 + 146)
+        self.assertGreaterEqual(pair.extent_blocks(blocks, 4096), 2 * full)
+        rows = pair.inventory(self.root / "data", self.owner, time.monotonic() + 10, self.limits["data"])
+        files = [row for row in rows if row[0].name == "block"]
+        with patch.object(pair, "spans", lambda *_: iter([(0, 64 * 1024**3)])):
+            read, required = pair.measure(files, self.limits["data"], time.monotonic() + 10, 4096)
+        self.assertEqual(read, 64 * 1024**3)
+        self.assertGreaterEqual(required, pair.ENTRY_OVERHEAD + (blocks + 2 * full) * 4096)
 
     def test_unsupported_sparse_seek_refuses_before_destination_without_reading(self):
         self.input["limits"]["meta"]["maxReadBytes"] = 1024**3

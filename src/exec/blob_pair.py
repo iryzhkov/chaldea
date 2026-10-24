@@ -23,11 +23,13 @@ COPY_CHUNK = 64 * 1024
 TREE_MAXIMA = {"maxEntries": 262144, "maxAllocatedBytes": 256 * 1024**3,
                "maxReadBytes": 256 * 1024**3, "maxLogicalBytes": 2 * 1024**4}
 MAX_ELAPSED_MS = 6 * 3600 * 1000
-# Conservative ext4 destination model. Every copied entry is charged a directory/inode
-# allowance; every read span is charged its block-rounded bytes plus one extent block per
-# 128 chunks. Sidecars are the private files the operator writes after this helper.
+# Conservative ext4 destination model (4 KiB-class blocks, no bigalloc). Every copied entry
+# is charged a directory/inode allowance; every file its block-rounded read spans plus a
+# worst-case extent tree. Sidecars are the private files the operator writes afterwards.
 ENTRY_OVERHEAD = 8192
-CHUNKS_PER_EXTENT_BLOCK = 128
+EXTENT_HEADER = 12
+EXTENT_ENTRY = 12
+INODE_EXTENTS = 4
 SIDECAR_BYTES = 2 * 1024**2
 SIDECAR_INODES = 64
 MANIFEST_ROW = 512
@@ -139,11 +141,15 @@ def mount_records():
         raw = stream.read(1024 * 1024 + 1)
     require(len(raw) <= 1024 * 1024, "mount inventory bound")
     records = []
-    for line in raw.splitlines():
+    # Only newline separates records; the kernel escapes newline but not carriage return.
+    for line in raw.split(b"\n"):
+        if not line:
+            continue
         left, right = line.split(b" - ", 1)
         # The kernel escapes space, tab, newline and backslash as ONE backslash plus octal.
-        target = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), left.split()[4])
-        records.append((Path(os.fsdecode(target)), right.split()[0].decode()))
+        # Fields are separated by single spaces; any other whitespace belongs to a field.
+        target = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), left.split(b" ")[4])
+        records.append((Path(os.fsdecode(target)), right.split(b" ")[0].decode()))
     return records
 
 
@@ -189,6 +195,19 @@ def stamp(value):
             value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
+def extent_blocks(extents, unit):
+    """Worst-case ext4 extent-tree blocks (leaves and every index level) for one file whose
+    data may fragment into one extent per filesystem block. The copy writes each file once in
+    ascending order, so ext4 appends and fills every node but the last; charging nodes as
+    only half full doubles that. The inode itself holds the first four entries."""
+    per_node = (unit - EXTENT_HEADER) // EXTENT_ENTRY // 2
+    total, level = 0, extents
+    while level > INODE_EXTENTS:
+        level = ceil_div(level, per_node)
+        total += level
+    return total
+
+
 def measure(rows, limits, deadline, unit):
     """Return the exact bytes the copy will read and conservative ext4 destination bytes
     for this inventory, from sparse seeks alone. Nothing is read or created."""
@@ -198,6 +217,7 @@ def measure(rows, limits, deadline, unit):
         if not stat.S_ISREG(value.st_mode):
             continue
         descriptor = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        blocks = 0
         try:
             require(stamp(os.fstat(descriptor)) == stamp(value), "source changed")
             for start, stop in spans(descriptor, value.st_size, lambda: limits["maxReadBytes"] - read):
@@ -205,10 +225,10 @@ def measure(rows, limits, deadline, unit):
                 read += stop - start
                 require(read <= limits["maxReadBytes"], "copy_read_bound")
                 # Only read chunks are written; their zero chunks and all holes stay holes.
-                required += ceil_div(stop - start, unit) * unit
-                required += ceil_div(ceil_div(stop - start, COPY_CHUNK), CHUNKS_PER_EXTENT_BLOCK) * unit
+                blocks += ceil_div(stop - start, unit)
         finally:
             os.close(descriptor)
+        required += (blocks + extent_blocks(blocks, unit)) * unit
     return read, required
 
 

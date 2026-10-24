@@ -73,7 +73,7 @@ the 2 TB data budget remains total across artifacts and results.
       "maxLogicalBytes": 2199023255552
     },
     "data": {
-      "maxEntries": 131072,
+      "maxEntries": 135168,
       "maxAllocatedBytes": 69793218560,
       "maxReadBytes": 68719476736,
       "maxLogicalBytes": 68719476736
@@ -162,13 +162,18 @@ a target qualification or a measured fact:
 
 - `data`: 64 GiB logical and read, the proposed actual-data operating bound.
   65 GiB allocated covers block rounding of small files and directories.
-  131072 entries covers about 64 GiB of Garage's default 1 MiB blocks plus their
-  two-level hash directories. Many small objects can hit the entry bound first.
+  135168 entries covers 65536 files of Garage's default 1 MiB blocks even when
+  all 65536 + 256 + 1 of its two-level hash directories exist (131329 entries).
+  Many small objects can hit the entry bound first.
 - `meta`: 16 GiB allocated, the existing metadata budget. 17 GiB read allows for
   64 KiB chunk rounding around sparse database pages. 2 TiB logical covers a
   sparse LMDB map, which is never read through its holes.
 - One hour bounds the backup, which runs while the service is stopped and
-  publication is fenced, and separately each resume verification.
+  publication is fenced, and separately each resume verification. At the full
+  bounds that needs roughly 40 MB/s sustained across NAS reads, local writes and
+  rehashing. That throughput is unmeasured; exceeding it is a fenced refusal
+  after up to an hour of stopped service. Live qualification must measure it,
+  together with the entry count of the actual store.
 
 The proposed bounds do not support a 2 TB backup. The 2,000,000,000,000 byte
 NAS total and 16 GiB metadata figures remain operating budgets, with no physical
@@ -178,10 +183,13 @@ Each backup inventories both trees incrementally within the bounds, then
 measures the copy without reading data. Sparse seeks give the exact 64 KiB
 chunk-aligned ranges the copy will read. The required destination space is:
 
-- every read range rounded up to whole filesystem blocks, plus one extent block
-  per 128 chunks of each range;
+- every read range rounded up to whole filesystem blocks;
+- for each file, a worst-case extent tree: one extent per filesystem block, every
+  leaf and index node only half full, and only four extents in the inode. The
+  copy writes each file once in ascending order, so ext4 appends and fills each
+  node but the last; the half-full charge doubles that;
 - 8 KiB per copied entry for directory blocks, directory entries and metadata;
-- the manifest bound (4096 + 512 bytes per configured entry, about 66 MiB for
+- the manifest bound (4096 + 512 bytes per configured entry, about 68 MiB for
   the proposal) and 2 MiB for the operator's private sidecars.
 
 Required inodes are the copied entries plus 64. The helper compares current
@@ -191,13 +199,17 @@ configured maximum. Older pairs already consume the space they hold and are
 never deleted to pass. The copy may read no more than measured, and after the
 copy the destination's actual allocation must not exceed the measured
 requirement; either failure refuses. The model is derived for ext4, so the
-backup refuses on any other destination filesystem. Holes stay holes. If the
+backup refuses on any other destination filesystem. It also assumes ext4
+without `bigalloc` (cluster size equal to block size), which `statvfs` cannot
+reveal; live qualification must confirm that read-only, for example with
+`dumpe2fs -h`. The post-copy allocation check still refuses if the assumption
+is wrong, but only after the space is consumed. Holes stay holes. If the
 source cannot report holes, the whole remaining logical size must fit the read
 bound or the measurement refuses without reading zeros.
 
 With the proposal at its full bounds the requirement is about 83 GiB for whole
-1 MiB block files and at most about 89 GiB for heavily fragmented sparse files,
-plus the 2 GiB reserve. The last read-only check on 2026-10-24 saw 216,670,908,416 bytes
+1 MiB block files and at most about 84 GiB for fully fragmented files, plus the
+2 GiB reserve. The last read-only check on 2026-10-24 saw 216,670,908,416 bytes
 available on `/mnt/docker-data`. That is point-in-time headroom on a shared
 disk, not reserved or supported capacity. Pairs are never rotated, so each
 successful run consumes space until the operator separately reconciles old pairs;
