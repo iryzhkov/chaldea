@@ -1,6 +1,36 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { maintain, OperatorRuntime, type MaintenanceRuntime } from '../../src/exec/blob-maintenance.ts';
+import { maintain, OperatorRuntime, removeResumePermit, type MaintenanceRuntime } from '../../src/exec/blob-maintenance.ts';
+
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+test('resume permit removal persists directory absence and fsync failure refuses', () => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'resume-permit-'));
+  const path = join(root, '.resume-permit');
+  const actualSync = fs.fsyncSync;
+  let calls = 0;
+  const sync = mock.method(fs, 'fsyncSync', (fd: number) => {
+    assert.equal(fs.existsSync(path), false);
+    assert(fs.fstatSync(fd).isDirectory());
+    calls++;
+    if (calls === 3) throw Error('injected directory sync failure');
+    actualSync(fd);
+  });
+  syncBuiltinESMExports();
+  try {
+    fs.writeFileSync(path, 'old success');
+    removeResumePermit(path);
+    removeResumePermit(path, true);
+    fs.writeFileSync(path, 'new success');
+    assert.throws(() => removeResumePermit(path), /directory sync failure/);
+    assert.equal(calls, 3);
+  } finally {
+    sync.mock.restore(); syncBuiltinESMExports(); fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function fixture(failure = '') {
   const calls: string[] = [];

@@ -154,9 +154,9 @@ has no resume receipt. Do not rerun an uncertain job or replay candidates.
 
 Resume is separate and requires a successful, unconsumed receipt under the
 unchanged trusted configuration. One private .resume-permit file binds it to
-the latest successful run. Every new run removes that permission before any
-revocation, so an older success cannot resume after a later failure. Resume
-consumes the permission before grants; interrupted or uncertain resume has no
+the latest successful run. Every new run removes that permission and fsyncs its
+parent directory before any revocation, so an older success cannot resume after a later failure. Resume
+consumes the permission and fsyncs its parent directory before grants; interrupted or uncertain resume has no
 automatic replay. It rehashes both backup trees, confirms current
 node/metadata/RPC identity, health and all fenced principals, then restores only
 reviewed publisher write permissions. A partial/uncertain grant attempts to
@@ -175,6 +175,14 @@ failure ordering and finite copy. The private real-Garage test exercises the
 finite sequence with synthetic keys and a test-owned process adapter, local
 storage and the same pinned executable. It does not qualify systemd installation,
 real NAS ownership, production credentials, full-scale backup or power loss.
+
+Maintenance's root process reads the mode0700 NAS data for backup. The accepted
+NAS copy proof used process1000:1000. Root reads under the actual export's squash
+policy remain unqualified and may refuse even when1000:1000 succeeds. Do not
+infer root access from that earlier proof or change export/ownership to fix a
+refusal. Root-read qualification is a remaining activation gate for the parent.
+Each retained local pair also retains an RPC secret copy; later rotation does
+not remove those older copies. The operator owns their continuing private custody.
 
 Actual installation, exact filled configuration hashes, initial bootstrap/grant
 removal, credential custody, real service stop/start and adverse-storage behavior

@@ -69,6 +69,33 @@ class PairTests(unittest.TestCase):
                     with patch.object(pair, "COPY_ENTRIES" if change == "entries" else "COPY_ALLOCATED", 1):
                         with self.assertRaises(ValueError): self.rows()
 
+
+    def test_large_directory_is_refused_while_enumerating(self):
+        file = self.file
+        class Flood:
+            seen = 0
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def __iter__(self): return self
+            def __next__(self):
+                self.seen += 1
+                if self.seen > pair.COPY_ENTRIES:
+                    raise AssertionError("unbounded enumeration")
+                return type("Entry", (), {
+                    "path": str(file),
+                    "stat": lambda self, **_: file.lstat(),
+                })()
+        stream = Flood()
+        with patch.object(pair.os, "scandir", return_value=stream):
+            with self.assertRaisesRegex(ValueError, "entry or elapsed bound"):
+                self.rows()
+        self.assertEqual(stream.seen, pair.COPY_ENTRIES)
+
+    def test_nested_same_device_mount_is_refused_before_enumeration(self):
+        with patch.object(pair, "mount_records", return_value=[(self.source / "nested", "ext4")]):
+            with self.assertRaisesRegex(ValueError, "nested mount"):
+                self.rows()
+
     def test_stale_inventory_and_destination_collision_refuse(self):
         rows = self.rows()
         self.file.write_bytes(b"new state")

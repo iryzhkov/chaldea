@@ -67,35 +67,52 @@ def sparse_file(source, target, budget, *, limit=None, deadline=None):
 
 
 
+def mount_records():
+    with open("/proc/self/mountinfo", "rb") as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    require(len(raw) <= 1024 * 1024, "mount inventory bound")
+    records = []
+    for line in raw.decode().splitlines():
+        left, right = line.split(" - ", 1)
+        target = re.sub(r"\\\\([0-7]{3})", lambda m: chr(int(m[1], 8)), left.split()[4])
+        records.append((Path(target), right.split()[0]))
+    return records
+
+
 def inventory(path, expected_owner, deadline):
     root = path.lstat()
     require(stat.S_ISDIR(root.st_mode), "directory required")
-    # Refuse nested mounts, including same-device bind mounts.
-    for line in Path("/proc/self/mountinfo").read_text().splitlines():
-        raw = line.split(" - ")[0].split()[4]
-        mount = Path(re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), raw))
+    # Include same-device bind mounts in the refusal, not only different devices.
+    for mount, _kind in mount_records():
         require(path not in mount.parents, "nested mount")
-    entries, allocated, logical = [], 0, 0
-    for base, dirs, files in os.walk(path, followlinks=False, onerror=lambda _: require(False, "unreadable")):
-        dirs.sort()
-        for entry in [Path(base)] + [Path(base) / name for name in sorted(files)]:
-            require(time.monotonic() < deadline, "elapsed")
-            value = entry.lstat()
-            require(value.st_dev == root.st_dev and
-                    (value.st_uid, value.st_gid) == tuple(expected_owner) and
-                    not value.st_mode & 0o077 and
-                    (stat.S_ISDIR(value.st_mode) or stat.S_ISREG(value.st_mode) and value.st_nlink == 1),
-                    "unsafe entry")
-            allocated += value.st_blocks * 512
-            logical += value.st_size if stat.S_ISREG(value.st_mode) else 0
-            entries.append((entry, value))
-            require(len(entries) <= COPY_ENTRIES and allocated <= COPY_ALLOCATED
-                    and logical <= COPY_LOGICAL, "tree limit")
-        # Inspect directory leaves before os.walk can descend through links or submounts.
-        for name in dirs:
-            value = (Path(base) / name).lstat()
-            require(stat.S_ISDIR(value.st_mode) and value.st_dev == root.st_dev, "submount or link")
-    return entries
+    entries, pending, allocated, logical = [], [path], 0, 0
+
+    def admit(entry, value):
+        nonlocal allocated, logical
+        require(time.monotonic() < deadline and len(entries) < COPY_ENTRIES, "entry or elapsed bound")
+        require(value.st_dev == root.st_dev and
+                (value.st_uid, value.st_gid) == tuple(expected_owner) and
+                not value.st_mode & 0o077 and
+                (stat.S_ISDIR(value.st_mode) or stat.S_ISREG(value.st_mode) and value.st_nlink == 1),
+                "unsafe entry")
+        allocated += value.st_blocks * 512
+        logical += value.st_size if stat.S_ISREG(value.st_mode) else 0
+        require(allocated <= COPY_ALLOCATED and logical <= COPY_LOGICAL, "tree limit")
+        entries.append((entry, value))
+
+    admit(path, root)
+    while pending:
+        directory = pending.pop()
+        # scandir yields one entry at a time; never materialize an unbounded directory.
+        with os.scandir(directory) as stream:
+            for item in stream:
+                require(time.monotonic() < deadline and len(entries) < COPY_ENTRIES, "entry or elapsed bound")
+                entry, value = Path(item.path), item.stat(follow_symlinks=False)
+                admit(entry, value)
+                if stat.S_ISDIR(value.st_mode):
+                    pending.append(entry)
+    # The complete inventory is now bounded; parents sort before their children.
+    return sorted(entries, key=lambda row: str(row[0]))
 
 
 def stamp(value):
@@ -169,13 +186,13 @@ def backup(config):
                     for a, b in ((meta, data), (meta, target), (data, target))), "overlap")
     require(not target.exists(), "destination exists")
     # Mount identity comes from the every-start preflight. Backups must remain local.
-    rows = Path("/proc/self/mountinfo").read_text().splitlines()
-    mounts = [(Path(line.split(" - ")[0].split()[4]), line.split(" - ")[1].split()[0]) for line in rows]
+    mounts = mount_records()
     def filesystem(path):
         return max((row for row in mounts if row[0] == path or row[0] in path.parents),
                    key=lambda row: len(row[0].parts))[1]
     require(filesystem(target.parent) in ("ext4", "xfs", "btrfs"), "local backup required")
     parent = target.parent.lstat()
+    require(parent.st_dev == meta.lstat().st_dev, "backup must share local metadata filesystem")
     require(parent.st_uid == os.geteuid() and not parent.st_mode & 0o077, "private backup parent")
     sources = [(meta, config["metadataOwner"]), (data, config["dataOwner"])]
     inventories = [inventory(path, owner, deadline) for path, owner in sources]
@@ -198,11 +215,12 @@ def backup(config):
         stream.write(raw)
         stream.flush()
         os.fsync(stream.fileno())
-    descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    for directory in (target, target.parent):
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
     return hashlib.sha256(raw).hexdigest()
 
 

@@ -69,11 +69,27 @@ function trusted(path: string, cap = 65536) {
   custody(path);
   return readTrustedFile(path, { owners: [0], maxBytes: cap });
 }
+function syncDirectory(path: string) {
+  const fd = openSync(path, 'r');
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
 function durable(path: string, bytes: Buffer) {
   const fd = openSync(path, 'wx', 0o600);
-  try { writeSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
-  const parent = openSync(dirname(path), 'r');
-  try { fsyncSync(parent); } finally { closeSync(parent); }
+  try {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const written = writeSync(fd, bytes, offset, bytes.length - offset);
+      require(written > 0); offset += written;
+    }
+    fsyncSync(fd);
+  } finally { closeSync(fd); }
+  syncDirectory(dirname(path));
+}
+export function removeResumePermit(path: string, optional = false) {
+  try { unlinkSync(path); }
+  catch (error) { if (!optional || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  // Persist absence BEFORE any new revocation or publisher grant.
+  syncDirectory(dirname(path));
 }
 // Fixed programs and fixed command families only. Suppress raw child diagnostics.
 function command(program: string, argv: string[], input?: string, timeout = 10000, maxBuffer = 1024 * 1024) {
@@ -262,9 +278,15 @@ export class OperatorRuntime implements MaintenanceRuntime {
     command('/usr/bin/python3', ['-I', '-B', helper], JSON.stringify(input), 125000);
     this.stopped();
     // The pair retains the exact server config and RPC secret for future offline recovery.
-    durable(join(this.pair, 'garage.toml'), trusted(CONFIG, 16384));
-    durable(join(this.pair, 'storage.json'), trusted(STORAGE));
-    durable(join(this.pair, 'rpc.secret'), readTrustedFile(RPC, { owners: [1000], secret: true, maxBytes: 128 }));
+    const copies = [
+      ['garage.toml', trusted(CONFIG, 16384)],
+      ['storage.json', trusted(STORAGE)],
+      ['rpc.secret', readTrustedFile(RPC, { owners: [1000], secret: true, maxBytes: 128 })],
+    ] as const;
+    for (const [name, bytes] of copies) {
+      durable(join(this.pair, name), bytes);
+      require(sha256(trusted(join(this.pair, name))) === sha256(bytes));
+    }
   }
   async start() {
     this.stopped();
@@ -315,13 +337,16 @@ export class OperatorRuntime implements MaintenanceRuntime {
       receipt.metadata === this.metadata && receipt.rpcSHA256 === this.rpcHash &&
       receipt.pairSHA256 === sha256(trusted(join(this.pair, 'pair.json'), 2 * 1024 ** 2)));
     require(!readdirSync(this.pair).includes('resumed.json'));
+    require(sha256(trusted(join(this.pair, 'garage.toml'))) === this.config.garageSHA256 &&
+      sha256(trusted(join(this.pair, 'storage.json'))) === this.config.storageSHA256 &&
+      sha256(trusted(join(this.pair, 'rpc.secret'))) === this.rpcHash);
     const permit = join(this.config.backupRoot, '.resume-permit');
     require(trusted(permit).toString() === this.pair);
     const helper = fileURLToPath(new URL('./blob_pair.py', import.meta.url));
     trusted(helper);
     command('/usr/bin/python3', ['-I', '-B', helper], JSON.stringify({ verify: this.pair }), 125000);
     // Consume before grants. A crash or later run cannot replay this permission.
-    unlinkSync(permit);
+    removeResumePermit(permit);
     // Caller requested this separate action. On any partial grant, refence ALL known writers.
     try {
       for (const b of this.config.bindings) for (const accessKeyId of b.publishers)
@@ -346,8 +371,7 @@ export async function operatorMain(args: string[]) {
     const runtime = new OperatorRuntime(config, hash, join(config.backupRoot, id));
     if (args[0] === 'run') {
       // Invalidate older success BEFORE any new revocation, even if this run then fails.
-      try { unlinkSync(join(config.backupRoot, '.resume-permit')); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      removeResumePermit(join(config.backupRoot, '.resume-permit'), true);
     }
     await maintain(runtime, args[0] as 'run' | 'resume');
     if (args[0] === 'run')

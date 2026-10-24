@@ -240,7 +240,10 @@ def file_stamp(value):
 
 
 def sparse_file(source, target, budget):
-    return copy_sparse(source, target, budget, limit=COPY_ALLOCATED)
+    try:
+        return copy_sparse(source, target, budget, limit=COPY_ALLOCATED)
+    except ValueError as error:
+        raise Refusal(str(error)) from error
 
 
 def stopped_tree(path, identity, expected_owner, *, nas, destination=None, created=None):
