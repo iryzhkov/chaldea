@@ -8,7 +8,7 @@ import { completion } from "./completion.ts";
 import { Deadlines } from "./deadlines.ts";
 import type { WaitInput, NativeDecisionInput, AnswerSource } from "./types.ts";
 import { SessionLifecycle, RESULT_GRACE_MS, type SessionOptions, type SessionStatus, type IssueDecision } from "../session/lifecycle.ts";
-import { CredentialRefusal, SessionCredentials } from "../session/credential.ts";
+import { CredentialRefusal, SessionCredentials, type HeadersReply } from "../session/credential.ts";
 
 export interface EngineOptions {
   // Test seam for abrupt process termination at durable/ambiguous boundaries.
@@ -95,7 +95,7 @@ export class WaitEngine {
   /** The issuance gate alone: grants and expiry for the preset's active session, never a token. */
   authorizeIssue(preset: string, audience: string, now?: number): IssueDecision { return this.sessions.authorizeIssue(preset,audience,now); }
   /** Native helper path only (private IPC); never an MCP tool. Refusals are fixed codes. */
-  async sessionHeaders(value: unknown): Promise<{Authorization:string}> {
+  async sessionHeaders(value: unknown): Promise<HeadersReply> {
     if (this.fatal || this.stopped) throw new CredentialRefusal("sessions_unavailable");
     return this.credentials.headers(value);
   }

@@ -24,30 +24,68 @@ chaldea decision answer ID --answer TEXT
 chaldea decision status ID
 chaldea mcp [--config PATH]
 chaldea session headers --preset NAME --audience jocasta|ov|homelab|ha [--config PATH]
+  [--context [--expect-session ID --expect-run ID --expect-deadline EPOCH_SECONDS]]
 All commands accept --config PATH. Registration commits immediately. Retry the same request-id and arguments.
 Defaults only skip or defer the dependent action. They never grant approval or permission.
 `;
-const SESSION_USAGE="chaldea session headers --preset NAME --audience jocasta|ov|homelab|ha [--config PATH]\n";
+const SESSION_USAGE="chaldea session headers --preset NAME --audience jocasta|ov|homelab|ha [--config PATH]\n"+
+  "  [--context [--expect-session ID --expect-run ID --expect-deadline EPOCH_SECONDS]]\n";
 const BEARER=/^Bearer [A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const ID=/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const EPOCH=/^[1-9][0-9]{0,11}$/;
+type Expect={sessionId:string;runId:string;deadline:number};
+const plain=(v:unknown,keys:string[]):v is Record<string,unknown>=>Boolean(v)&&typeof v==="object"&&!Array.isArray(v)&&
+  Object.keys(v as object).length===keys.length&&keys.every(k=>Object.hasOwn(v as object,k));
+const epoch=(v:unknown):v is number=>typeof v==="number"&&Number.isSafeInteger(v)&&v>0;
+/** The context reply line, built afresh in a fixed order, or a refusal code. */
+function contextLine(result:unknown,expect:Expect|null):{line:string}|{code:string}{
+  if(!plain(result,["headers","context"])||!plain(result.headers,["Authorization"])||
+    !plain(result.context,["sessionId","runId","deadline","tokenExpiresAt"]))return {code:"invalid_response"};
+  const header=result.headers.Authorization,c=result.context;
+  if(typeof header!=="string"||!BEARER.test(header)||typeof c.sessionId!=="string"||!ID.test(c.sessionId)||
+    typeof c.runId!=="string"||!ID.test(c.runId)||!epoch(c.deadline)||!epoch(c.tokenExpiresAt)||c.tokenExpiresAt>c.deadline)return {code:"invalid_response"};
+  // The service already refused any other session; a disagreeing reply is never printed.
+  if(expect&&(c.sessionId!==expect.sessionId||c.runId!==expect.runId||c.deadline!==expect.deadline))return {code:"session_mismatch"};
+  return {line:JSON.stringify({headers:{Authorization:header},context:{sessionId:c.sessionId,runId:c.runId,deadline:c.deadline,tokenExpiresAt:c.tokenExpiresAt}})};
+}
 /**
  * Native credential helper: stdout is exactly {"Authorization":"Bearer ..."} and a
- * newline. Every failure is one fixed refusal code on stderr and exit status 1;
- * no receipts, tracing, service text or token bytes reach stderr.
+ * newline. With --context it is exactly
+ * {"headers":{"Authorization":"Bearer ..."},"context":{"sessionId","runId","deadline","tokenExpiresAt"}}
+ * and a newline; the --expect-* flags (all three or none) bind the call to the
+ * session a first --context call returned. Every failure is one fixed refusal
+ * code on stderr and exit status 1; no receipts, tracing, service text or token
+ * bytes reach stderr.
  */
 export async function sessionCli(args:ReadonlyArray<string>):Promise<number>{
   const refuse=(code:string)=>{process.stderr.write(code+"\n");return 1;};
   if(args.length===1&&(args[0]==="--help"||args[0]==="-h")){process.stdout.write(SESSION_USAGE);return 0;}
-  let values:{preset?:string|undefined;audience?:string|undefined;config?:string|undefined};
+  let values:{preset?:string|undefined;audience?:string|undefined;config?:string|undefined;context?:boolean|undefined;
+    "expect-session"?:string|undefined;"expect-run"?:string|undefined;"expect-deadline"?:string|undefined};
   try{
-    const parsed=parseArgs({args:[...args],allowPositionals:true,strict:true,options:{preset:{type:"string"},audience:{type:"string"},config:{type:"string"}}});
+    const parsed=parseArgs({args:[...args],allowPositionals:true,strict:true,options:{preset:{type:"string"},audience:{type:"string"},config:{type:"string"},
+      context:{type:"boolean"},"expect-session":{type:"string"},"expect-run":{type:"string"},"expect-deadline":{type:"string"}}});
     if(parsed.positionals.length!==1||parsed.positionals[0]!=="headers"||parsed.values.preset===undefined||parsed.values.audience===undefined)return refuse("invalid_request");
     values=parsed.values;
   }catch{return refuse("invalid_request");}
+  const given=[values["expect-session"],values["expect-run"],values["expect-deadline"]].filter(v=>v!==undefined).length;
+  if((given!==0&&given!==3)||(given===3&&!values.context))return refuse("invalid_request");
+  let expect:Expect|null=null;
+  if(given===3){
+    if(!ID.test(values["expect-session"]!)||!ID.test(values["expect-run"]!)||!EPOCH.test(values["expect-deadline"]!))return refuse("invalid_request");
+    expect={sessionId:values["expect-session"]!,runId:values["expect-run"]!,deadline:Number(values["expect-deadline"])};
+  }
   let socket:string;
   try{socket=loadConfig(values.config).socket;}catch{return refuse("config_unavailable");}
+  const input={preset:values.preset,audience:values.audience,...(values.context?{context:true}:{}),...(expect?{expect}:{})};
   let result:unknown;
-  try{result=await callService(socket,"chaldea_session_headers",{preset:values.preset,audience:values.audience},10_000);}
+  try{result=await callService(socket,"chaldea_session_headers",input,10_000);}
   catch(error){return refuse(error instanceof ServiceRefusal&&/^[a-z_]{1,64}$/.test(error.message)?error.message:"service_unavailable");}
+  if(values.context){
+    const out=contextLine(result,expect);
+    if("code" in out)return refuse(out.code);
+    process.stdout.write(out.line+"\n");return 0;
+  }
   const header=result&&typeof result==="object"&&!Array.isArray(result)&&Object.keys(result).length===1?(result as Record<string,unknown>).Authorization:undefined;
   if(typeof header!=="string"||!BEARER.test(header))return refuse("invalid_response");
   process.stdout.write(JSON.stringify({Authorization:header})+"\n");return 0;
