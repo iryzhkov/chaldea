@@ -13,10 +13,26 @@ import stat
 import sys
 import time
 
+# Legacy fixture bounds. Omitted limits keep exactly these per-tree values.
 COPY_ENTRIES = 4096
 COPY_ALLOCATED = 512 * 1024 * 1024
 COPY_LOGICAL = 2 * 1024**4
+COPY_ELAPSED_MS = 120000
 COPY_CHUNK = 64 * 1024
+# Finite global maxima for protected configured limits. Capacity is checked separately.
+TREE_MAXIMA = {"maxEntries": 262144, "maxAllocatedBytes": 256 * 1024**3,
+               "maxReadBytes": 256 * 1024**3, "maxLogicalBytes": 2 * 1024**4}
+MAX_ELAPSED_MS = 6 * 3600 * 1000
+# Conservative ext4 destination model. Every copied entry is charged a directory/inode
+# allowance; every read span is charged its block-rounded bytes plus one extent block per
+# 128 chunks. Sidecars are the private files the operator writes after this helper.
+ENTRY_OVERHEAD = 8192
+CHUNKS_PER_EXTENT_BLOCK = 128
+SIDECAR_BYTES = 2 * 1024**2
+SIDECAR_INODES = 64
+MANIFEST_ROW = 512
+MOUNTINFO = "/proc/self/mountinfo"
+INPUT_KEYS = {"meta", "data", "backup", "metadataOwner", "dataOwner", "minFreeBytes", "minFreeInodes"}
 
 
 def require(value, reason):
@@ -24,33 +40,86 @@ def require(value, reason):
         raise ValueError(reason)
 
 
-def sparse_file(source, target, budget, *, limit=None, deadline=None):
-    """Hash fixed nonzero chunks and logical size, retaining holes on disk."""
-    limit = COPY_ALLOCATED if limit is None else limit
-    size = os.fstat(source.fileno()).st_size
-    digest = hashlib.sha256(str(size).encode() + b"\0")
+def ceil_div(value, unit):
+    return -(-value // unit)
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True).encode()
+
+
+def legacy_limits() -> dict:
+    tree = {"maxEntries": COPY_ENTRIES, "maxAllocatedBytes": COPY_ALLOCATED,
+            "maxReadBytes": COPY_ALLOCATED, "maxLogicalBytes": COPY_LOGICAL}
+    return {"maxElapsedMs": COPY_ELAPSED_MS, "meta": dict(tree), "data": dict(tree)}
+
+
+def bounded(value, maximum, minimum=1):
+    # type() excludes bool; JSON floats, NaN and infinity are never int.
+    return type(value) is int and minimum <= value <= maximum
+
+
+def checked_limits(value: "dict | None") -> dict:
+    """Validate protected per-tree limits. Omitted limits keep the legacy fixture bounds."""
+    if value is None:
+        return legacy_limits()
+    require(type(value) is dict and set(value) == {"maxElapsedMs", "meta", "data"}, "limits")
+    require(bounded(value["maxElapsedMs"], MAX_ELAPSED_MS), "limits")
+    for name in ("meta", "data"):
+        tree = value[name]
+        require(type(tree) is dict and set(tree) == set(TREE_MAXIMA), "limits")
+        require(all(bounded(tree[key], maximum) for key, maximum in TREE_MAXIMA.items()), "limits")
+    return value
+
+
+def manifest_limit(limits):
+    return 4096 + MANIFEST_ROW * (limits["meta"]["maxEntries"] + limits["data"]["maxEntries"])
+
+
+def copy_limits(tree):
+    """Inventory bounds for our own copy. Chunk-granular writes may allocate more than
+    the source, never more than twice the bound read bytes plus one chunk per entry."""
+    return {**tree, "maxAllocatedBytes": 2 * tree["maxReadBytes"] + tree["maxEntries"] * COPY_CHUNK}
+
+
+def spans(descriptor, size, remaining):
+    """Yield the chunk-aligned ranges the copy reads, using seeks only and no data reads."""
     offset = 0
     while offset < size:
         try:
-            start = os.lseek(source.fileno(), offset, os.SEEK_DATA)
-            end = os.lseek(source.fileno(), start, os.SEEK_HOLE)
+            start = os.lseek(descriptor, offset, os.SEEK_DATA)
+            end = os.lseek(descriptor, start, os.SEEK_HOLE)
         except OSError as error:
             if error.errno == errno.ENXIO:
-                break
+                return
             require(error.errno in (errno.EINVAL, errno.ENOTSUP), "sparse_seek_failed")
             # Unsupported sparse seek is safe only within the remaining read bound.
-            require(size - offset <= limit - budget[0], "sparse_seek_required")
+            require(size - offset <= remaining(), "sparse_seek_required")
             start, end = offset, size
         require(offset <= start < end <= size, "sparse_extent")
-        position = start // COPY_CHUNK * COPY_CHUNK
-        while position < end:
-            amount = min(COPY_CHUNK, size - position)
+        stop = min(size, ceil_div(end, COPY_CHUNK) * COPY_CHUNK)
+        yield start // COPY_CHUNK * COPY_CHUNK, stop
+        offset = stop
+
+
+def sparse_file(source, target, budget, *, limit=None, deadline=None):
+    """Hash fixed nonzero chunks and logical size, retaining holes on disk."""
+    limit = COPY_ALLOCATED if limit is None else limit
+    descriptor = source.fileno()
+    size = os.fstat(descriptor).st_size
+    digest = hashlib.sha256(str(size).encode() + b"\0")
+    for position, stop in spans(descriptor, size, lambda: limit - budget[0]):
+        while position < stop:
+            amount = min(COPY_CHUNK, stop - position)
             budget[0] += amount
             require(budget[0] <= limit, "copy_read_bound")
             require(deadline is None or time.monotonic() < deadline, "elapsed")
-            source.seek(position)
-            block = source.read(amount)
-            require(len(block) == amount, "copy_short_read")
+            # Positional reads never depend on the file offset moved by the sparse seeks.
+            block = b""
+            while len(block) < amount:
+                part = os.pread(descriptor, amount - len(block), position + len(block))
+                require(part, "copy_short_read")
+                block += part
             if any(block):
                 digest.update(position.to_bytes(8, "big"))
                 digest.update(hashlib.sha256(block).digest())
@@ -58,7 +127,6 @@ def sparse_file(source, target, budget, *, limit=None, deadline=None):
                     target.seek(position)
                     target.write(block)
             position += amount
-        offset = position
     if target is not None:
         target.truncate(size)
         target.flush()
@@ -66,20 +134,21 @@ def sparse_file(source, target, budget, *, limit=None, deadline=None):
     return digest.hexdigest()
 
 
-
 def mount_records():
-    with open("/proc/self/mountinfo", "rb") as stream:
+    with open(MOUNTINFO, "rb") as stream:
         raw = stream.read(1024 * 1024 + 1)
     require(len(raw) <= 1024 * 1024, "mount inventory bound")
     records = []
-    for line in raw.decode().splitlines():
-        left, right = line.split(" - ", 1)
-        target = re.sub(r"\\\\([0-7]{3})", lambda m: chr(int(m[1], 8)), left.split()[4])
-        records.append((Path(target), right.split()[0]))
+    for line in raw.splitlines():
+        left, right = line.split(b" - ", 1)
+        # The kernel escapes space, tab, newline and backslash as ONE backslash plus octal.
+        target = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), left.split()[4])
+        records.append((Path(os.fsdecode(target)), right.split()[0].decode()))
     return records
 
 
-def inventory(path, expected_owner, deadline):
+def inventory(path, expected_owner, deadline, limits=None):
+    limits = legacy_limits()["meta"] if limits is None else limits
     root = path.lstat()
     require(stat.S_ISDIR(root.st_mode), "directory required")
     # Include same-device bind mounts in the refusal, not only different devices.
@@ -89,7 +158,7 @@ def inventory(path, expected_owner, deadline):
 
     def admit(entry, value):
         nonlocal allocated, logical
-        require(time.monotonic() < deadline and len(entries) < COPY_ENTRIES, "entry or elapsed bound")
+        require(time.monotonic() < deadline and len(entries) < limits["maxEntries"], "entry or elapsed bound")
         require(value.st_dev == root.st_dev and
                 (value.st_uid, value.st_gid) == tuple(expected_owner) and
                 not value.st_mode & 0o077 and
@@ -97,7 +166,7 @@ def inventory(path, expected_owner, deadline):
                 "unsafe entry")
         allocated += value.st_blocks * 512
         logical += value.st_size if stat.S_ISREG(value.st_mode) else 0
-        require(allocated <= COPY_ALLOCATED and logical <= COPY_LOGICAL, "tree limit")
+        require(allocated <= limits["maxAllocatedBytes"] and logical <= limits["maxLogicalBytes"], "tree limit")
         entries.append((entry, value))
 
     admit(path, root)
@@ -106,7 +175,7 @@ def inventory(path, expected_owner, deadline):
         # scandir yields one entry at a time; never materialize an unbounded directory.
         with os.scandir(directory) as stream:
             for item in stream:
-                require(time.monotonic() < deadline and len(entries) < COPY_ENTRIES, "entry or elapsed bound")
+                require(time.monotonic() < deadline and len(entries) < limits["maxEntries"], "entry or elapsed bound")
                 entry, value = Path(item.path), item.stat(follow_symlinks=False)
                 admit(entry, value)
                 if stat.S_ISDIR(value.st_mode):
@@ -120,7 +189,38 @@ def stamp(value):
             value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
 
 
-def tree(path, rows, destination, deadline):
+def measure(rows, limits, deadline, unit):
+    """Return the exact bytes the copy will read and conservative ext4 destination bytes
+    for this inventory, from sparse seeks alone. Nothing is read or created."""
+    read, required = 0, 0
+    for entry, value in rows:
+        required += ENTRY_OVERHEAD
+        if not stat.S_ISREG(value.st_mode):
+            continue
+        descriptor = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            require(stamp(os.fstat(descriptor)) == stamp(value), "source changed")
+            for start, stop in spans(descriptor, value.st_size, lambda: limits["maxReadBytes"] - read):
+                require(time.monotonic() < deadline, "elapsed")
+                read += stop - start
+                require(read <= limits["maxReadBytes"], "copy_read_bound")
+                # Only read chunks are written; their zero chunks and all holes stay holes.
+                required += ceil_div(stop - start, unit) * unit
+                required += ceil_div(ceil_div(stop - start, COPY_CHUNK), CHUNKS_PER_EXTENT_BLOCK) * unit
+        finally:
+            os.close(descriptor)
+    return read, required
+
+
+def requirement(inventories, measured, limits, unit):
+    """Destination bytes and inodes for both trees, the manifest and operator sidecars."""
+    entries = sum(len(rows) for rows in inventories)
+    manifest = ceil_div(manifest_limit(limits), unit) * unit
+    return (sum(required for _read, required in measured) + manifest + SIDECAR_BYTES,
+            entries + SIDECAR_INODES)
+
+
+def tree(path, rows, destination, deadline, read_limit=None):
     result, budget = [], [0]
     if destination is not None:
         destination.mkdir(mode=0o700)
@@ -139,10 +239,10 @@ def tree(path, rows, destination, deadline):
             with os.fdopen(descriptor, "rb") as source:
                 require(stamp(os.fstat(source.fileno())) == stamp(value), "source changed")
                 if output is None:
-                    row["sha256"] = sparse_file(source, None, budget, deadline=deadline)
+                    row["sha256"] = sparse_file(source, None, budget, limit=read_limit, deadline=deadline)
                 else:
                     with output.open("xb") as target:
-                        row["sha256"] = sparse_file(source, target, budget, deadline=deadline)
+                        row["sha256"] = sparse_file(source, target, budget, limit=read_limit, deadline=deadline)
                     output.chmod(row["mode"])
                 require(stamp(entry.lstat()) == stamp(value), "source changed")
         result.append(row)
@@ -157,31 +257,49 @@ def tree(path, rows, destination, deadline):
     return result
 
 
-def verify(target):
-    deadline = time.monotonic() + 120
+def checked_path(value):
+    require(type(value) is str, "canonical path")
+    path = Path(value)
+    require(path.is_absolute() and ".." not in path.parts and str(path) == value, "canonical path")
+    for part in (*reversed(path.parents), path):
+        require(not part.is_symlink(), "symlink")
+    return path
+
+
+def verify(target, limits):
+    """Rehash a stored pair under its exact recorded limits. Changed limits refuse."""
+    deadline = time.monotonic() + limits["maxElapsedMs"] / 1000
+    cap = manifest_limit(limits)
     fd = os.open(target / "pair.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as stream:
         value = os.fstat(stream.fileno())
-        require(stat.S_ISREG(value.st_mode) and value.st_nlink == 1
-                and value.st_size <= 2 * 1024**2, "manifest bound")
-        raw = stream.read(2 * 1024**2 + 1)
-    require(len(raw) <= 2 * 1024**2, "manifest bound")
+        require(stat.S_ISREG(value.st_mode) and value.st_nlink == 1 and value.st_size <= cap, "manifest bound")
+        raw = stream.read(cap + 1)
+    require(len(raw) <= cap, "manifest bound")
     pair = json.loads(raw)
+    require(type(pair) is dict and canonical(pair.get("limits")) == canonical(limits), "pair limits")
+    trees = {}
     for name in ("meta", "data"):
         path = target / name
-        actual = tree(path, inventory(path, (os.geteuid(), os.getegid()), deadline), None, deadline)
-        require(actual == pair["trees"][name], "pair changed")
+        rows = inventory(path, (os.geteuid(), os.getegid()), deadline, copy_limits(limits[name]))
+        trees[name] = tree(path, rows, None, deadline, limits[name]["maxReadBytes"])
+    # Only the exact canonical bytes this helper writes are accepted; nothing is trusted.
+    require(raw == canonical({"version": 2, "limits": limits, "trees": trees}), "pair changed")
     return hashlib.sha256(raw).hexdigest()
 
 
 def backup(config):
-    deadline = time.monotonic() + 120
-    paths = [Path(config[name]) for name in ("meta", "data", "backup")]
-    for path in paths:
-        require(path.is_absolute() and ".." not in path.parts, "canonical path")
-        for part in (*reversed(path.parents), path):
-            require(not part.is_symlink(), "symlink")
-    meta, data, target = paths
+    require(set(config) in (INPUT_KEYS, INPUT_KEYS | {"limits"}), "input")
+    limits = checked_limits(config.get("limits"))
+    deadline = time.monotonic() + limits["maxElapsedMs"] / 1000
+    for key in ("minFreeBytes", "minFreeInodes"):
+        require(bounded(config[key], 2**62, 0), "reserve")
+    owners = []
+    for key in ("metadataOwner", "dataOwner"):
+        value = config[key]
+        require(type(value) is list and len(value) == 2 and all(bounded(v, 2**32 - 2, 0) for v in value), "owner")
+        owners.append(tuple(value))
+    meta, data, target = paths = [checked_path(config[name]) for name in ("meta", "data", "backup")]
     require(not any(a == b or a in b.parents or b in a.parents
                     for a, b in ((meta, data), (meta, target), (data, target))), "overlap")
     require(not target.exists(), "destination exists")
@@ -190,27 +308,37 @@ def backup(config):
     def filesystem(path):
         return max((row for row in mounts if row[0] == path or row[0] in path.parents),
                    key=lambda row: len(row[0].parts))[1]
-    require(filesystem(target.parent) in ("ext4", "xfs", "btrfs"), "local backup required")
+    # The destination capacity model below is derived for ext4 only.
+    require(filesystem(target.parent) == "ext4", "local ext4 backup required")
     parent = target.parent.lstat()
     require(parent.st_dev == meta.lstat().st_dev, "backup must share local metadata filesystem")
     require(parent.st_uid == os.geteuid() and not parent.st_mode & 0o077, "private backup parent")
-    sources = [(meta, config["metadataOwner"]), (data, config["dataOwner"])]
-    inventories = [inventory(path, owner, deadline) for path, owner in sources]
-    # Reserve worst-case bounded copy, directory overhead, and configured shared free space.
+    sources = [(meta, owners[0], limits["meta"]), (data, owners[1], limits["data"])]
+    inventories = [inventory(path, owner, deadline, bound) for path, owner, bound in sources]
+    unit = os.statvfs(target.parent).f_frsize
+    require(type(unit) is int and 512 <= unit <= COPY_CHUNK and COPY_CHUNK % unit == 0, "block size")
+    measured = [measure(rows, bound, deadline, unit) for rows, (_p, _o, bound) in zip(inventories, sources)]
+    required_bytes, required_inodes = requirement(inventories, measured, limits, unit)
+    # Point-in-time admission against CURRENT space. Older pairs already consume it and
+    # are never deleted to pass; shared consumers may still fill the disk afterwards.
     available = os.statvfs(target.parent)
-    require(available.f_bavail * available.f_frsize >= 2 * COPY_ALLOCATED + config["minFreeBytes"]
-            and available.f_favail >= 2 * COPY_ENTRIES + config["minFreeInodes"], "headroom")
+    require(available.f_frsize == unit and
+            available.f_bavail * unit >= required_bytes + config["minFreeBytes"] and
+            available.f_favail >= required_inodes + config["minFreeInodes"], "headroom")
     target.mkdir(mode=0o700)
     manifests = {}
-    for name, (path, owner), before in zip(("meta", "data"), sources, inventories):
-        manifests[name] = tree(path, before, target / name, deadline)
-        require([stamp(s) for _, s in inventory(path, owner, deadline)] ==
+    for name, (path, owner, bound), before, (read, required) in zip(("meta", "data"), sources, inventories, measured):
+        # The copy may read no more than measured; a changed extent map refuses.
+        manifests[name] = tree(path, before, target / name, deadline, read)
+        require([stamp(s) for _, s in inventory(path, owner, deadline, bound)] ==
                 [stamp(s) for _, s in before], "inventory changed")
         copied = target / name
-        actual = tree(copied, inventory(copied, (os.geteuid(), os.getegid()), deadline), None, deadline)
-        require(actual == manifests[name], "backup mismatch")
-    raw = json.dumps({"version": 1, "trees": manifests}, sort_keys=True).encode()
-    require(len(raw) <= 2 * 1024**2, "manifest bound")
+        rows = inventory(copied, (os.geteuid(), os.getegid()), deadline, copy_limits(bound))
+        require(sum(value.st_blocks * 512 for _, value in rows) <= required, "capacity estimate exceeded")
+        actual = tree(copied, rows, None, deadline, read)
+        require(canonical(actual) == canonical(manifests[name]), "backup mismatch")
+    raw = canonical({"version": 2, "limits": limits, "trees": manifests})
+    require(len(raw) <= manifest_limit(limits), "manifest bound")
     with (target / "pair.json").open("xb") as stream:
         stream.write(raw)
         stream.flush()
@@ -224,12 +352,19 @@ def backup(config):
     return hashlib.sha256(raw).hexdigest()
 
 
+def main(raw):
+    require(len(raw) <= 65536, "input bound")
+    config = json.loads(raw)
+    require(type(config) is dict, "input")
+    if "verify" not in config:
+        return backup(config)
+    require(set(config) <= {"verify", "limits"}, "input")
+    return verify(checked_path(config["verify"]), checked_limits(config.get("limits")))
+
+
 if __name__ == "__main__":
     try:
-        raw = sys.stdin.buffer.read(65537)
-        require(len(raw) <= 65536, "input bound")
-        config = json.loads(raw)
-        print(json.dumps({"pairSHA256": verify(Path(config["verify"])) if "verify" in config else backup(config)}))
+        print(json.dumps({"pairSHA256": main(sys.stdin.buffer.read(65537))}))
     except Exception:
         print("stopped pair refused; preserve originals and partial destination", file=sys.stderr)
         sys.exit(2)

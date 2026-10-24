@@ -1,6 +1,6 @@
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { maintain, OperatorRuntime, removeResumePermit, type MaintenanceRuntime } from '../../src/exec/blob-maintenance.ts';
+import { maintain, OperatorRuntime, removeResumePermit, validateBackupLimits, type MaintenanceRuntime } from '../../src/exec/blob-maintenance.ts';
 
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
@@ -160,6 +160,30 @@ test('key-local aliases cannot redirect the trusted global bucket', async () => 
     return value;
   };
   await assert.rejects(r.verifyFence());
+});
+test('backup limits are exact finite safe integers and the documented proposal validates', () => {
+  const docs = fs.readFileSync(new URL('../../docs/blob-maintenance.md', import.meta.url), 'utf8');
+  const proposal = JSON.parse(docs.split('```json\n')[1]!.split('\n```')[0]!).backupLimits;
+  assert.deepEqual(validateBackupLimits(structuredClone(proposal)), proposal);
+  assert.equal(proposal.data.maxLogicalBytes, 64 * 1024 ** 3);
+  assert.equal(proposal.meta.maxAllocatedBytes, 16 * 1024 ** 3);
+  const mutations: ((l: any) => void)[] = [
+    l => { l.maxElapsedMs = true; }, l => { l.maxElapsedMs = 0; }, l => { l.maxElapsedMs = 1.5; },
+    l => { l.maxElapsedMs = 6 * 3600 * 1000 + 1; }, l => { l.data.maxReadBytes = -1; },
+    l => { l.data.maxReadBytes = Infinity; }, l => { l.data.maxReadBytes = NaN; },
+    l => { l.meta.maxEntries = '4096'; }, l => { l.meta.maxEntries = 262145; },
+    l => { l.data.maxEntries = 2 ** 53; }, l => { l.data.maxLogicalBytes = 2 * 1024 ** 4 + 1; },
+    l => { l.data.maxAllocatedBytes = 256 * 1024 ** 3 + 1; }, l => { l.extra = 1; }, l => { delete l.meta; },
+    l => { l.meta.extra = 1; }, l => { delete l.data.maxReadBytes; }, l => { l.data = [1]; }, l => { l.meta = null; },
+  ];
+  for (const mutate of mutations) {
+    const value = structuredClone(proposal); mutate(value);
+    assert.throws(() => validateBackupLimits(value));
+  }
+  for (const value of [null, [], 1, 'limits']) assert.throws(() => validateBackupLimits(value));
+});
+test('completion receipt requires the pair hash reported by the helper', async () => {
+  await assert.rejects(new RPCFixture().completed());
 });
 test('missing known key and publisher owner permission refuse', async () => {
   const r = new RPCFixture(); await r.fence(); r.keys.delete(reader);
