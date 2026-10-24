@@ -18,6 +18,8 @@ export const OPERATIONS_PAIRS=[
 export const DAY = 86400;
 export const DEFAULT_BUDGET = { main: 4 * 1024 ** 3, wal: 64 * 1024 ** 2, outbox: 128 * 1024 ** 2, quarantine: 16 * 1024 ** 2 };
 export interface Budget { main: number; wal: number; outbox: number; quarantine: number }
+const PRUNE_TAG_ROWS = "SELECT t.tag,t.event_id FROM events e, json_each(e.envelope,'$.tags') j " +
+  "JOIN event_tags t ON t.tag=j.value AND t.event_id=e.event_id WHERE e.seq=?";
 const RECEIPT_INDICES = [
   { name: "receipts_state_expiry", columns: ["state", "expires"], bytes: "length(CAST(state AS BLOB))+8" },
   { name: "receipts_status_scope", columns: ["profile", "project", "source"],
@@ -406,6 +408,34 @@ export class EventStore {
       this.transaction(fn, estimate);
     } finally { this.db.exec("PRAGMA cache_spill=" + spill); }
   }
+  private pruneTags(victims: { seq: number }[], depths: Map<string, { depth: number; pages: number }[]>, fits: (estimate: number) => boolean): void {
+    const select = this.db.prepare(PRUNE_TAG_ROWS);
+    const remove = this.db.prepare("DELETE FROM event_tags WHERE tag=? AND event_id=?");
+    let chunk: { tag: string; event_id: string }[] = [], bytes = 0, estimate = 0;
+    const flush = () => {
+      if (chunk.length) this.pruneTransaction(() => {
+        for (const row of chunk) remove.run(row.tag, row.event_id);
+      }, estimate);
+      chunk = []; bytes = 0; estimate = 0;
+    };
+    // event_tags is an unread copy; envelopes and feed tags stay visible until
+    // the atomic event transaction. A refusal/crash can safely leave this partial.
+    for (const victim of victims) {
+      const rows = select.all(victim.seq) as { tag: string; event_id: string }[];
+      for (const row of rows) {
+        const size = 256 + 2 * Buffer.byteLength(row.event_id) + 2 * (Buffer.byteLength(row.tag) + 3);
+        let next = this.pruneEstimate([{ table: "event_tags", rows: chunk.length + 1, deleting: true }], bytes + size, depths);
+        if (chunk.length && !fits(next)) {
+          flush();
+          next = this.pruneEstimate([{ table: "event_tags", rows: 1, deleting: true }], size, depths);
+        }
+        // Always try the first row: the unchanged guard must refuse an oversized
+        // step, rather than silently skipping it and permitting an event cascade.
+        chunk.push(row); bytes += size; estimate = next;
+      }
+    }
+    flush();
+  }
   prune(now: number, max = 100): number {
     ensure(Number.isInteger(max) && max > 0 && max <= 100, "invalid_prune_batch");
     type Victim = { seq: number; event_id: string };
@@ -428,31 +458,32 @@ export class EventStore {
         event_id,event_id,issuer,issuer,profile,profile,project,project,project,
         source,source,source,source,host,host,host,host,kind,kind,received_at,received_at,
         occurred_at,occurred_at,occurred_at,expiry,expiry,session,session,tool,tool,client,client
-      ) AS BLOB)) AS bytes,
-      json_array_length(envelope,'$.tags') AS tags,
-      2*length(CAST(json_extract(envelope,'$.tags') AS BLOB))+
-        json_array_length(envelope,'$.tags')*(256+2*length(CAST(event_id AS BLOB))) AS tag_bytes
+      ) AS BLOB)) AS bytes
       FROM events WHERE seq=?`);
     const feedBytes = this.db.prepare(`SELECT length(CAST(body AS BLOB))+512+
       length(CAST(json_array(event_id,event_id,created_at,created_at,created_at,created_at,created_at,created_at,
         host,host,host,source,source,source,severity,severity,title,tags,link) AS BLOB)) AS bytes
       FROM feed_entries WHERE event_id=?`);
-    const victims: Victim[] = []; let bytes = 0, tags = 0, feeds = 0, estimate = 0;
+    const victims: Victim[] = []; let bytes = 0, feeds = 0, estimate = 0;
     for (const row of candidates) {
       const event = eventBytes.get(row.seq)!;
       const feed = feedBytes.get(row.event_id);
-      const nextBytes = bytes + Number(event.bytes) + Number(event.tag_bytes) +
+      const nextBytes = bytes + Number(event.bytes) +
         Number(feed?.bytes ?? 0) + Number(receiptBytes.get(row.event_id)?.bytes ?? 0);
-      const nextTags = tags + Number(event.tags), nextFeeds = feeds + Number(!!feed);
+      const nextFeeds = feeds + Number(!!feed);
       const next = this.pruneEstimate([
         { table: "events", rows: victims.length + 1, deleting: true }, { table: "receipts", rows: victims.length + 1, stateOnly: true },
-        { table: "feed_entries", rows: nextFeeds, deleting: true }, { table: "event_tags", rows: nextTags, deleting: true },
+        { table: "feed_entries", rows: nextFeeds, deleting: true },
         { table: "meta", rows: 1 },
       ], nextBytes, depths);
       if (victims.length && (!fits(next) || nextBytes > 1024 ** 2)) break;
-      victims.push(row); bytes = nextBytes; tags = nextTags; feeds = nextFeeds; estimate = next;
+      victims.push(row); bytes = nextBytes; feeds = nextFeeds; estimate = next;
     }
+    this.pruneTags(victims, depths, fits);
     if (victims.length) this.pruneTransaction(() => {
+      // Check under BEGIN IMMEDIATE before any visible deletion/tombstoning.
+      const tags = this.db.prepare(PRUNE_TAG_ROWS);
+      for (const row of victims) ensure(!tags.get(row.seq), "prune_page_estimate", 503);
       let floor = Number(this.get("floor"));
       for (const row of victims) {
         this.db.prepare("UPDATE receipts SET state='tombstone' WHERE event_id=?").run(row.event_id);
