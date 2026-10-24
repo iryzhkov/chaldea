@@ -12,7 +12,7 @@ import { boundedLog } from "./log.ts";
 import { object, text } from "./types.ts";
 import { loadSessionPolicy } from "../session/policy.ts";
 import { createSessionT3 } from "../session/t3.ts";
-import { CredentialRefusal } from "../session/credential.ts";
+import { CredentialRefusal, type HeadersReply } from "../session/credential.ts";
 import { formatWaitResponse, formatWaitCancellation, waitResponseMode } from "./presentation.ts";
 
 /** The thread is explicitly selected by a same-UID operator, never inferred. */
@@ -74,7 +74,7 @@ export async function startWaitService(config:WaitConfig, extras:Partial<EngineO
       const v=object(JSON.parse(await body(req)));const input=object(v.input??{});
       if(v.method==="chaldea_session_headers"){
         // Native helper path only; MCP never lists or forwards it. The reply is the header or a fixed refusal code.
-        let headers:{Authorization:string};
+        let headers:HeadersReply;
         try{headers=await engine.sessionHeaders(input);}
         catch(error){send(res,400,{error:error instanceof CredentialRefusal?error.code:"headers_unavailable"});return;}
         send(res,200,headers);return;

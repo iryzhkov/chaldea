@@ -249,7 +249,64 @@ printed: no receipts, tracing, service text or token bytes.
 The command calls the private IPC method `chaldea_session_headers`, whose input
 is exactly `{preset, audience}`, with `audience` one of `jocasta`, `ov`,
 `homelab` or `ha`. Unknown fields are refused. The
-method is never an MCP tool. MCP neither lists it nor forwards it, with or
+method is never an MCP tool.
+
+### Session-bound renewal
+
+A supervisor that calls the helper several times over one session, such as a
+foreground launcher that refreshes a token file, must not receive a token for
+a later session that took over the preset. Two optional forms bind its calls
+to the session it started with. The legacy form above and its output are
+unchanged.
+
+```sh
+# First call: the header and the session it belongs to.
+chaldea session headers --preset <preset> --audience jocasta --context
+# Every later call: the identity the first call returned.
+chaldea session headers --preset <preset> --audience jocasta --context \
+  --expect-session <sessionId> --expect-run <runId> --expect-deadline <deadline>
+```
+
+The three `--expect-*` flags are given all together or not at all, and only
+with `--context`. Stdout is exactly one line and a newline:
+
+```json
+{"headers":{"Authorization":"Bearer <jwt>"},"context":{"sessionId":"<id>","runId":"<id>","deadline":1793000000,"tokenExpiresAt":1792998800}}
+```
+
+- `sessionId` and `runId` name the admitted session that held the preset at
+  the gate check that released this header.
+- `deadline` is that run's original absolute deadline, in epoch seconds, from
+  its stored admission.
+- `tokenExpiresAt` is the released token's verified `exp`, in epoch seconds.
+  It is never later than `deadline`, and at release it is at least 30 s away.
+
+The header and the context come from one synchronous gate check, so they
+always agree. With `--expect-*`, the service refuses `session_mismatch` when
+the preset is held by any other session, run or deadline. It checks before
+reading the secret or making a network request, and again after every await,
+before a cached or fresh token is released. A cancelled, expired or released
+original session gets the gate's ordinary refusal, as in the legacy form. A
+stale caller's mismatch does not drop the current session's cached token or
+in-flight fetch. A session swap while a shared fetch is out still discards
+that fetch for every waiter (`session_changed`), as before.
+
+The context is scheduling information only. It never grants access, extends
+the deadline or bypasses any check: every call still passes the full gate.
+The cache is unchanged. A call may return the cached token while it has at
+least 30 s left, so a caller that wants a fresh token schedules its next call
+for less than 30 s before `tokenExpiresAt`. No token is minted in a run's last
+300 s (`run_ending`), so access ends before the deadline.
+
+The IPC input forms are exactly `{preset, audience}`,
+`{preset, audience, context: true}`, and
+`{preset, audience, context: true, expect: {sessionId, runId, deadline}}`.
+`context` must be `true`. `expect` requires `context`. The IDs follow the
+usual identifier rule, and `deadline` is a positive integer of epoch seconds.
+Any other shape is `invalid_request`. A context reply is
+`{headers: {Authorization}, context: {sessionId, runId, deadline, tokenExpiresAt}}`.
+The CLI checks that shape and the expected identity again before it prints
+anything. MCP neither lists it nor forwards it, with or
 without a session policy. IPC errors are fixed codes only, never response
 bodies, headers, secrets or tokens.
 
@@ -329,7 +386,8 @@ Refusal codes: the gate's codes above, plus `invalid_request`,
 `credential_unavailable`, `run_ending`, `issuer_busy`, `jwks_unavailable`,
 `token_request_failed`, `token_response_invalid`, `token_invalid`,
 `token_claims_invalid`, `token_outlives_run`, `token_expired`,
-`session_changed`, `sessions_unavailable` and `headers_unavailable`. The CLI
+`session_changed`, `session_mismatch`, `sessions_unavailable` and
+`headers_unavailable`. The CLI
 adds `config_unavailable`, `service_unavailable` and `invalid_response`.
 
 

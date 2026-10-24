@@ -50,18 +50,45 @@ interface Identity { key: string; decision: Admitted; enrollment: Enrollment; se
 interface Minted { token: string; exp: number }
 interface Entry extends Minted { key: string }
 interface Flight { preset: string; discarded: boolean; promise: Promise<Minted> }
+interface Released extends Minted { decision: Admitted }
+/** The admitted session a bound caller started with; it can only narrow issuance. */
+export interface ExpectedSession { sessionId: string; runId: string; deadline: number }
+/**
+ * Scheduling metadata released with the header from the same gate check:
+ * the admitted session and run, the run's original absolute deadline and the
+ * token's exp, both in epoch seconds. It never grants access by itself.
+ */
+export interface SessionContext extends ExpectedSession { tokenExpiresAt: number }
+export type HeadersReply = { Authorization: string } | { headers: { Authorization: string }; context: SessionContext };
+interface HeadersRequest { preset: string; audience: ServiceAudience; context: boolean; expect: ExpectedSession | null }
+/** Largest accepted deadline: 9999-12-31T23:59:59Z. */
+const MAX_DEADLINE_SECONDS = 253_402_300_799;
+const SESSION_MISMATCH = "session_mismatch";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 const seconds = (ms: number) => Math.floor(ms / 1000);
 
-/** Exactly {preset, audience}; no caller-selected claims or endpoint. */
-function request(input: unknown): { preset: string; audience: ServiceAudience } {
+/**
+ * Exactly {preset, audience}, optionally with context: true, and then optionally
+ * expect: {sessionId, runId, deadline}. No caller-selected claims or endpoint.
+ */
+function request(input: unknown): HeadersRequest {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw refusal("invalid_request");
   const v = input as Record<string, unknown>, keys = Object.keys(v);
-  if (keys.length !== 2 || !Object.hasOwn(v, "preset") || !Object.hasOwn(v, "audience")) throw refusal("invalid_request");
+  const has = (k: string) => Object.hasOwn(v, k);
+  if (!has("preset") || !has("audience") || keys.some(k => !["preset", "audience", "context", "expect"].includes(k)) ||
+    (has("context") && v.context !== true) || (has("expect") && !has("context"))) throw refusal("invalid_request");
   if (!(SERVICE_AUDIENCES as readonly unknown[]).includes(v.audience)) throw refusal("unsupported_audience");
   try { identifier(v.preset); } catch { throw refusal("invalid_request"); }
-  return { preset: v.preset as string, audience: v.audience as ServiceAudience };
+  return { preset: v.preset as string, audience: v.audience as ServiceAudience, context: has("context"), expect: has("expect") ? expected(v.expect) : null };
+}
+function expected(input: unknown): ExpectedSession {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw refusal("invalid_request");
+  const e = input as Record<string, unknown>, keys = Object.keys(e);
+  if (keys.length !== 3 || !["sessionId", "runId", "deadline"].every(k => Object.hasOwn(e, k))) throw refusal("invalid_request");
+  try { identifier(e.sessionId); identifier(e.runId); } catch { throw refusal("invalid_request"); }
+  if (!integer(e.deadline) || e.deadline < 1 || e.deadline > MAX_DEADLINE_SECONDS) throw refusal("invalid_request");
+  return { sessionId: e.sessionId as string, runId: e.runId as string, deadline: e.deadline };
 }
 function aborted(signal: AbortSignal): Promise<never> {
   return new Promise((_, reject) => {
@@ -124,12 +151,24 @@ export class SessionCredentials {
   constructor(gate: Gate, options: CredentialOptions = {}) {
     this.gate = gate; this.transport = options.transport ?? httpsTransport; this.clock = options.now ?? Date.now;
   }
-  async headers(input: unknown): Promise<{ Authorization: string }> {
-    const { preset, audience } = request(input);
-    try { return { Authorization: "Bearer " + await this.release(preset, audience) }; }
-    catch (error) {
+  /**
+   * The legacy request returns exactly {Authorization}. With context: true the
+   * reply is {headers, context}, both taken from the one gate check that
+   * released the token. With expect, any other session, run or deadline holding
+   * the preset is refused (session_mismatch) before any credential read, and
+   * again after every await, before a token is cached or released.
+   */
+  async headers(input: unknown): Promise<HeadersReply> {
+    const { preset, audience, context, expect } = request(input);
+    try {
+      const out = await this.release(preset, audience, expect), Authorization = "Bearer " + out.token;
+      if (!context) return { Authorization };
+      const d = out.decision;
+      return { headers: { Authorization }, context: { sessionId: d.sessionId, runId: d.runId, deadline: d.expiresAt, tokenExpiresAt: out.exp } };
+    } catch (error) {
       // Any refusal for a preset drops its cached token and orphans its in-flight fetch.
-      this.purge(preset);
+      // A stale bound caller's mismatch says nothing against the current occupant, so it keeps its token.
+      if (!(error instanceof CredentialRefusal && error.code === SESSION_MISMATCH)) this.purge(preset);
       throw error instanceof CredentialRefusal ? error : refusal("headers_unavailable");
     }
   }
@@ -143,9 +182,11 @@ export class SessionCredentials {
     return entry.exp - seconds(now) >= MIN_REMAINING_SECONDS && entry.exp <= decision.expiresAt;
   }
   /** Gate, then public enrollment, then the ordinary secret. Throws before any network I/O. */
-  private identity(preset: string, audience: string, now: number): Identity {
+  private identity(preset: string, audience: string, now: number, expect: ExpectedSession | null): Identity {
     const { decision, policy } = this.gate(preset, audience, now);
     if (!decision.ok) throw refusal(decision.refusal);
+    if (expect && (decision.sessionId !== expect.sessionId || decision.runId !== expect.runId ||
+      decision.expiresAt !== expect.deadline)) throw refusal(SESSION_MISMATCH);
     const enrollments = policy?.enrollments;
     const enrollment = enrollments && Object.hasOwn(enrollments, preset) ? enrollments[preset] : undefined;
     if (!enrollment) throw refusal("enrollment_missing");
@@ -160,13 +201,13 @@ export class SessionCredentials {
       enrollmentDigest(enrollment), sha256(secret), audience, decision.service, decision.expiresAt]));
     return { key, decision, enrollment, secret };
   }
-  private async release(preset: string, audience: string): Promise<string> {
+  private async release(preset: string, audience: string, expect: ExpectedSession | null): Promise<Released> {
     const now = this.clock();
     for (const [name, entry] of this.cache) if (entry.exp - seconds(now) < MIN_REMAINING_SECONDS) this.cache.delete(name);
-    const id = this.identity(preset, audience, now);
+    const id = this.identity(preset, audience, now, expect);
     const cached = this.cache.get(preset);
     // A hit is released synchronously right after the gate check above.
-    if (cached && cached.key === id.key && this.usable(cached, id.decision, now)) return cached.token;
+    if (cached && cached.key === id.key && this.usable(cached, id.decision, now)) return { token: cached.token, exp: cached.exp, decision: id.decision };
     this.cache.delete(preset);
     // No fresh mint late in a run, so a new token cannot outlive it.
     if (id.decision.expiresAt - seconds(now) < ENROLLMENT_TOKEN_SECONDS) throw refusal("run_ending");
@@ -179,20 +220,20 @@ export class SessionCredentials {
       flight = created;
     }
     const minted = await flight.promise;
-    const after = this.recheck(preset, id, flight);
+    const after = this.recheck(preset, id, flight, expect);
     if (!this.usable(minted, after.decision, this.clock())) throw refusal("token_expired");
     this.cache.delete(preset);
     this.cache.set(preset, { key: id.key, ...minted });
     while (this.cache.size > MAX_ENTRIES) this.cache.delete(this.cache.keys().next().value!);
-    return minted.token;
+    return { token: minted.token, exp: minted.exp, decision: after.decision };
   }
   /**
    * After any await: the gate, protected policy, enrollment and secret must still
    * give the same session, run, thread, preset hash, digests and deadline, and no
    * refusal may have orphaned this fetch meanwhile.
    */
-  private recheck(preset: string, id: Identity, flight: Flight): Identity {
-    const after = this.identity(preset, id.decision.audience, this.clock());
+  private recheck(preset: string, id: Identity, flight: Flight, expect: ExpectedSession | null): Identity {
+    const after = this.identity(preset, id.decision.audience, this.clock(), expect);
     if (flight.discarded || after.key !== id.key) throw refusal("session_changed");
     return after;
   }
@@ -202,12 +243,14 @@ export class SessionCredentials {
     const keys = signingKeys(json(await this.fetch(e.jwksUrl, { method: "GET", headers: { Accept: "application/json" }, signal },
       MAX_JWKS_BODY, "jwks_unavailable")), "audience" in e && e.audience === "holonet");
     // A run cancelled or changed while the keys loaded never causes a token request.
-    this.recheck(preset, id, flight);
+    // The fetch is shared by every waiter of this identity, so it checks the identity key;
+    // each bound waiter checks its own expected session again when the fetch settles.
+    this.recheck(preset, id, flight, null);
     const body = new URLSearchParams({ grant_type: "client_credentials", client_id: e.clientId, username: e.username,
       password: id.secret, scope: e.scope }).toString();
     const response = json(await this.fetch(e.tokenUrl, { method: "POST", signal, body,
       headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" } }, MAX_TOKEN_BODY, "token_request_failed"));
-    this.recheck(preset, id, flight);
+    this.recheck(preset, id, flight, null);
     const token = response?.access_token;
     if (!response || typeof response.token_type !== "string" || response.token_type.toLowerCase() !== "bearer" ||
       typeof token !== "string" || token.length > MAX_JWT_BYTES || !COMPACT_JWT.test(token)) throw refusal("token_response_invalid");

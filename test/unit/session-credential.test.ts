@@ -15,7 +15,9 @@ import { WaitEngine } from "../../src/waits/engine.ts";
 import { callService, ServiceRefusal, startWaitService } from "../../src/waits/service.ts";
 import type { WaitConfig } from "../../src/waits/config.ts";
 import { enrollmentDigest, parsePolicy, presetHash, type SessionPolicy } from "../../src/session/policy.ts";
-import { CredentialRefusal, FETCH_BUDGET_MS, type Transport } from "../../src/session/credential.ts";
+import { CredentialRefusal, FETCH_BUDGET_MS, SessionCredentials, type Transport } from "../../src/session/credential.ts";
+import type { IssueDecision } from "../../src/session/lifecycle.ts";
+import type { SessionServiceGrant } from "../../src/session/service-grant.ts";
 import { finalAssistant, type LaunchResult, type SessionT3 } from "../../src/session/t3.ts";
 import { NATIVE_ONLY_METHODS, SESSION_TOOLS, WAIT_TOOLS } from "../../src/mcp.ts";
 import type { WaitT3, WaitSnapshot, WaitRun } from "../../src/t3/waits.ts";
@@ -182,7 +184,9 @@ async function fixture(name: string) {
   const shut = async () => { if (!closed) { closed = true; await engine.stop(); store.close(); } };
   return {
     dir, secretFile, clock, now, issuer, t3, ref, events, store, engine, shut,
-    headers: (over: Record<string, unknown> = {}) => engine.sessionHeaders({ preset: "reporter", audience: "jocasta", ...over }),
+    /** The legacy reply type by default; context tests name their reply type. */
+    headers: <T = { Authorization: string }>(over: Record<string, unknown> = {}) =>
+      engine.sessionHeaders({ preset: "reporter", audience: "jocasta", ...over }) as Promise<unknown> as Promise<T>,
     async close() { await shut(); dir.remove(); },
   };
 }
@@ -917,4 +921,268 @@ test("new signed JWTs refuse duplicate JSON names before caching", async () => {
     await refused(f.headers({ audience: "ov" }), "token_invalid");
     assert.equal(f.issuer.posts().length, 1);
   } finally { await f.close(); }
+});
+
+// --- session-bound renewal: context replies and expected identity ---
+type Ctx = { headers: { Authorization: string }; context: { sessionId: string; runId: string; deadline: number; tokenExpiresAt: number } };
+const expOf = (authorization: string) => JSON.parse(Buffer.from(authorization.split(".")[1]!, "base64url").toString("utf8")).exp as number;
+const expectOf = (c: Ctx) => ({ sessionId: c.context.sessionId, runId: c.context.runId, deadline: c.context.deadline });
+const bound = (f: Fixture, c: Ctx) => f.headers<Ctx>({ context: true, expect: expectOf(c) });
+const released = async (f: Fixture, s: { sessionId: string; threadId: string }) => {
+  f.t3.finish(s.threadId);
+  await until(() => f.engine.sessionStatus(s.sessionId).occupancy === "released");
+};
+
+test("context reply: header and admitted identity from one gate check; legacy reply stays exactly {Authorization}", async () => {
+  const f = await fixture("ctx");
+  try {
+    const s = await start(f), deadline = Date.parse(s.deadline) / 1000;
+    assert.ok(Number.isSafeInteger(deadline));
+    const ctx = await f.headers<Ctx>({ context: true });
+    assert.deepEqual(Object.keys(ctx), ["headers", "context"]);
+    assert.deepEqual(Object.keys(ctx.headers), ["Authorization"]);
+    assert.equal(ctx.headers.Authorization, "Bearer " + f.issuer.minted[0]);
+    assert.deepEqual(ctx.context, { sessionId: s.sessionId, runId: s.sessionId, deadline, tokenExpiresAt: expOf(ctx.headers.Authorization) });
+    assert.ok(ctx.context.tokenExpiresAt <= ctx.context.deadline);
+    const gate = f.engine.authorizeIssue("reporter", "jocasta");
+    if (!gate.ok) throw new Error(gate.refusal);
+    assert.deepEqual([gate.sessionId, gate.runId, gate.expiresAt], [ctx.context.sessionId, ctx.context.runId, ctx.context.deadline]);
+    // The legacy form shares the same cache entry and keeps its exact shape.
+    const legacy = await f.headers();
+    assert.deepEqual(Object.keys(legacy), ["Authorization"]);
+    assert.deepEqual(legacy, ctx.headers);
+    assert.deepEqual(await bound(f, ctx), ctx);
+    assert.equal(f.issuer.requests.length, 2);
+    // A cached token is returned while 30 s remain, so the context shows its unchanged exp.
+    f.clock.offset = 260_000;
+    assert.deepEqual(await bound(f, ctx), ctx);
+    // Past the cache threshold a bound call mints, and the context follows the new token.
+    f.clock.offset = 271_000;
+    const renewed = await bound(f, ctx);
+    assert.equal(renewed.headers.Authorization, "Bearer " + f.issuer.minted[1]);
+    assert.deepEqual(expectOf(renewed), expectOf(ctx));
+    assert.equal(renewed.context.tokenExpiresAt, expOf(renewed.headers.Authorization));
+    assert.ok(renewed.context.tokenExpiresAt > ctx.context.tokenExpiresAt && renewed.context.tokenExpiresAt <= deadline);
+    assert.equal(f.issuer.requests.length, 4);
+    await f.shut();
+    for (const n of readdirSync(f.dir.path).filter(n => n.startsWith("waits.sqlite")))
+      for (const token of f.issuer.minted) assert.ok(!readFileSync(join(f.dir.path, n)).includes(token), "token in " + n);
+    assert.ok(!JSON.stringify(f.events).includes("Bearer"));
+  } finally { await f.close(); }
+});
+
+test("context and expect shapes are validated exactly, before the gate and before any request", async () => {
+  const f = await fixture("ctx-shape");
+  try {
+    const good = { sessionId: "s-1", runId: "s-1", deadline: 1_800_000_000 };
+    const bad: Array<Record<string, unknown>> = [
+      { context: false }, { context: "true" }, { context: 1 }, { context: null }, { expect: good },
+      { context: true, expect: null }, { context: true, expect: [] }, { context: true, expect: "s-1" },
+      { context: true, expect: { sessionId: "s-1", runId: "s-1" } },
+      { context: true, expect: { ...good, threadId: "t" } },
+      { context: true, expect: { ...good, sessionId: "../s" } }, { context: true, expect: { ...good, runId: "" } },
+      { context: true, expect: { ...good, sessionId: 7 } }, { context: true, expect: { ...good, runId: "r".repeat(129) } },
+      { context: true, expect: { ...good, deadline: "1800000000" } }, { context: true, expect: { ...good, deadline: 1.5 } },
+      { context: true, expect: { ...good, deadline: 0 } }, { context: true, expect: { ...good, deadline: -1 } },
+      { context: true, expect: { ...good, deadline: 253_402_300_800 } }, { context: true, expect: { ...good, deadline: Number.NaN } },
+      { context: true, runId: "s-1" }, { context: true, expect: good, extra: 1 },
+    ];
+    // With no active run, a shape refusal proves the shape is checked before the gate.
+    for (const over of bad) await refused(f.headers(over), "invalid_request", JSON.stringify(over));
+    await refused(f.headers({ context: true, audience: "akasha" }), "unsupported_audience");
+    await refused(f.headers({ context: true }), "no_active_run");
+    await refused(f.headers({ context: true, expect: good }), "no_active_run");
+    assert.equal(f.issuer.requests.length, 0);
+  } finally { await f.close(); }
+});
+
+test("a stale expected identity is refused before any credential read and leaves the current session's token and fetch alone", async () => {
+  const f = await fixture("ctx-stale");
+  try {
+    const a = await start(f), ctxA = await f.headers<Ctx>({ context: true });
+    await released(f, a);
+    await start(f);
+    const ctxB = await f.headers<Ctx>({ context: true });
+    assert.notEqual(ctxB.context.sessionId, ctxA.context.sessionId);
+    assert.notEqual(ctxB.headers.Authorization, ctxA.headers.Authorization);
+    assert.equal(f.issuer.requests.length, 4);
+    // With the secret gone, any credential read would surface as credential_unavailable.
+    unlinkSync(f.secretFile);
+    await refused(bound(f, ctxA), "session_mismatch");
+    for (const over of [{ runId: "other-run" }, { sessionId: "other-session" }, { deadline: ctxB.context.deadline + 1 }, { deadline: ctxB.context.deadline - 1 }])
+      await refused(f.headers({ context: true, expect: { ...expectOf(ctxB), ...over } }), "session_mismatch", JSON.stringify(over));
+    assert.equal(f.issuer.requests.length, 4);
+    resetSecret(f);
+    // B's cached token survived the stale refusals: no new request.
+    assert.deepEqual(await bound(f, ctxB), ctxB);
+    assert.equal(f.issuer.requests.length, 4);
+    // B's in-flight fetch also survives a stale caller arriving during it.
+    writeFileSync(f.secretFile, SECRET + "-2\n");
+    f.issuer.pause("POST");
+    const pending = bound(f, ctxB);
+    await until(() => f.issuer.requests.length === 6);
+    await refused(bound(f, ctxA), "session_mismatch");
+    f.issuer.resume();
+    const renewed = await pending;
+    assert.equal(renewed.headers.Authorization, "Bearer " + f.issuer.minted.at(-1));
+    assert.deepEqual(expectOf(renewed), expectOf(ctxB));
+    assert.equal(f.issuer.requests.length, 6);
+  } finally { await f.close(); }
+});
+
+test("a session swap during the JWKS or token await never releases the next occupant's token to the old bound caller", async () => {
+  for (const phase of ["GET", "POST"] as const) {
+    const f = await fixture("ctx-swap-" + phase.toLowerCase());
+    try {
+      const a = await start(f), ctxA = await f.headers<Ctx>({ context: true });
+      // Force a fresh fetch for A and hold it while A ends and B starts.
+      writeFileSync(f.secretFile, SECRET + "-2\n");
+      f.issuer.pause(phase);
+      const pending = bound(f, ctxA);
+      await until(() => f.issuer.requests.length === (phase === "GET" ? 3 : 4));
+      await released(f, a);
+      const b = await start(f);
+      f.issuer.resume();
+      await refused(pending, "session_changed", phase);
+      // A change while the keys load never sends A's token request.
+      assert.equal(f.issuer.posts().length, phase === "GET" ? 1 : 2, phase);
+      const ctxB = await f.headers<Ctx>({ context: true });
+      assert.equal(ctxB.context.sessionId, b.sessionId);
+      assert.ok(![ctxA.headers.Authorization, ...f.issuer.minted.slice(0, -1).map(t => "Bearer " + t)].includes(ctxB.headers.Authorization));
+      // From now on the old caller only ever gets a refusal, while B keeps its token.
+      await refused(bound(f, ctxA), "session_mismatch", phase);
+      assert.deepEqual(await bound(f, ctxB), ctxB);
+    } finally { await f.close(); }
+  }
+});
+
+test("a bound waiter rechecks its expected session after the shared fetch settles, before caching or release", async () => {
+  const dir = scratchDir("cred-bound-gate");
+  assert.ok(insideScratch(dir.path));
+  try {
+    const secretFile = join(dir.path, "reporter.secret");
+    writeFileSync(secretFile, SECRET + "\n", { mode: 0o600 }); chmodSync(secretFile, 0o600);
+    const policy = policyOf(secretFile), issuer = await Issuer.make(Date.now), expiresAt = Math.floor(Date.now() / 1000) + 900;
+    const decision = (id: string): IssueDecision => ({ ok: true, sessionId: id, runId: id, threadId: "thread-" + id, profile: "reporter",
+      project: "projectA", audience: "jocasta", service: structuredClone(GRANTS[0]!) as SessionServiceGrant, expiresAt,
+      presetHash: presetHash(policy.presets.reporter!) });
+    // The gate names session A until call number swapAt, then session B.
+    let calls = 0, swapAt = Infinity;
+    const credentials = new SessionCredentials(() => ({ decision: decision(++calls >= swapAt ? "session-b" : "session-a"), policy }),
+      { transport: issuer.transport });
+    const a = { sessionId: "session-a", runId: "session-a", deadline: expiresAt };
+    const req = { preset: "reporter", audience: "jocasta" }, boundA = { ...req, context: true, expect: a };
+    // Gate calls: the first check, after the JWKS, after the token request, then the waiter's own check.
+    swapAt = 4;
+    await refused(credentials.headers(boundA), "session_mismatch");
+    assert.equal(calls, 4); assert.equal(issuer.posts().length, 1); assert.equal(credentials.size, 0, "nothing cached");
+    // A legacy caller in the same position is refused by the identity key.
+    calls = 0; swapAt = 4;
+    await refused(credentials.headers(req), "session_changed");
+    assert.equal(credentials.size, 0);
+    // Cache path: A's token is cached, then B holds the preset.
+    calls = 0; swapAt = Infinity;
+    const first = await credentials.headers(boundA) as Ctx;
+    assert.deepEqual(first.context, { ...a, tokenExpiresAt: expOf(first.headers.Authorization) });
+    swapAt = 0;
+    const before = issuer.requests.length;
+    await refused(credentials.headers(boundA), "session_mismatch");
+    assert.equal(issuer.requests.length, before, "refused synchronously, with no request");
+    const next = await credentials.headers({ ...req, context: true }) as Ctx;
+    assert.equal(next.context.sessionId, "session-b");
+    assert.notEqual(next.headers.Authorization, first.headers.Authorization);
+  } finally { dir.remove(); }
+});
+
+test("the original session's cancel, run end and deadline end bound issuance; nothing replaces it", async () => {
+  const f = await fixture("ctx-end");
+  try {
+    const s = await start(f), ctx = await f.headers<Ctx>({ context: true }), deadline = ctx.context.deadline * 1000;
+    f.clock.offset = deadline - 299_000 - Date.now();
+    await refused(bound(f, ctx), "run_ending");
+    f.clock.offset = deadline - Date.now();
+    await refused(bound(f, ctx), "run_expired");
+    f.clock.offset = 0;
+    // Those refusals dropped the cached token, as for any refusal; the same session mints again.
+    const again = await bound(f, ctx);
+    assert.deepEqual(expectOf(again), expectOf(ctx));
+    assert.ok(again.headers.Authorization !== ctx.headers.Authorization, "a fresh token after the purge");
+    assert.equal(f.issuer.requests.length, 4);
+    f.engine.cancelSession(s.sessionId);
+    await refused(bound(f, ctx), "run_inactive");
+    await released(f, s);
+    await refused(bound(f, ctx), "no_active_run");
+    // A new admission for the preset never satisfies the old binding.
+    await start(f);
+    await refused(bound(f, ctx), "session_mismatch");
+    assert.equal(f.issuer.requests.length, 4);
+  } finally { await f.close(); }
+});
+
+test("native CLI context forms: exact request, exact single-line output, strict reply checks and flag refusals", async () => {
+  const dir = scratchDir("cred-cli-ctx");
+  assert.ok(insideScratch(dir.path));
+  try {
+    const socket = testSocketPath(join(dir.path, "s.sock")), configFile = join(dir.path, "waits.json");
+    writeFileSync(configFile, JSON.stringify({ environment: "env", socket }), { mode: 0o600 });
+    const base = ["session", "headers", "--preset", "reporter", "--audience", "jocasta", "--config", configFile];
+    const expectArgs = ["--expect-session", "s-1", "--expect-run", "s-1", "--expect-deadline", "1800000000"];
+    const context = { sessionId: "s-1", runId: "s-1", deadline: 1_800_000_000, tokenExpiresAt: 1_799_999_000 };
+    const okBody = { headers: { Authorization: "Bearer aaa.bbb.ccc" }, context };
+    const okLine = '{"headers":{"Authorization":"Bearer aaa.bbb.ccc"},"context":{"sessionId":"s-1","runId":"s-1","deadline":1800000000,"tokenExpiresAt":1799999000}}\n';
+    let reply: { status: number; body: unknown } = { status: 200, body: okBody };
+    const fake = await fakeService(socket, () => reply);
+    try {
+      assert.deepEqual(await cli([...base, "--context"]), { code: 0, stdout: okLine, stderr: "" });
+      assert.deepEqual(await cli([...base, "--context", ...expectArgs]), { code: 0, stdout: okLine, stderr: "" });
+      assert.deepEqual(fake.calls, [
+        { method: "chaldea_session_headers", input: { preset: "reporter", audience: "jocasta", context: true } },
+        { method: "chaldea_session_headers", input: { preset: "reporter", audience: "jocasta", context: true, expect: { sessionId: "s-1", runId: "s-1", deadline: 1_800_000_000 } } },
+      ]);
+      // Reordered keys in the reply still print in the fixed order.
+      reply = { status: 200, body: { context: { tokenExpiresAt: 1_799_999_000, deadline: 1_800_000_000, runId: "s-1", sessionId: "s-1" }, headers: okBody.headers } };
+      assert.deepEqual(await cli([...base, "--context"]), { code: 0, stdout: okLine, stderr: "" });
+      const outcomes: Array<[unknown, string[], string]> = [
+        [{ ...okBody, context: { ...context, sessionId: "s-2" } }, expectArgs, "session_mismatch"],
+        [{ ...okBody, context: { ...context, runId: "s-2" } }, expectArgs, "session_mismatch"],
+        [{ ...okBody, context: { ...context, deadline: 1_800_000_001, tokenExpiresAt: 1_799_999_000 } }, expectArgs, "session_mismatch"],
+        [{ ...okBody, context: { ...context, tokenExpiresAt: 1_800_000_001 } }, [], "invalid_response"],
+        [{ ...okBody, context: { ...context, deadline: "1800000000" } }, [], "invalid_response"],
+        [{ ...okBody, context: { ...context, threadId: "t" } }, [], "invalid_response"],
+        [{ ...okBody, receipt: "x" }, [], "invalid_response"],
+        [{ ...okBody, headers: { Authorization: "Basic abc" } }, [], "invalid_response"],
+        [{ Authorization: "Bearer aaa.bbb.ccc" }, [], "invalid_response"],
+      ];
+      for (const [body, extra, code] of outcomes) {
+        reply = { status: 200, body };
+        assert.deepEqual(await cli([...base, "--context", ...extra]), { code: 1, stdout: "", stderr: code + "\n" }, JSON.stringify(body));
+      }
+      reply = { status: 400, body: { error: "session_mismatch" } };
+      assert.deepEqual(await cli([...base, "--context", ...expectArgs]), { code: 1, stdout: "", stderr: "session_mismatch\n" });
+      // The legacy form refuses a context-shaped reply, exactly as before.
+      reply = { status: 200, body: okBody };
+      assert.deepEqual(await cli(base), { code: 1, stdout: "", stderr: "invalid_response\n" });
+      const calls = fake.calls.length;
+      for (const bad of [expectArgs, ["--context", ...expectArgs.slice(0, 4)], ["--context", "--expect-session", "s-1"],
+        ["--context", ...expectArgs.slice(0, 5), "01"], ["--context", ...expectArgs.slice(0, 5), "1.5"], ["--context", ...expectArgs.slice(0, 5), "-1"],
+        ["--context", ...expectArgs.slice(0, 5), "1e9"], ["--context", "--expect-session", "../s", ...expectArgs.slice(2)], ["--context=yes"]])
+        assert.deepEqual(await cli([...base, ...bad]), { code: 1, stdout: "", stderr: "invalid_request\n" }, bad.join(" "));
+      assert.equal(fake.calls.length, calls, "flag refusals never reach the service");
+    } finally { await fake.close(); }
+    // The real service validates the same shapes and keeps headers disabled without a policy.
+    const answer = join(dir.path, "answer-token"); writeFileSync(answer, "fake-answer-token", { mode: 0o600 });
+    const config: WaitConfig = { environment: "env", t3BaseDir: dir.path, tokenFile: join(dir.path, "t3-token"), database: join(dir.path, "w.sqlite"),
+      socket, listenAddress: "127.0.0.1", port: 0, answerBaseUrl: "http://127.0.0.1:7385", answerTokenFile: answer, logFile: join(dir.path, "w.log") };
+    const issuer = await Issuer.make(Date.now), secretFile = join(dir.path, "absent.secret");
+    const enabled = await startWaitService(config, { sessions: { policy: () => policyOf(secretFile), credentials: { transport: issuer.transport } } });
+    try {
+      const call = (input: unknown) => callService(socket, "chaldea_session_headers", input);
+      const code = (c: string) => (e: unknown) => e instanceof ServiceRefusal && e.message === c;
+      await assert.rejects(call({ preset: "reporter", audience: "jocasta", context: true }), code("no_active_run"));
+      await assert.rejects(call({ preset: "reporter", audience: "jocasta", context: true, expect: { sessionId: "s", runId: "s", deadline: "1" } }), code("invalid_request"));
+      await assert.rejects(call({ preset: "reporter", audience: "jocasta", expect: { sessionId: "s", runId: "s", deadline: 1 } }), code("invalid_request"));
+      assert.deepEqual(await cli([...base, "--context", ...expectArgs]), { code: 1, stdout: "", stderr: "no_active_run\n" });
+      assert.equal(issuer.requests.length, 0);
+    } finally { await enabled.stop(); }
+  } finally { dir.remove(); }
 });
