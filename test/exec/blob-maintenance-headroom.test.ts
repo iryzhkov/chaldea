@@ -46,6 +46,22 @@ function storageFixture(): any {
     metadata: store('/mnt/docker-data/swarm/objectstore', { target: '/mnt/docker-data',
       source: '/dev/fixture', fstype: 'ext4', fsroot: '/', options: ['rw'] }, 16 * 1024 ** 3) };
 }
+// Synthetic immutable-shaped references, never live qualification evidence.
+function operatorContract(f: ReturnType<typeof setup>, composite = true) {
+  f.storage.operating_contract = 'operator_budget_v1';
+  f.refresh();
+  const configuration = f.storage.qualifications.configuration;
+  const reference = 'jocasta:' + '0'.repeat(32) + '@1';
+  for (const gate of gates) {
+    const type = ['full_volume', 'mount_loss'].includes(gate) ? 'accepted_risk'
+      : composite && gate !== 'last_copy_policy' ? 'composite' : 'measured';
+    f.storage.qualifications[gate] = { type, references: [reference],
+      limitation: 'Synthetic contract fixture; no live evidence or operational authority.',
+      ...(type === 'composite' ? { measured_configuration: 'sha256:' + 'a'.repeat(64),
+        qualifying_configuration: configuration, difference_reference: reference } : { configuration }) };
+  }
+  f.refresh();
+}
 const known = () => ({ f_bavail: 16 * 1024 ** 4, f_frsize: 1, f_files: 50000, f_ffree: 20000, f_favail: 10000 });
 function setup(t: any) {
   const storage = storageFixture();
@@ -141,7 +157,7 @@ test('health accepts observed all-zero NFS only as explicit UNKNOWN, never free 
 
 test('reviewed native and preflight fixture bytes are unchanged', () => {
   assert.equal(hash(starter), '9bce8cf779b7fe7eb8c66bf65e6894391d76c056d4fe0eff36799a38cb3a18ec');
-  assert.equal(hash(preflight), '857bc50d85a711a3253ecfe762fc2d40e84cf5a82e5c24ab3a9b91fa5d5b98af');
+  assert.equal(hash(preflight), 'c3b5a5e653de899456c75fa774071a0209f31a188ef0120214d8eccbb4cf7ca3');
 });
 for (const change of [
   (f: any) => { delete f.storage.data.unknown_filecount_risk_acceptance; },
@@ -216,6 +232,72 @@ for (const path of [META, BACKUP]) test('local destination floors and failures r
 for (const gate of gates) test('normal unqualified gate remains refused ' + gate, async t => {
   const f = setup(t); f.storage.qualifications[gate] = null; f.refresh();
   await assert.rejects(f.runtime.health());
+});
+for (const composite of [false, true]) test('operator contract uses actual hash-bound native.check ' + composite, async t => {
+  const f = setup(t); operatorContract(f, composite);
+  await f.runtime.health();
+  assert.equal(f.calls(), 1);
+  assert.deepEqual(f.runtime.headroomReport?.data, {
+    available_bytes: 16 * 1024 ** 4, filecounts: 'UNKNOWN', available_inodes: null });
+  assert.equal(f.runtime.headroomReport?.metadata.filecounts, 'known');
+});
+for (const gate of gates) test('operator contract requires each typed gate through fixed snippet ' + gate, async t => {
+  const f = setup(t); operatorContract(f);
+  f.storage.qualifications[gate] = null; f.refresh();
+  await assert.rejects(f.runtime.health()); assert.equal(f.calls(), 1);
+  assert.equal(f.runtime.headroomReport, null);
+});
+for (const [gate, type] of [
+  ['full_volume', 'measured'], ['mount_loss', 'composite'],
+  ['consistent_restore', 'accepted_risk'], ['fresh_client_roundtrip', 'accepted_risk'],
+  ['last_copy_policy', 'composite'],
+]) test('operator contract gate classification refuses through native.check ' + gate, async t => {
+  const f = setup(t); operatorContract(f);
+  f.storage.qualifications[gate!].type = type; f.refresh();
+  await assert.rejects(f.runtime.headroom()); assert.equal(f.runtime.headroomReport, null);
+});
+for (const change of [
+  (s: any) => { s.operating_contract = 'unknown'; },
+  (s: any) => { delete s.metadata.acceptance_mode; },
+  (s: any) => { s.qualifications.extra = 'fixture'; },
+  (s: any) => { s.qualifications.mount_loss.extra = 'fixture'; },
+  (s: any) => { s.qualifications.consistent_restore.measured_configuration = 'sha256:' + 'A'.repeat(64); },
+  (s: any) => { s.qualifications.consistent_restore.difference_reference += ' '; },
+  (s: any) => { s.qualifications.last_copy_policy.references = []; },
+  (s: any) => { s.qualifications.full_volume.limitation = ' '; },
+  (s: any) => { s.qualifications.fresh_client_roundtrip.qualifying_configuration = 'sha256:' + '0'.repeat(64); },
+  (s: any) => { s.data.unknown_filecount_risk_acceptance = 'changed-reference'; },
+]) test('operator schema and current binding refuse through actual snippet', async t => {
+  const f = setup(t); operatorContract(f); change(f.storage); f.refresh();
+  await assert.rejects(f.runtime.health()); assert.equal(f.runtime.headroomReport, null);
+});
+test('composite disclosure checks bindings without claiming historical byte verification', async t => {
+  const f = setup(t);
+  const measured = f.storage.qualifications.configuration;
+  // The actual legacy string was nonempty; selector and risk-string changes alter the digest.
+  f.storage.data.unknown_filecount_risk_acceptance = 'test-only new S3 risk reference';
+  operatorContract(f);
+  assert.notEqual(f.storage.qualifications.configuration, measured);
+  f.storage.qualifications.fresh_client_roundtrip.measured_configuration = measured;
+  f.refresh(); await f.runtime.health();
+  f.storage.qualifications.consistent_restore.measured_configuration = 'sha256:' + 'b'.repeat(64);
+  f.refresh(); await f.runtime.health();
+  // Truth of the immutable receipt and the allowlisted JSON difference remain operator duties.
+  f.storage.qualifications.fresh_client_roundtrip.qualifying_configuration = measured;
+  f.refresh(); await assert.rejects(f.runtime.health());
+});
+test('typed mode preserves native UNKNOWN, byte, inode, IO and mount failure policy', async t => {
+  const f = setup(t); operatorContract(f);
+  for (const [label, values] of [
+    ['data', { ...known(), f_bavail: 0 }],
+    ['data', { ...known(), f_favail: 4095 }],
+    ['metadata', { ...known(), f_files: 0, f_ffree: 0, f_favail: 0 }],
+    ['metadata', 'OSError'],
+  ] as const) {
+    const original = f.telemetry[label]; f.telemetry[label] = values;
+    await assert.rejects(f.runtime.health()); f.telemetry[label] = original;
+  }
+  f.mountLoss(); await assert.rejects(f.runtime.health());
 });
 test('normal policy digest, storage paths and current mount identity remain bound', async t => {
   const f = setup(t);

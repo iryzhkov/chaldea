@@ -36,6 +36,37 @@ The disabled Swarm source is not selected by this path. Concurrent root or RPC
 administration can defeat these checks; it must remain excluded for the entire
 interval. This is not protection against a malicious trusted operator.
 
+## Qualification producer compatibility
+
+The fixed read-only Python snippet calls the hash-bound native producer's
+`check`, including preflight qualification validation, then returns only its
+existing `startup_headroom` object. Legacy string qualifications and explicitly
+selected `operator_budget_v1` typed records use that same path. Maintenance adds
+no selector, policy implementation or lifecycle knob. Normal startup and
+maintenance still refuse any missing gate, wrong type or current-digest drift.
+
+The selected operator-budget contract requires explicit data and metadata
+operational budgets. Fullness/mount-loss gates accept only accepted-risk records;
+restore/client gates accept measured or composite evidence; last-copy requires
+measured custody/policy evidence. Composite records disclose distinct measured
+and qualifying digests and an immutable difference reference. Startup checks
+local shape and qualifying bindings only. The reviewed operator preparation
+compares historical bytes, permits exact configuration differences and verifies
+receipt truth/path mapping. Neither producer nor maintenance fetches evidence.
+
+When changing either producer helper, review both repositories as one acceptance
+batch. Freeze the infra head, then refresh the exact
+`scripts/garage-storage-{preflight,native}.py` bytes into
+`test/fixtures/blob-headroom/` using guarded repository edits. Record both SHA256s
+and update the fixture-hash assertion in
+`test/exec/blob-maintenance-headroom.test.ts` only where bytes changed. Run that
+test against the actual fixed snippet with legacy and typed qualifications,
+five-gate refusals and existing headroom cases, plus exec typechecks. Record
+both source heads and job logs together. Fixture hashes are test assumptions,
+not running configuration pins. Installation and new protected pins require a
+separately reviewed operator packet and authority; these source fixtures grant
+no start, credential, restore or maintenance permission.
+
 ## Trusted local inputs
 
 The root-owned, non-writable-ancestor config is fixed at
