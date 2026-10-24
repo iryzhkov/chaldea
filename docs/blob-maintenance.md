@@ -110,6 +110,24 @@ The operator checks on-disk unit/startup/preflight/storage/Garage config hashes,
 no systemd drop-ins or pending daemon reload, native UID/GID, no automatic restart
 or KILL escalation, process exe/argv, cgroup, and one live node.
 
+Headroom uses a fixed read-only Python snippet against the same hash-pinned
+native starter, preflight, storage policy and Garage config. It calls native
+`check()`, including all five normal qualification gates, current mounts and
+custody, without calling `main()` or starting Garage. The native helper owns the
+NFS filecount policy. Only its explicit storage-policy acceptance of all-zero
+NFS data counters can return `filecounts: "UNKNOWN"` with
+`available_inodes: null`. This establishes no free file-slot capacity.
+Known counts still meet `minFreeInodes`, including values above 4096.
+Local metadata and backup retain their byte and inode floors.
+The finite command output and completion receipt include the headroom report.
+
+The contract tests retain byte-identical native/preflight fixtures from infra
+PR80, accepted source `d7de0142c623fa5498ec63fd50ab0cca7eca0879`.
+They simulate telemetry, mounts and custody without real host access.
+This source correction grants no risk acceptance or qualification. An earlier
+S1/S2-only acceptance cannot authorize normal maintenance. S3 must separately
+decide the applicable policy, exact source/config hashes and all normal gates.
+
 Cleanup credential files contain only `accessKeyId` and `secretAccessKey`,
 mode 0600, root-owned, singly linked, under root-owned non-writable ancestors.
 The existing BlobStore private reader and SigV4 transport read these locally.
