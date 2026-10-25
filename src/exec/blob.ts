@@ -8,7 +8,7 @@ export const sha256 = (bytes: Uint8Array | string) => createHash('sha256').updat
 const hex = /^[0-9a-f]{64}$/;
 const jobPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export function jobId(value: string) { if (!jobPattern.test(value)) throw new Error('invalid job id'); }
-export type BlobConfig = { endpoint: string; bucket: string; principal: string; region: string; credentialFile: string };
+export type BlobConfig = { endpoint: string; bucket: string; principal: string; region: string; credentialFile: string; publication?: 'automatic' | 'manual' };
 export type BlobManifest = { version: 1; jobId: string; principal: string; createdAt: number; expiresAt: number;
   requested: string[]; artifacts: { path: string; size: number; sha256: string }[] };
 export const RETENTION = 14 * 86400;
@@ -17,9 +17,11 @@ export const MANIFEST_CAP = 1024 * 1024;
 export function blobConfig(): BlobConfig | undefined {
   const c = readJson(configPath('blob'), true);
   if (!Object.keys(c).length) return;
-  onlyKeys(c, ['version', 'endpoint', 'bucket', 'principal', 'region', 'credentialFile']);
+  onlyKeys(c, ['version', 'endpoint', 'bucket', 'principal', 'region', 'credentialFile', 'publication']);
   if (c.version !== 1 || ['endpoint', 'bucket', 'principal', 'region', 'credentialFile'].some(k => typeof c[k] !== 'string'))
     throw new ConfigurationError('Invalid blob configuration');
+  if (c.publication !== undefined && c.publication !== 'automatic' && c.publication !== 'manual')
+    throw new ConfigurationError('Invalid blob publication mode');
   const config = c as unknown as BlobConfig;
   let u: URL;
   try { u = new URL(config.endpoint); } catch { throw new ConfigurationError('Invalid blob endpoint'); }

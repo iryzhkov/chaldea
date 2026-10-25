@@ -74,8 +74,8 @@ def checked_limits(value: "dict | None") -> dict:
     return value
 
 
-def manifest_limit(limits):
-    return 4096 + MANIFEST_ROW * (limits["meta"]["maxEntries"] + limits["data"]["maxEntries"])
+def manifest_limit(limits, managed=False):
+    return 4096 + (2048 if managed else MANIFEST_ROW) * (limits["meta"]["maxEntries"] + limits["data"]["maxEntries"])
 
 
 def copy_limits(tree):
@@ -153,7 +153,7 @@ def mount_records():
     return records
 
 
-def inventory(path, expected_owner, deadline, limits=None):
+def inventory(path, expected_owner, deadline, limits=None, *, managed=False, private=False):
     limits = legacy_limits()["meta"] if limits is None else limits
     root = path.lstat()
     require(stat.S_ISDIR(root.st_mode), "directory required")
@@ -167,7 +167,8 @@ def inventory(path, expected_owner, deadline, limits=None):
         require(time.monotonic() < deadline and len(entries) < limits["maxEntries"], "entry or elapsed bound")
         require(value.st_dev == root.st_dev and
                 (value.st_uid, value.st_gid) == tuple(expected_owner) and
-                not value.st_mode & 0o077 and
+                (stat.S_IMODE(value.st_mode) in ((0o700, 0o770) if stat.S_ISDIR(value.st_mode) else (0o600, 0o660))
+                 if managed else private_mode(value) if private else not value.st_mode & 0o077) and
                 (stat.S_ISDIR(value.st_mode) or stat.S_ISREG(value.st_mode) and value.st_nlink == 1),
                 "unsafe entry")
         allocated += value.st_blocks * 512
@@ -232,27 +233,33 @@ def measure(rows, limits, deadline, unit):
     return read, required
 
 
-def requirement(inventories, measured, limits, unit):
+def requirement(inventories, measured, limits, unit, managed=False):
     """Destination bytes and inodes for both trees, the manifest and operator sidecars."""
     entries = sum(len(rows) for rows in inventories)
-    manifest = ceil_div(manifest_limit(limits), unit) * unit
+    manifest = ceil_div(manifest_limit(limits, managed), unit) * unit
     return (sum(required for _read, required in measured) + manifest + SIDECAR_BYTES,
             entries + SIDECAR_INODES)
 
 
-def tree(path, rows, destination, deadline, read_limit=None):
+def tree(path, rows, destination, deadline, read_limit=None, *, normalize=False):
     result, budget = [], [0]
     if destination is not None:
         destination.mkdir(mode=0o700)
+        if normalize:
+            destination.chmod(0o700)
     for entry, value in rows:
         require(time.monotonic() < deadline and stamp(entry.lstat()) == stamp(value), "changed or elapsed")
         relative = entry.relative_to(path)
         output = None if destination is None else destination / relative
         row = {"path": str(relative), "mode": stat.S_IMODE(value.st_mode),
                "directory": stat.S_ISDIR(value.st_mode)}
+        if normalize:
+            row["mode"] = 0o700 if row["directory"] else 0o600
         if row["directory"]:
             if output is not None and relative != Path("."):
                 output.mkdir(mode=row["mode"])
+                if normalize:
+                    output.chmod(0o700)
         else:
             row["size"] = value.st_size
             descriptor = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -261,10 +268,13 @@ def tree(path, rows, destination, deadline, read_limit=None):
                 if output is None:
                     row["sha256"] = sparse_file(source, None, budget, limit=read_limit, deadline=deadline)
                 else:
-                    with output.open("xb") as target:
+                    with os.fdopen(os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if normalize else 0o666), "wb") as target:
+                        if normalize:
+                            os.fchmod(target.fileno(), row["mode"])
                         row["sha256"] = sparse_file(source, target, budget, limit=read_limit, deadline=deadline)
                     output.chmod(row["mode"])
-                require(stamp(entry.lstat()) == stamp(value), "source changed")
+                require((not normalize or stamp(os.fstat(source.fileno())) == stamp(value))
+                        and stamp(entry.lstat()) == stamp(value), "source changed")
         result.append(row)
     if destination is not None:
         for row in reversed(result):
@@ -308,8 +318,136 @@ def verify(target, limits):
     return hashlib.sha256(raw).hexdigest()
 
 
+
+MANAGED_PROFILE = "managed_nfs_data_v1"
+DATA_KEYS = {"path", "mount", "acceptance_mode", "operational_budget", "physical_cap",
+             "identity_mapping", "unknown_filecount_risk_acceptance", "access_profile"}
+
+
+def managed_profile(raw, expected_sha):
+    """Derive policy from the exact protected storage bytes, never a pair policy selector.
+    Normal native.check remains responsible for live mount/gate/headroom checks."""
+    require(type(raw) is str and len(raw.encode()) <= 65536
+            and type(expected_sha) is str and re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            and hashlib.sha256(raw.encode()).hexdigest() == expected_sha, "storage binding")
+    storage = json.loads(raw)
+    require(type(storage) is dict and storage.get("enabled") is True
+            and storage.get("operating_contract") == "operator_budget_v1", "managed storage")
+    data, metadata = storage.get("data"), storage.get("metadata")
+    require(type(data) is dict and set(data) <= DATA_KEYS and type(metadata) is dict
+            and "access_profile" not in metadata, "managed storage keys")
+    profile = data.get("access_profile")
+    require(type(profile) is dict and set(profile) == {"name", "acceptance_reference"}
+            and profile["name"] == MANAGED_PROFILE, "managed profile")
+    reference = profile["acceptance_reference"]
+    require(type(reference) is str and len(reference) <= 96
+            and re.fullmatch(r"jocasta:[0-9a-f]{32}@[1-9][0-9]*", reference), "acceptance reference")
+    require(data.get("acceptance_mode") == "operational_budget"
+            and type(data.get("mount")) is dict and data["mount"].get("fstype") in ("nfs", "nfs4")
+            and data.get("physical_cap") is None, "managed NFS budget")
+    budget = data.get("operational_budget")
+    require(type(budget) is dict and set(budget) == {"bytes", "risk_acceptance"}
+            and bounded(budget["bytes"], 2**62) and type(budget["risk_acceptance"]) is str
+            and bool(budget["risk_acceptance"].strip()), "managed budget")
+    mapping = data.get("identity_mapping")
+    require(type(mapping) is dict and set(mapping) == {"owner_uid", "owner_gid", "evidence"}
+            and all(bounded(mapping[k], 2**32 - 2) for k in ("owner_uid", "owner_gid"))
+            and type(mapping["evidence"]) is str and bool(mapping["evidence"].strip()), "managed owner")
+    effective = {**profile, "owner": [mapping["owner_uid"], mapping["owner_gid"]],
+                 "directoryModes": [0o700, 0o770], "fileModes": [0o600, 0o660]}
+    configuration = {k: v for k, v in storage.items() if k != "qualifications"}
+    digest = "sha256:" + hashlib.sha256(json.dumps(configuration, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {**effective, "sourceStorageSHA256": expected_sha, "sourceConfiguration": digest,
+            "effectiveProfileSHA256": hashlib.sha256(canonical(effective)).hexdigest()}
+
+
+def private_mode(value):
+    return stat.S_IMODE(value.st_mode) == (0o700 if stat.S_ISDIR(value.st_mode) else 0o600)
+
+
+def source_observations(path, rows):
+    # Historical provenance only. These are never expected destination inode/ctime values.
+    return [{"path": str(entry.relative_to(path)), "sourceMode": stat.S_IMODE(value.st_mode),
+             "stamp": list(stamp(value))} for entry, value in rows]
+
+
+def checked_observations(observations, trees, profile, limits):
+    require(type(observations) is dict and set(observations) == {"meta", "data"}, "source observations")
+    for name in ("meta", "data"):
+        rows = observations[name]
+        require(type(rows) is list and len(rows) == len(trees[name])
+                and len(rows) <= limits[name]["maxEntries"], "observation bound")
+        for old, row in zip(rows, trees[name]):
+            require(type(old) is dict and set(old) == {"path", "sourceMode", "stamp"}
+                    and old["path"] == row["path"], "observation path")
+            s = old["stamp"]
+            require(type(s) is list and len(s) == 9
+                    and all(type(v) is int and v >= 0 for v in s)
+                    and type(old["sourceMode"]) is int and old["sourceMode"] == stat.S_IMODE(s[2]),
+                    "observation stamp")
+            directory = row["directory"]
+            require((stat.S_ISDIR(s[2]) if directory else stat.S_ISREG(s[2]) and s[5] == 1),
+                    "source kind or link")
+            modes = ([0o700, 0o770] if directory else [0o600, 0o660]) if name == "data" else (
+                     [0o700] if directory else [0o600])
+            require(old["sourceMode"] in modes and (directory or s[6] == row["size"]),
+                    "source mode or size")
+            require(s[3:5] == (profile["owner"] if name == "data" else [1000, 1000]),
+                    "source owner")
+    return observations
+
+
+def private_custody(target):
+    # v3 pairs are root-owned private local trees. No links or group access.
+    require(os.geteuid() == os.getegid() == 0, "root pair custody")
+    mounts = mount_records()
+    require(max((row for row in mounts if row[0] == target or row[0] in target.parents),
+                key=lambda row: len(row[0].parts))[1] == "ext4", "local ext4 pair required")
+    for entry in (*reversed(target.parents), target):
+        value = entry.lstat()
+        require(stat.S_ISDIR(value.st_mode) and value.st_uid == 0
+                and not value.st_mode & 0o022, "pair ancestry")
+    for entry in (target, target / "pair.json"):
+        value = entry.lstat()
+        require((value.st_uid, value.st_gid) == (0, 0) and private_mode(value)
+                and (stat.S_ISDIR(value.st_mode) or stat.S_ISREG(value.st_mode) and value.st_nlink == 1),
+                "private pair custody")
+
+
+def verify_managed(target, limits, profile):
+    private_custody(target)
+    deadline = time.monotonic() + limits["maxElapsedMs"] / 1000
+    cap = manifest_limit(limits, True)
+    fd = os.open(target / "pair.json", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require(before.st_size <= cap, "manifest bound")
+        raw = stream.read(cap + 1)
+        require(stamp(os.fstat(stream.fileno())) == stamp(before), "manifest changed")
+    require(len(raw) <= cap, "manifest bound")
+    pair = json.loads(raw)
+    require(type(pair) is dict and set(pair) == {"version", "limits", "profile", "trees", "source"}
+            and type(pair["version"]) is int and pair["version"] == 3
+            and pair["limits"] == limits and pair["profile"] == profile, "managed pair binding")
+    trees = {}
+    for name in ("meta", "data"):
+        path = target / name
+        rows = inventory(path, (0, 0), deadline, copy_limits(limits[name]), private=True)
+        trees[name] = tree(path, rows, None, deadline, limits[name]["maxReadBytes"])
+        require([(str(p), stamp(v)) for p, v in inventory(path, (0, 0), deadline,
+                copy_limits(limits[name]), private=True)] == [(str(p), stamp(v)) for p, v in rows],
+                "local inventory changed")
+    source = checked_observations(pair["source"], trees, profile, limits)
+    require(raw == canonical({"version": 3, "limits": limits, "profile": profile,
+                              "trees": trees, "source": source}), "pair changed")
+    require(stamp((target / "pair.json").lstat()) == stamp(before), "manifest changed")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def backup(config):
-    require(set(config) in (INPUT_KEYS, INPUT_KEYS | {"limits"}), "input")
+    extra = {"storage", "storageSHA256"} if "storage" in config else set()
+    require(set(config) in (INPUT_KEYS | extra, INPUT_KEYS | extra | {"limits"}), "input")
+    profile = managed_profile(config["storage"], config["storageSHA256"]) if extra else None
     limits = checked_limits(config.get("limits"))
     deadline = time.monotonic() + limits["maxElapsedMs"] / 1000
     for key in ("minFreeBytes", "minFreeInodes"):
@@ -319,7 +457,13 @@ def backup(config):
         value = config[key]
         require(type(value) is list and len(value) == 2 and all(bounded(v, 2**32 - 2, 0) for v in value), "owner")
         owners.append(tuple(value))
+    if profile is not None:
+        require(owners == [(1000, 1000), tuple(profile["owner"])] and os.geteuid() == os.getegid() == 0, "profile owner binding")
     meta, data, target = paths = [checked_path(config[name]) for name in ("meta", "data", "backup")]
+    if profile is not None:
+        storage = json.loads(config["storage"])
+        require(str(data) == storage["data"].get("path")
+                and str(meta) == storage["metadata"].get("path") + "/meta", "source path binding")
     require(not any(a == b or a in b.parents or b in a.parents
                     for a, b in ((meta, data), (meta, target), (data, target))), "overlap")
     require(not target.exists(), "destination exists")
@@ -334,11 +478,12 @@ def backup(config):
     require(parent.st_dev == meta.lstat().st_dev, "backup must share local metadata filesystem")
     require(parent.st_uid == os.geteuid() and not parent.st_mode & 0o077, "private backup parent")
     sources = [(meta, owners[0], limits["meta"]), (data, owners[1], limits["data"])]
-    inventories = [inventory(path, owner, deadline, bound) for path, owner, bound in sources]
+    inventories = [inventory(path, owner, deadline, bound, managed=profile is not None and path == data,
+                             private=profile is not None and path == meta) for path, owner, bound in sources]
     unit = os.statvfs(target.parent).f_frsize
     require(type(unit) is int and 512 <= unit <= COPY_CHUNK and COPY_CHUNK % unit == 0, "block size")
     measured = [measure(rows, bound, deadline, unit) for rows, (_p, _o, bound) in zip(inventories, sources)]
-    required_bytes, required_inodes = requirement(inventories, measured, limits, unit)
+    required_bytes, required_inodes = requirement(inventories, measured, limits, unit, profile is not None)
     # Point-in-time admission against CURRENT space. Older pairs already consume it and
     # are never deleted to pass; shared consumers may still fill the disk afterwards.
     available = os.statvfs(target.parent)
@@ -346,20 +491,35 @@ def backup(config):
             available.f_bavail * unit >= required_bytes + config["minFreeBytes"] and
             available.f_favail >= required_inodes + config["minFreeInodes"], "headroom")
     target.mkdir(mode=0o700)
-    manifests = {}
+    if profile is not None:
+        target.chmod(0o700)
+    manifests, observations = {}, {}
     for name, (path, owner, bound), before, (read, required) in zip(("meta", "data"), sources, inventories, measured):
         # The copy may read no more than measured; a changed extent map refuses.
-        manifests[name] = tree(path, before, target / name, deadline, read)
-        require([stamp(s) for _, s in inventory(path, owner, deadline, bound)] ==
-                [stamp(s) for _, s in before], "inventory changed")
+        manifests[name] = tree(path, before, target / name, deadline, read, normalize=profile is not None)
+        after = inventory(path, owner, deadline, bound, managed=profile is not None and name == "data",
+                          private=profile is not None and name == "meta")
+        require([(str(p), stamp(s)) for p, s in after] == [(str(p), stamp(s)) for p, s in before],
+                "inventory changed")
+        if profile is not None:
+            # A second bounded content scan refuses drift even when a writer restores mtime.
+            require(tree(path, after, None, deadline, read, normalize=True) == manifests[name], "source content changed")
+            final = inventory(path, owner, deadline, bound, managed=name == "data", private=name == "meta")
+            require([(str(p), stamp(s)) for p, s in final] == [(str(p), stamp(s)) for p, s in before],
+                    "source inventory changed")
+            observations[name] = source_observations(path, before)
         copied = target / name
-        rows = inventory(copied, (os.geteuid(), os.getegid()), deadline, copy_limits(bound))
+        rows = inventory(copied, (os.geteuid(), os.getegid()), deadline, copy_limits(bound), private=profile is not None)
         require(sum(value.st_blocks * 512 for _, value in rows) <= required, "capacity estimate exceeded")
         actual = tree(copied, rows, None, deadline, read)
         require(canonical(actual) == canonical(manifests[name]), "backup mismatch")
-    raw = canonical({"version": 2, "limits": limits, "trees": manifests})
-    require(len(raw) <= manifest_limit(limits), "manifest bound")
-    with (target / "pair.json").open("xb") as stream:
+    value = {"version": 2, "limits": limits, "trees": manifests}
+    if profile is not None:
+        value.update(version=3, profile=profile,
+                     source=checked_observations(observations, manifests, profile, limits))
+    raw = canonical(value)
+    require(len(raw) <= manifest_limit(limits, profile is not None), "manifest bound")
+    with os.fdopen(os.open(target / "pair.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if profile is not None else 0o666), "wb") as stream:
         stream.write(raw)
         stream.flush()
         os.fsync(stream.fileno())
@@ -378,7 +538,11 @@ def main(raw):
     require(type(config) is dict, "input")
     if "verify" not in config:
         return backup(config)
-    require(set(config) <= {"verify", "limits"}, "input")
+    extra = {"storage", "storageSHA256"} if "storage" in config else set()
+    require(set(config) in ({"verify"} | extra, {"verify", "limits"} | extra), "input")
+    if extra:
+        return verify_managed(checked_path(config["verify"]), checked_limits(config.get("limits")),
+                              managed_profile(config["storage"], config["storageSHA256"]))
     return verify(checked_path(config["verify"]), checked_limits(config.get("limits")))
 
 

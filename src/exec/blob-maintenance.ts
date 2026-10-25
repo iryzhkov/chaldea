@@ -351,10 +351,17 @@ export class OperatorRuntime implements MaintenanceRuntime {
   pairHelper(input: Record<string, unknown>) {
     const helper = fileURLToPath(new URL('./blob_pair.py', import.meta.url));
     trusted(helper);
+    // The profile is derived from protected storage, never from maintenance config.
+    // Native check's normal interface and every-start result fields stay unchanged.
+    const storage = trusted(STORAGE);
+    require(sha256(storage) === this.config.storageSHA256);
+    const declared = JSON.parse(storage.toString());
+    const managed = Object.hasOwn(declared.data ?? {}, 'access_profile');
+    const boundInput = managed ? { ...input, storage: storage.toString(), storageSHA256: this.config.storageSHA256 } : input;
     const limits = this.config.backupLimits;
     const elapsed = limits?.maxElapsedMs ?? LEGACY_BACKUP_ELAPSED_MS;
     const out = JSON.parse(command('/usr/bin/python3', ['-I', '-B', helper],
-      JSON.stringify(limits ? { ...input, limits } : input), elapsed + 5000));
+      JSON.stringify(limits ? { ...boundInput, limits } : boundInput), elapsed + 5000));
     require(exactKeys(out, ['pairSHA256']) && typeof out.pairSHA256 === 'string' && /^[a-f0-9]{64}$/.test(out.pairSHA256));
     return out.pairSHA256 as string;
   }

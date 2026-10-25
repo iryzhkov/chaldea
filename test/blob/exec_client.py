@@ -51,15 +51,16 @@ s["main"]()
     (tools / "ssh").chmod(0o700)
     (base / "host.json").write_text(json.dumps({"state_root": str(base / "jobs"), "require_mount": False}))
 
-    def configure(target, key):
+    def configure(target, key, publication=None):
         directory = target / ".config" / "chaldea"
-        directory.mkdir(parents=True, mode=0o700)
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
         secret = directory / "garage-key.json"
         secret.write_text(json.dumps({"accessKeyId": key.access, "secretAccessKey": key.secret}))
         secret.chmod(0o600)
         (directory / "blob.json").write_text(json.dumps({
             "version": 1, "endpoint": endpoint, "bucket": "artifact-c", "principal": "fixture-client",
-            "region": "garage", "credentialFile": str(secret)}))
+            "region": "garage", "credentialFile": str(secret),
+            **({"publication": publication} if publication is not None else {})}))
 
     configure(client_home, publisher)
     node = shutil.which("node")
@@ -87,6 +88,26 @@ s["main"]()
         entries = [json.loads(p.read_text()) for p in (state / "journal").glob("*.json")]
         return dict(sorted(entries, key=lambda e: e["started"])[-1], fixtureStderr=result.stderr.decode(errors="replace")[-4096:])
 
+    # Manual completion must not invoke publication: no draft precedes explicit publish,
+    # no S3 object/manifest exists, and reserve/journal/store binding remain pending.
+    configure(client_home, publisher, "manual")
+    manual = produce()
+    assert manual["outcome"] == "finished" and manual["blob"]["state"] == "pending"
+    assert "draft" not in manual["blob"] and manual["artifactReserve"] > 0
+    assert manual["artifactPaths"] and "custody pending" not in manual["fixtureStderr"]
+    status, listing = publisher.request("GET", "artifact-c?list-type=2&max-keys=2&prefix=v1/" + manual["jobId"] + "/")
+    assert status == 200 and b"<Key>" not in listing
+    config_path = client_home / ".config/chaldea/blob.json"
+    selected = json.loads(config_path.read_text())
+    config_path.write_text(json.dumps(dict(selected, endpoint="http://127.0.0.1:43900")))
+    mismatch = command(client_home, "artifacts", "publish", manual["jobId"], expected=255)
+    assert b"blob_store_binding" in mismatch.stderr
+    config_path.write_text(json.dumps(selected))
+    command(client_home, "artifacts", "publish", manual["jobId"])
+    confirmed = json.loads((state / "journal" / (manual["jobId"] + ".json")).read_text())
+    assert confirmed["blob"]["state"] == "confirmed"
+    assert confirmed["jobId"] == manual["jobId"] and confirmed["blob"]["store"] == manual["blob"]["store"]
+    configure(client_home, publisher)  # Omitted mode retains automatic publication.
     completed = produce()
     if completed["outcome"] != "finished" or completed["blob"]["state"] != "confirmed":
         _, listing = publisher.request("GET", "artifact-c?list-type=2&max-keys=2&prefix=v1/" + completed["jobId"] + "/manifests/")

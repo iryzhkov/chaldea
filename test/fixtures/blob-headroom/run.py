@@ -26,7 +26,11 @@ real_read = Path.read_bytes
 class Probe:
     def lstat(self, path):
         owner = 1000 if path in (storage["data"]["path"], storage["metadata"]["path"] + "/meta") else 0
-        return SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=owner, st_gid=owner, st_dev=1)
+        mapping = storage["data"].get("identity_mapping") if path == storage["data"]["path"] else None
+        managed = mapping and "access_profile" in storage["data"]
+        return SimpleNamespace(st_mode=stat.S_IFDIR | (0o770 if managed else 0o700),
+                               st_uid=mapping["owner_uid"] if mapping else owner,
+                               st_gid=mapping["owner_gid"] if mapping else owner, st_dev=1)
     def mount(self, path):
         label = "data" if path.startswith("/mnt/nas/") else "metadata"
         result = dict(storage[label]["mount"])

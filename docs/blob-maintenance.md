@@ -189,6 +189,85 @@ contain keys and require root-only local custody. The command does not restore
 or provision storage. Reuse the accepted stopped-pair restore protocol for a
 separately authorized recovery.
 
+
+### Managed DATA and pair version 3
+
+Maintenance derives the fixed `managed_nfs_data_v1` profile from the exact
+storage bytes covered by `storageSHA256`. There is no selectable maintenance
+profile. Native `check()`, `check_headroom()`, startup preflight fields and
+the every-start interface are unchanged. The producer fixture is byte-for-byte
+the paired homelab-infra producer. Profile/acceptance additions exceed the old
+S2 selector plus UNKNOWN-reference allowlist. Future composite records must
+name a mechanically checked immutable difference receipt; accepted-risk,
+composite and measured records must keep their distinct meanings. Source
+preparation supplies no acceptance, production digest or gate.
+
+Without the profile, private pair version 2 canonical bytes and dispatch remain.
+With it, version 3 binds exact source storage SHA256, source configuration
+digest, the fixed profile/immutable acceptance reference, effective profile
+SHA256, mapped owner and exact limits. DATA accepts stable 0700/0770 directories
+and 0600/0660 files. Metadata remains strict. Both copied trees are root-owned
+private local 0700/0600. Destination `mode`/content rows describe that normalized
+copy; separate `sourceMode` and nine-field source stamps record historical
+dev/inode/mode/uid/gid/nlink/size/mtime-ns/ctime-ns. They are provenance and change
+guards, never expected local inode or ctime values.
+
+Pre/post inventories compare paths and all stamps, each opened file checks its
+descriptor before/after copying, and bounded source and local content scans
+verify hashes. The first implementation refuses ALL observed epoch drift,
+including policy-allowed mode changes and unexplained ctime-only changes.
+It has no mode transition tolerance or actor attribution. Failures keep the last
+good pair and partial output without rotation, overwrite, deletion or automatic
+retry. Each content pass retains the configured read ceiling and the same
+deadline; v3 adds a source verification pass and charges a larger bounded
+manifest before creation. No full-scale throughput/capacity claim follows.
+
+Version 3 verification requires private root local custody, exact canonical
+bytes, content, profile-constrained historical provenance, digests and limits.
+Unknown versions/profiles, mismatched bindings/limits, local group access,
+unsafe owners and links refuse. Resume re-verifies the selected representation
+using the same config-bound receipt and saved storage bytes before any grant.
+
+Recovery remains the packet-local stopped-pair protocol
+`jocasta:d20c4ef5fec9d4d4016748b9fdd0dbf5@4`. Its concrete consumers are
+`restore-copy.py`, `prepare-host.py` and `restore-start.py` with derived
+configuration checks. The old frozen annex is unchanged. The new protected
+outside-Git `managed-persistent-source/recovery` annex freezes an inert
+representation adapter and explicit integration gaps. Its identical test source
+is `test/fixtures/blob-recovery/representation.py`; it is a packet fixture,
+not an installed restore command. Version 2 delegates unchanged. Version 3
+verifies the private pair before copying, checks normalized restored content
+and actual fresh mapping 1000:1000 metadata / 977:988 DATA, and records requested
+0700/0600 versus admitted 0700/0770/0600/0660. New destination identities are
+recorded separately. Source-pair hash, current source storage, restored
+path-derived config and effective profile bindings remain distinct. Wrong
+content/mode/owner refuses and preserves partial state. Future packet-specific
+identity/TERM/lifecycle/capacity/mount/secret constraints are retained, not
+replaced by this adapter. No future production epoch values are invented.
+
+For the proposed one-job window, capacity must cover TWO FULL maintenance runs
+plus all retained pairs: before first publication, then after publication to
+refence and back up new bytes. The second run requires the active healthy service;
+it is not a fence shortcut. Only explicit separate `resume UUID` grants the
+window. Abort uses trusted pinned local RPC `DenyBucketKey` for the exact known
+publisher/bucket with selectors `{read:false,write:true,owner:false}`, followed
+by `GetKeyInfo` proving read=true/write=false/owner=false. Reconcile uncertain
+mutations read-only; never replay an uncertain run. Keep publisher, reader and
+maintenance keys DISTINCT, with the same exact manifest principal and bucket.
+No controller profiles, credentials, tunnel, units or production values are
+created by this source.
+
+The existing NAS is a proposed visibility/integrity domain only for nonsecret,
+replaceable DATA. NAS actors/ACLs/client restrictions remain UNKNOWN and raw
+share clients may alter/read/delete bytes. Hashes do not authenticate replacing
+both object and manifest. Local metadata, credentials and copies stay private.
+The 2e12 TOTAL DATA budget is unquotaed, separate local metadata stays 16 GiB,
+and all-zero NFS filecounts remain UNKNOWN rather than free inode capacity.
+The namespace TEST receipt is consumed historical evidence; it is no current
+artifact restore, NAS security, shared-fullness/outage, power-loss or full-scale
+qualification. Unit `Restart=no`, every native start, TERM and `SendSIGKILL=no`
+remain the existing lifecycle. Production shared-access acceptance is unresolved.
+
 ### Backup limits and local capacity
 
 The selected operating model starts within verified local backup capacity. The
