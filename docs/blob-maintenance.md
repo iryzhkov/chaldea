@@ -206,7 +206,9 @@ Without the profile, private pair version 2 canonical bytes and dispatch remain.
 With it, version 3 binds exact source storage SHA256, source configuration
 digest, the fixed profile/immutable acceptance reference, effective profile
 SHA256, mapped owner and exact limits. DATA accepts stable 0700/0770 directories
-and 0600/0660 files. Metadata remains strict. Both copied trees are root-owned
+and 0600/0660 files. Version 3 metadata sources must be exactly 0700/0600;
+0500 directories and 0400 files refuse. The expected service UMask is 077.
+Both copied trees are root-owned
 private local 0700/0600. Destination `mode`/content rows describe that normalized
 copy; separate `sourceMode` and nine-field source stamps record historical
 dev/inode/mode/uid/gid/nlink/size/mtime-ns/ctime-ns. They are provenance and change
@@ -226,7 +228,8 @@ Version 3 verification requires private root local custody, exact canonical
 bytes, content, profile-constrained historical provenance, digests and limits.
 Unknown versions/profiles, mismatched bindings/limits, local group access,
 unsafe owners and links refuse. Resume re-verifies the selected representation
-using the same config-bound receipt and saved storage bytes before any grant.
+using the same config-bound receipt and live protected storage bytes, whose
+hash must match the config and the saved pair sidecar, before any grant.
 
 Recovery remains the packet-local stopped-pair protocol
 `jocasta:d20c4ef5fec9d4d4016748b9fdd0dbf5@4`. Its concrete consumers are

@@ -8,11 +8,13 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 import tempfile
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location("managed_pair", ROOT / "src/exec/blob_pair.py")
@@ -294,6 +296,192 @@ class ManagedPairTests(unittest.TestCase):
         adapter = importlib.util.module_from_spec(spec); spec.loader.exec_module(adapter)
         self.assertEqual(adapter.verified_pair(pair, self.target, pair.legacy_limits(), b"", "", expected)["version"], 2)
         self.assertEqual((self.target/"pair.json").read_bytes(), golden)
+
+
+
+class RecoveryManifestReadTests(unittest.TestCase):
+    """Initial dispatch uses real local descriptors; downstream verifiers are spies.
+    Existing ManagedPairTests separately exercise unchanged actual v2/v3 verification."""
+
+    def setUp(self):
+        home = Path(os.environ["HOME"])
+        assert home == Path(os.environ["BLOB_TEST_HOME"]) and home.is_relative_to(Path(os.environ["TMPDIR"]))
+        temp = tempfile.TemporaryDirectory(dir=home)
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.manifest = self.root / "pair.json"
+        spec = importlib.util.spec_from_file_location("recovery_read", ROOT / "test/fixtures/blob-recovery/representation.py")
+        self.adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.adapter)
+        self.limits = pair.legacy_limits()
+        self.raw = pair.canonical({"version": 2, "trees": {"meta": [], "data": []}})
+        self.manifest.write_bytes(self.raw)
+        self.digest = hashlib.sha256(self.raw).hexdigest()
+        self.consumer = types.SimpleNamespace(
+            checked_path=pair.checked_path, checked_limits=pair.checked_limits,
+            manifest_limit=pair.manifest_limit, stamp=pair.stamp,
+            verify=Mock(return_value=self.digest), verify_managed=Mock(return_value=self.digest),
+            managed_profile=Mock(return_value={"fixture": True}))
+
+    def call(self):
+        return self.adapter.verified_pair(self.consumer, self.root, self.limits, b"{}", "fixture", self.digest)
+
+    def assert_no_dispatch(self):
+        self.consumer.verify.assert_not_called()
+        self.consumer.verify_managed.assert_not_called()
+        self.consumer.managed_profile.assert_not_called()
+
+    def test_manifest_open_flags_bounded_read_and_v2_v3_dispatch(self):
+        original_open, original_close, original_fdopen, original_fstat = os.open, os.close, os.fdopen, os.fstat
+        opened, closed, reads = [], [], []
+        def opening(path, flags, *args, **kwargs):
+            self.assertEqual(flags, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            fd = original_open(path, flags, *args, **kwargs); opened.append(fd); return fd
+        def closing(fd):
+            closed.append(fd); return original_close(fd)
+        class Reader:
+            def __init__(self, fd, *args, **kwargs): self.stream = original_fdopen(fd, *args, **kwargs)
+            def __enter__(self): return self
+            def __exit__(self, *args): self.stream.close()
+            def read(self, count):
+                reads.append(count); return self.stream.read(count)
+        for version in (2, 3):
+            self.raw = pair.canonical({"version": version, "trees": {"meta": [], "data": []}})
+            self.digest = hashlib.sha256(self.raw).hexdigest()
+            self.manifest.write_bytes(self.raw)
+            self.consumer.verify.return_value = self.consumer.verify_managed.return_value = self.digest
+            with patch.object(os, "open", opening), patch.object(os, "close", closing), patch.object(os, "fdopen", Reader):
+                self.assertEqual(self.call()["version"], version)
+            with self.assertRaises(OSError): original_fstat(opened[-1])
+        self.assertEqual(opened, closed)
+        self.assertEqual(reads, [pair.manifest_limit(self.limits, True) + 1] * 2)
+        self.consumer.verify.assert_called_once_with(self.root, self.limits)
+        self.consumer.verify_managed.assert_called_once_with(self.root, self.limits, {"fixture": True})
+
+    def test_fifo_without_writer_refuses_with_bounded_child_timeout(self):
+        self.manifest.unlink(); os.mkfifo(self.manifest, 0o600)
+        # A regression to blocking open must fail this test within 3 seconds, not hang CI.
+        program = """import importlib.util, pathlib, sys
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    value = importlib.util.module_from_spec(spec); spec.loader.exec_module(value)
+    return value
+pair = module("pair", sys.argv[1])
+adapter = module("adapter", sys.argv[2])
+def forbidden(*args): raise AssertionError("verifier reached for FIFO")
+pair.verify = pair.verify_managed = forbidden
+try:
+    adapter.verified_pair(pair, pathlib.Path(sys.argv[3]), pair.legacy_limits(), b"", "", "0"*64)
+except ValueError as error:
+    assert str(error) == "manifest bound", str(error)
+else:
+    raise AssertionError("FIFO accepted")
+"""
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", program,
+                                 str(ROOT/"src/exec/blob_pair.py"),
+                                 str(ROOT/"test/fixtures/blob-recovery/representation.py"), str(self.root)],
+                                capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_symlink_directory_multilink_and_oversize_refuse_before_read(self):
+        original_open, original_fstat = os.open, os.fstat
+        opened = []
+        def opening(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs); opened.append(fd); return fd
+        for kind in ("symlink", "directory", "multilink", "oversize"):
+            with self.subTest(kind=kind):
+                self.manifest.unlink()
+                if kind == "symlink":
+                    other = self.root/"other"; other.write_bytes(self.raw); self.manifest.symlink_to(other)
+                elif kind == "directory": self.manifest.mkdir()
+                else:
+                    self.manifest.write_bytes(self.raw)
+                    if kind == "multilink": os.link(self.manifest, self.root/"hardlink")
+                    else:
+                        with self.manifest.open("r+b") as stream:
+                            stream.truncate(pair.manifest_limit(self.limits, True) + 1)
+                with patch.object(os, "open", opening), patch.object(os, "fdopen", side_effect=AssertionError("unsafe read")):
+                    with self.assertRaises((OSError, ValueError)): self.call()
+                for fd in opened:
+                    with self.assertRaises(OSError): original_fstat(fd)
+                self.assert_no_dispatch()
+                if kind == "directory": self.manifest.rmdir(); self.manifest.write_bytes(self.raw)
+
+    def test_fd_path_and_ancestry_drift_refuse_before_or_after_verifier(self):
+        original_fstat = os.fstat
+        for phase in ("before-read", "after-read", "after-verifier", "fd", "ancestry"):
+            with self.subTest(phase=phase):
+                self.manifest.write_bytes(self.raw)
+                changed = False
+                original_lstat = Path.lstat
+                calls = 0
+                def value_at_path(path):
+                    nonlocal changed
+                    if phase == "before-read" and path == self.manifest and not changed:
+                        changed = True
+                        self.manifest.rename(self.root/"retained-before")
+                        self.manifest.write_bytes(self.raw)
+                    return original_lstat(path)
+                def drift_fd(fd):
+                    nonlocal calls
+                    value = original_fstat(fd); calls += 1
+                    if phase == "fd" and calls == 2:
+                        fields = {k: getattr(value, k) for k in dir(value) if k.startswith("st_")}
+                        fields["st_ctime_ns"] += 1
+                        return types.SimpleNamespace(**fields)
+                    return value
+                original_fdopen = os.fdopen
+                class Reader:
+                    def __init__(self, fd, *args, **kwargs): self.stream = original_fdopen(fd, *args, **kwargs)
+                    def __enter__(self): return self
+                    def __exit__(self, *args): self.stream.close()
+                    def read(inner, count):
+                        raw = inner.stream.read(count)
+                        if phase == "after-read":
+                            self.manifest.rename(self.root/"retained-after")
+                            self.manifest.write_bytes(raw)
+                        return raw
+                def verified(*args):
+                    if phase == "after-verifier":
+                        self.manifest.rename(self.root/"retained-handoff")
+                        self.manifest.write_bytes(self.raw)
+                    return self.digest
+                checked = self.consumer.checked_path
+                self.consumer.verify.reset_mock()
+                self.consumer.verify.side_effect = verified
+                path_calls = 0
+                def ancestry(path):
+                    nonlocal path_calls
+                    path_calls += 1
+                    if phase == "ancestry" and path_calls == 2: raise ValueError("symlink")
+                    return pair.checked_path(path)
+                self.consumer.checked_path = ancestry
+                with patch.object(Path, "lstat", value_at_path), patch.object(os, "fstat", drift_fd), patch.object(os, "fdopen", Reader):
+                    with self.assertRaises(ValueError): self.call()
+                self.assertEqual(self.consumer.verify.call_count, 1 if phase == "after-verifier" else 0)
+                self.consumer.checked_path = checked
+                self.consumer.verify.side_effect = None
+
+    def test_hash_shape_version_and_verifier_failures_close_fd(self):
+        original_open, original_fstat = os.open, os.fstat
+        opened = []
+        def opening(path, flags, *args, **kwargs):
+            fd = original_open(path, flags, *args, **kwargs); opened.append(fd); return fd
+        for value in (None, [], 1, {}, {"version": 2, "trees": []},
+                      {"version": 2, "trees": {"meta": []}}, {"version": 4, "trees": {"meta": [], "data": []}}):
+            self.manifest.write_bytes(pair.canonical(value))
+            self.digest = hashlib.sha256(self.manifest.read_bytes()).hexdigest()
+            with patch.object(os, "open", opening), self.assertRaises(ValueError): self.call()
+            self.assert_no_dispatch()
+            with self.assertRaises(OSError): original_fstat(opened[-1])
+        self.manifest.write_bytes(self.raw); self.digest = "0"*64
+        with patch.object(os, "open", opening), self.assertRaises(ValueError): self.call()
+        self.assert_no_dispatch()
+        self.digest = hashlib.sha256(self.raw).hexdigest()
+        self.consumer.verify.side_effect = ValueError("verifier refused")
+        with patch.object(os, "open", opening), self.assertRaises(ValueError): self.call()
+        for fd in opened:
+            with self.assertRaises(OSError): original_fstat(fd)
 
 
 if __name__ == "__main__":

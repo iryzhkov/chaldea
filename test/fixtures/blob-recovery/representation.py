@@ -5,6 +5,7 @@ A future exact packet must bind its inputs and call these seams from the existin
 import copy
 import hashlib
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -19,21 +20,41 @@ def verified_pair(pair, root, limits, source_storage, source_sha, expected_pair_
     root = pair.checked_path(str(root))
     # The protected caller fixes the pair hash and limits BEFORE interpreting rows.
     cap = pair.manifest_limit(limits, True)
-    with (root / "pair.json").open("rb") as stream:
-        raw = stream.read(cap + 1)
-    need(len(raw) <= cap, "manifest bound")
-    need(hashlib.sha256(raw).hexdigest() == expected_pair_sha, "fixed pair bytes")
-    version = json.loads(raw).get("version")
-    need(type(version) is int and version in (2, 3), "pair version")
-    if version == 2:
-        digest = pair.verify(root, limits)  # Unchanged legacy dispatch.
-        profile = None
-    else:
-        profile = pair.managed_profile(source_storage.decode(), source_sha)
-        digest = pair.verify_managed(root, limits, profile)
-    need(digest == expected_pair_sha, "fixed pair hash")
-    return {"version": version, "pairSHA256": digest, "profile": profile,
-            "trees": json.loads(raw)["trees"]}
+    manifest = root / "pair.json"
+    fd = os.open(manifest, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+             and 0 <= before.st_size <= cap, "manifest bound")
+        need(pair.stamp(manifest.lstat()) == pair.stamp(before), "manifest path changed")
+        # Keep ownership of fd even if fdopen/read/dispatch fails.
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(cap + 1)
+        pair.checked_path(str(root))  # Recheck nofollow ancestry after the read.
+        need(len(raw) == before.st_size and len(raw) <= cap
+             and pair.stamp(os.fstat(fd)) == pair.stamp(before)
+             and pair.stamp(manifest.lstat()) == pair.stamp(before), "manifest changed")
+        need(hashlib.sha256(raw).hexdigest() == expected_pair_sha, "fixed pair bytes")
+        value = json.loads(raw)
+        need(type(value) is dict and type(value.get("trees")) is dict
+             and set(value["trees"]) == {"meta", "data"}
+             and all(type(rows) is list for rows in value["trees"].values()), "pair object")
+        version = value.get("version")
+        need(type(version) is int and version in (2, 3), "pair version")
+        if version == 2:
+            digest = pair.verify(root, limits)  # Unchanged legacy dispatch.
+            profile = None
+        else:
+            profile = pair.managed_profile(source_storage.decode(), source_sha)
+            digest = pair.verify_managed(root, limits, profile)
+        need(digest == expected_pair_sha, "fixed pair hash")
+        pair.checked_path(str(root))
+        need(pair.stamp(os.fstat(fd)) == pair.stamp(before)
+             and pair.stamp(manifest.lstat()) == pair.stamp(before), "manifest handoff changed")
+        return {"version": version, "pairSHA256": digest, "profile": profile,
+                "trees": value["trees"]}
+    finally:
+        os.close(fd)
 
 
 def derived_configuration(pair, preflight, source_raw, restored_raw, source_sha,
