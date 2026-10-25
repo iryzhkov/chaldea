@@ -316,7 +316,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       await cleanArtifacts(journal, options.host);
       await cleanLogs(state);
     });
-    if (intent.blob && intent.outcome === 'finished' && !intent.outputSyncFailed) {
+    if (intent.blob && intent.outcome === 'finished' && !intent.outputSyncFailed && blob?.publication !== 'manual') {
       try {
         await publishJob(state, jobId);
         process.stderr.write('chaldea artifact custody confirmed for ' + jobId + '\n');

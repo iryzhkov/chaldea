@@ -4,7 +4,7 @@ import * as fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { validateManifest, sha256, RETENTION, blobConfig, BlobStore } from '../../src/exec/blob.ts';
+import { validateManifest, sha256, RETENTION, blobConfig, BlobStore, storeIdentity } from '../../src/exec/blob.ts';
 import { cleanArtifacts, removeArtifacts } from '../../src/exec/artifacts.ts';
 import { record, prune, type Intent } from '../../src/exec/journal.ts';
 
@@ -68,6 +68,19 @@ test('blob configuration is opt-in, validates origin and reuses private credenti
     await put(config);
     const valid = blobConfig()!;
     new BlobStore(valid);
+    for (const publication of ['automatic', 'manual'] as const) {
+      await put({ ...config, publication });
+      assert.equal(blobConfig()!.publication, publication);
+      assert.equal(storeIdentity(blobConfig()!), storeIdentity(valid));
+    }
+    for (const publication of [null, '', 'MANUAL', true, 1]) {
+      await put({ ...config, publication }); assert.throws(blobConfig, /Invalid blob/);
+    }
+    await put({ ...config, publcation: 'manual' }); assert.throws(blobConfig);
+    await put({ ...config, endpoint: 'http://127.0.0.1:43900', publication: 'manual' });
+    const selected = blobConfig()!;
+    await put({ ...config, endpoint: 'http://127.0.0.1:3900', publication: 'manual' });
+    assert.notEqual(storeIdentity(blobConfig()!), storeIdentity(selected));
     for (const endpoint of ['http://store.example', 'https://u:p@store.example', 'https://store.example/path', 'https://store.example?q=x']) {
       await put({ ...config, endpoint }); assert.throws(blobConfig, /Invalid blob/);
     }

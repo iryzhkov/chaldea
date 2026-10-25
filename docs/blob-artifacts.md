@@ -15,6 +15,27 @@ Example configuration (paths are literal):
 }
 ```
 
+
+For an operator-controlled publication window, add `"publication": "manual"`
+to this same config. Omission or `"automatic"` retains automatic publication
+after a finished job. Other values and unknown keys refuse. Manual completion
+keeps the pending journal entry, exact store binding, artifact reserve and
+journal slot, and makes no automatic S3 call. Only the existing explicit
+`chaldea exec artifacts publish ORIGINAL-JOB-ID` publishes. No abandon path
+exists: pending entries can retain their reserve/slot indefinitely. Plan
+one-job batches and preserve local bytes until explicit custody confirmation.
+
+Publication mode does not change store identity. The endpoint origin does.
+A job journaled against `http://127.0.0.1:43900` must explicitly publish with
+that same origin, bucket, principal and region or refuse. A reader has a
+DISTINCT read-only key for the SAME principal/bucket and a fresh state directory.
+Maintenance uses a third key. Installing maintenance does not select or upgrade
+the controller. A later frozen controller bundle must name its source/tree,
+bundle and bin hashes and qualified absolute Node path/version/hash, invoked as
+`<qualified-node> <frozen-bin/chaldea>`. The env-node shebang alone does not
+bind Node. Target-local publisher/reader XDG profiles and an owned loopback
+tunnel at 43900 remain later operational work; this source creates none.
+
 Use a principal-specific artifact bucket and an existing Garage-issued read/write key without owner/administration rights for publication. A fresh consumer uses a read-only key for that same bucket and principal. The private target-local credential file contains only {"accessKeyId":"…","secretAccessKey":"…"} and must be owned by the effective UID, mode 0600 or stricter, one regular inode and at most 4096 bytes. The existing descriptor-based trusted reader enforces this. This is a projection of the existing Garage key, not an issuer or renewal service. Credential enrollment, rotation and distribution remain operator work. No key enters the job snapshot or environment.
 
 Only HTTPS origins are accepted, with the normal trust store and hostname verification; literal loopback HTTP supports the isolated fixture/local service. Embedded URL credentials, paths, queries, fragments and redirects refuse. Requests have a 15 second timeout, status errors expose only the HTTP code, and response bytes are bounded. The S3 SigV4 calculation follows the existing pinned bootstrap contract and is exercised against the actual pinned Garage executable.

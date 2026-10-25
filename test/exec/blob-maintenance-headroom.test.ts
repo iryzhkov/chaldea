@@ -62,6 +62,87 @@ function operatorContract(f: ReturnType<typeof setup>, composite = true) {
   }
   f.refresh();
 }
+
+function managedContract(f: ReturnType<typeof setup>) {
+  f.storage.data.identity_mapping = { owner_uid: 977, owner_gid: 988, evidence: 'fixture only' };
+  f.storage.data.access_profile = { name: 'managed_nfs_data_v1', acceptance_reference: 'jocasta:' + '0'.repeat(32) + '@1' };
+  operatorContract(f);
+}
+test('managed stable 0770 DATA passes actual producer without changing native headroom fields', async t => {
+  const f = setup(t); managedContract(f);
+  await f.runtime.health();
+  assert.equal(f.calls(), 1);
+  assert.deepEqual(Object.keys(f.runtime.headroomReport!).sort(), ['data', 'metadata']);
+  assert.deepEqual(f.runtime.headroomReport?.data, {
+    available_bytes: 16 * 1024 ** 4, filecounts: 'UNKNOWN', available_inodes: null });
+});
+for (const mutate of [
+  (s: any) => { s.data.access_profile.name = 'typo'; },
+  (s: any) => { s.data.access_profile.extra = true; },
+  (s: any) => { s.data.extra = true; },
+  (s: any) => { delete s.data.identity_mapping; },
+]) test('managed storage errors refuse through actual every-start consumer', async t => {
+  const f = setup(t); managedContract(f); mutate(f.storage); operatorContract(f);
+  await assert.rejects(f.runtime.health());
+  assert.equal(f.runtime.headroomReport, null);
+});
+test('pairHelper derives its request only from hash-bound storage and carries exact limits', t => {
+  const f = setup(t); managedContract(f);
+  const helper = fileURLToPath(new URL('../../src/exec/blob_pair.py', import.meta.url));
+  f.files.set(helper, Buffer.from('# trusted fixture helper'));
+  f.config.backupLimits = { maxElapsedMs: 1000, meta: { maxEntries: 8, maxAllocatedBytes: 4096,
+    maxReadBytes: 4096, maxLogicalBytes: 4096 }, data: { maxEntries: 8, maxAllocatedBytes: 4096,
+    maxReadBytes: 4096, maxLogicalBytes: 4096 } };
+  assert.equal(f.runtime.pairHelper({ verify: '/fixture-pair' }), 'a'.repeat(64));
+  assert.deepEqual(f.pairInput(), { verify: '/fixture-pair', storage: f.files.get(STORAGE)!.toString(),
+    storageSHA256: f.config.storageSHA256, limits: f.config.backupLimits });
+  f.config.storageSHA256 = '0'.repeat(64);
+  assert.throws(() => f.runtime.pairHelper({ verify: '/fixture-pair' }));
+});
+
+
+test('resume binds receipt, saved storage and selected v3 verification before consuming permit or granting', async t => {
+  const f = setup(t); managedContract(f);
+  const helper = fileURLToPath(new URL('../../src/exec/blob_pair.py', import.meta.url));
+  f.files.set(helper, Buffer.from('# trusted fixture helper'));
+  f.config.backupLimits = { maxElapsedMs: 1000, meta: { maxEntries: 8, maxAllocatedBytes: 4096,
+    maxReadBytes: 4096, maxLogicalBytes: 4096 }, data: { maxEntries: 8, maxAllocatedBytes: 4096,
+    maxReadBytes: 4096, maxLogicalBytes: 4096 } };
+  f.config.bindings = [{ bucketId: 'fixture-bucket', publishers: ['fixture-publisher'] }];
+  const runtime = f.runtime as any;
+  runtime.before = 'fixture-node'; runtime.metadata = '1:1';
+  runtime.rpcHash = hash(f.files.get('/etc/garage/rpc.secret')!);
+  const receipt = { version: 1, configSHA256: 'fixture-config-hash', node: runtime.before,
+    metadata: runtime.metadata, rpcSHA256: runtime.rpcHash, pairSHA256: 'a'.repeat(64) };
+  const complete = () => f.files.set('/fixture-pair/complete.json', Buffer.from(JSON.stringify(receipt)));
+  for (const [name, bytes] of [
+    ['garage.toml', f.files.get(CONFIG)!], ['storage.json', f.files.get(STORAGE)!],
+    ['rpc.secret', f.files.get('/etc/garage/rpc.secret')!],
+  ] as const) f.files.set('/fixture-pair/' + name, Buffer.from(bytes));
+  f.files.set(BACKUP + '/.resume-permit', Buffer.from('/fixture-pair'));
+  f.files.set(BACKUP, Buffer.alloc(0));
+  let consumed = false, grants = 0;
+  t.mock.method(fs, 'readdirSync', () => ['pair.json', 'complete.json']);
+  t.mock.method(fs, 'unlinkSync', (p: string) => { assert.equal(p, BACKUP + '/.resume-permit'); consumed = true; });
+  t.mock.method(fs, 'fsyncSync', () => {});
+  runtime.api = (endpoint: string) => { assert(consumed); assert.equal(endpoint, 'AllowBucketKey'); grants++; };
+  runtime.permissions = async (fenced: boolean) => { assert.equal(fenced, false); };
+  syncBuiltinESMExports();
+  receipt.configSHA256 = 'wrong'; complete();
+  await assert.rejects(f.runtime.resume()); assert(!consumed); assert.equal(grants, 0);
+  receipt.configSHA256 = 'fixture-config-hash'; receipt.pairSHA256 = 'b'.repeat(64); complete();
+  await assert.rejects(f.runtime.resume()); assert(!consumed); assert.equal(grants, 0);
+  assert.equal(f.pairInput().storageSHA256, f.config.storageSHA256);
+  receipt.pairSHA256 = 'a'.repeat(64); complete();
+  // Durable resumed receipt is already exercised by the operator tests. Capture just this new file here.
+  const open = fs.openSync;
+  t.mock.method(fs, 'openSync', (p: string, flags: string) => p === '/fixture-pair/resumed.json' ? 30000
+    : p === '/fixture-pair' ? 30001 : open(p, flags));
+  t.mock.method(fs, 'writeSync', (_fd: number, _bytes: Buffer, _offset: number, length: number) => length);
+  syncBuiltinESMExports();
+  await f.runtime.resume(); assert(consumed); assert.equal(grants, 1);
+});
+
 const known = () => ({ f_bavail: 16 * 1024 ** 4, f_frsize: 1, f_files: 50000, f_ffree: 20000, f_favail: 10000 });
 function setup(t: any) {
   const storage = storageFixture();
@@ -69,6 +150,7 @@ function setup(t: any) {
   const config: any = { backupRoot: BACKUP, minFreeBytes: 2 * 1024 ** 3, minFreeInodes: 4096 };
   let commandCalls = 0, mountLoss = false, commandFailure = false;
   let response: string | undefined;
+  let pairInput: any;
   let unsafeParent = false;
   const files = new Map<string, Buffer>([[STARTER, starter], [PREFLIGHT, preflight], [CONFIG, Buffer.from(garage)]]);
   const refresh = () => {
@@ -121,6 +203,12 @@ function setup(t: any) {
   t.mock.method(cp, 'execFileSync', (program: string, args: string[], options: any) => {
     commandCalls++;
     assert.equal(program, '/usr/bin/python3');
+    if (args[2] === fileURLToPath(new URL('../../src/exec/blob_pair.py', import.meta.url))) {
+      assert.deepEqual(args.slice(0, 2), ['-I', '-B']);
+      pairInput = JSON.parse(options.input);
+      assert.equal(options.timeout, 6000);
+      return JSON.stringify({ pairSHA256: 'a'.repeat(64) });
+    }
     assert.deepEqual(args.slice(0, 3), ['-I', '-B', '-c']);
     assert.equal(args.length, 4);
     assert(!args[3]!.includes('native.main(') && !args[3]!.includes('execGarage'));
@@ -142,6 +230,7 @@ function setup(t: any) {
   }
   const runtime = new Runtime(config, 'fixture-config-hash', '/fixture-pair');
   return { runtime, storage, telemetry, config, local, refresh, files,
+    pairInput: () => pairInput,
     calls: () => commandCalls, mountLoss: () => { mountLoss = true; },
     failCommand: () => { commandFailure = true; }, response: (v: string) => { response = v; },
     unsafeParent: () => { unsafeParent = true; } };
@@ -155,9 +244,9 @@ test('health accepts observed all-zero NFS only as explicit UNKNOWN, never free 
     available_bytes: 16 * 1024 ** 4, filecounts: 'UNKNOWN', available_inodes: null });
 });
 
-test('reviewed native and preflight fixture bytes are unchanged', () => {
+test('native is unchanged and preflight fixture matches the managed producer bytes', () => {
   assert.equal(hash(starter), '9bce8cf779b7fe7eb8c66bf65e6894391d76c056d4fe0eff36799a38cb3a18ec');
-  assert.equal(hash(preflight), 'c3b5a5e653de899456c75fa774071a0209f31a188ef0120214d8eccbb4cf7ca3');
+  assert.equal(hash(preflight), '0831bb72893e5e1e9508edb4961ecdc49677ca860a94df817de3e8e24d71ed6d');
 });
 for (const change of [
   (f: any) => { delete f.storage.data.unknown_filecount_risk_acceptance; },

@@ -80,6 +80,7 @@ jobs:
           test "$HOME" = "$TMPDIR/blob-pair-home"
           mkdir -p "$HOME"
           python3 -B test/blob/maintenance_pair.py
+          python3 -B test/blob/managed_pair.py
       - name: Run ordered fallback against two fake job hosts
         run: node --test test/exec/fallback.e2e.ts test/exec/queue.e2e.ts
       - name: Run real SSH, bubblewrap and pasta against the in-tree server
