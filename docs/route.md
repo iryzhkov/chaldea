@@ -14,7 +14,7 @@ thread. Chaldea recommends only.
 {"role":"critical-review","authorProvider":"codex"}
 ```
 
-Input roles are `builder`, `critical-review`, `bulk-read` and `general`.
+Input roles are `builder`, `critical-review`, `bulk-read`, `general` and `executor`.
 `authorProvider` forces a review onto the other driver. `effortOverride` accepts
 only `low`, `medium`, `high` and `xhigh`. CLI equivalents are `--role`,
 `--author-provider` and `--effort`. Max and higher efforts are rejected.
@@ -27,6 +27,17 @@ Fallbacks when no AA snapshot exists:
 | critical-review | Fable 5.1 | Astra | medium |
 | bulk-read | Haiku 5.5 | Luna 6 | medium |
 | general | Opus 5.5 | Sol 6.1 | medium |
+| executor | Opus 5.5 | Sol 6.1 | medium |
+
+Use `chaldea route --role executor` for roadmap execution and other long-running
+work with large, persistent contexts. This role prefers eligible Codex candidates
+before quota pacing, including when Claude has unused quota near its reset.
+Its separate intelligence floor defaults to the same 48 as general; legacy scoring uses the general objective. Pins still override
+the preference, and availability, effort, quality, probation, reliability, quota
+stops and review separation still gate eligibility. If no eligible Codex remains,
+the usual policy ranks the remaining candidates. Bounded builders and reviewers
+keep their existing roles. Routing recommends a target; it does not migrate an
+existing thread or switch its provider.
 
 The router uses the cached T3 `server.getConfig` model/option descriptors that
 back `orchestrator_capabilities`. It preserves instance IDs, requires an
@@ -262,7 +273,8 @@ An old lock can be cleared after its cadence; lock contention skips collection.
 
 The router fetches [the T3 usage dataset](https://slopalytics.com/data/t3-usage.json)
 at most once per day, including failures, retaining last successful aggregate
-data and `fetchedAt`. It aggregates exact model names and matching native
+data and `fetchedAt`. Schema versions 2 and 3 share the terminal/timing metrics
+used here; additional v3 token and spend fields do not affect routing. It aggregates exact model names and matching native
 harness rows over `start` through `endExclusive`: completion, failed and
 interrupted rates use terminal turns; minutes per turn uses timed turns.
 The name-to-T3 mapping lives in one table. Older model generations stay separate.
@@ -394,6 +406,54 @@ AA snapshots older than `scoreMaxAgeMs` remain usable as last good data, with ag
 and an explicit reason. A failed refresh retains the last good snapshot.
 Future-dated or invalid snapshots never replace it. With no snapshot the fixed
 pairs above apply, with Sonnet removed. Stale AA never relaxes quota checks.
+
+## Benchmark selection within providers
+
+Igor's policy, 2026-10-29, chooses the cheapest measured model and effort that
+clears the role's intelligence floor within each provider. Quota admission and
+provider pacing remain separate decisions; executor prefers eligible Codex even
+when Claude quota would expire. Benchmark task cost is an efficiency comparison,
+not a subscription bill or a prediction of the cost of the current task.
+
+Opt in with `"benchmark": {"indexVersion": "4.3"}` in route.json after reviewing
+the floor calibration for that exact upstream index. This mode requires a version
+2 snapshot and refuses missing or mismatched data. It never falls back to fixed
+pairs while claiming benchmark qualification. No floors are rounded or lowered.
+An old, complete compatible snapshot stays usable with its real age and an
+explicit stale-data reason. Quota observations retain their existing freshness
+requirements.
+
+Version 2 adds `metric: "aa-intelligence-cost-per-task"` and
+`benchmarkCostUSDPerTask` from AA's
+`artificial_analysis_intelligence_index_cost.cost_per_task.total_cost`.
+Coding and token prices may be null, and absent benchmark cost stays null,
+distinct from a measured zero. This mode uses intelligence and task cost, so it
+does not invent coding scores. Version 1 remains accepted by legacy routing.
+
+Selection searches catalog-supported low, medium and high effort. Luna and
+Haiku may also use xhigh. An explicit `--effort` remains exact. Max and higher
+efforts never participate. The mapping includes Terra and exact additional
+allowed variants of the native models; a max result never stands in for medium
+or high. New models retain the existing operational evidence and probation gates.
+
+`benchmarkCoverage` reports measured model coverage per runnable driver. It
+excludes banned models and disabled instances. A model is covered when an
+allowed, catalog-supported effort has measured intelligence and cost on the
+configured scale. A provider missing any such model is held, rather than
+advertised as fully compared. An exact effort request requires coverage at that
+effort. A fully measured model below the role floor counts as covered but remains
+ineligible. Per-provider recommendations use minimum cost, then intelligence,
+then operational tie-breaks. Quota ranks the resulting provider choices.
+After probation share admission, provider choices and quota ordering are
+recomputed from the surviving candidates; a held trial cannot keep deciding
+which provider wins. The separate topPick still describes the pre-draw choice.
+
+The producer emits version 1 by default. Set `scores.formatVersion: 2` on the
+existing homelab publisher only after consumers and the Akasha validator support
+version 2. This source change does not enable score transport or modify grants.
+Current AA API examples use index 5; that is not evidence that legacy 4.3 floors
+are calibrated on index 5. A live rollout must verify actual index identity,
+coverage, floor calibration and the existing protected publication/read path.
 
 ## Snapshot transport and route-change events
 

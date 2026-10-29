@@ -7,6 +7,8 @@ import { Ingress } from "../../src/akasha/ingress.ts";
 import { httpServer } from "../../src/akasha/http.ts";
 import { hash, normalize } from "../../src/akasha/schema.ts";
 import type { Envelope } from "../../src/akasha/schema.ts";
+import { collectScores } from "../../src/route/snapshot.ts";
+import { join } from "node:path";
 import { scores as fixture } from "../fixtures/route/targets.ts";
 
 test("route source grants read homelab scores across hosts without widening other sources or kinds", async () => {
@@ -23,7 +25,9 @@ test("route source grants read homelab scores across hosts without widening othe
   const base = "http://127.0.0.1:" + (server.address() as { port: number }).port;
   const read = await r.token({ source: "route", grants: [{ resource: "route", actions: ["read"] }] });
   try {
-    const scores = { ...fixture, fetchedAt: new Date(N * 1000).toISOString() };
+    const scores = { ...fixture, version: 2 as const, metric: "aa-intelligence-cost-per-task" as const,
+      fetchedAt: new Date(N * 1000).toISOString(), models: fixture.models.map(m => ({ ...m, coding: null,
+        benchmarkCostUSDPerTask: .5 })) };
     const identity = { issuer: "chaldea:homelab", host: "homelab", source: "route", profile: r.r.profile,
       project: r.r.project, source_id: "route-homelab", run_id: "scores" };
     const input = normalize({ v: 1, kind: "route_score_snapshot", title: "Scores", data: { scores } }, identity, false);
@@ -41,6 +45,12 @@ test("route source grants read homelab scores across hosts without widening othe
     const get = (query: string) => fetch(base + "/api/v1/events" + query, { headers: { authorization: "Bearer " + read } });
     const visible = await (await get("")).json() as { events: Envelope[] };
     assert.equal(visible.events.length, 1); assert.equal(visible.events[0]!.host, "homelab");
+    const collected = await collectScores({ enabled: true, url: base, tokenHelper: "/fixture", host: "agent-a" },
+      join(process.env.HOME!, ".cache", "scores-" + original.event_id + ".json"), N * 1000,
+      fetch, async () => read);
+    assert.deepEqual(collected.value, scores);
+    assert.equal(collected.value?.models[0]?.coding, null);
+    assert.equal(collected.value?.models[0]?.benchmarkCostUSDPerTask, .5);
     for (const q of ["?kind=route_pick_changed", "?host=agent-b", "?source=foreign", "?project=foreign"]) {
       assert.equal(((await (await get(q)).json()) as { events: Envelope[] }).events.length, 0);
     }

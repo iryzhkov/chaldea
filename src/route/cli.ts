@@ -11,7 +11,7 @@ import { route, routeReviewPair } from "./runtime.ts";
 import { recommendReviewPair, reviewPairInput } from "./pair.ts";
 import { compactRoute } from "./output.ts";
 import { RouteError, routeFailure } from "./errors.ts";
-export const ROUTE_USAGE = `chaldea route --role builder|critical-review|bulk-read|general
+export const ROUTE_USAGE = `chaldea route --role builder|critical-review|bulk-read|general|executor
   [--author-provider claudeAgent|codex] [--effort low|medium|high|xhigh]
   [--config PATH] [--fixture PATH] [--explain|--legacy-full]
 Returns compact JSON with exact native target fields. --explain retains full legacy diagnostics.

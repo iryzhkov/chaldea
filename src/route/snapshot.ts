@@ -6,7 +6,7 @@ import type { ScoreSnapshot } from "./scores.ts";
 import { helperToken, publish } from "../events/publisher.ts";
 import type { PublisherOptions } from "../events/publisher.ts";
 
-export interface ScoreTransport { enabled: boolean; url: string; tokenHelper: string; host: string }
+export interface ScoreTransport { enabled: boolean; url: string; tokenHelper: string; host: string; formatVersion?: 1 | 2 }
 export const AA_KEY = "/etc/chaldea-route/artificial-analysis-key";
 const AA_URL = "https://artificialanalysis.ai/api/v2/language/models/free";
 export function readAAKey(path = AA_KEY): string {
@@ -20,7 +20,7 @@ export function readAAKey(path = AA_KEY): string {
     return key;
   } finally { closeSync(fd); }
 }
-export async function fetchScores(now: number, fetcher: typeof fetch = fetch, keyReader = readAAKey): Promise<ScoreSnapshot> {
+export async function fetchScores(now: number, fetcher: typeof fetch = fetch, keyReader = readAAKey, formatVersion: 1 | 2 = 1): Promise<ScoreSnapshot> {
   try {
     const key = keyReader(), rows: Array<Record<string, any>> = [];
     let version: number | undefined;
@@ -32,7 +32,7 @@ export async function fetchScores(now: number, fetcher: typeof fetch = fetch, ke
           page > 1 && version !== r.intelligence_index_version) throw new Error();
       version = r.intelligence_index_version; rows.push(...r.data);
       if (rows.length > 5000) throw new Error();
-      if (r.pagination.has_more === false) return scoreSnapshot({ data: rows, intelligence_index_version: version }, now);
+      if (r.pagination.has_more === false) return scoreSnapshot({ data: rows, intelligence_index_version: version }, now, formatVersion);
       if (r.pagination.has_more !== true) throw new Error();
     }
     throw new Error();
@@ -43,7 +43,7 @@ export async function publishScores(config: ScoreTransport, cacheFile: string, n
   if ((options.machine ?? hostname().split(".")[0]) !== "homelab") throw new Error("aa_fetch_homelab_only");
   if (!config.enabled || config.host !== "homelab") throw new Error("aa_publishing_not_configured");
   const result = await cached(cacheFile, 86400000, Math.floor(now / 86400000) * 86400000, validateScores,
-    () => fetchScores(now, options.fetch, options.keyReader));
+    () => fetchScores(now, options.fetch, options.keyReader, config.formatVersion));
   if (!result.value || result.reason) throw new Error("aa_fetch_failed_last_good_retained");
   const s = result.value;
   const ok = await publish({ key: "route-scores:" + s.fetchedAt, source: "route", host: "homelab",
@@ -52,8 +52,24 @@ export async function publishScores(config: ScoreTransport, cacheFile: string, n
   if (!ok) throw new Error("aa_snapshot_publication_pending");
   return s;
 }
+/** Prefer old measured coverage over a newer partial refresh on the same scale.
+ * Version 1 retains its legacy newest-snapshot behavior.
+ */
+function preferredSnapshot(candidate: ScoreSnapshot, prior: ScoreSnapshot): ScoreSnapshot {
+  if (candidate.version === 2 && prior.version === 2 && candidate.indexVersion === prior.indexVersion) {
+    const keys = (s: ScoreSnapshot) => new Set(s.models.filter(m => m.benchmarkCostUSDPerTask !== null &&
+      m.benchmarkCostUSDPerTask !== undefined).map(m => m.model + ":" + m.effort));
+    const next = keys(candidate), previous = keys(prior);
+    const retains = [...previous].every(key => next.has(key));
+    const extendsCoverage = [...next].some(key => !previous.has(key));
+    if (!retains) return prior;
+    if (extendsCoverage) return candidate;
+  }
+  return Date.parse(candidate.fetchedAt) > Date.parse(prior.fetchedAt) ? candidate : prior;
+}
 export async function collectScores(config: ScoreTransport, cacheFile: string, now: number,
-  fetcher: typeof fetch = fetch, tokenReader = helperToken) {
+  fetcher: typeof fetch = fetch, tokenReader = helperToken,
+  compatible: (scores: ScoreSnapshot) => boolean = () => true) {
   if (!config.enabled) {
     // Disabling transport keeps last-good data usable without reserving a refresh.
     let value: ScoreSnapshot | null = null, fetchedAt: string | null = null;
@@ -82,14 +98,14 @@ export async function collectScores(config: ScoreTransport, cacheFile: string, n
         if (e.source !== "route" || e.host !== "homelab" || e.kind !== "route_score_snapshot" || e.provenance?.type !== "verified") continue;
         try {
           const s = validateScores(e.data?.scores);
-          if (Date.parse(s.fetchedAt) <= now && (!best || Date.parse(s.fetchedAt) > Date.parse(best.fetchedAt))) best = s;
+          if (compatible(s) && Date.parse(s.fetchedAt) <= now) best = best ? preferredSnapshot(s, best) : s;
         } catch {}
       }
       if (r.next_cursor === null) {
         if (!best) throw new Error();
         try {
           const prior = validateScores((readJson(cacheFile) as { value: unknown }).value);
-          if (Date.parse(prior.fetchedAt) <= now && Date.parse(prior.fetchedAt) > Date.parse(best.fetchedAt)) return prior;
+          if (compatible(prior) && Date.parse(prior.fetchedAt) <= now) return preferredSnapshot(best, prior);
         } catch {}
         return best;
       }

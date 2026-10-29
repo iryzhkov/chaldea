@@ -58,7 +58,7 @@ test("byProvider returns each driver's best eligible pick, including rejected pr
   const banned = recommend({ role: "builder" }, { ...base, config: { bans: ["gpt-*"] } });
   assert.equal(banned.byProvider.codex?.eligible, false);
   assert.match(banned.byProvider.codex!.reasons.join("; "), /banned/);
-  const below = recommend({ role: "builder" }, { ...base, config: { floors: { builder: 51, "critical-review": 49, "bulk-read": 30, general: 48 } } });
+  const below = recommend({ role: "builder" }, { ...base, config: { floors: { builder: 51, "critical-review": 49, "bulk-read": 30, general: 48, executor: 48 } } });
   assert.equal(below.byProvider.codex?.eligible, false);
   assert.match(below.byProvider.codex!.reasons.join("; "), /floor/);
   const review = recommend({ role: "critical-review", authorProvider: "codex" }, base);

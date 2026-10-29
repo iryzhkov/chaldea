@@ -33,6 +33,37 @@ test("runtime consumes observer cache/stops without writing observer, collector 
     await assert.rejects(route({ role: "builder" }, opts), /refusing to ignore possible active stops/);
   } finally { d.remove(); }
 });
+test("runtime accepts partial benchmark coverage and holds only the unmeasured provider", async () => {
+  for (const missing of ["claude-opus-5-5", "gpt-6.1-sol"]) {
+    const d = routeScratch();
+    try {
+      const helper = join(d.path, "helper");
+      writeFileSync(helper, "#!/bin/sh\nprintf 'fixture.token.value\\n'\n", { mode: 0o700 });
+      const configPath = join(d.path, "route.json");
+      writeFileSync(configPath, JSON.stringify({ cacheDir: join(d.path, "cache"),
+        benchmark: { indexVersion: "4.3" }, scores: { enabled: true, url: "https://akasha.fixture",
+          tokenHelper: helper, host: "omarchy-pc" } }));
+      const selected = catalog.filter(p => ["codex", "claudeAgent"].includes(p.providerInstanceId)).map(p => ({
+        ...p, models: p.models.filter(m => ["gpt-6.1-sol", "claude-opus-5-5"].includes(m.id)),
+      }));
+      const scores = { version: 2, metric: "aa-intelligence-cost-per-task", indexVersion: "4.3",
+        fetchedAt: iso(now), unmapped: [], models: ["gpt-6.1-sol", "claude-opus-5-5"].map(model => ({
+          model, effort: "high", aaSlug: model + "-high", intelligence: 52, coding: null,
+          inputPrice: null, outputPrice: null, benchmarkCostUSDPerTask: model === missing ? null : .5,
+        })) };
+      const result = await route({ role: "executor" }, { home: d.path, configPath, now, catalog: async () => selected,
+        fetcher: async url => {
+          if (!String(url).startsWith("https://akasha.fixture/")) throw new Error("fixture offline");
+          return Response.json({ events: [{ source: "route", host: "homelab", kind: "route_score_snapshot",
+            provenance: { type: "verified" }, data: { scores } }], next_cursor: null });
+        } });
+      const expected = missing.startsWith("claude") ? "codex" : "claudeAgent";
+      assert.equal(result.providerInstanceId, expected);
+      assert.equal(result.byProvider[expected]?.eligible, true);
+      assert.equal(result.byProvider[expected === "codex" ? "claudeAgent" : "codex"]?.eligible, false);
+    } finally { d.remove(); }
+  }
+});
 test("operator weekly fallback lasts until reset, collector failures degrade with a reason", async () => {
   const d = routeScratch();
   try {

@@ -55,6 +55,21 @@ test("cached analytics ignore obsolete models without changing stats, timestamps
       assert.throws(() => validateAnalytics({ ...value, models: { ...value.models, "claude-opus-5-5": bad } }), /Invalid analytics/);
   } finally { d.remove(); }
 });
+test("Slopalytics v3 refreshes the real collector cache and keeps exact harness isolation", async () => {
+  const d = routeScratch();
+  try {
+    const payload = { ...report, schemaVersion: 3, metrics: [
+      { ...row, tokenTurns: 100, input: 1000, estimatedCost: 1 },
+      { ...row, harness: "codex", completed: 1, failed: 99, interrupted: 0 },
+    ] };
+    const result = await collectAnalytics(join(d.path, "v3.json"), now, async () => Response.json(payload));
+    assert.equal(result.reason, null);
+    assert.equal(result.value?.models["claude-opus-5-5"]?.turns, 100);
+    assert.equal(result.value?.models["claude-opus-5-5"]?.completionRate, .9);
+    assert.throws(() => aggregate({ ...payload, schemaVersion: 4 }, iso(now)), /Invalid/);
+    assert.throws(() => aggregate({ ...payload, metrics: [{ ...row, terminal: 101 }] }, iso(now)), /Invalid/);
+  } finally { d.remove(); }
+});
 test("Slopalytics caches successes and failures at most daily", async () => {
   const d = routeScratch();
   try {

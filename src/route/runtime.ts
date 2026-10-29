@@ -90,7 +90,8 @@ async function collectContext(options: RouteOptions) {
       } else reasons.push("Claude operator weekly target expired or invalid for the current window");
     }
   }
-  const scores = await collectScores(config.scores, join(config.cacheDir, "aa-scores.json"), now, options.fetcher);
+  const scores = await collectScores(config.scores, join(config.cacheDir, "aa-scores.json"), now, options.fetcher, undefined,
+    s => !config.benchmark || s.version === 2 && s.indexVersion === config.benchmark.indexVersion);
   if (scores.reason) reasons.push("AA " + scores.reason);
   const analytics = await collectAnalytics(join(config.cacheDir, "slopalytics.json"), now, options.fetcher);
   if (analytics.reason) reasons.push("Slopalytics " + analytics.reason);

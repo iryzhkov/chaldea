@@ -32,6 +32,45 @@ test("AA collector uses a fixed HTTPS API, header key, bounded pagination and pu
     e => String(e) === "Error: aa_fetch_failed");
   await assert.rejects(fetchScores(now, async () => response([row], 1, true), () => "fixture-key"), /aa_fetch_failed/);
 });
+test("v2 publisher preserves nullable coding and measured task cost through the existing API", async () => {
+  const scratch = routeScratch();
+  try {
+    const rich = { ...row, evaluations: { ...row.evaluations, artificial_analysis_coding_index: null },
+      artificial_analysis_intelligence_index_cost: { cost_per_task: { total_cost: .123 } } };
+    const result = await publishScores({ ...config, formatVersion: 2 }, join(scratch.path, "v2.json"), now, {
+      machine: "homelab", keyReader: () => "fixture-key", token: async () => "fixture-token",
+      fetch: async (_, init) => {
+        if (init?.method === "GET") return response([rich]);
+        const payload = JSON.parse(String(init?.body));
+        assert.equal(payload.data.scores.version, 2);
+        assert.equal(payload.data.scores.models[0].coding, null);
+        assert.equal(payload.data.scores.models[0].benchmarkCostUSDPerTask, .123);
+        return Response.json({ state: "visible", event_id: "a".repeat(64) }, { status: 201 });
+      },
+    });
+    assert.equal(result.version, 2);
+  } finally { scratch.remove(); }
+});
+test("incomplete or wrong-index refresh retains an older complete benchmark snapshot and its age", async () => {
+  const scratch = routeScratch();
+  try {
+    const old = { ...scores, version: 2 as const, metric: "aa-intelligence-cost-per-task" as const,
+      fetchedAt: iso(now - 120 * 86400000),
+      models: scores.models.map(s => ({ ...s, coding: null, benchmarkCostUSDPerTask: .5 })) };
+    const path = join(scratch.path, "complete.json");
+    writeFileSync(path, JSON.stringify({ attemptedAt: now - 86400000, fetchedAt: old.fetchedAt, value: old }), { mode: 0o600 });
+    const partial = { ...old, fetchedAt: iso(now), models: old.models.filter(s => s.model !== "gpt-6.1-sol") };
+    const event = (s: unknown) => ({ source: "route", host: "homelab", kind: "route_score_snapshot",
+      provenance: { type: "verified" }, data: { scores: s } });
+    const r = await collectScores(config, path, now,
+      async () => Response.json({ events: [event(partial), event({ ...old, indexVersion: "5", fetchedAt: iso(now) })], next_cursor: null }),
+      async () => "fixture-token",
+      s => s.version === 2 && s.indexVersion === "4.3");
+    assert.deepEqual(r.value, old);
+    assert.equal(r.value?.fetchedAt, old.fetchedAt);
+    assert.equal(r.reason, null);
+  } finally { scratch.remove(); }
+});
 test("unmapped diagnostics stay within the snapshot publication budget", () => {
   const s = scoreSnapshot({ intelligence_index_version: 4.3,
     data: [row, ...Array.from({ length: 500 }, (_, n) => ({ slug: "unknown-" + n + "-" + "a".repeat(140) }))] }, now);

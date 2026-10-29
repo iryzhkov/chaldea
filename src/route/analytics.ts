@@ -7,7 +7,7 @@ export const SLOPALYTICS_URL = "https://slopalytics.com/data/t3-usage.json";
 const count = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
 export function aggregate(raw: unknown, fetchedAt: string): Analytics {
   const r = raw as Record<string, unknown> | null;
-  if (!r || r.schemaVersion !== 2 || typeof r.fetchedAt !== "string" || !Number.isFinite(Date.parse(r.fetchedAt)) ||
+  if (!r || ![2, 3].includes(r.schemaVersion as number) || typeof r.fetchedAt !== "string" || !Number.isFinite(Date.parse(r.fetchedAt)) ||
     typeof r.start !== "string" || typeof r.endExclusive !== "string" ||
     !Number.isFinite(Date.parse(r.start)) || !(Date.parse(r.endExclusive) > Date.parse(r.start)) ||
     !Array.isArray(r.metrics)) throw new Error("Invalid Slopalytics data");

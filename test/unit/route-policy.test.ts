@@ -24,11 +24,13 @@ test("18-instance catalog uses safe fallback pairs/options including Haiku", () 
   assert.equal(catalog.length, 18);
   for (const role of Object.keys(PAIRS) as Array<keyof typeof PAIRS>) {
     const r = recommend({ role }, base);
-    assert.equal(r.providerInstanceId, "claudeAgent");
-    assert.equal(r.model, PAIRS[role][0]);
-    assert.deepEqual(r.options, { effort: role === "builder" ? "high" : "medium" });
-    assert.equal(r.alternatives[0]?.model, PAIRS[role][1]);
-    assert.deepEqual(r.alternatives[0]?.options, { reasoningEffort: role === "builder" ? "high" : "medium" });
+    const executor = role === "executor";
+    assert.equal(r.providerInstanceId, executor ? "codex" : "claudeAgent");
+    assert.equal(r.model, PAIRS[role][executor ? 1 : 0]);
+    const effort = role === "builder" ? "high" : "medium";
+    assert.deepEqual(r.options, executor ? { reasoningEffort: effort } : { effort });
+    assert.equal(r.alternatives[0]?.model, PAIRS[role][executor ? 0 : 1]);
+    assert.deepEqual(r.alternatives[0]?.options, executor ? { effort } : { reasoningEffort: effort });
     assert.notEqual(r.model, "claude-sonnet-5-5");
     assert.equal(r.byProvider.claudeAgent?.model, PAIRS[role][0]);
     assert.equal(r.byProvider.codex?.model, PAIRS[role][1]);
@@ -115,7 +117,7 @@ test("unknown Claude capacity ties paced Codex and preserves every role default"
   const paced = { ...unknown, class: "paced" as const, reasons: ["fixture paced"] };
   for (const role of Object.keys(PAIRS) as Array<keyof typeof PAIRS>) {
     const r = recommend({ role }, { ...base, quota: { codex: weekly(40) }, capacity: { claudeAgent: unknown, codex: paced } });
-    assert.equal(r.providerInstanceId, "claudeAgent", role);
+    assert.equal(r.providerInstanceId, role === "executor" ? "codex" : "claudeAgent", role);
   }
 });
 test("statistics cannot remove the only eligible review or stopped-peer fallback", () => {
