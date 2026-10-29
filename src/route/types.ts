@@ -49,7 +49,7 @@ export interface RouteResult extends Target {
   topPick?: Target;
 }
 export interface PolicyConfig {
-  benchmark: { indexVersion: string } | null;
+  benchmark: { indexVersion: string; anchors?: Partial<Record<Role, string[]>> } | null;
   paceMargin: number;
   minimumRemaining: number;
   failureMargin: number;

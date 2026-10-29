@@ -4,7 +4,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { openDb, tx } from "../store/sqlite.ts";
 import { publish } from "../events/publisher.ts";
 import type { Publication, PublisherOptions } from "../events/publisher.ts";
-import { recommendReviewPair, reviewPairInput, type ReviewPairInput, type ReviewPairResult } from "./pair.ts";
+import { recommendReviewPair, reviewPairInput, pairRequest, type ReviewPairInput, type ReviewPairResult } from "./pair.ts";
 import { recommend } from "./policy.ts";
 import type { PolicyData } from "./policy.ts";
 import { emptyHistory, inProbation, roleKey } from "./targets.ts";
@@ -122,8 +122,8 @@ export class RouteState {
         [result.peer, input.peerRole ?? "builder", false]] as const) {
         if (!target) continue;
         const driver = data.catalog.find(p => p.providerInstanceId === target.providerInstanceId)!.driverKind;
-        const request: RouteInput = { role, effortOverride: Object.values(target.options)[0]!,
-          ...(main && driver !== input.authorProvider ? { authorProvider: input.authorProvider } : {}) };
+        const request = pairRequest(role, driver, main ? input.mainEffort : input.peerEffort,
+          input.authorProvider, main, !!config.benchmark && !config.pins[role]);
         const key = roleKey(role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
         const slot = slots.get(key) ?? { request, models: [] };
         slot.models.push(target.model); slots.set(key, slot);

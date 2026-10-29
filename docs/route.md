@@ -42,7 +42,11 @@ existing thread or switch its provider.
 The router uses the cached T3 `server.getConfig` model/option descriptors that
 back `orchestrator_capabilities`. It preserves instance IDs, requires an
 enabled, installed, authenticated provider and checks exact model and option
-IDs. All live drivers can participate once their exact model and effort have a
+IDs. When server-side model preferences are present, their per-instance hidden
+model IDs are excluded in every routing mode, including legacy mode and pins.
+A hidden pin cannot route. If preferences are null, FATE has no server-side
+hidden list to apply; unmigrated composer-local preferences are unavailable.
+The generic quota-observer catalog stays unchanged. All live drivers can participate once their exact model and effort have a
 reviewed AA mapping and probation evidence. Sonnet-family models are banned by
 default, including custom IDs containing Sonnet. Haiku is allowed. Models without
 the requested effort option are held. With no eligible candidate it returns an error, including for a review
@@ -423,6 +427,19 @@ An old, complete compatible snapshot stays usable with its real age and an
 explicit stale-data reason. Quota observations retain their existing freshness
 requirements.
 
+A new benchmark scale can leave a role without a usable default baseline.
+For example, the verified AA index 5 capture on 2026-10-29 has Luna medium 18.3,
+below the unchanged reader floor 30, while Sol low 34.5 clears it. Explicit
+operator calibration can add per-role baseline models with
+`"benchmark": {"indexVersion": "5", "anchors": {"bulk-read":
+["gpt-6.1-sol", "claude-opus-5-5"], "critical-review":
+["gpt-6.1-sol", "claude-opus-5-5"]}}`.
+These known models bootstrap those roles instead of waiting for a trial share
+that cannot accumulate when every default is below the floor or hidden.
+The measured role floor, required cost, catalog availability, bans, quota and
+review separation still apply. Other models retain normal operational evidence
+and probation. No calibration anchors are added automatically or in legacy mode.
+
 Version 2 adds `metric: "aa-intelligence-cost-per-task"` and
 `benchmarkCostUSDPerTask` from AA's
 `artificial_analysis_intelligence_index_cost.cost_per_task.total_cost`.
@@ -447,6 +464,11 @@ then operational tie-breaks. Quota ranks the resulting provider choices.
 After probation share admission, provider choices and quota ordering are
 recomputed from the surviving candidates; a held trial cannot keep deciding
 which provider wins. The separate topPick still describes the pre-draw choice.
+
+Benchmark review pairs use the same cost/floor search and permitted effort
+levels, instead of forcing legacy Opus medium. An explicit main/peer effort
+remains exact. Automatic pair selection and trial-share reservation use the
+same history context; returned effort does not silently change the request key.
 
 The producer emits version 1 by default. Set `scores.formatVersion: 2` on the
 existing homelab publisher only after consumers and the Akasha validator support

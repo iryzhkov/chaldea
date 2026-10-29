@@ -44,7 +44,9 @@ the account. Remote credits never establish local spend-control evidence.
 ## One-call review pair
 
 `chaldea route review-pair --author-provider codex` recommends the adopted
-Sol 6.1 high and Opus 5.5 medium pair. The main reviewer uses the other underlying
+Sol 6.1 high and Opus 5.5 medium pair in legacy mode. Benchmark mode searches
+permitted models and efforts that clear the role floor; explicit efforts and
+role pins remain binding. The main reviewer uses the other underlying
 provider driver. Both picks come from one collected context and one history
 transaction. Only returned recommendation slots consume their probation shares.
 

@@ -142,8 +142,10 @@ export interface SwitchProvider {
     readonly unavailable?: unknown;
   };
 }
+export type CatalogModelPreferences = Readonly<Record<string, { readonly hiddenModels: ReadonlyArray<string> }>>;
 export interface SwitchPort {
-  catalog(): Promise<{ readonly providers: ReadonlyArray<SwitchProvider>; readonly autoResume: boolean }>;
+  catalog(): Promise<{ readonly providers: ReadonlyArray<SwitchProvider>; readonly autoResume: boolean;
+    readonly modelPreferences?: CatalogModelPreferences | null }>;
   thread(threadId: string): Promise<ShellThread | undefined>;
   recovery(input: { threadId: string; runId: string; resetAt: string; commandId: string; autoResume: boolean; snooze?: boolean }): Promise<boolean>;
   clearRecovery(threadId: string, commandId: string): Promise<boolean>;
@@ -222,6 +224,7 @@ export function switchPort(options: ConnectOptions): SwitchPort {
     catalog: () => request((client) => client["server.getConfig"]({}).pipe(
       Effect.map((config) => ({
         providers: config.providers.map(toSwitchProvider),
+        modelPreferences: config.settings.providerModelPreferences,
         autoResume: config.settings.autoResumeLimitedThreads,
       })),
     )),
