@@ -14,6 +14,7 @@ import { readToken } from "../quota/run.ts";
 import { loadRouteConfig } from "./config.ts";
 import { collectClaudeUsage, claudeCacheFile, claudeSourceId } from "./claude-usage.ts";
 import { collectAnalytics } from "./analytics.ts";
+import { benchmarkCoverage } from "./benchmark.ts";
 import { collectScores } from "./snapshot.ts";
 import { RouteState } from "./state.ts";
 import { reviewPairInput, type ReviewPairResult } from "./pair.ts";
@@ -90,7 +91,9 @@ async function collectContext(options: RouteOptions) {
       } else reasons.push("Claude operator weekly target expired or invalid for the current window");
     }
   }
-  const scores = await collectScores(config.scores, join(config.cacheDir, "aa-scores.json"), now, options.fetcher);
+  const scores = await collectScores(config.scores, join(config.cacheDir, "aa-scores.json"), now, options.fetcher, undefined,
+    s => !config.benchmark || s.version === 2 && s.indexVersion === config.benchmark.indexVersion &&
+      Object.values(benchmarkCoverage(catalog.filter(p => ["codex", "claudeAgent"].includes(p.driverKind)), s, config.bans)).every(c => c.complete));
   if (scores.reason) reasons.push("AA " + scores.reason);
   const analytics = await collectAnalytics(join(config.cacheDir, "slopalytics.json"), now, options.fetcher);
   if (analytics.reason) reasons.push("Slopalytics " + analytics.reason);

@@ -39,7 +39,7 @@ export class RouteState {
     this.epoch = String(this.db.prepare("SELECT value FROM route_meta WHERE name=?").get("epoch")!.value);
   }
   recommend(input: RouteInput, data: PolicyData, host: string, announce: boolean): RouteResult {
-    const key = roleKey(input.role, input.authorProvider, input.effortOverride);
+    const key = roleKey(input.role, input.authorProvider, input.effortOverride, data.config?.benchmark?.indexVersion);
     const result = tx(this.db, () => {
       const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
       const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
@@ -103,7 +103,7 @@ export class RouteState {
     return tx(this.db, () => {
       const histories = new Map<string, RoutingHistory>();
       const historyFor = (request: RouteInput) => {
-        const key = roleKey(request.role, request.authorProvider, request.effortOverride);
+        const key = roleKey(request.role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
         if (!histories.has(key)) {
           const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
           const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
@@ -124,7 +124,7 @@ export class RouteState {
         const driver = data.catalog.find(p => p.providerInstanceId === target.providerInstanceId)!.driverKind;
         const request: RouteInput = { role, effortOverride: Object.values(target.options)[0]!,
           ...(main && driver !== input.authorProvider ? { authorProvider: input.authorProvider } : {}) };
-        const key = roleKey(role, request.authorProvider, request.effortOverride);
+        const key = roleKey(role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
         const slot = slots.get(key) ?? { request, models: [] };
         slot.models.push(target.model); slots.set(key, slot);
       }

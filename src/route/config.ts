@@ -49,6 +49,12 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
       c[key] = r[key];
     }
   }
+  if (r.benchmark !== undefined && r.benchmark !== null) {
+    const b = r.benchmark as Record<string, unknown>;
+    if (!b || typeof b !== "object" || Array.isArray(b) || Object.keys(b).some(k => k !== "indexVersion") ||
+        typeof b.indexVersion !== "string" || !/^[0-9]+(?:[.][0-9]+)?$/.test(b.indexVersion)) throw new Error("Invalid benchmark index policy");
+    c.benchmark = { indexVersion: b.indexVersion };
+  }
   if (r.bans !== undefined) {
     if (!Array.isArray(r.bans) || r.bans.length > 100 || r.bans.some(b => typeof b !== "string" || !/^[a-zA-Z0-9_.*:/-]{1,160}$/.test(b))) throw new Error("Invalid model bans");
     c.bans = r.bans;
@@ -74,9 +80,10 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
   }
   if (r.scores !== undefined) {
     const s = r.scores as Record<string, any>;
-    if (!s || typeof s !== "object" || Array.isArray(s) || Object.keys(s).some(k => !["enabled", "url", "tokenHelper", "host"].includes(k))) throw new Error("Invalid score transport");
+    if (!s || typeof s !== "object" || Array.isArray(s) || Object.keys(s).some(k => !["enabled", "url", "tokenHelper", "host", "formatVersion"].includes(k))) throw new Error("Invalid score transport");
     c.scores = { ...c.scores, ...s };
     const t = c.scores;
+    if (t.formatVersion !== undefined && ![1, 2].includes(t.formatVersion)) throw new Error("Invalid score format version");
     if (typeof t.enabled !== "boolean" || typeof t.host !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(t.host) ||
       typeof t.tokenHelper !== "string" || typeof t.url !== "string") throw new Error("Invalid score transport");
     if (t.enabled) {

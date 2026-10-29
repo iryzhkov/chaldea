@@ -1,3 +1,4 @@
+import { benchmarkCoverage, benchmarkEfforts, compareBenchmark, targetEffort } from "./benchmark.ts";
 import { RouteError } from "./errors.ts";
 import { modelWindowPolicy } from "../quota/window-policy.ts";
 import type { Capacity } from "../quota/capacity.ts";
@@ -33,7 +34,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   try { if (data.scores && ageSeconds(data.scores.fetchedAt, data.now) !== null) scores = validateScores(data.scores); } catch {}
   const scoreAge = ageSeconds(scores?.fetchedAt, data.now);
   let overrideFallback = false;
-  if (scores && input.effortOverride && !pair.some(model => scoreFor(scores, model, effort))) {
+  const benchmark = !!config.benchmark && !pin;
+  if (benchmark && (!scores || scores.version !== 2 || scores.indexVersion !== config.benchmark!.indexVersion))
+    throw new RouteError("no_candidate", "Benchmark routing requires a version 2 snapshot with configured index " + config.benchmark!.indexVersion);
+  if (!benchmark && scores && input.effortOverride && !pair.some(model => scoreFor(scores, model, effort))) {
     scores = null;
     overrideFallback = true;
     reasons.push("Explicit effort override has no mapped role anchors; use fixed role pairs without an AA quality claim");
@@ -44,6 +48,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     : "AA unavailable; no last good snapshot; use fixed role pairs with Sonnet removed");
   if (scores?.unmapped.length) reasons.push("AA models unmapped, held: " + scores.unmapped.join(", "));
   diagnostics.quality_source = scores && !pin ? "AA" : "fixed_policy";
+  if (benchmark) {
+    diagnostics.benchmarkCoverage = benchmarkCoverage(data.catalog, scores, config.bans, input.effortOverride);
+    reasons.push("Benchmark selection uses minimum measured USD per task above the role floor within each provider; quota admission and provider pacing still apply");
+  }
   const policyReasons = [...reasons];
   const providerReasons = new Map<Provider, string[]>();
   const candidates: Array<Target & { driver: Provider; pace: number | null; scopeKnown: boolean }> = [];
@@ -57,6 +65,9 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     if (pin?.providerInstanceId && pin.providerInstanceId !== p.providerInstanceId) {
       reject(p.providerInstanceId + ": fleet pin requires instance " + pin.providerInstanceId); continue;
     }
+    if (benchmark && !diagnostics.benchmarkCoverage?.[p.driverKind]?.complete) {
+      reject(p.providerInstanceId + ": incomplete benchmark coverage: " + (diagnostics.benchmarkCoverage?.[p.driverKind]?.missing.join(", ") || "no measured models")); continue;
+    }
     const start = reasons.length;
     if (!p.models.length) reasons.push(p.providerInstanceId + ": no catalog models");
 
@@ -69,7 +80,8 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     if (!pin && !scores && model !== (p.driverKind === "claudeAgent" ? pair[0] : p.driverKind === "codex" ? pair[1] : undefined)) {
       reasons.push(model + ": outside fixed role pair while AA unavailable"); continue;
     }
-    const incumbent = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride)]?.model ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
+    for (const effort of benchmark ? benchmarkEfforts(model, input.effortOverride) : [input.effortOverride ?? (input.role === "builder" ? "high" : "medium")]) {
+    const incumbent = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride, config.benchmark?.indexVersion)]?.model ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
     if (!pin && scores && !targetEligible(model, effort, input.role, scores, data.analytics, config, data.now, incumbent, reasons)) continue;
     const option = m.options?.find(o => ["reasoningEffort", "effort", "variant"].includes(o.id) &&
       o.type === "select" && o.options?.some(v => v.id === effort))?.id;
@@ -108,6 +120,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     if (!advice.pacing) reasons.push(`${p.providerInstanceId}: quota pacing unknown${p.driverKind === "codex" ? ", not assumed unlimited" : ""}${age !== null && age * 1000 >= config.quotaMaxAgeMs ? " (stale cache)" : ""}`);
     candidates.push({ ...(p.accountKey ? { accountKey: p.accountKey } : {}), providerInstanceId: p.providerInstanceId, model, options: { [option]: effort }, driver: p.driverKind, pace, scopeKnown: advice.scopeKnown && !q?.incomplete });
     }
+    }
     scoped.push(...reasons.slice(start));
   }
   const a = data.analytics;
@@ -141,7 +154,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     : pacedClaude.length ? "codex" : "claudeAgent";
   const hasPace = pacedClaude.length > 0;
   if (!preferCodex) reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
-  eligible.sort((x, y) => {
+  const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
     if (preferCodex && (x.driver === "codex") !== (y.driver === "codex"))
       return Number(y.driver === "codex") - Number(x.driver === "codex");
     const rank = (c: typeof x) => {
@@ -158,7 +171,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     // Known quota preference takes precedence over a statistical tie-break.
     if (hasPace && x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
     if (x.driver === y.driver && x.pace !== y.pace) return (y.pace ?? -Infinity) - (x.pace ?? -Infinity);
-    if (scores && !pin) {
+    if (scores && !pin && !benchmark) {
       const xs = scoreFor(scores, x.model, effort)!, ys = scoreFor(scores, y.model, effort)!;
       const objective = compareScores(input.role, xs, ys);
       if (objective) return objective;
@@ -174,9 +187,23 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     }
     if (x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
     return x.providerInstanceId.localeCompare(y.providerInstanceId);
-  });
+  };
+  if (benchmark) {
+    // Choose the cheapest eligible model/effort per driver before comparing providers.
+    // Representatives keep cross-provider quota ordering independent of model price.
+    const localCompare = (x: typeof candidates[number], y: typeof candidates[number]) =>
+      compareBenchmark(x, y, scores!) || quotaCompare(x, y) || x.model.localeCompare(y.model) ||
+      targetEffort(x).localeCompare(targetEffort(y));
+    const representatives = new Map<string, typeof candidates[number]>();
+    for (const c of eligible) {
+      const prior = representatives.get(c.driver);
+      if (!prior || localCompare(c, prior) < 0) representatives.set(c.driver, c);
+    }
+    const drivers = [...representatives.values()].sort(quotaCompare).map(c => c.driver);
+    eligible.sort((x, y) => drivers.indexOf(x.driver) - drivers.indexOf(y.driver) || localCompare(x, y));
+  } else eligible.sort(quotaCompare);
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
-  if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target");
+  if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target" + (benchmark ? "; " + Object.entries(diagnostics.benchmarkCoverage ?? {}).filter(([, c]) => !c.complete).map(([p, c]) => p + " missing benchmark coverage: " + c.missing.join(", ")).join("; ") : ""));
   if (input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
@@ -196,9 +223,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
       : { eligible: false, model: null, options: null, reasons: [...new Set([...policyReasons, ...details]), "No eligible " + input.role + " model for " + driver] }];
   }));
   if (scores && !pin) {
-    const s = scoreFor(scores, topPick.model, effort)!;
-    reasons.push("Role top pick " + topPick.model + ": AA intelligence " + s.intelligence + ", coding " + s.coding +
-      ", 3:1 input/output price $" + ((3 * s.inputPrice + s.outputPrice) / 4) + "/M; " + input.role + " objective after quota policy");
+    const s = scoreFor(scores, topPick.model, benchmark ? targetEffort(topPick) : effort)!;
+    if (benchmark) reasons.push("Role top pick " + topPick.model + " at " + targetEffort(topPick) + ": AA intelligence " + s.intelligence + ", benchmark cost $" + s.benchmarkCostUSDPerTask + "/task; index " + scores.indexVersion);
+    else reasons.push("Role top pick " + topPick.model + ": AA intelligence " + s.intelligence + ", coding " + s.coding +
+      ", 3:1 input/output price $" + (s.inputPrice === null || s.outputPrice === null ? "unknown" : (3 * s.inputPrice + s.outputPrice) / 4) + "/M; " + input.role + " objective after quota policy");
   }
   return { ...target(eligible[0]!), diagnostics, topPick, byProvider, alternatives: eligible.slice(1).map(target), reasons,
     dataAges: { quota: ages, slopalytics: analyticsAge, slopalyticsWindow: windowAge, artificialAnalysis: scoreAge } };

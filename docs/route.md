@@ -407,6 +407,51 @@ and an explicit reason. A failed refresh retains the last good snapshot.
 Future-dated or invalid snapshots never replace it. With no snapshot the fixed
 pairs above apply, with Sonnet removed. Stale AA never relaxes quota checks.
 
+## Benchmark selection within providers
+
+Igor's policy, 2026-10-29, chooses the cheapest measured model and effort that
+clears the role's intelligence floor within each provider. Quota admission and
+provider pacing remain separate decisions; executor prefers eligible Codex even
+when Claude quota would expire. Benchmark task cost is an efficiency comparison,
+not a subscription bill or a prediction of the cost of the current task.
+
+Opt in with `"benchmark": {"indexVersion": "4.3"}` in route.json after reviewing
+the floor calibration for that exact upstream index. This mode requires a version
+2 snapshot and refuses missing or mismatched data. It never falls back to fixed
+pairs while claiming benchmark qualification. No floors are rounded or lowered.
+An old, complete compatible snapshot stays usable with its real age and an
+explicit stale-data reason. Quota observations retain their existing freshness
+requirements.
+
+Version 2 adds `metric: "aa-intelligence-cost-per-task"` and
+`benchmarkCostUSDPerTask` from AA's
+`artificial_analysis_intelligence_index_cost.cost_per_task.total_cost`.
+Coding and token prices may be null, and absent benchmark cost stays null,
+distinct from a measured zero. This mode uses intelligence and task cost, so it
+does not invent coding scores. Version 1 remains accepted by legacy routing.
+
+Selection searches catalog-supported low, medium and high effort. Luna and
+Haiku may also use xhigh. An explicit `--effort` remains exact. Max and higher
+efforts never participate. The mapping includes Terra and exact additional
+allowed variants of the native models; a max result never stands in for medium
+or high. New models retain the existing operational evidence and probation gates.
+
+`benchmarkCoverage` reports measured model coverage per runnable driver. It
+excludes banned models and disabled instances. A model is covered when an
+allowed, catalog-supported effort has measured intelligence and cost on the
+configured scale. A provider missing any such model is held, rather than
+advertised as fully compared. An exact effort request requires coverage at that
+effort. A fully measured model below the role floor counts as covered but remains
+ineligible. Per-provider recommendations use minimum cost, then intelligence,
+then operational tie-breaks. Quota ranks the resulting provider choices.
+
+The producer emits version 1 by default. Set `scores.formatVersion: 2` on the
+existing homelab publisher only after consumers and the Akasha validator support
+version 2. This source change does not enable score transport or modify grants.
+Current AA API examples use index 5; that is not evidence that legacy 4.3 floors
+are calibrated on index 5. A live rollout must verify actual index identity,
+coverage, floor calibration and the existing protected publication/read path.
+
 ## Snapshot transport and route-change events
 
 Use Akasha. Its existing source-bound token helper and authenticated

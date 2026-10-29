@@ -35,6 +35,7 @@ export type ProviderPick = (Target & { eligible: true; reasons: string[] }) |
   { eligible: false; model: null; options: null; reasons: string[] };
 export interface RouteDiagnostics {
   quality_source: "fixed_policy" | "AA";
+  benchmarkCoverage?: Record<string, { complete: boolean; models: number; covered: number; missing: string[] }>;
   fleet?: { readiness: "absent" | "disabled" | "ready" | "empty" | "unavailable"; freshAccounts: number };
   quota: Record<string, { accountKey: string | null; bindingSource: string; source: string; ageSeconds: number | null;
     freshness: "fresh" | "stale" | "unknown"; bindingWindow: string | null; scopedKnown: boolean; conflicts?: string[] }>;
@@ -48,6 +49,7 @@ export interface RouteResult extends Target {
   topPick?: Target;
 }
 export interface PolicyConfig {
+  benchmark: { indexVersion: string } | null;
   paceMargin: number;
   minimumRemaining: number;
   failureMargin: number;
@@ -65,7 +67,7 @@ export const DEFAULT_POLICY: PolicyConfig = {
   paceMargin: 0.10, minimumRemaining: 0.10, failureMargin: 0.10, minimumTurns: 100,
   quotaMaxAgeMs: 15 * 60_000, analyticsMaxAgeMs: 21 * 86_400_000,
   scoreMaxAgeMs: 3 * 86_400_000, probationMs: 7 * 86_400_000, probationShare: 0.10,
-  bans: ["*sonnet*"], pins: {},
+  bans: ["*sonnet*"], pins: {}, benchmark: null,
   floors: { builder: 50, "critical-review": 49, "bulk-read": 30, general: 48, executor: 48 },
 };
 export const PAIRS = {

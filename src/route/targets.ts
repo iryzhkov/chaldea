@@ -8,8 +8,8 @@ export interface RoutingHistory {
   allocations: Record<string, { calls: number; trials: number }>;
 }
 export const emptyHistory = (): RoutingHistory => ({ seen: {}, picks: {}, allocations: {} });
-export const roleKey = (role: Role, author?: string, effort?: Effort) => role +
-  (role === "critical-review" && author ? ":" + author : "") + (effort ? ":" + effort : "");
+export const roleKey = (role: Role, author?: string, effort?: Effort, benchmarkIndex?: string) => role +
+  (author ? ":" + author : "") + (effort ? ":" + effort : "") + (benchmarkIndex ? ":benchmark:" + benchmarkIndex : "");
 export const banned = (id: string, bans: readonly string[]) => bans.some(pattern =>
   new RegExp("^" + pattern.split("*").map(p => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i").test(id));
 export function usableAnalytics(a: Analytics | null, now: number, config: PolicyConfig): a is Analytics {
@@ -19,19 +19,24 @@ export function usableAnalytics(a: Analytics | null, now: number, config: Policy
 export function scoreFor(snapshot: ScoreSnapshot | null | undefined, model: string, effort: Effort): Score | undefined {
   return snapshot?.models.find(m => m.model === model && m.effort === effort);
 }
-const price = (s: Score) => (3 * s.inputPrice + s.outputPrice) / 4;
+const price = (s: Score) => s.inputPrice === null || s.outputPrice === null ? Infinity : (3 * s.inputPrice + s.outputPrice) / 4;
+const coding = (s: Score) => s.coding ?? -Infinity;
 export function compareScores(role: Role, x: Score, y: Score): number {
-  if (role === "builder") return y.coding - x.coding || y.intelligence - x.intelligence || price(x) - price(y);
+  if (role === "builder") return coding(y) - coding(x) || y.intelligence - x.intelligence || price(x) - price(y);
   if (role === "bulk-read") return price(x) - price(y) || y.intelligence - x.intelligence;
-  if (role === "critical-review") return y.intelligence - x.intelligence || y.coding - x.coding || price(x) - price(y);
+  if (role === "critical-review") return y.intelligence - x.intelligence || coding(y) - coding(x) || price(x) - price(y);
   // An extra dollar per million tokens must buy two points of average quality.
-  return ((y.intelligence + y.coding) / 2 - 2 * price(y)) - ((x.intelligence + x.coding) / 2 - 2 * price(x));
+  return ((y.intelligence + coding(y)) / 2 - 2 * price(y)) - ((x.intelligence + coding(x)) / 2 - 2 * price(x));
 }
 export function targetEligible(model: string, effort: Effort, role: Role, scores: ScoreSnapshot,
   analytics: Analytics | null, config: PolicyConfig, now: number,
   incumbent: string, reasons: string[]): boolean {
   const score = scoreFor(scores, model, effort);
   if (!score) { reasons.push(model + ": unmapped or missing AA data for " + effort + "; held"); return false; }
+  if (config.benchmark ? score.benchmarkCostUSDPerTask === undefined || score.benchmarkCostUSDPerTask === null
+      : score.coding === null || score.inputPrice === null || score.outputPrice === null) {
+    reasons.push(model + ": missing " + (config.benchmark ? "benchmark cost per task" : "legacy coding or token prices")); return false;
+  }
   if (score.intelligence < config.floors[role]) { reasons.push(model + ": below AA intelligence floor " + config.floors[role]); return false; }
   // The fixed defaults are the bootstrapping incumbents, not new launches.
   if (model === incumbent || (PAIRS[role] as readonly string[]).includes(model)) return true;
