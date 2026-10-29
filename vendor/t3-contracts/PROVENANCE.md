@@ -8,8 +8,17 @@ The matching T3 implementation must be installed separately. Official v0.1.0
 does not support the guard, and new external waits/decisions fail closed on it.
 This is not a vendor-version or runtime pin upgrade.
 
-Keep these two files byte-identical to the corresponding files in the matching
-T3 source batch. The runtime sub-executor report records the exact T3 commit and
+A separate compatibility backport in `src/keybindings.ts` adds only the four
+command literals introduced by official v0.1.5: `workspace.focusNext`,
+`workspace.focusPrevious`, `composer.increaseEffort` and `composer.decreaseEffort`.
+Source: [official v0.1.5 keybindings contract](https://github.com/pingdotgg/t3code/blob/6d450a4284852af137b2f3407fddd89eb76e7644/packages/contracts/src/keybindings.ts).
+The closed command schema and existing commands are preserved. Synthetic RPC
+fixtures in `test/unit/usage-compat.test.ts` cover v0.1.0 and v0.1.5 config reads
+and usage subscriptions. This does not qualify other v0.1.5 APIs or advertise
+external-wake support on official T3.
+
+Keep `orchestrationV2.ts` and `server.ts` byte-identical to the corresponding
+files in the matching T3 source batch. The runtime sub-executor report records the exact T3 commit and
 isolated qualification jobs. Adopt a future official release by replacing the
 whole package after qualification; do not infer support from protocol 2 alone.
 
