@@ -52,6 +52,21 @@ export async function publishScores(config: ScoreTransport, cacheFile: string, n
   if (!ok) throw new Error("aa_snapshot_publication_pending");
   return s;
 }
+/** Prefer old measured coverage over a newer partial refresh on the same scale.
+ * Version 1 retains its legacy newest-snapshot behavior.
+ */
+function preferredSnapshot(candidate: ScoreSnapshot, prior: ScoreSnapshot): ScoreSnapshot {
+  if (candidate.version === 2 && prior.version === 2 && candidate.indexVersion === prior.indexVersion) {
+    const keys = (s: ScoreSnapshot) => new Set(s.models.filter(m => m.benchmarkCostUSDPerTask !== null &&
+      m.benchmarkCostUSDPerTask !== undefined).map(m => m.model + ":" + m.effort));
+    const next = keys(candidate), previous = keys(prior);
+    const retains = [...previous].every(key => next.has(key));
+    const extendsCoverage = [...next].some(key => !previous.has(key));
+    if (!retains) return prior;
+    if (extendsCoverage) return candidate;
+  }
+  return Date.parse(candidate.fetchedAt) > Date.parse(prior.fetchedAt) ? candidate : prior;
+}
 export async function collectScores(config: ScoreTransport, cacheFile: string, now: number,
   fetcher: typeof fetch = fetch, tokenReader = helperToken,
   compatible: (scores: ScoreSnapshot) => boolean = () => true) {
@@ -83,14 +98,14 @@ export async function collectScores(config: ScoreTransport, cacheFile: string, n
         if (e.source !== "route" || e.host !== "homelab" || e.kind !== "route_score_snapshot" || e.provenance?.type !== "verified") continue;
         try {
           const s = validateScores(e.data?.scores);
-          if (compatible(s) && Date.parse(s.fetchedAt) <= now && (!best || Date.parse(s.fetchedAt) > Date.parse(best.fetchedAt))) best = s;
+          if (compatible(s) && Date.parse(s.fetchedAt) <= now) best = best ? preferredSnapshot(s, best) : s;
         } catch {}
       }
       if (r.next_cursor === null) {
         if (!best) throw new Error();
         try {
           const prior = validateScores((readJson(cacheFile) as { value: unknown }).value);
-          if (compatible(prior) && Date.parse(prior.fetchedAt) <= now && Date.parse(prior.fetchedAt) > Date.parse(best.fetchedAt)) return prior;
+          if (compatible(prior) && Date.parse(prior.fetchedAt) <= now) return preferredSnapshot(best, prior);
         } catch {}
         return best;
       }

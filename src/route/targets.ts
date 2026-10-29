@@ -9,7 +9,8 @@ export interface RoutingHistory {
 }
 export const emptyHistory = (): RoutingHistory => ({ seen: {}, picks: {}, allocations: {} });
 export const roleKey = (role: Role, author?: string, effort?: Effort, benchmarkIndex?: string) => role +
-  (author ? ":" + author : "") + (effort ? ":" + effort : "") + (benchmarkIndex ? ":benchmark:" + benchmarkIndex : "");
+  ((role === "critical-review" || benchmarkIndex) && author ? ":" + author : "") +
+  (effort ? ":" + effort : "") + (benchmarkIndex ? ":benchmark:" + benchmarkIndex : "");
 export const banned = (id: string, bans: readonly string[]) => bans.some(pattern =>
   new RegExp("^" + pattern.split("*").map(p => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$", "i").test(id));
 export function usableAnalytics(a: Analytics | null, now: number, config: PolicyConfig): a is Analytics {

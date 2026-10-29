@@ -32,7 +32,7 @@ Fallbacks when no AA snapshot exists:
 Use `chaldea route --role executor` for roadmap execution and other long-running
 work with large, persistent contexts. This role prefers eligible Codex candidates
 before quota pacing, including when Claude has unused quota near its reset.
-It uses the general intelligence floor and score objective. Pins still override
+Its separate intelligence floor defaults to the same 48 as general; legacy scoring uses the general objective. Pins still override
 the preference, and availability, effort, quality, probation, reliability, quota
 stops and review separation still gate eligibility. If no eligible Codex remains,
 the usual policy ranks the remaining candidates. Bounded builders and reviewers

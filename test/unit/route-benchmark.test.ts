@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { loadRouteConfig } from "../../src/route/config.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
 import { recommend } from "../../src/route/policy.ts";
+import { roleKey } from "../../src/route/targets.ts";
 import { benchmarkCoverage } from "../../src/route/benchmark.ts";
 import { scoreSnapshot, validateScores, type ScoreSnapshot } from "../../src/route/scores.ts";
 import { compactRoute } from "../../src/route/output.ts";
@@ -77,6 +78,21 @@ test("incomplete provider coverage is explicit; index mismatch and absent v2 do 
     assert.throws(() => recommend({ role: "executor" }, { ...data(), scores }), /version 2 snapshot with configured index/);
   const missing = benchmarkCoverage(data().catalog, null, ["*sonnet*"]);
   assert.equal(missing.codex?.covered, 0);
+});
+test("legacy history keys stay unchanged and exact xhigh skips prohibited heavy models", () => {
+  assert.equal(roleKey("builder", "codex"), "builder");
+  assert.equal(roleKey("critical-review", "codex"), "critical-review:codex");
+  assert.equal(roleKey("builder", "codex", undefined, "4.3"), "builder:codex:benchmark:4.3");
+  const f = data();
+  f.scores.models.push({ ...score("gpt-6-luna", "high", 34, .15), effort: "xhigh" });
+  f.history.seen["gpt-6-luna"] = now - 8 * 86400000;
+  const r = recommend({ role: "bulk-read", effortOverride: "xhigh" }, f);
+  assert.equal(r.model, "gpt-6-luna");
+  assert.deepEqual(r.options, { reasoningEffort: "xhigh" });
+  assert.equal(r.diagnostics?.benchmarkCoverage?.codex?.models, 1);
+  const stopped = { observedAt: iso(now), activeStop: true, windows: [] };
+  const fallback = recommend({ role: "executor" }, { ...data(), quota: { codex: stopped } });
+  assert.match(compactRoute(fallback).reasons.join(" "), /available fallback/);
 });
 test("benchmark configuration and compact CLI preserve the selected native model and effort", () => {
   const scratch = routeScratch();

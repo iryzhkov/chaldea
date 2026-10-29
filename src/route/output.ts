@@ -9,7 +9,8 @@ export function compactRoute(result: RouteResult) {
     ...(quota?.conflicts?.length ? ["observation_conflict"] : [])];
   const reasons = [...new Set(result.reasons.filter(r => r.startsWith(result.providerInstanceId + " ") && !r.includes("capacity")))].slice(0, 2);
   const objective = result.reasons.find(r => r.startsWith("Executor prefers")) ?? result.reasons.find(r => r.startsWith("Role top pick"));
-  if (objective) reasons.push(objective);
+  if (objective) reasons.push(objective.startsWith("Executor prefers") && !result.byProvider.codex?.eligible
+    ? "Executor selected an available fallback; no eligible Codex recommendation" : objective);
   if (!reasons.length) reasons.push("Selected eligible target under role, quota and separation policy");
   return { ...target, target, reasons, reasonCodes, quota,
     quality_source: result.diagnostics?.quality_source ?? "fixed_policy",

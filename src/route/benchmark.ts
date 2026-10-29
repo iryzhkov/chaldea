@@ -18,10 +18,11 @@ export function benchmarkCoverage(catalog: readonly CatalogProvider[], scores: S
     groups.set(p.driverKind, models);
     for (const m of p.models) {
       if (banned(m.id, bans)) continue;
-      const covered = benchmarkEfforts(m.id, exact).some(effort =>
+      const offered = benchmarkEfforts(m.id, exact).filter(effort =>
         m.options?.some(o => ["reasoningEffort", "effort", "variant"].includes(o.id) &&
-          o.type === "select" && o.options?.some(v => v.id === effort)) &&
-        scoreFor(scores, m.id, effort)?.benchmarkCostUSDPerTask != null);
+          o.type === "select" && o.options?.some(v => v.id === effort)));
+      if (!offered.length) continue;
+      const covered = offered.some(effort => scoreFor(scores, m.id, effort)?.benchmarkCostUSDPerTask != null);
       models.set(m.id, (models.get(m.id) ?? false) || covered);
     }
   }
