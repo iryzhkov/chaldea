@@ -42,9 +42,11 @@ existing thread or switch its provider.
 The router uses the cached T3 `server.getConfig` model/option descriptors that
 back `orchestrator_capabilities`. It preserves instance IDs, requires an
 enabled, installed, authenticated provider and checks exact model and option
-IDs. Environment-hidden model IDs are excluded using the same per-instance
-preferences as the native composer; the generic quota-observer catalog stays
-unchanged. All live drivers can participate once their exact model and effort have a
+IDs. When server-side model preferences are present, their per-instance hidden
+model IDs are excluded in every routing mode, including legacy mode and pins.
+A hidden pin cannot route. If preferences are null, FATE has no server-side
+hidden list to apply; unmigrated composer-local preferences are unavailable.
+The generic quota-observer catalog stays unchanged. All live drivers can participate once their exact model and effort have a
 reviewed AA mapping and probation evidence. Sonnet-family models are banned by
 default, including custom IDs containing Sonnet. Haiku is allowed. Models without
 the requested effort option are held. With no eligible candidate it returns an error, including for a review
