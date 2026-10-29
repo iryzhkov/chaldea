@@ -94,6 +94,24 @@ test("legacy history keys stay unchanged and exact xhigh skips prohibited heavy 
   const fallback = recommend({ role: "executor" }, { ...data(), quota: { codex: stopped } });
   assert.match(compactRoute(fallback).reasons.join(" "), /available fallback/);
 });
+test("probation admission precedes final provider quota ordering", () => {
+  const f = data();
+  f.scores.models = f.scores.models.map(s => s.model === "claude-fable-5-1" && s.effort === "medium"
+    ? { ...s, benchmarkCostUSDPerTask: .1 } : s);
+  f.history.seen["claude-fable-5-1"] = now;
+  f.history.allocations["claude-fable-5-1"] = { calls: 10, trials: 0 };
+  const common = { reasons: ["fixture"], remainingFraction: .62, reserveWeeks: 0,
+    observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null, observedAt: iso(now) };
+  const inputs = { ...f, quota: { claudeAgent: { observedAt: iso(now), activeStop: false, windows: [
+    { kind: "weekly", remainingPercent: 62, windowDurationMins: 10080, resetsAt: iso(now + .4 * 7 * 86400000) },
+  ] } }, capacity: { codex: { ...common, class: "unlimited" as const, creditFunded: true as const },
+    claudeAgent: { ...common, class: "use-it" as const } } };
+  assert.equal(recommend({ role: "general" }, inputs).providerInstanceId, "codex");
+  f.history.allocations["claude-fable-5-1"]!.trials = 1;
+  const result = recommend({ role: "general" }, inputs);
+  assert.equal(result.byProvider.claudeAgent?.model, "claude-opus-5-5");
+  assert.equal(result.providerInstanceId, "claudeAgent");
+});
 test("benchmark configuration and compact CLI preserve the selected native model and effort", () => {
   const scratch = routeScratch();
   try {

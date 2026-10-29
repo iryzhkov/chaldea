@@ -148,60 +148,63 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   }
   const preferCodex = input.role === "executor" && !pin;
   if (preferCodex) reasons.push("Executor prefers eligible Codex for long-running work and large contexts, ahead of expiring Claude quota");
-  const claude = eligible.filter(c => c.driver === "claudeAgent");
-  const pacedClaude = claude.filter(c => c.pace !== null);
-  const preferred: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent"
-    : pacedClaude.length ? "codex" : "claudeAgent";
-  const hasPace = pacedClaude.length > 0;
-  if (!preferCodex) reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
-  const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
-    if (preferCodex && (x.driver === "codex") !== (y.driver === "codex"))
-      return Number(y.driver === "codex") - Number(x.driver === "codex");
-    const rank = (c: typeof x) => {
-      if (!c.scopeKnown && !data.capacity?.[c.providerInstanceId]?.creditFunded) return data.capacity ? 2 : null;
-      const kind = data.capacity?.[c.providerInstanceId]?.class;
-      return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
-    };
-    const xr = rank(x), yr = rank(y);
-    if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
-    const underPaced = (c: typeof x) => c.driver === "claudeAgent" && c.pace !== null && c.pace >= config.paceMargin;
-    if (underPaced(x) !== underPaced(y)) return Number(underPaced(y)) - Number(underPaced(x));
-    if (xr !== null && yr !== null && xr !== yr) return xr - yr;
-    // Unknown and paced tie, preserving the role default when Claude pacing is unknown.
-    // Known quota preference takes precedence over a statistical tie-break.
-    if (hasPace && x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
-    if (x.driver === y.driver && x.pace !== y.pace) return (y.pace ?? -Infinity) - (x.pace ?? -Infinity);
-    if (scores && !pin && !benchmark) {
-      const xs = scoreFor(scores, x.model, effort)!, ys = scoreFor(scores, y.model, effort)!;
-      const objective = compareScores(input.role, xs, ys);
-      if (objective) return objective;
-    }
-    if (usable) {
-      const s = a.models[x.model], t = a.models[y.model];
-      if (s && t && s.turns >= config.minimumTurns && t.turns >= config.minimumTurns) {
-        const reliability = t.completionRate - s.completionRate;
-        if (reliability) return reliability;
-        if (s.minutesPerTurn !== null && t.minutesPerTurn !== null && s.minutesPerTurn !== t.minutesPerTurn)
-          return s.minutesPerTurn - t.minutesPerTurn;
+  const rankCandidates = (pool: typeof candidates, explain: boolean) => {
+    const claude = pool.filter(c => c.driver === "claudeAgent");
+    const pacedClaude = claude.filter(c => c.pace !== null);
+    const preferred: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent"
+      : pacedClaude.length ? "codex" : "claudeAgent";
+    const hasPace = pacedClaude.length > 0;
+    if (explain && !preferCodex) reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
+    const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
+      if (preferCodex && (x.driver === "codex") !== (y.driver === "codex"))
+        return Number(y.driver === "codex") - Number(x.driver === "codex");
+      const rank = (c: typeof x) => {
+        if (!c.scopeKnown && !data.capacity?.[c.providerInstanceId]?.creditFunded) return data.capacity ? 2 : null;
+        const kind = data.capacity?.[c.providerInstanceId]?.class;
+        return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
+      };
+      const xr = rank(x), yr = rank(y);
+      if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
+      const underPaced = (c: typeof x) => c.driver === "claudeAgent" && c.pace !== null && c.pace >= config.paceMargin;
+      if (underPaced(x) !== underPaced(y)) return Number(underPaced(y)) - Number(underPaced(x));
+      if (xr !== null && yr !== null && xr !== yr) return xr - yr;
+      // Unknown and paced tie, preserving the role default when Claude pacing is unknown.
+      // Known quota preference takes precedence over a statistical tie-break.
+      if (hasPace && x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
+      if (x.driver === y.driver && x.pace !== y.pace) return (y.pace ?? -Infinity) - (x.pace ?? -Infinity);
+      if (scores && !pin && !benchmark) {
+        const xs = scoreFor(scores, x.model, effort)!, ys = scoreFor(scores, y.model, effort)!;
+        const objective = compareScores(input.role, xs, ys);
+        if (objective) return objective;
       }
-    }
-    if (x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
-    return x.providerInstanceId.localeCompare(y.providerInstanceId);
+      if (usable) {
+        const s = a.models[x.model], t = a.models[y.model];
+        if (s && t && s.turns >= config.minimumTurns && t.turns >= config.minimumTurns) {
+          const reliability = t.completionRate - s.completionRate;
+          if (reliability) return reliability;
+          if (s.minutesPerTurn !== null && t.minutesPerTurn !== null && s.minutesPerTurn !== t.minutesPerTurn)
+            return s.minutesPerTurn - t.minutesPerTurn;
+        }
+      }
+      if (x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
+      return x.providerInstanceId.localeCompare(y.providerInstanceId);
+    };
+    if (benchmark) {
+      // Choose the cheapest pool model/effort per driver before comparing providers.
+      // Representatives keep cross-provider quota ordering independent of model price.
+      const localCompare = (x: typeof candidates[number], y: typeof candidates[number]) =>
+        compareBenchmark(x, y, scores!) || quotaCompare(x, y) || x.model.localeCompare(y.model) ||
+        targetEffort(x).localeCompare(targetEffort(y));
+      const representatives = new Map<string, typeof candidates[number]>();
+      for (const c of pool) {
+        const prior = representatives.get(c.driver);
+        if (!prior || localCompare(c, prior) < 0) representatives.set(c.driver, c);
+      }
+      const drivers = [...representatives.values()].sort(quotaCompare).map(c => c.driver);
+      pool.sort((x, y) => drivers.indexOf(x.driver) - drivers.indexOf(y.driver) || localCompare(x, y));
+    } else pool.sort(quotaCompare);
   };
-  if (benchmark) {
-    // Choose the cheapest eligible model/effort per driver before comparing providers.
-    // Representatives keep cross-provider quota ordering independent of model price.
-    const localCompare = (x: typeof candidates[number], y: typeof candidates[number]) =>
-      compareBenchmark(x, y, scores!) || quotaCompare(x, y) || x.model.localeCompare(y.model) ||
-      targetEffort(x).localeCompare(targetEffort(y));
-    const representatives = new Map<string, typeof candidates[number]>();
-    for (const c of eligible) {
-      const prior = representatives.get(c.driver);
-      if (!prior || localCompare(c, prior) < 0) representatives.set(c.driver, c);
-    }
-    const drivers = [...representatives.values()].sort(quotaCompare).map(c => c.driver);
-    eligible.sort((x, y) => drivers.indexOf(x.driver) - drivers.indexOf(y.driver) || localCompare(x, y));
-  } else eligible.sort(quotaCompare);
+  rankCandidates(eligible, !benchmark);
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
   if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target" + (benchmark ? "; " + Object.entries(diagnostics.benchmarkCoverage ?? {}).filter(([, c]) => !c.complete).map(([p, c]) => p + " missing benchmark coverage: " + c.missing.join(", ")).join("; ") : ""));
   if (input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
@@ -216,6 +219,8 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     return !held;
   });
   if (!eligible[0]) throw new RouteError("no_candidate", "No settled candidate while probation share is exhausted");
+  // Trial admission can replace a provider representative and its scoped quota.
+  if (benchmark) rankCandidates(eligible, true);
   const byProvider: RouteResult["byProvider"] = Object.fromEntries([...providerReasons].map(([driver, details]) => {
     const best = eligible.find(c => c.driver === driver);
     return [driver, best ? { ...target(best), eligible: true, reasons: [...new Set([...policyReasons, ...details]),

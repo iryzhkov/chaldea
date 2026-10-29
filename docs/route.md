@@ -444,6 +444,9 @@ advertised as fully compared. An exact effort request requires coverage at that
 effort. A fully measured model below the role floor counts as covered but remains
 ineligible. Per-provider recommendations use minimum cost, then intelligence,
 then operational tie-breaks. Quota ranks the resulting provider choices.
+After probation share admission, provider choices and quota ordering are
+recomputed from the surviving candidates; a held trial cannot keep deciding
+which provider wins. The separate topPick still describes the pre-draw choice.
 
 The producer emits version 1 by default. Set `scores.formatVersion: 2` on the
 existing homelab publisher only after consumers and the Akasha validator support
