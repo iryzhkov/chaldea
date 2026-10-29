@@ -3,7 +3,7 @@ import { loadCapacityConfig } from "../quota/capacity-config.ts";
 import { hostname } from "node:os";
 import type { ScoreTransport } from "./snapshot.ts";
 import { join } from "node:path";
-import { DEFAULT_POLICY } from "./types.ts";
+import { DEFAULT_POLICY, type Role } from "./types.ts";
 import type { PolicyConfig, QuotaWindow } from "./types.ts";
 import { tokenSource, type ClaudeTokenSource } from "./claude-usage.ts";
 
@@ -51,9 +51,18 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
   }
   if (r.benchmark !== undefined && r.benchmark !== null) {
     const b = r.benchmark as Record<string, unknown>;
-    if (!b || typeof b !== "object" || Array.isArray(b) || Object.keys(b).some(k => k !== "indexVersion") ||
+    if (!b || typeof b !== "object" || Array.isArray(b) || Object.keys(b).some(k => !["indexVersion", "anchors"].includes(k)) ||
         typeof b.indexVersion !== "string" || !/^[0-9]+(?:[.][0-9]+)?$/.test(b.indexVersion)) throw new Error("Invalid benchmark index policy");
     c.benchmark = { indexVersion: b.indexVersion };
+    if (b.anchors !== undefined) {
+      const anchors = b.anchors as Record<string, unknown>;
+      if (!anchors || typeof anchors !== "object" || Array.isArray(anchors) ||
+          Object.entries(anchors).some(([role, models]) => !Object.hasOwn(c.floors, role) ||
+            !Array.isArray(models) || models.length > 10 || new Set(models).size !== models.length ||
+            models.some(m => typeof m !== "string" || !/^[a-zA-Z0-9_.:/-]{1,160}$/.test(m))))
+        throw new Error("Invalid benchmark baseline anchors");
+      c.benchmark.anchors = anchors as Partial<Record<Role, string[]>>;
+    }
   }
   if (r.bans !== undefined) {
     if (!Array.isArray(r.bans) || r.bans.length > 100 || r.bans.some(b => typeof b !== "string" || !/^[a-zA-Z0-9_.*:/-]{1,160}$/.test(b))) throw new Error("Invalid model bans");

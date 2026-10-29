@@ -29,6 +29,8 @@ export function compareScores(role: Role, x: Score, y: Score): number {
   // An extra dollar per million tokens must buy two points of average quality.
   return ((y.intelligence + coding(y)) / 2 - 2 * price(y)) - ((x.intelligence + coding(x)) / 2 - 2 * price(x));
 }
+export const roleAnchors = (role: Role, config: PolicyConfig): readonly string[] =>
+  [...PAIRS[role], ...(config.benchmark?.anchors?.[role] ?? [])];
 export function targetEligible(model: string, effort: Effort, role: Role, scores: ScoreSnapshot,
   analytics: Analytics | null, config: PolicyConfig, now: number,
   incumbent: string, reasons: string[]): boolean {
@@ -40,7 +42,10 @@ export function targetEligible(model: string, effort: Effort, role: Role, scores
   }
   if (score.intelligence < config.floors[role]) { reasons.push(model + ": below AA intelligence floor " + config.floors[role]); return false; }
   // The fixed defaults are the bootstrapping incumbents, not new launches.
-  if (model === incumbent || (PAIRS[role] as readonly string[]).includes(model)) return true;
+  if (model === incumbent || roleAnchors(role, config).includes(model)) {
+    if (config.benchmark?.anchors?.[role]?.includes(model)) reasons.push(model + ": operator-calibrated benchmark baseline; measured floor and quota gates still apply");
+    return true;
+  }
   const s = analytics?.models[model], peer = analytics?.models[incumbent];
   if (!usableAnalytics(analytics, now, config) || !s || !peer || s.turns < config.minimumTurns || peer.turns < config.minimumTurns) {
     reasons.push(model + ": probation held; needs fresh Slopalytics and at least " + config.minimumTurns + " turns for candidate and current pick"); return false;
@@ -52,7 +57,7 @@ export function targetEligible(model: string, effort: Effort, role: Role, scores
   return true;
 }
 export function inProbation(model: string, role: Role, history: RoutingHistory, config: PolicyConfig, now: number): boolean {
-  return !(PAIRS[role] as readonly string[]).includes(model) && now - (history.seen[model] ?? now) < config.probationMs;
+  return !roleAnchors(role, config).includes(model) && now - (history.seen[model] ?? now) < config.probationMs;
 }
 export function trialAvailable(history: RoutingHistory, config: PolicyConfig, model: string): boolean {
   const a = history.allocations[model] ?? { calls: 0, trials: 0 };

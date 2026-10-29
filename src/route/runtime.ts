@@ -9,7 +9,7 @@ import { classifyCapacity } from "../quota/capacity.ts";
 import { loadCapacityConfig } from "../quota/capacity-config.ts";
 import { metricNow, newProvider } from "../quota/headroom.ts";
 import { discoverServerUrl, switchPort } from "../t3/adapter.ts";
-import type { SwitchProvider } from "../t3/adapter.ts";
+import type { SwitchProvider, CatalogModelPreferences } from "../t3/adapter.ts";
 import { readToken } from "../quota/run.ts";
 import { loadRouteConfig } from "./config.ts";
 import { collectClaudeUsage, claudeCacheFile, claudeSourceId } from "./claude-usage.ts";
@@ -25,12 +25,13 @@ import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
 /** The same cached provider/model descriptors used by orchestrator_capabilities.
  * Never starts a probe, refreshes a provider or launches a child.
  */
-export function routeCatalog(providers: ReadonlyArray<SwitchProvider>): CatalogProvider[] {
+export function routeCatalog(providers: ReadonlyArray<SwitchProvider>, preferences?: CatalogModelPreferences | null): CatalogProvider[] {
   return providers.map(p => ({
     providerInstanceId: p.instanceId, ...(p.quotaAccountKey ? { accountKey: p.quotaAccountKey } : {}), driverKind: p.driver,
     canRunChildTask: p.enabled && p.installed && p.availability !== "unavailable" &&
       ["ready", "warning"].includes(p.status) && p.auth.status === "authenticated",
-    models: p.models.map(m => ({ id: m.slug, options: m.capabilities?.optionDescriptors ?? [] })),
+    models: p.models.filter(m => !preferences?.[p.instanceId]?.hiddenModels.includes(m.slug))
+      .map(m => ({ id: m.slug, options: m.capabilities?.optionDescriptors ?? [] })),
   }));
 }
 export interface RouteOptions {
@@ -68,7 +69,8 @@ async function collectContext(options: RouteOptions) {
     try {
       const url = discoverServerUrl(config.t3BaseDir);
       if (!url) throw new Error();
-      catalog = routeCatalog((await switchPort({ serverUrl: url, token: readToken(config.tokenFile) }).catalog()).providers);
+      const snapshot = await switchPort({ serverUrl: url, token: readToken(config.tokenFile) }).catalog();
+      catalog = routeCatalog(snapshot.providers, snapshot.modelPreferences);
     } catch { throw new RouteError("catalog_unavailable", "T3 catalog unavailable; no routing recommendation"); }
   }
   const id = config.claudeUsage.providerInstanceId;

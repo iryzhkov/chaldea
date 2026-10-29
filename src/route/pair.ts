@@ -30,18 +30,24 @@ export function reviewPairInput(value: unknown): ReviewPairInput {
 export const pairTarget = (r: Target): Target => ({ providerInstanceId: r.providerInstanceId,
   model: r.model, options: r.options, ...(r.accountKey ? { accountKey: r.accountKey } : {}) });
 export type PairHistory = (input: RouteInput) => PolicyData["history"];
+/** Automatic benchmark efforts and exact overrides need the same selection/reservation key. */
+export function pairRequest(role: Role, driver: string, effort: Effort | undefined,
+  author: ReviewPairInput["authorProvider"], main: boolean, benchmark: boolean): RouteInput {
+  return { role, ...(effort !== undefined || !benchmark
+    ? { effortOverride: effort ?? (driver === "codex" ? "high" : "medium") } : {}),
+    ...(main && driver !== author ? { authorProvider: author } : {}) };
+}
 /** Pure selection over one snapshot. No launches, refreshes, quota grants or reservations. */
 export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, historyFor?: PairHistory): ReviewPairResult {
   const input = reviewPairInput(value), config = { ...DEFAULT_POLICY, ...data.config };
   const other = input.authorProvider === "codex" ? "claudeAgent" : "codex";
   const mainRole = input.mainRole ?? "builder", peerRole = input.peerRole ?? "builder";
   const choose = (driver: string, role: Role, effort: Effort | undefined, main: boolean, excluded?: string, alternate = false) => {
-    const request: RouteInput = { role, effortOverride: effort ?? (driver === "codex" ? "high" : "medium"),
-      ...(main && driver !== input.authorProvider ? { authorProvider: input.authorProvider } : {}) };
-    const pin = config.pins[role];
+    const pin = config.pins[role], benchmark = !!config.benchmark && !pin;
+    const request = pairRequest(role, driver, effort, input.authorProvider, main, benchmark);
     const model = driver === "codex" ? "gpt-6.1-sol" : "claude-opus-5-5";
     const catalog = data.catalog.filter(p => p.driverKind === driver).map(p => ({ ...p,
-      models: p.models.filter(m => m.id !== excluded && (pin || alternate || m.id === model)) }));
+      models: p.models.filter(m => m.id !== excluded && (benchmark || pin || alternate || m.id === model)) }));
     try {
       const history = historyFor?.(request) ?? data.history;
       const result = recommend(request, { ...data, catalog, ...(history ? { history } : {}) });
