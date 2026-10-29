@@ -273,7 +273,8 @@ An old lock can be cleared after its cadence; lock contention skips collection.
 
 The router fetches [the T3 usage dataset](https://slopalytics.com/data/t3-usage.json)
 at most once per day, including failures, retaining last successful aggregate
-data and `fetchedAt`. It aggregates exact model names and matching native
+data and `fetchedAt`. Schema versions 2 and 3 share the terminal/timing metrics
+used here; additional v3 token and spend fields do not affect routing. It aggregates exact model names and matching native
 harness rows over `start` through `endExclusive`: completion, failed and
 interrupted rates use terminal turns; minutes per turn uses timed turns.
 The name-to-T3 mapping lives in one table. Older model generations stay separate.
