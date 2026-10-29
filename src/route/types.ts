@@ -1,7 +1,7 @@
 import { RouteError } from "./errors.ts";
 import { MODEL_MAP } from "./scores.ts";
 export type Provider = string;
-export type Role = "builder" | "critical-review" | "bulk-read" | "general";
+export type Role = "builder" | "critical-review" | "bulk-read" | "general" | "executor";
 export type Effort = "low" | "medium" | "high" | "xhigh";
 export interface RouteInput { role: Role; authorProvider?: Provider; effortOverride?: Effort }
 export interface CatalogProvider {
@@ -66,13 +66,14 @@ export const DEFAULT_POLICY: PolicyConfig = {
   quotaMaxAgeMs: 15 * 60_000, analyticsMaxAgeMs: 21 * 86_400_000,
   scoreMaxAgeMs: 3 * 86_400_000, probationMs: 7 * 86_400_000, probationShare: 0.10,
   bans: ["*sonnet*"], pins: {},
-  floors: { builder: 50, "critical-review": 49, "bulk-read": 30, general: 48 },
+  floors: { builder: 50, "critical-review": 49, "bulk-read": 30, general: 48, executor: 48 },
 };
 export const PAIRS = {
   builder: ["claude-opus-5-5", "gpt-6.1-sol"],
   "critical-review": ["claude-fable-5-1", "gpt-6-astra"],
   "bulk-read": ["claude-haiku-5-5", "gpt-6-luna"],
   general: ["claude-opus-5-5", "gpt-6.1-sol"],
+  executor: ["claude-opus-5-5", "gpt-6.1-sol"],
 } as const;
 export const MODEL_NAMES: Record<string, string> = Object.fromEntries(MODEL_MAP.map(m => [m.analytics, m.model]));
 export function routeInput(value: unknown): RouteInput {

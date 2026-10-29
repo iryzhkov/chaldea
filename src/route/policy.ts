@@ -133,13 +133,17 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     });
     reasons.push("Slopalytics compares only the role pair; minimum sample applies to both models");
   }
+  const preferCodex = input.role === "executor" && !pin;
+  if (preferCodex) reasons.push("Executor prefers eligible Codex for long-running work and large contexts, ahead of expiring Claude quota");
   const claude = eligible.filter(c => c.driver === "claudeAgent");
   const pacedClaude = claude.filter(c => c.pace !== null);
   const preferred: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent"
     : pacedClaude.length ? "codex" : "claudeAgent";
   const hasPace = pacedClaude.length > 0;
-  reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
+  if (!preferCodex) reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
   eligible.sort((x, y) => {
+    if (preferCodex && (x.driver === "codex") !== (y.driver === "codex"))
+      return Number(y.driver === "codex") - Number(x.driver === "codex");
     const rank = (c: typeof x) => {
       if (!c.scopeKnown && !data.capacity?.[c.providerInstanceId]?.creditFunded) return data.capacity ? 2 : null;
       const kind = data.capacity?.[c.providerInstanceId]?.class;

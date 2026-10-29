@@ -14,7 +14,7 @@ thread. Chaldea recommends only.
 {"role":"critical-review","authorProvider":"codex"}
 ```
 
-Input roles are `builder`, `critical-review`, `bulk-read` and `general`.
+Input roles are `builder`, `critical-review`, `bulk-read`, `general` and `executor`.
 `authorProvider` forces a review onto the other driver. `effortOverride` accepts
 only `low`, `medium`, `high` and `xhigh`. CLI equivalents are `--role`,
 `--author-provider` and `--effort`. Max and higher efforts are rejected.
@@ -27,6 +27,17 @@ Fallbacks when no AA snapshot exists:
 | critical-review | Fable 5.1 | Astra | medium |
 | bulk-read | Haiku 5.5 | Luna 6 | medium |
 | general | Opus 5.5 | Sol 6.1 | medium |
+| executor | Opus 5.5 | Sol 6.1 | medium |
+
+Use `chaldea route --role executor` for roadmap execution and other long-running
+work with large, persistent contexts. This role prefers eligible Codex candidates
+before quota pacing, including when Claude has unused quota near its reset.
+It uses the general intelligence floor and score objective. Pins still override
+the preference, and availability, effort, quality, probation, reliability, quota
+stops and review separation still gate eligibility. If no eligible Codex remains,
+the usual policy ranks the remaining candidates. Bounded builders and reviewers
+keep their existing roles. Routing recommends a target; it does not migrate an
+existing thread or switch its provider.
 
 The router uses the cached T3 `server.getConfig` model/option descriptors that
 back `orchestrator_capabilities`. It preserves instance IDs, requires an
