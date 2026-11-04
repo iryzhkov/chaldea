@@ -85,7 +85,7 @@ test("ongoing stream recheck observes trust removal and expiry deadline", async 
     assert.equal(session.validUntil, N + 90);
     await session.recheck();
     await r.trust.install(await r.sign({ ...r.bundle, sequence: 2, keys: [] }));
-    await assert.rejects(() => session.recheck(), /unknown_key/);
+    await assert.rejects(() => session.recheck(), /trust_changed/);
   } finally { r.remove(); }
 });
 test("trust install is authenticated; same sequence retry cannot extend freshness", async () => {
