@@ -80,10 +80,9 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
   const kind = q.get("kind") || (scope.missionControlSources ? "agent_status" :
     scope.routeScores && scope.source === "route" ? "route_score_snapshot" :
     scope.quotaFleet && scope.source === "quota" ? "quota_headroom_snapshot" : undefined);
-  const generation = store.pruneMark().gen;
+  const generation = store.pruneGeneration();
   const fresh = (g: number, position: number) => {
-    const mark = store.pruneMark(kind);
-    ensure(mark.gen <= g || mark.seq <= position, "cursor_expired_reset", 410);
+    ensure(store.cursorFresh(kind, g, position), "cursor_expired_reset", 410);
   };
   let seq = 0;
   if (q.has("cursor")) {
@@ -94,9 +93,10 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
     catch { throw new HttpError(400, "invalid_cursor"); }
     ensure(c.v === 1 && c.binding === binding && Number.isSafeInteger(c.seq) && (c.seq as number) >= 0, "invalid_cursor");
     ensure(c.g !== undefined && c.r !== undefined, "cursor_expired_reset", 410);
-    ensure(Number.isSafeInteger(c.g) && (c.g as number) >= 0 && (c.g as number) <= generation &&
+    ensure(Number.isSafeInteger(c.g) && (c.g as number) >= 0 &&
       typeof c.r === "string" && /^[a-f0-9-]{36}$/.test(c.r), "invalid_cursor");
     ensure(c.epoch === store.get("epoch") && c.r === store.run, "cursor_expired_reset", 410);
+    ensure((c.g as number) <= generation, "invalid_cursor");
     fresh(c.g as number, c.seq as number);
     seq = c.seq as number;
   }

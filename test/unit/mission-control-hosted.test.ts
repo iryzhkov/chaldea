@@ -197,7 +197,7 @@ test("collector yields a slow ordinary drain after durable ACKs and both lanes p
   const d=scratch(),file=join(d.path,"snapshot.json"),db=join(d.path,"sliced.db");
   let now=now0,o=new Outbox(db);const ordinary:string[]=[],statuses:number[]=[];
   try{
-    for(let i=0;i<7;i++)o.admit({key:"ordinary-"+i,source:"agent-a.toolfeedback",host:"agent-a",payload:{v:1,kind:"tool_call"}},"input",{generation:"fixture",dev:"0",ino:"1",offset:i+1,prefix:"",prefixLength:0,tail:""});
+    for(let i=0;i<70;i++)o.admit({key:"ordinary-"+i,source:"agent-a.toolfeedback",host:"agent-a",payload:{v:1,kind:"tool_call"}},"input",{generation:"fixture",dev:"0",ino:"1",offset:i+1,prefix:"",prefixLength:0,tail:""});
     for(let seq=1;seq<=4;seq++){
       writeFileSync(file,JSON.stringify(sample(seq,now)),{mode:0o600});
       const start=now;let delivered=0,first=true;
@@ -207,11 +207,11 @@ test("collector yields a slow ordinary drain after durable ACKs and both lanes p
         else {ordinary.push(e.key);delivered++;now+=1100;}
         return true;
       }});
-      assert.ok(delivered>=1&&delivered<=2);assert.ok(now-start<=3100,"two-second slice plus one request");
+      assert.ok(delivered>=1&&delivered<=19);assert.ok(now-start<=21100,"twenty-second slice plus one request");
       assert.equal(o.cursor("input")!.offset,ordinary.length);
       o.close();o=new Outbox(db);now+=5000;
     }
-    assert.deepEqual(statuses,[1,2,3,4]);assert.deepEqual(ordinary,Array.from({length:7},(_,i)=>"ordinary-"+i));
+    assert.deepEqual(statuses,[1,2,3,4]);assert.deepEqual(ordinary,Array.from({length:70},(_,i)=>"ordinary-"+i));
     assert.equal(o.next(),null);
   }finally{o.close();d.close();}
 });

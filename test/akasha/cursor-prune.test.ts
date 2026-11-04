@@ -81,6 +81,48 @@ test("a prune during page streaming cannot produce a complete response with a si
     assert.throws(() => p.next(), /cursor_expired_reset/);
   } finally { f.close(); }
 });
+test("earlier high deletions do not poison fresh cursors after later below-position prune", () => {
+  for (const kind of ["feed_post", ""]) {
+    const f = fixture();
+    try {
+      f.store.db.prepare("UPDATE events SET expiry=? WHERE seq=4").run(N - 1);
+      f.store.prune(N);
+      f.store.put("floor", "999999");
+      const first = page(f.store, query(kind)), second = page(f.store, next(query(kind), first.cursor));
+      f.store.db.prepare("UPDATE events SET expiry=? WHERE seq=1").run(N - 1);
+      f.store.prune(N);
+      assert.equal(page(f.store, next(query(kind), second.cursor)).rows[0]!.event_id, event(3).event_id);
+    } finally { f.close(); }
+  }
+});
+test("a later below-position prune cannot hide an earlier unseen deletion since cursor issue", () => {
+  const f = fixture();
+  try {
+    const first = page(f.store);
+    f.store.db.prepare("UPDATE events SET expiry=? WHERE seq=4").run(N - 1);
+    f.store.prune(N);
+    f.store.db.prepare("UPDATE events SET expiry=? WHERE seq=1").run(N - 1);
+    f.store.prune(N);
+    assert.throws(() => page(f.store, next(query(), first.cursor)), /cursor_expired_reset/);
+  } finally { f.close(); }
+});
+test("bounded prune history fails closed when an old generation is discarded", () => {
+  const f = fixture();
+  try {
+    for (let i = 5; i <= 70; i++) f.store.admit(event(i), hash("fixture-" + i), N);
+    project(f.store);
+    const first = page(f.store);
+    for (let seq = 70; seq >= 5; seq--) {
+      f.store.db.prepare("UPDATE events SET expiry=? WHERE seq=?").run(N - 1, seq);
+      f.store.prune(N);
+    }
+    assert.throws(() => page(f.store, next(query(), first.cursor)), /cursor_expired_reset/);
+    const fresh = page(f.store);
+    assert.equal(page(f.store, next(query(), fresh.cursor)).rows[0]!.event_id, event(2).event_id);
+    assert.equal(JSON.parse(f.store.get("prune_kind:feed_post")!).rows.length, 64);
+    assert.ok(Buffer.byteLength(f.store.get("prune_kind:feed_post")!) < 4096);
+  } finally { f.close(); }
+});
 test("legacy cursors reset, malformed generations and query changes refuse, reopen resets", () => {
   const f = fixture();
   let reopened: EventStore | undefined;

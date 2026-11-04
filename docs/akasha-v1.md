@@ -246,7 +246,11 @@ seq, query/scope binding, prune generation and a process nonce. Restart and lega
 cursors return 410/reset. A cursor also resets when a prune since its issue
 deleted a matching kind above its position. Deletions before issue do not poison
 new traversals, and unrelated status expiry does not reset `kind=tool_call`.
-Unfiltered queries conservatively track all kinds. Page streaming rechecks the
+Unfiltered queries conservatively track all kinds. Bounded per-kind and global
+deletion histories retain up to 64 non-dominated generation/sequence pairs.
+Cursors older than discarded history reset rather than assuming completeness.
+Reservations include 4096 bytes per metadata row for the bounded history.
+Page streaming rechecks the
 generation before returning rows and completion, so pruning cannot silently omit
 selected rows. The old global floor remains maintained for runtime rollback.
 No DDL or open-time writes are required; database format stays version 1.
