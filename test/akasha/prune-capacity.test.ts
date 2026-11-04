@@ -244,7 +244,12 @@ test("refusal after tag commit preserves visible state and resumes after reopen"
     store.close();
     store = new EventStore(join(dir.path, "events.db"));
     store.budget.wal = 4 * MAX_ENVELOPE;
-    assert.deepEqual(visible(), before, "partial tag cleanup survives reopen invisibly");
+    const reopened = visible();
+    assert.notEqual(reopened.cursor, before.cursor, "restart resets the cursor nonce");
+    assert.throws(() => eventPage(store, new URLSearchParams({ limit: "1", cursor: before.cursor! }), scope, N), /cursor_expired_reset/);
+    const decode = (cursor: string) => { const { r, ...rest } = JSON.parse(Buffer.from(cursor, "base64url").toString()); return rest; };
+    assert.deepEqual(decode(reopened.cursor!), decode(before.cursor!));
+    assert.deepEqual({ ...reopened, cursor: before.cursor }, before, "partial tag cleanup survives reopen invisibly");
     assert.equal(store.prune(N), 1);
     assert.equal(store.receipt(e.event_id)?.state, "tombstone");
     assert.equal(store.scalar("SELECT count(*) FROM events"), 1);
