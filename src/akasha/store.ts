@@ -59,6 +59,36 @@ export function scopeSql(scope: Scope, prefix = ""): Query {
 }
 export class EventStore {
   readonly db: DatabaseSync; readonly path: string; readonly budget: Budget;
+  // A restart also covers an intervening rollback whose runtime did not track generations.
+  readonly run = randomUUID();
+  pruneGeneration(): number {
+    const gen = Number(this.get("prune_gen") ?? 0);
+    ensure(Number.isSafeInteger(gen) && gen >= 0, "invalid_prune_mark", 503);
+    return gen;
+  }
+  private pruneMark(kind?: string): { discarded: number; rows: [number, number][] } {
+    const mark = JSON.parse(this.get(kind ? "prune_kind:" + kind : "prune_all") ?? '{"discarded":0,"rows":[]}');
+    ensure(Number.isSafeInteger(mark.discarded) && mark.discarded >= 0 &&
+      Array.isArray(mark.rows) && mark.rows.length <= 64 &&
+      mark.rows.every((r: number[], i: number) => Array.isArray(r) && r.length === 2 &&
+        r.every(n => Number.isSafeInteger(n) && n >= 0) &&
+        r[0]! > (i ? mark.rows[i - 1][0] : mark.discarded) &&
+        (!i || r[1]! < mark.rows[i - 1][1])), "invalid_prune_mark", 503);
+    return mark;
+  }
+  cursorFresh(kind: string | undefined, generation: number, position: number): boolean {
+    const mark = this.pruneMark(kind);
+    return generation >= mark.discarded &&
+      mark.rows.every(([gen, seq]) => gen <= generation || seq <= position);
+  }
+  private recordPrune(kind: string | undefined, gen: number, seq: number): void {
+    const mark = this.pruneMark(kind);
+    // A newer, higher deletion dominates older lower deletions for every cursor.
+    while (mark.rows.length && mark.rows.at(-1)![1] <= seq) mark.rows.pop();
+    mark.rows.push([gen, seq]);
+    if (mark.rows.length > 64) mark.discarded = mark.rows.shift()![0];
+    this.put(kind ? "prune_kind:" + kind : "prune_all", JSON.stringify(mark));
+  }
   alarm: string | null = null;
   private readonly outbox: Outbox<Pending>;
   private readonly receiptWaiters = new Map<string, Set<() => void>>();
@@ -438,7 +468,7 @@ export class EventStore {
   }
   prune(now: number, max = 100): number {
     ensure(Number.isInteger(max) && max > 0 && max <= 100, "invalid_prune_batch");
-    type Victim = { seq: number; event_id: string };
+    type Victim = { seq: number; event_id: string; kind: string };
     const depths = new Map<string, { depth: number; pages: number }[]>();
     const fits = (estimate: number) => estimate * 4 + 128 * 1024 < this.budget.wal;
     // JSON encoding overcounts escaping; repeated fields charge every receipt
@@ -448,11 +478,11 @@ export class EventStore {
       issuer,profile,profile,project,project,source,source,host,expires,expires,expires
     ) AS BLOB)) AS bytes FROM receipts WHERE event_id=?`);
     // Two index-ordered selections: never CASE/OR over the whole retained table.
-    let candidates = this.db.prepare("SELECT seq,event_id FROM events WHERE expiry<=? ORDER BY expiry,seq LIMIT ?")
+    let candidates = this.db.prepare("SELECT seq,event_id,kind FROM events WHERE expiry<=? ORDER BY expiry,seq LIMIT ?")
       .all(now, max) as unknown as Victim[];
     const pressure = (this.scalar("PRAGMA page_count") - this.scalar("PRAGMA freelist_count")) * 4096 > this.budget.main * 0.85;
     if (!candidates.length && pressure) candidates = this.db.prepare(
-      "SELECT seq,event_id FROM events ORDER BY received_at,seq LIMIT ?").all(max) as unknown as Victim[];
+      "SELECT seq,event_id,kind FROM events ORDER BY received_at,seq LIMIT ?").all(max) as unknown as Victim[];
     const eventBytes = this.db.prepare(`SELECT
       length(CAST(envelope AS BLOB))+512+length(CAST(json_array(
         event_id,event_id,issuer,issuer,profile,profile,project,project,project,
@@ -471,11 +501,12 @@ export class EventStore {
       const nextBytes = bytes + Number(event.bytes) +
         Number(feed?.bytes ?? 0) + Number(receiptBytes.get(row.event_id)?.bytes ?? 0);
       const nextFeeds = feeds + Number(!!feed);
+      const metaRows = 3 + new Set([...victims.map(v => v.kind), row.kind]).size;
       const next = this.pruneEstimate([
         { table: "events", rows: victims.length + 1, deleting: true }, { table: "receipts", rows: victims.length + 1, stateOnly: true },
         { table: "feed_entries", rows: nextFeeds, deleting: true },
-        { table: "meta", rows: 1 },
-      ], nextBytes, depths);
+        { table: "meta", rows: metaRows },
+      ], nextBytes + metaRows * 4096, depths);
       if (victims.length && (!fits(next) || nextBytes > 1024 ** 2)) break;
       victims.push(row); bytes = nextBytes; feeds = nextFeeds; estimate = next;
     }
@@ -485,6 +516,13 @@ export class EventStore {
       const tags = this.db.prepare(PRUNE_TAG_ROWS);
       for (const row of victims) ensure(!tags.get(row.seq), "prune_page_estimate", 503);
       let floor = Number(this.get("floor"));
+      const gen = this.pruneGeneration() + 1;
+      ensure(Number.isSafeInteger(gen), "invalid_prune_mark", 503);
+      const marks = new Map<string, number>();
+      for (const row of victims) marks.set(row.kind, Math.max(marks.get(row.kind) ?? 0, row.seq));
+      this.put("prune_gen", String(gen));
+      for (const [kind, seq] of marks) this.recordPrune(kind, gen, seq);
+      this.recordPrune(undefined, gen, Math.max(...victims.map(row => row.seq)));
       for (const row of victims) {
         this.db.prepare("UPDATE receipts SET state='tombstone' WHERE event_id=?").run(row.event_id);
         this.db.prepare("DELETE FROM events WHERE seq=?").run(row.seq); floor = Math.max(floor, row.seq);

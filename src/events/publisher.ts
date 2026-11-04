@@ -32,6 +32,29 @@ export async function helperToken(helper: string, event: Publication, action: "a
     child.once("close", code => finish(code === 0));
   });
 }
+/** A collector invocation may reuse only the same source/host/kind lease.
+ * The server still verifies each request. No bearer survives this invocation.
+ */
+export function publisherForRun(options: PublisherOptions = {}, now = Date.now): PublisherOptions {
+  const leases = new Map<string, { token: string; until: number }>();
+  return { ...options, token: async event => {
+    const key = JSON.stringify([event.source, event.host, event.payload.kind]);
+    const cached = leases.get(key);
+    if (cached && now() < cached.until) return cached.token;
+    leases.delete(key);
+    const token = await (options.token ? options.token(event) :
+      helperToken(options.helper ?? eventsConfig().tokenHelper ?? "", event));
+    // Decoding expiry is only a cache hint, never an authorization decision.
+    try {
+      const exp = JSON.parse(Buffer.from(token.split(".")[1]!, "base64url").toString()).exp;
+      if (Number.isSafeInteger(exp)) {
+        const until = Math.min(now() + 20_000, exp * 1000 - 5_000);
+        if (until > now()) leases.set(key, { token, until });
+      }
+    } catch { /* Unparseable leases retain the existing per-request mint behavior. */ }
+    return token;
+  } };
+}
 type PublicationResult = "visible" | "expired" | "deferred";
 /** Preserve ordinary terminal acknowledgement semantics, including tombstones. */
 export async function publish(event: Publication, options: PublisherOptions = {}): Promise<boolean> {

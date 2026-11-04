@@ -116,6 +116,7 @@ test("blocked reader prevents event tombstoning, cascades and floor writes", () 
     for (let i = 0; store.walBytes() < store.budget.wal - 128 * 1024; i++)
       store.put("churn", String(i % 10).repeat(16 * 1024));
     const before = store.walBytes(), floor = store.get("floor"), cursor = store.cursor("nats");
+    const marks = store.db.prepare("SELECT * FROM meta WHERE name LIKE 'prune_%' ORDER BY name").all();
     const spill = store.scalar("PRAGMA cache_spill"), samples = observe(store);
     assert.throws(() => store.prune(N), /checkpoint_blocked|wal_capacity/);
     assert.equal(samples.length, 0);
@@ -126,6 +127,7 @@ test("blocked reader prevents event tombstoning, cascades and floor writes", () 
     assert.equal(store.scalar("SELECT count(*) FROM feed_entries"), 1);
     assert.equal(store.scalar("SELECT count(*) FROM event_tags"), 1);
     assert.equal(store.get("floor"), floor);
+    assert.deepEqual(store.db.prepare("SELECT * FROM meta WHERE name LIKE 'prune_%' ORDER BY name").all(), marks);
     assert.equal(store.cursor("nats"), cursor);
     assert.equal(store.pending(N).length, 1);
     reader.exec("ROLLBACK"); reader.close(); reader = undefined;
@@ -242,7 +244,12 @@ test("refusal after tag commit preserves visible state and resumes after reopen"
     store.close();
     store = new EventStore(join(dir.path, "events.db"));
     store.budget.wal = 4 * MAX_ENVELOPE;
-    assert.deepEqual(visible(), before, "partial tag cleanup survives reopen invisibly");
+    const reopened = visible();
+    assert.notEqual(reopened.cursor, before.cursor, "restart resets the cursor nonce");
+    assert.throws(() => eventPage(store, new URLSearchParams({ limit: "1", cursor: before.cursor! }), scope, N), /cursor_expired_reset/);
+    const decode = (cursor: string) => { const { r, ...rest } = JSON.parse(Buffer.from(cursor, "base64url").toString()); return rest; };
+    assert.deepEqual(decode(reopened.cursor!), decode(before.cursor!));
+    assert.deepEqual({ ...reopened, cursor: before.cursor }, before, "partial tag cleanup survives reopen invisibly");
     assert.equal(store.prune(N), 1);
     assert.equal(store.receipt(e.event_id)?.state, "tombstone");
     assert.equal(store.scalar("SELECT count(*) FROM events"), 1);
