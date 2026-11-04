@@ -69,16 +69,14 @@ export class Authorization {
     ensure(action !== "read" || r.mode !== "report", "append_only", 403);
     const identity: Identity = { issuer: c.iss, profile: c.sub, project: c.project, source: c.source!,
       host: c.host!, source_id: r.source_id, run_id: c.run_id };
-    const clock = this.clock, trust = this.trust;
-    let sequence: number | undefined;
+    let checked = false;
     return { identity, registration: r, access,
       scope: { ...(action === "read" && r.mission_control_read_sources ? { missionControlSources: [...r.mission_control_read_sources] } : {}), issuer: c.iss, profile: c.sub, project: c.project, source: c.source!, host: c.host!, global: r.global_read === true, routeScores: action === "read" && r.route_scores_read === true, quotaFleet: action === "read" && r.quota_fleet_read === true },
       async recheck() {
-        const bundle = await trust.snapshot(); await access.recheck(); trust.assertCurrent(bundle.sequence);
-        ensure(clock.check() < access.validUntil, "expired", 401); sequence = bundle.sequence;
+        checked = false;
+        access.checkCurrent(); checked = true;
       },
-      checkCommit() { ensure(sequence !== undefined, "recheck_required", 401); trust.assertCurrent(sequence);
-        ensure(clock.check() < access.validUntil, "expired", 401); },
+      checkCommit() { ensure(checked, "recheck_required", 401); access.checkCurrent(); },
     };
   }
   validateDelivery(event: import("./schema.ts").Envelope): void {

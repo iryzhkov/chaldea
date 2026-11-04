@@ -101,7 +101,7 @@ try {
     host: registration.host, source_id: registration.source_id, run_id: "service-lease-1" };
   const p: Principal = { identity, scope: { issuer: identity.issuer, profile: identity.profile, project: identity.project,
     source: identity.source, host: identity.host, global: false }, registration: { ...registration, mode: "service" },
-    access: { claims: {} as never, validUntil: N + 300, async recheck() {} }, async recheck() {}, checkCommit() {} };
+    access: { claims: {} as never, validUntil: N + 300, async recheck() {}, checkCurrent() {} }, async recheck() {}, checkCommit() {} };
   const auth = { clock: { check: now } } as unknown as Authorization;
   let ingress = new Ingress(auth, store, () => {}, { waitMs: 0 }); ingress.rate = () => {};
   const publish = async (i: number) => {

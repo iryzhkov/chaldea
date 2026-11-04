@@ -131,6 +131,7 @@ export function validateBundle(value: unknown): TrustBundle {
 }
 interface KeyHistory { x: string; not_before: number; issue_until: number; verify_until: number; removed: boolean }
 export class TrustStore {
+  #snapshots = new WeakMap<TrustBundle, { raw: string; bundle: TrustBundle }>();
   readonly anchors: TrustAnchor[];
   readonly state: AccessState;
   readonly clock: Clock;
@@ -188,7 +189,24 @@ export class TrustStore {
     const saved = JSON.parse(raw) as { sequence: number; envelope: string };
     const bundle = await this.authenticate(saved.envelope); this.fresh(bundle);
     requireAccess(this.state.get("trust") === raw, "trust_changed");
+    this.#snapshots.set(bundle, { raw, bundle: structuredClone(bundle) });
     return bundle;
+  }
+  /** Bind only an authenticated snapshot, retaining private immutable proof. Each call
+   * freshly reads durable trust and commits the health/rollback high-water check.
+   * No caller-supplied time or unchecked bundle can authorize ongoing work. */
+  currentCheck(snapshot: TrustBundle): () => number {
+    const proof = this.#snapshots.get(snapshot);
+    requireAccess(proof, "unverified_trust");
+    const { raw, bundle } = proof;
+    return () => {
+      requireAccess(this.state.get("trust") === raw, "trust_changed");
+      const now = this.clock.check();
+      // A competing process may install revocation while clock.check waits for its lock.
+      requireAccess(this.state.get("trust") === raw, "trust_changed");
+      requireAccess(bundle.published_at <= now + MAX_SKEW_SECONDS && now < bundle.expires_at, "stale_trust");
+      return now;
+    };
   }
   assertCurrent(sequence: number): void {
     const raw = this.state.get("trust"); requireAccess(raw, "missing_trust");

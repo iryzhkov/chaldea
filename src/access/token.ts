@@ -130,10 +130,13 @@ export interface VerifiedAccess {
   validUntil: number;
   /** Revalidate before every operation/chunk and after waits; observes trust removal and clocks. */
   recheck(): Promise<void>;
+  /** Synchronous equivalent for commit guards; never retains a time-based authorization. */
+  checkCurrent(): void;
 }
 export async function verifyToken(
   token: unknown, operation: Operation, trust: TrustStore, clock: Clock, skew = MAX_SKEW_SECONDS,
 ): Promise<VerifiedAccess> {
+  requireAccess(clock === trust.clock, "invalid_trust_clock");
   requireAccess(Number.isInteger(skew) && skew >= 0 && skew <= MAX_SKEW_SECONDS, "invalid_skew");
   operation = structuredClone(operation);
   audienceName(operation.audience); resourceName(operation.resource); identifier(operation.action);
@@ -143,17 +146,26 @@ export async function verifyToken(
   const claims = validateClaims(strictJson(payload, true));
   requireAccess(claims.aud === operation.audience, "wrong_audience");
   const bundle = await trust.snapshot();
+  const currentTrust = trust.currentCheck(bundle);
   const key = bundle.keys.find(k => k.issuer === claims.iss && k.kid === header.kid);
   requireAccess(key, "unknown_key");
   await compactVerify(token as string, await importJWK(key.public_key, "EdDSA"), { algorithms: ["EdDSA"] });
-  trust.assertCurrent(bundle.sequence);
-  const now = clock.check();
+  // Exact durable bytes must still match after both asynchronous signature steps.
+  const now = currentTrust();
   checkTime(claims, key, now, skew);
   requireAccess(allows(claims, key), "issuer_ceiling");
   requireAccess(claims.grants.some(g => g.resource === operation.resource && g.actions.includes(operation.action)), "forbidden");
+  const validUntil = Math.min(claims.exp, key.verify_until, bundle.expires_at);
+  const checkCurrent = () => {
+    const now = currentTrust();
+    checkTime(claims, key, now, skew);
+    requireAccess(now < validUntil, "token_time");
+    requireAccess(allows(claims, key), "issuer_ceiling");
+    requireAccess(claims.grants.some(g => g.resource === operation.resource && g.actions.includes(operation.action)), "forbidden");
+  };
   return {
-    claims,
-    validUntil: Math.min(claims.exp, key.verify_until, bundle.expires_at),
-    async recheck() { await verifyToken(token, operation, trust, clock, skew); },
+    // Consumers may annotate their copy without modifying the authenticated proof.
+    claims: structuredClone(claims), validUntil, checkCurrent,
+    async recheck() { checkCurrent(); },
   };
 }
