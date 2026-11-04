@@ -129,7 +129,8 @@ test("Mission Control candidates seek constrained kind through real eventPage pa
     assert.throws(() => eventPage(store, query(), { ...scope, missionControlOperations: "report" }, N), /operations_selector_required/);
     const expired = eventPage(store, query(), scope, N + 3600);
     assert.deepEqual([...expired.rows], []); assert.equal(expired.next(), null);
-    store.put("floor", String(sequences[128]));
+    store.db.prepare("UPDATE events SET expiry=? WHERE seq=?").run(N - 1, sequences[128]!);
+    store.prune(N);
     assert.throws(() => eventPage(store, bound, scope, N), /cursor_expired_reset/);
     store.put("floor", "0"); store.put("epoch", "replaced");
     assert.throws(() => eventPage(store, bound, scope, N), /cursor_expired_reset/);

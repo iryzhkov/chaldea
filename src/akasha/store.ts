@@ -59,6 +59,15 @@ export function scopeSql(scope: Scope, prefix = ""): Query {
 }
 export class EventStore {
   readonly db: DatabaseSync; readonly path: string; readonly budget: Budget;
+  // A restart also covers an intervening rollback whose runtime did not track generations.
+  readonly run = randomUUID();
+  pruneMark(kind?: string): { gen: number; seq: number } {
+    const mark = kind ? JSON.parse(this.get("prune_kind:" + kind) ?? '{"gen":0,"seq":0}') :
+      { gen: Number(this.get("prune_gen") ?? 0), seq: Number(this.get("floor") ?? 0) };
+    ensure(Number.isSafeInteger(mark.gen) && mark.gen >= 0 &&
+      Number.isSafeInteger(mark.seq) && mark.seq >= 0, "invalid_prune_mark", 503);
+    return mark;
+  }
   alarm: string | null = null;
   private readonly outbox: Outbox<Pending>;
   private readonly receiptWaiters = new Map<string, Set<() => void>>();
@@ -438,7 +447,7 @@ export class EventStore {
   }
   prune(now: number, max = 100): number {
     ensure(Number.isInteger(max) && max > 0 && max <= 100, "invalid_prune_batch");
-    type Victim = { seq: number; event_id: string };
+    type Victim = { seq: number; event_id: string; kind: string };
     const depths = new Map<string, { depth: number; pages: number }[]>();
     const fits = (estimate: number) => estimate * 4 + 128 * 1024 < this.budget.wal;
     // JSON encoding overcounts escaping; repeated fields charge every receipt
@@ -448,11 +457,11 @@ export class EventStore {
       issuer,profile,profile,project,project,source,source,host,expires,expires,expires
     ) AS BLOB)) AS bytes FROM receipts WHERE event_id=?`);
     // Two index-ordered selections: never CASE/OR over the whole retained table.
-    let candidates = this.db.prepare("SELECT seq,event_id FROM events WHERE expiry<=? ORDER BY expiry,seq LIMIT ?")
+    let candidates = this.db.prepare("SELECT seq,event_id,kind FROM events WHERE expiry<=? ORDER BY expiry,seq LIMIT ?")
       .all(now, max) as unknown as Victim[];
     const pressure = (this.scalar("PRAGMA page_count") - this.scalar("PRAGMA freelist_count")) * 4096 > this.budget.main * 0.85;
     if (!candidates.length && pressure) candidates = this.db.prepare(
-      "SELECT seq,event_id FROM events ORDER BY received_at,seq LIMIT ?").all(max) as unknown as Victim[];
+      "SELECT seq,event_id,kind FROM events ORDER BY received_at,seq LIMIT ?").all(max) as unknown as Victim[];
     const eventBytes = this.db.prepare(`SELECT
       length(CAST(envelope AS BLOB))+512+length(CAST(json_array(
         event_id,event_id,issuer,issuer,profile,profile,project,project,project,
@@ -471,11 +480,12 @@ export class EventStore {
       const nextBytes = bytes + Number(event.bytes) +
         Number(feed?.bytes ?? 0) + Number(receiptBytes.get(row.event_id)?.bytes ?? 0);
       const nextFeeds = feeds + Number(!!feed);
+      const metaRows = 2 + new Set([...victims.map(v => v.kind), row.kind]).size;
       const next = this.pruneEstimate([
         { table: "events", rows: victims.length + 1, deleting: true }, { table: "receipts", rows: victims.length + 1, stateOnly: true },
         { table: "feed_entries", rows: nextFeeds, deleting: true },
-        { table: "meta", rows: 1 },
-      ], nextBytes, depths);
+        { table: "meta", rows: metaRows },
+      ], nextBytes + metaRows * 256, depths);
       if (victims.length && (!fits(next) || nextBytes > 1024 ** 2)) break;
       victims.push(row); bytes = nextBytes; feeds = nextFeeds; estimate = next;
     }
@@ -485,6 +495,12 @@ export class EventStore {
       const tags = this.db.prepare(PRUNE_TAG_ROWS);
       for (const row of victims) ensure(!tags.get(row.seq), "prune_page_estimate", 503);
       let floor = Number(this.get("floor"));
+      const gen = this.pruneMark().gen + 1;
+      ensure(Number.isSafeInteger(gen), "invalid_prune_mark", 503);
+      const marks = new Map<string, number>();
+      for (const row of victims) marks.set(row.kind, Math.max(marks.get(row.kind) ?? this.pruneMark(row.kind).seq, row.seq));
+      this.put("prune_gen", String(gen));
+      for (const [kind, seq] of marks) this.put("prune_kind:" + kind, JSON.stringify({ gen, seq }));
       for (const row of victims) {
         this.db.prepare("UPDATE receipts SET state='tombstone' WHERE event_id=?").run(row.event_id);
         this.db.prepare("DELETE FROM events WHERE seq=?").run(row.seq); floor = Math.max(floor, row.seq);

@@ -189,7 +189,7 @@ vacuum/free-page reuse/checkpoints reclaim space without a full vacuum copy. Rec
 tombstones remain 180d; no retry recreates a retained tombstone.
 
 Prune reservations count the selected records' UTF-8 data, repeated index keys,
-feed cascades, receipt tombstoning and floor updates. Before the atomic event
+feed cascades, receipt tombstoning, floor updates and bounded per-kind prune generation marks. Before the atomic event
 transaction, bounded transactions delete each victim's auxiliary `event_tags`
 rows through the existing `(tag,event_id)` primary key, using envelope tags.
 Each tag chunk uses the same page estimate and 4x WAL guard. The event transaction
@@ -242,7 +242,20 @@ qualification items; no schema/index change is included.
 Feed/lifecycle/deployment/job/review/agent summaries expire after 180d from receive
 time. Tool calls expire after 90d from original occurrence, clamped to server admission for future producer timestamps. Legacy import expiry uses
 original created_at, with the same future-time clamp. Loki raw logs remain separately 30d. Cursor stores epoch/local
-seq plus query/scope binding. Pruned/foreign-epoch cursors return 410/reset; authorization
+seq, query/scope binding, prune generation and a process nonce. Restart and legacy
+cursors return 410/reset. A cursor also resets when a prune since its issue
+deleted a matching kind above its position. Deletions before issue do not poison
+new traversals, and unrelated status expiry does not reset `kind=tool_call`.
+Unfiltered queries conservatively track all kinds. Page streaming rechecks the
+generation before returning rows and completion, so pruning cannot silently omit
+selected rows. The old global floor remains maintained for runtime rollback.
+No DDL or open-time writes are required; database format stays version 1.
+The collector prioritizes recently modified spool files after retrying durable
+intents, retains historical offsets, and uses a 20-second delivery slice with
+the existing 100-event cap. Within one invocation, leases may be reused only for
+the same source/host/kind, for at most 20 seconds and never within five seconds
+of expiry. Bearers remain memory-only; the server verifies every publication.
+Authorization
 always filters replay. Stream first-sequence gaps, quarantine, delivery exhaustion,
 capacity and >60s backlog are health alarms, never asserted complete history.
 At max delivery/transient SQL failure, keep the intent and alarm; operator replay uses

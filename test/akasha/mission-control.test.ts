@@ -263,7 +263,7 @@ test("status admission rate, one-hour payload TTL and24h receipts cannot resurre
   }finally{await h.close();}
 });
 
-test("real scoped event cursors bind the exact query and reset with410 after retention floor changes",async()=>{
+test("real scoped event cursors bind the exact query and reset with410 after matching retention changes",async()=>{
   const h=await hostedRig();
   try{
     assert.equal((await h.post(payload())).status,201);
@@ -274,7 +274,7 @@ test("real scoped event cursors bind the exact query and reset with410 after ret
     const cursor="&cursor="+encodeURIComponent(first.next_cursor);
     assert.equal((await h.get(path+cursor)).status,200);
     assert.equal((await h.get(path+cursor+"&host=agent-a")).status,400);
-    h.x.store.put("floor","999999");assert.equal((await h.get(path+cursor)).status,410);
+    h.x.store.db.prepare("UPDATE events SET expiry=?").run(N-1);h.x.store.prune(N);assert.equal((await h.get(path+cursor)).status,410);
     assert.equal((await h.get("/api/v1/events?from="+new Date((N-7200)*1000).toISOString()+"&to="+new Date(N*1000).toISOString())).status,403);
     const forgedScope={issuer:"chaldea:agent-b",profile:"mission-control-reader",source:"mission-control-reader",host:"omarchy-normandy",project:"chaldea",global:false,missionControlSources:[identity.source_id]};
     assert.throws(()=>scopeSql(forgedScope));

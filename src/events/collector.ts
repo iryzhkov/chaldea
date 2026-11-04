@@ -13,7 +13,7 @@ import { ConfigurationError } from "../config/files.ts";
 import { EXIT } from "../config/exit.ts";
 import { pathToFileURL } from "node:url";
 import { Outbox, type Cursor } from "./outbox.ts";
-import { publish,publishStatus, type Publication, type PublisherOptions } from "./publisher.ts";
+import { publish,publishStatus,publisherForRun, type Publication, type PublisherOptions } from "./publisher.ts";
 const LINE_BYTES = 64 * 1024;
 const DAY = 86400_000;
 const sha = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
@@ -156,11 +156,12 @@ export async function collectStatus(options:CollectorOptions,deliver:(e:Publicat
 }
 export async function collect(options: CollectorOptions): Promise<void> {
   const { outbox } = options, now = (options.now ?? Date.now)();
-  const deliver = options.deliver ?? ((e: Publication) => publish(e, options.publisher));
-  if (options.missionControlSnapshotFile) await collectStatus(options,options.deliver?async(e)=>await options.deliver!(e)?"visible":"deferred":(e)=>publishStatus(e,options.publisher),now);
+  const publisher = publisherForRun(options.publisher);
+  const deliver = options.deliver ?? ((e: Publication) => publish(e, publisher));
+  if (options.missionControlSnapshotFile) await collectStatus(options,options.deliver?async(e)=>await options.deliver!(e)?"visible":"deferred":(e)=>publishStatus(e,publisher),now);
   let budget = options.maxEvents ?? 100;
   // Yield only at durable boundaries. A single in-flight request may exceed the slice.
-  const elapsed = options.now ?? Date.now, deadline = elapsed() + 2000;
+  const elapsed = options.now ?? Date.now, deadline = elapsed() + 20_000;
   let delivered = 0;
   const sliced = () => delivered > 0 && elapsed() >= deadline;
   async function drain(): Promise<boolean> {
@@ -189,7 +190,12 @@ export async function collect(options: CollectorOptions): Promise<void> {
   }
   if (!await drain()) return;
   for (const [root, timer] of [[options.spool, false], ...(options.timers ? [[options.timers, true]] : [])] as [string, boolean][]) {
-    for (const path of files(root, timer, () => outbox.count("scan_errors"))) {
+    // Keep active spool files visible while historical backfill drains. Existing
+    // durable intents still go first; file offsets and historical input are retained.
+    const recent = [...files(root, timer, () => outbox.count("scan_errors"))]
+      .map(path => ({ path, modified: lstatSync(path).mtimeMs }))
+      .sort((a, b) => b.modified - a.modified || a.path.localeCompare(b.path));
+    for (const { path } of recent) {
       if (budget <= 0 || sliced()) return;
       const rel = relative(root, path), file = (timer ? "timer/" : "tool/") + rel;
       const st = lstatSync(path);

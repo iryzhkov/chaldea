@@ -70,13 +70,21 @@ export function* feedRows(store: EventStore, q: URLSearchParams, scope: Scope, n
     }
   }
 }
-interface Cursor { v: number; epoch: string; seq: number; binding: string }
+interface Cursor { v: number; epoch: string; seq: number; binding: string; g: number; r: string }
 export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, now: number): {
   rows: Generator<Envelope>; next: () => string | null;
 } {
   ensure(scope.missionControlOperations===undefined,"operations_selector_required",403);
   const count = limit(q), query = new URLSearchParams(q); query.delete("cursor");
   const binding = hash([scope, [...query.entries()].sort()]);
+  const kind = q.get("kind") || (scope.missionControlSources ? "agent_status" :
+    scope.routeScores && scope.source === "route" ? "route_score_snapshot" :
+    scope.quotaFleet && scope.source === "quota" ? "quota_headroom_snapshot" : undefined);
+  const generation = store.pruneMark().gen;
+  const fresh = (g: number, position: number) => {
+    const mark = store.pruneMark(kind);
+    ensure(mark.gen <= g || mark.seq <= position, "cursor_expired_reset", 410);
+  };
   let seq = 0;
   if (q.has("cursor")) {
     const raw = q.get("cursor")!;
@@ -85,7 +93,11 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
     try { c = record(JSON.parse(Buffer.from(raw, "base64url").toString("utf8"))); }
     catch { throw new HttpError(400, "invalid_cursor"); }
     ensure(c.v === 1 && c.binding === binding && Number.isSafeInteger(c.seq) && (c.seq as number) >= 0, "invalid_cursor");
-    ensure(c.epoch === store.get("epoch") && (c.seq as number) >= Number(store.get("floor")), "cursor_expired_reset", 410);
+    ensure(c.g !== undefined && c.r !== undefined, "cursor_expired_reset", 410);
+    ensure(Number.isSafeInteger(c.g) && (c.g as number) >= 0 && (c.g as number) <= generation &&
+      typeof c.r === "string" && /^[a-f0-9-]{36}$/.test(c.r), "invalid_cursor");
+    ensure(c.epoch === store.get("epoch") && c.r === store.run, "cursor_expired_reset", 410);
+    fresh(c.g as number, c.seq as number);
     seq = c.seq as number;
   }
   const start = q.get("from") ? since(q.get("from")!, now)! : new Date((now - 7 * 86400) * 1000).toISOString();
@@ -108,16 +120,19 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
   const ids = count ? store.db.prepare("SELECT seq FROM events" + statusIndex + " WHERE " + parts.join(" AND ") + " AND seq>? ORDER BY seq LIMIT ?")
     .all(...params, seq, count + 1) as { seq: number }[] : [];
   const read = store.db.prepare("SELECT envelope FROM events WHERE seq=? AND " + parts.join(" AND "));
+  const position = seq;
   function* rows(): Generator<Envelope> {
     for (const id of ids.slice(0, count)) {
+      fresh(generation, position);
       seq = id.seq;
       const r = read.get(seq, ...params) as { envelope: string } | undefined;
       if (r) yield JSON.parse(r.envelope) as Envelope;
     }
   }
   return { rows: rows(), next: () => {
+    fresh(generation, position);
     if (ids.length <= count) return null;
-    const c: Cursor = { v: 1, epoch: store.get("epoch")!, seq, binding };
+    const c: Cursor = { v: 1, epoch: store.get("epoch")!, seq, binding, g: generation, r: store.run };
     return Buffer.from(JSON.stringify(c)).toString("base64url");
   } };
 }
