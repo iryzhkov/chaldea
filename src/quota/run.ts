@@ -102,7 +102,7 @@ export class EventSink {
   constructor(
     state: ObserverState,
     statePath: string,
-    poster: Pick<FeedPoster, "enqueue"> & Partial<Pick<FeedPoster, "discard">>,
+    poster: Pick<FeedPoster, "enqueue">,
     logger: Logger,
     retryDelaysMs: ReadonlyArray<number> = BACKOFF_MS,
   ) {
