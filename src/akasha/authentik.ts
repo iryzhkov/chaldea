@@ -55,10 +55,16 @@ export class AuthentikVerifier {
       ensure(Array.isArray(body.keys) && body.keys.length <= 128, "invalid_jwks", 401);
       this.keys = { keys: body.keys.map(object).filter(k =>
         k.kty === "RSA" && k.use === "sig" && (k.alg === undefined || k.alg === "RS256") && k.d === undefined) };
-      this.fetchedAt = this.monotonic();
-    })().finally(() => {
-      // Bound sequential unknown-kid traffic and failed fetch retries, even after slow requests.
+      // One reading for cache age and cooldown, so a TTL of at least the
+      // cooldown can never expire the cache while the cooldown still runs.
+      const now = this.monotonic();
+      this.fetchedAt = now;
+      this.refreshFinishedAt = now;
+    })().catch((error: unknown) => {
+      // Failed fetches also start the cooldown, bounding retries.
       this.refreshFinishedAt = this.monotonic();
+      throw error;
+    }).finally(() => {
       this.pending = undefined;
     });
     await this.pending;

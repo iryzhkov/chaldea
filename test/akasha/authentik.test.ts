@@ -82,6 +82,25 @@ test("JWKS cooldown bounds identical and varying unknown kids, then permits rota
   }
 });
 
+test("minimum TTL never rejects cached keys inside the refresh cooldown", async () => {
+  // Every clock reading is distinct, as on a real host.
+  let base = 0, ticks = 0, calls = 0;
+  const fetcher: typeof fetch = async () => {
+    calls++;
+    return new Response(JSON.stringify({ keys: [jwk()] }), { status: 200 });
+  };
+  const verifier = new AuthentikVerifier({ ...config, jwksTtlSeconds: 30 }, fetcher, () => N,
+    () => base + (ticks++) * 0.0001);
+  await verifier.verify(await token());
+  const fetchedAt = (verifier as unknown as { fetchedAt: number }).fetchedAt;
+  assert.equal((verifier as unknown as { refreshFinishedAt: number }).refreshFinishedAt, fetchedAt);
+  for (const offset of [29.9999, 30, 30.0005]) {
+    base = fetchedAt + offset - ticks * 0.0001;
+    await verifier.verify(await token());
+  }
+  assert.equal(calls, 2);
+});
+
 test("concurrent JWKS requests share successful and failed fetches", async () => {
   for (const fail of [false, true]) {
     let calls = 0, release!: () => void;
