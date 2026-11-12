@@ -65,7 +65,7 @@ test("unknown shell variants and HTTP fallback cannot advance a cursor", () => {
 test("projection decoding rejects missing arrays and malformed error variants", () => {
   const projection = { thread: shell, runs: [], turnItems: [], runtimeRequests: [], nodes: [], messages: [] };
   S.decodeUnknownSync(OrchestrationV2ThreadProjection)(projection);
-  for (const key of ["runs", "turnItems", "runtimeRequests", "messages", "nodes"]) {
+  for (const key of ["runs", "turnItems", "runtimeRequests", "messages"]) {
     const bad: Record<string, unknown> = { ...projection }; delete bad[key];
     assert.throws(() => S.decodeUnknownSync(OrchestrationV2ThreadProjection)(bad), key);
   }

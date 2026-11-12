@@ -85,7 +85,7 @@ test("T3 projection preserves full windows/reset count and drops identity and re
 test("exact credit units, zero/null, duplicate map, permissions and independent freshness", () => {
   const row = newProvider("codex", "codex"); applyT3(row, provider()); applyCodex(row, response, AT);
   assert.equal(row.credits.value?.balance, "61951.0098125000");
-  assert.equal(row.manualResets.state, "unknown", "app-server reset inventory is ignored");
+  assert.equal(row.manualResets.value?.availableCount, 1, "native reset inventory is retained");
   assert.equal(row.ordinaryUsageAllowed.value, false);
   const duplicate = newProvider("alias", "codex");
   const wallet = { credits: { balance: "7.000", hasCredits: true, unlimited: false } };
@@ -94,10 +94,10 @@ test("exact credit units, zero/null, duplicate map, permissions and independent 
   applyCodex(duplicate, { rateLimitsByLimitId: { a: wallet, b: { credits: { ...wallet.credits, balance: "8" } } } }, AT);
   assert.equal(duplicate.credits.value, null);
   applyT3(row, { ...provider(), usageLimits: { checkedAt: new Date(START - 1).toISOString(), windows: [], resetCredits: { availableCount: 9 } } });
-  assert.equal(row.manualResets.value?.availableCount, 9);
+  assert.equal(row.manualResets.value?.availableCount, 1);
   const later = new Date(START + 5 * 60_000).toISOString();
   applyT3(row, { ...provider(), usageLimits: { checkedAt: later, windows: [{ usedPercent: 20 }] } });
-  assert.equal(row.manualResets.observedAt, new Date(START - 1).toISOString()); assert.equal(row.credits.observedAt, AT);
+  assert.equal(row.manualResets.observedAt, AT); assert.equal(row.credits.observedAt, AT);
   assert.equal(metricNow(row.included, START + STALE_AFTER_MS).state, "fresh");
   assert.equal(hasQuota({ ...provider(), usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] }, headroom: routingLanes(row, START) }, START), false);
   failCodex(row, "rate_limited");
@@ -347,7 +347,7 @@ test("catalog rejection recovery preserves normal cadence and rate-limit backoff
           assert.equal(row.ordinaryUsageAllowed.value, false);
           assert.equal(row.spendControlReached.value, false);
           assert.equal(row.plan.value, null, "plan is not collected by the wallet adapter");
-          assert.equal(row.manualResets.state, "unknown", "app-server reset inventory is ignored");
+          assert.equal(row.manualResets.value?.availableCount, 1, "native reset inventory is retained");
         }
       }
       now = START + COLLECT_EVERY_MS * (rateLimited ? 2 : 1) - 1;
