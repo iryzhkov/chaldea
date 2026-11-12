@@ -68,6 +68,10 @@ test("projection decoding rejects missing arrays and malformed error variants", 
     const bad: Record<string, unknown> = { ...projection }; delete bad[key];
     assert.throws(() => S.decodeUnknownSync(OrchestrationV2ThreadProjection)(bad), key);
   }
+  const errorItem = { id: "i", runId: null, nodeId: null, type: "error", status: "failed",
+    ordinal: 0, updatedAt: "2026-11-12T00:00:00Z", failure: { class: "usage_limit", resetAt: null } };
+  const decoded = S.decodeUnknownSync(OrchestrationV2ThreadProjection)({ ...projection, turnItems: [errorItem] });
+  assert.equal("failure" in decoded.turnItems[0]! && decoded.turnItems[0].failure.resetAt, null);
   assert.throws(() => S.decodeUnknownSync(OrchestrationV2ThreadProjection)({
     ...projection, turnItems: [{ id: "i", runId: null, nodeId: null, type: "error", status: "failed",
       ordinal: 0, updatedAt: "2026-11-12T00:00:00Z" }],

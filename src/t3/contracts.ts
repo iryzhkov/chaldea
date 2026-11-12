@@ -32,7 +32,7 @@ export const OrchestrationV2ThreadShell = S.Struct({
   pendingRuntimeRequest: S.NullOr(S.Struct({ kind: S.String })),
 });
 export type OrchestrationV2ThreadShell = typeof OrchestrationV2ThreadShell.Type;
-const failure = S.Struct({ class: S.String, resetAt: opt(S.String) });
+const failure = S.Struct({ class: S.String, resetAt: opt(S.NullOr(S.String)) });
 const itemBase = {
   id, runId: S.NullOr(id), nodeId: S.NullOr(id), status: S.String, ordinal: seq, updatedAt: time,
 };
