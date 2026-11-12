@@ -524,8 +524,7 @@ announce or mutate the normal role's pick. An explicit override with no mapped
 role anchors falls back to the fixed pair without claiming its AA floor is met.
 Transitions queue on the authority even before transport is configured.
 Transient publication failures
-appear in reasons and remain queued for the next route invocation. The
-mission-control board can consume the normal Akasha event stream.
+appear in reasons and remain queued for the next route invocation.
 
 ## Homelab activation, operator steps only
 

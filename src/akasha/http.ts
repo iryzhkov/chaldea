@@ -4,7 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { once } from "node:events";
 import type { Principal } from "./auth.ts";
 import type { Ingress } from "./ingress.ts";
-import { article, eventPage, operationsPage, feedRows, limit } from "./compat.ts";
+import { article, eventPage, feedRows, limit } from "./compat.ts";
 import { ensure, HttpError, MAX_EVENT, MAX_LEGACY, parse } from "./schema.ts";
 import type { Receipt } from "./store.ts";
 
@@ -78,7 +78,6 @@ export function httpServer(ingress: Ingress) {
         try { p = await ingress.auth.authorize(token, action); }
         catch (e) { if (e instanceof HttpError) throw e; throw new HttpError(401, "authorization_denied"); }
         await p.recheck();
-        if (p.scope.missionControlSources) ensure(req.method === "GET" && path === "/api/v1/events", "mission_control_events_only", 403);
         const deadline = setTimeout(() => res.destroy(), Math.max(1, Math.min(10_000, (p.access.validUntil - ingress.now()) * 1000)));
         res.once("close", () => clearTimeout(deadline)); res.once("finish", () => clearTimeout(deadline));
         if (req.method === "POST") {
@@ -133,11 +132,6 @@ export function httpServer(ingress: Ingress) {
           await fragments(res, p, values()); res.end(); return;
         }
         if (path === "/api/v1/events") {
-          if(url.searchParams.has("mission_control_operations")){
-            ensure(p.registration.mission_control_operations_read===true&&p.scope.missionControlSources!==undefined,"operations_forbidden",403);
-            const result=operationsPage(ingress.store,url.searchParams,p.scope,ingress.now());
-            await p.recheck();json(res,200,result);return;
-          }
           const page = eventPage(ingress.store, url.searchParams, p.scope, ingress.now());
           res.writeHead(200, { "content-type": "application/json" });
           function* values(): Generator<string> {
