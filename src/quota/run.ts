@@ -92,11 +92,10 @@ export class EventSink {
   #retryAttempt = 0;
   readonly #pending: Array<QuotaRecord> = [];
   readonly #outbox: Outbox<QuotaRecord>;
-  readonly #discarded = new Set<string>();
 
   readonly state: ObserverState;
   readonly statePath: string;
-  readonly poster: Pick<FeedPoster, "enqueue"> & Partial<Pick<FeedPoster, "discard">>;
+  readonly poster: Pick<FeedPoster, "enqueue">;
   readonly logger: Logger;
   readonly retryDelaysMs: ReadonlyArray<number>;
 
@@ -151,9 +150,6 @@ export class EventSink {
       this.#saveFailing = false;
       this.logger.info("state file written again", { path: this.statePath, pending: this.#pending.length });
     }
-    // Superseded advisory payloads are removed only after the new state is durable.
-    for (const key of this.#discarded) this.poster.discard?.(key);
-    this.#discarded.clear();
     // Their claims are durable now.
     for (const record of this.#pending.splice(0)) {
       this.poster.enqueue(record, () => {

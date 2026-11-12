@@ -39,7 +39,6 @@ export interface QuotaRecord {
   readonly subagent: boolean;
   /** Set when the record was reconstructed from a snapshot after the observer missed the events. */
   readonly reconciled?: true;
-  readonly headroom?: ReturnType<typeof import("./headroom.ts").statusSnapshot>;
   readonly reason?: string;
   readonly fromProvider?: string;
   readonly fromModel?: string;
