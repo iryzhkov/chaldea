@@ -128,6 +128,7 @@ export interface SwitchProvider {
   readonly headroom?: ReturnType<typeof import("../quota/headroom.ts").routingLanes>;
   readonly usageLimits?: {
     readonly checkedAt: string;
+    readonly credentialFingerprint?: string;
     readonly windows: ReadonlyArray<{ readonly usedPercent: number; readonly id?: string; readonly kind?: string; readonly windowDurationMins?: number; readonly resetsAt?: string }>;
     readonly resetCredits?: { readonly availableCount: number; readonly nextExpiresAt?: string };
     readonly unavailable?: unknown;
@@ -165,6 +166,7 @@ export function toSwitchProvider(p: import("./contracts.ts").ServerProvider): Sw
     })),
     ...(p.usageLimits === undefined ? {} : { usageLimits: {
       checkedAt: p.usageLimits.checkedAt,
+      ...(p.usageLimits.credentialFingerprint ? { credentialFingerprint: createHash("sha256").update(p.usageLimits.credentialFingerprint).digest("hex") } : {}),
       windows: p.usageLimits.windows.map((w) => ({
         id: w.id, kind: w.kind, usedPercent: w.usedPercent,
         ...(w.windowDurationMins === undefined ? {} : { windowDurationMins: w.windowDurationMins }),
@@ -508,18 +510,6 @@ export async function dispatchChaldeaWake(options: ConnectOptions, payload: stri
           ? Effect.succeed(false) : Effect.fail(error)));
   }));
   if (!accepted) throw new WakeRejectedError("T3 durably rejected this wake; operator attention required");
-}
-
-/**
- * Sets T3's server-scoped `autoResumeLimitedThreads` through the public
- * `server.updateSettings` RPC, so T3 persists it with its own writer. Needs a
- * bearer with the `settings:write` scope. Resolves to the value T3 reports back.
- */
-export async function setAutoResumeLimitedThreads(options: ConnectOptions, enabled: boolean): Promise<boolean> {
-  const settings = await withClient(options, (client) =>
-    client["server.updateSettings"]({ patch: { autoResumeLimitedThreads: enabled } }),
-  );
-  return settings.autoResumeLimitedThreads;
 }
 
 /**

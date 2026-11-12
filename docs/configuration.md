@@ -71,8 +71,8 @@ redirects them into the scratch HOME.
 Quota's existing `contexts`, nested `assertRuntimeHome`, and
 `lowHeadroomPercent` remain unchanged. The same file can also supply
 `serverUrl`, `t3BaseDir`, `tokenFile`, `stateFile`, `feedCommand`, `host`,
-`enableProviderSwitch`, `switchConfig` and `restartConfig`. Existing flags override
-these values. Switch/restart paths name their existing JSON support files.
+`enableProviderSwitch` and `switchConfig`. Existing flags override these values.
+Retired restart configuration is accepted and ignored.
 
 Exec example:
 

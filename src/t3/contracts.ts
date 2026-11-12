@@ -36,22 +36,19 @@ const failure = S.Struct({ class: S.String, resetAt: opt(S.NullOr(S.String)) });
 const itemBase = {
   id, runId: S.NullOr(id), nodeId: S.NullOr(id), status: S.String, ordinal: seq, updatedAt: time,
 };
-// Restart-only variants remain until the post-upgrade restart removal.
 const turnItem = S.Union([
   S.Struct({ ...itemBase, type: S.Literal("error"), failure }),
-  S.Struct({ ...itemBase, type: S.Literal("secret_request"), secretStatus: S.String }),
-  S.Struct({ ...itemBase, type: S.String.check(S.isPattern(/^(?!error$|secret_request$).+/)) }),
+  S.Struct({ ...itemBase, type: S.String.check(S.isPattern(/^(?!error$).+/)) }),
 ]);
 export const OrchestrationV2ThreadProjection = S.Struct({
   thread: S.Struct({ ...threadFields, snoozedUntil: opt(nullableTime) }),
   runs: S.Array(S.Struct({
     id, ordinal: seq, status: S.String, rootNodeId: S.NullOr(id), providerInstanceId: id, modelSelection: model,
     startedAt: nullableTime, completedAt: nullableTime,
-    userMessageId: id, restartContinuationOfRunId: opt(id),
+    userMessageId: id,
   })),
   turnItems: S.Array(turnItem),
   runtimeRequests: S.Array(S.Struct({ status: S.String, kind: S.String, nodeId: id })),
-  nodes: S.Array(S.Struct({ id, runId: id })),
   messages: S.Array(S.Struct({ id, role: S.String, text: S.String, attachments: S.Array(S.Unknown) })),
 });
 export type OrchestrationV2ThreadProjection = typeof OrchestrationV2ThreadProjection.Type;
@@ -83,6 +80,7 @@ export const ServerProvider = S.Struct({
   })) })),
   usageLimits: opt(S.Struct({
     checkedAt: S.String,
+    credentialFingerprint: opt(S.String),
     windows: S.Array(S.Struct({
       id, kind: S.String,
       usedPercent: S.Number.check(S.isGreaterThanOrEqualTo(0), S.isLessThanOrEqualTo(100)),
@@ -134,7 +132,7 @@ export const WsRpcGroup = RpcGroup.make(
     success: OrchestrationV2ShellStreamItem,
     error: S.Union([authError, taggedError("OrchestrationV2GetShellSnapshotError")]), stream: true,
   }),
-  // Temporary production dependency of set-auto-resume, also used by fixtures.
+  // Test fixture settings writer; production never changes native resume settings.
   Rpc.make("server.updateSettings", {
     payload: S.Struct({ patch: S.Record(S.String, S.Unknown) }), success: settings, error: configError,
   }),

@@ -51,7 +51,25 @@ try {
     return result.stdout;
   };
   const route = JSON.parse(run(["route", "--role", "general"])); assert.ok(route.model);
-  run(["quota", "status", "--state-file", stateFile]);
+  const status = JSON.parse(run(["quota", "status", "--json", "--state-file", stateFile]));
+  assert.equal(status.version, 1);
+  // Exercise packaged reporting with the same native projection as the observer.
+  const { HeadroomMonitor } = await import("../../src/quota/headroom.ts");
+  const { headroomConfig } = await import("../../src/quota/codex-balance.ts");
+  const nativeState = emptyState();
+  const monitor = new HeadroomMonitor({ state: nativeState.headroom, config: headroomConfig(),
+    local: true, save() {} });
+  try {
+    monitor.update([{ ...(await port.catalog()).providers[0]!, usageLimits: {
+      checkedAt: new Date().toISOString(), windows: [{ id: "weekly", kind: "weekly",
+        usedPercent: 25, windowDurationMins: 10080 }] } }]);
+    await monitor.tick();
+    saveState(stateFile, nativeState, Date.now());
+    const nativeStatus = JSON.parse(run(["quota", "status", "--json", "--state-file", stateFile]));
+    assert.equal(nativeStatus.providers[0].included.windows.source, "t3");
+    assert.ok(nativeStatus.providers[0].included.windows.checkedAt);
+    assert.equal(nativeStatus.providers[0].included.windows.value[0].usedPercent, 25);
+  } finally { await monitor.close(); }
   const list = JSON.parse(run(["mcp", "--config", configPath],
     JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) + "\n"));
   assert.deepEqual(list.result.tools.map((t: { name: string }) => t.name),

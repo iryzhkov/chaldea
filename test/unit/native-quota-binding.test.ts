@@ -2,12 +2,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
-import { HeadroomMonitor, emptyHeadroom, STALE_AFTER_MS } from "../../src/quota/headroom.ts";
+import { HeadroomMonitor, emptyHeadroom, STALE_AFTER_MS, statusSnapshot, validateHeadroom } from "../../src/quota/headroom.ts";
 import { headroomConfig } from "../../src/quota/codex-balance.ts";
 import { emptyState, saveState } from "../../src/quota/state.ts";
 import { route } from "../../src/route/runtime.ts";
 import type { SwitchProvider } from "../../src/t3/adapter.ts";
-import type { collectClaudeUsage } from "../../src/route/claude-usage.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
 
@@ -76,102 +75,50 @@ test("unbound native observations remain unshared and stale native windows retai
   } finally { await m.close(); }
 });
 
-test("native quota is authoritative and HTTP fallback cannot relabel another account", async () => {
-  let clock = now, calls = 0;
-  let reply: Awaited<ReturnType<typeof collectClaudeUsage>> = { value: { accountKey: other, observedAt: iso(now),
-    windows: [{ kind: "weekly", remainingPercent: 80, windowDurationMins: 10080, resetsAt: iso(now + 4 * 86400000) }] },
-    fetchedAt: iso(now), reason: null };
-  const m = new HeadroomMonitor({ state: emptyHeadroom(), local: true, now: () => clock, save() {},
-    config: headroomConfig({ claudeContexts: [{ enabled: true, providerInstanceId: alias, credentialFile: "/unused" }] }),
-    claudeRead: async () => { calls++; return reply; } });
-  const row = () => m.state.providers[0]!;
-  const unavailable = () => ({ ...provider(), usageLimits: { checkedAt: iso(clock), windows: [], unavailable: { reason: "unsupported" } } });
+
+test("missing native data remains unknown and stale data keeps checkedAt", async () => {
+  const m = monitor();
   try {
-    m.update([provider()]); await m.tick();
-    assert.equal(row().accountKey, account, "HTTP credentials must not replace the native account binding");
-    assert.equal(calls, 0, "fresh native quota must not launch a redundant HTTP read");
-    assert.equal(row().included.source, "t3"); assert.equal(row().included.error, null);
-    m.update([unavailable()]); await m.tick();
-    assert.equal(row().included.error, "context_mismatch"); assert.equal(row().included.value, null);
-    reply = { value: null, fetchedAt: null, reason: "rate_limited; no successful cache" };
-    m.update([provider()]); await m.tick();
-    clock += STALE_AFTER_MS;
-    m.update([provider()]); await m.tick();
-    assert.equal(row().included.source, "t3"); assert.equal(row().included.error, null);
-    assert.equal(row().included.observedAt, iso(now), "HTTP failure cannot relabel or rejuvenate native windows");
-    reply = { ...reply, reason: null, fetchedAt: iso(clock), value: {
-      accountKey: account, observedAt: iso(clock), windows: [{ kind: "weekly", remainingPercent: 80,
-        windowDurationMins: 10080, resetsAt: iso(clock + 4 * 86400000) }] } };
-    m.update([unavailable()]); await m.tick();
-    assert.equal(row().accountKey, account); assert.equal(row().included.source, "claude-usage");
-    assert.equal(row().included.observedAt, iso(clock)); assert.equal(row().included.error, null);
-    m.update([{ ...provider(null), usageLimits: unavailable().usageLimits }]); await m.tick();
-    assert.equal(row().manualResets.value, null, "native reset inventory cannot outlive its binding");
+    const { usageLimits, ...missing } = provider();
+    m.update([missing]); await m.tick();
+    assert.equal(m.state.providers[0]?.included.state, "unknown");
+    assert.equal(m.state.providers[0]?.included.value, null);
+    m.update([{ ...provider(), usageLimits: { ...provider().usageLimits!, checkedAt: iso(now - STALE_AFTER_MS) } }]);
+    await m.tick();
+    const snapshot = statusSnapshot(m.state, now).providers[0]!;
+    assert.equal(snapshot.included.windows.state, "stale");
+    assert.equal(snapshot.included.windows.checkedAt, iso(now - STALE_AFTER_MS));
+    assert.equal(snapshot.included.windows.source, "t3");
   } finally { await m.close(); }
 });
 
-test("configured Claude binding rejects a different native account before HTTP", async () => {
-  const m = new HeadroomMonitor({ state: emptyHeadroom(), local: true, now: () => now, save() {},
-    config: headroomConfig({ claudeContexts: [{ enabled: true, providerInstanceId: alias,
-      accountKey: other, credentialFile: "/unused" }] }),
-    claudeRead: async () => { throw new Error("binding mismatch must not read credentials"); } });
-  try {
-    m.update([provider()]);
-    await m.tick();
-    assert.equal(m.state.providers[0]?.included.error, "context_mismatch");
-    assert.equal(m.state.providers[0]?.accountKey, undefined);
-  } finally { await m.close(); }
-});
-
-test("a native refresh during a pending HTTP read keeps the current account authoritative", async () => {
-  let finish!: (value: Awaited<ReturnType<typeof collectClaudeUsage>>) => void;
-  const pending = new Promise<Awaited<ReturnType<typeof collectClaudeUsage>>>(resolve => { finish = resolve; });
-  const m = new HeadroomMonitor({ state: emptyHeadroom(), local: true, now: () => now, save() {},
-    config: headroomConfig({ claudeContexts: [{ enabled: true, providerInstanceId: alias, credentialFile: "/unused" }] }),
-    claudeRead: async () => pending });
-  try {
-    m.update([{ ...provider(), usageLimits: { checkedAt: iso(now), windows: [], unavailable: { reason: "unsupported" } } }]);
-    m.update([provider(other)]);
-    finish({ value: { accountKey: account, observedAt: iso(now), windows: [] }, fetchedAt: iso(now), reason: null });
-    await m.tick();
-    assert.equal(m.state.providers[0]?.accountKey, other);
-    assert.equal(m.state.providers[0]?.included.source, "t3");
-    assert.equal(m.state.providers[0]?.included.error, null);
-  } finally { await m.close(); }
-});
-
-for (const configured of [false, true]) test(`unbound native updates never inherit HTTP identity, configured=${configured}`, async () => {
-  let clock = now;
-  const http = { accountKey: other, observedAt: iso(now - 1000), windows: [
-    { kind: "weekly" as const, remainingPercent: 80, windowDurationMins: 10080, resetsAt: iso(now + 4 * 86400000) }] };
-  let reply: Awaited<ReturnType<typeof collectClaudeUsage>> = { value: http, fetchedAt: http.observedAt, reason: null };
-  const m = new HeadroomMonitor({ state: emptyHeadroom(), local: true, now: () => clock, save() {},
-    config: headroomConfig({ claudeContexts: [{ enabled: true, providerInstanceId: alias,
-      credentialFile: "/unused", ...(configured ? { accountKey: other } : {}) }] }),
-    claudeRead: async () => reply });
-  const row = () => m.state.providers[0]!;
-  const native = () => ({ ...provider(null), usageLimits: { ...provider().usageLimits!, checkedAt: iso(clock) } });
-  try {
-    m.update([{ ...provider(null), usageLimits: { checkedAt: iso(clock), windows: [], unavailable: { reason: "unsupported" } } }]);
-    await m.tick();
-    assert.equal(row().accountKey, other); assert.equal(row().included.source, "claude-usage");
-    reply = { value: null, fetchedAt: null, reason: "rate_limited; no successful cache" };
-    clock++;
-    m.update([native()]);
-    assert.equal(row().accountKey, undefined, "unbound native data must lose the prior HTTP key before async collection");
-    await m.tick();
-    assert.equal(row().included.source, "t3"); assert.equal(row().included.observedAt, iso(clock));
-    assert.equal(row().included.error, null); assert.equal(row().manualResets.value, null);
-    reply = { value: { observedAt: iso(clock), windows: http.windows }, fetchedAt: iso(clock), reason: null };
-    await m.tick();
-    assert.notEqual(row().included.error, "context_mismatch", "missing HTTP identity is unknown, not a conflicting account");
-    reply = { value: http, fetchedAt: http.observedAt, reason: null };
-    for (let repeat = 0; repeat < 2; repeat++) {
-      clock++; m.update([native()]);
+test("credential changes clear cached native windows for both drivers", async () => {
+  for (const driver of ["codex", "claudeAgent"]) {
+    const m = monitor();
+    try {
+      m.update([{ ...provider(), driver, usageLimits: { ...provider().usageLimits!, credentialFingerprint: "first" } }]);
       await m.tick();
-      assert.equal(row().accountKey, other); assert.equal(row().included.source, "claude-usage");
-      assert.equal(row().included.value?.[0]?.usedPercent, 20);
-      assert.equal(row().included.observedAt, http.observedAt); assert.equal(row().manualResets.value, null);
-    }
+      assert.ok(m.state.providers[0]?.included.value?.length);
+      m.update([{ ...provider(), driver, usageLimits: {
+        checkedAt: iso(now), windows: [], credentialFingerprint: "second",
+        unavailable: { reason: "probeFailed" } } }]);
+      await m.tick();
+      assert.equal(m.state.providers[0]?.included.value, null);
+      assert.equal(m.state.providers[0]?.included.error, "probe_failed");
+    } finally { await m.close(); }
+  }
+});
+
+test("old collector windows and burn samples cannot survive cache migration", async () => {
+  const m = monitor();
+  try {
+    m.update([provider()]); await m.tick();
+    const state = JSON.parse(JSON.stringify(m.state));
+    state.providers[0].included.source = "retired-collector";
+    state.providers[0].burnHistory = [{ observedAt: iso(now), windows: state.providers[0].included.value }];
+    const migrated = validateHeadroom(state);
+    assert.equal(migrated.providers[0]?.included.value, null);
+    assert.equal(migrated.providers[0]?.included.state, "unknown");
+    assert.equal(migrated.providers[0]?.burnHistory, undefined);
   } finally { await m.close(); }
 });

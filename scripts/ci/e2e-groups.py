@@ -18,8 +18,6 @@ GROUPS = {
         "test/e2e/route.e2e.test.ts",
     ],
     "e2e-3": [
-        "test/e2e/restart-investigation.e2e.test.ts",
-        "test/e2e/restart.e2e.test.ts",
         "test/e2e/token-helper.e2e.test.ts",
     ],
 }

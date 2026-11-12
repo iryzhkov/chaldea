@@ -16,7 +16,7 @@ test("runtime consumes observer cache/stops without writing observer, collector 
     writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(d.path, "cache") }));
     const state = emptyState(), provider = newProvider("claudeAgent", "claudeAgent");
     provider.included = { value: [{ id: "weekly", kind: "weekly", usedPercent: 38, remainingPercent: 62,
-      windowDurationMins: 10080, resetsAt: iso(now + .4 * 7 * 86400000) }], observedAt: iso(now), state: "fresh", source: "fixture", error: null };
+      windowDurationMins: 10080, resetsAt: iso(now + .4 * 7 * 86400000) }], observedAt: iso(now), state: "fresh", source: "t3", error: null };
     state.headroom.providers.push(provider); saveState(stateFile, state, now);
     const before = readFileSync(stateFile, "utf8");
     const opts = { home: d.path, configPath, now, catalog: async () => catalog, fetcher: failFetch };
@@ -64,35 +64,6 @@ test("runtime accepts partial benchmark coverage and holds only the unmeasured p
     } finally { d.remove(); }
   }
 });
-test("operator weekly fallback lasts until reset, collector failures degrade with a reason", async () => {
-  const d = routeScratch();
-  try {
-    const configPath = join(d.path, "route.json");
-    writeFileSync(configPath, JSON.stringify({ stateFile: join(d.path, "none"), cacheDir: join(d.path, "cache"),
-      claudeUsage: { enabled: true, credentialFile: join(d.path, "missing-credential") },
-      claudeWeeklyTarget: { observedAt: iso(now - 86400000), remainingPercent: 62, resetsAt: iso(now + .4 * 7 * 86400000) } }));
-    const r = await route({ role: "builder" }, { home: d.path, configPath, now, catalog: async () => catalog, fetcher: failFetch });
-    assert.equal(r.model, "claude-opus-5-5");
-    assert.match(r.reasons.join(" "), /operator-set weekly target/);
-    assert.match(r.reasons.join(" "), /under-paced/);
-    assert.equal(r.dataAges.quota.claudeAgent, 86400);
-    assert.match(r.reasons.join(" "), /credential_unavailable/);
-  } finally { d.remove(); }
-});
-test("enabled collector skips credential access when its catalog binding is absent", async () => {
-  const d = routeScratch();
-  try {
-    const configPath = join(d.path, "route.json"), cacheDir = join(d.path, "cache");
-    writeFileSync(configPath, JSON.stringify({ cacheDir, claudeUsage: { enabled: true } }));
-    const requests: string[] = [];
-    const r = await route({ role: "builder" }, { home: d.path, configPath, now,
-      catalog: async () => catalog.filter(p => p.providerInstanceId === "codex"),
-      fetcher: async url => { requests.push(String(url)); throw new Error("fixture offline"); } });
-    assert.equal(r.providerInstanceId, "codex");
-    assert.ok(!requests.some(url => url.includes("api.anthropic.com")));
-    assert.equal(existsSync(join(cacheDir, "claude-usage.json")), false);
-  } finally { d.remove(); }
-});
 test("capacity thresholds are shared defaults; route overrides also govern capacity ranking", async () => {
   const d = routeScratch();
   try {
@@ -109,14 +80,13 @@ test("capacity thresholds are shared defaults; route overrides also govern capac
 test("config defaults safe, validates fractions/keys/collector/target", () => {
   const d = routeScratch();
   try {
-    assert.equal(loadRouteConfig(d.path).claudeUsage.enabled, false);
     assert.equal(loadRouteConfig(d.path).analyticsMaxAgeMs, 21 * 86400000);
     const valid = join(d.path, "valid.json");
     writeFileSync(valid, JSON.stringify({ analyticsMaxAgeMs: 7 * 86400000 }));
     assert.equal(loadRouteConfig(d.path, valid).analyticsMaxAgeMs, 7 * 86400000);
     for (const invalid of [{ minimumRemaining: -1 }, { paceMargin: 15 }, { minimumTurns: 0 },
       { analyticsMaxAgeMs: 0 }, { analyticsMaxAgeMs: -1 }, { analyticsMaxAgeMs: "21" },
-      { claudeUsage: { enabled: "yes" } }, { claudeWeeklyTarget: { remainingPercent: 62 } }, { misspelled: true }]) {
+      { misspelled: true }]) {
       const path = join(d.path, "config.json"); writeFileSync(path, JSON.stringify(invalid));
       assert.throws(() => loadRouteConfig(d.path, path), /Invalid/);
     }

@@ -10,7 +10,6 @@ import { discoverServerUrl, switchPort } from "../t3/adapter.ts";
 import type { SwitchProvider, CatalogModelPreferences } from "../t3/adapter.ts";
 import { readToken } from "../quota/run.ts";
 import { loadRouteConfig } from "./config.ts";
-import { collectClaudeUsage, claudeCacheFile, claudeSourceId } from "./claude-usage.ts";
 import { collectAnalytics } from "./analytics.ts";
 import { collectScores } from "./snapshot.ts";
 import { RouteState } from "./state.ts";
@@ -72,25 +71,6 @@ async function collectContext(options: RouteOptions) {
       catalog = routeCatalog(snapshot.providers, snapshot.modelPreferences);
     } catch { throw new RouteError("catalog_unavailable", "T3 catalog unavailable; no routing recommendation"); }
   }
-  const id = config.claudeUsage.providerInstanceId;
-  const claudeBound = catalog.some(p => p.providerInstanceId === id && p.driverKind === "claudeAgent" && p.canRunChildTask);
-  const usage = await collectClaudeUsage({ ...config.claudeUsage, enabled: config.claudeUsage.enabled && claudeBound, cacheFile: claudeCacheFile(options.home ?? homedir(), claudeSourceId(config.claudeUsage)), now,
-    ...(options.fetcher ? { fetcher: options.fetcher } : {}) });
-  if (usage.reason) reasons.push(!config.claudeUsage.enabled || claudeBound ? usage.reason : "Claude collector binding absent or unavailable; skipped");
-  if (claudeBound) {
-    const prior = quota[id] ?? { observedAt: null, windows: [], activeStop: false };
-    if (usage.value && now - Date.parse(usage.value.observedAt) < config.quotaMaxAgeMs) {
-      quota[id] = { ...usage.value, activeStop: prior.activeStop };
-    } else if ((prior.windows.length === 0 || prior.observedAt === null || now - Date.parse(prior.observedAt) >= config.quotaMaxAgeMs) && config.claudeWeeklyTarget) {
-      const t = config.claudeWeeklyTarget;
-      const reset = Date.parse(t.window.resetsAt!);
-      if (Date.parse(t.observedAt) <= now && reset > now && reset - now <= 7 * 86_400_000) {
-        // Operator estimate lasts until the stated reset, with its real age reported.
-        quota[id] = { observedAt: t.observedAt, windows: [t.window], activeStop: prior.activeStop, operatorEstimate: true };
-        reasons.push("Claude pacing uses operator-set weekly target, an estimate valid until its reset");
-      } else reasons.push("Claude operator weekly target expired or invalid for the current window");
-    }
-  }
   const scores = await collectScores(config.scores, join(config.cacheDir, "aa-scores.json"), now, options.fetcher, undefined,
     s => !config.benchmark || s.version === 2 && s.indexVersion === config.benchmark.indexVersion);
   if (scores.reason) reasons.push("AA " + scores.reason);
@@ -100,7 +80,6 @@ async function collectContext(options: RouteOptions) {
     .filter(p => p.driverKind === "codex" || p.driverKind === "claudeAgent").map(p => {
       const original = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
       const row = { ...(original ?? newProvider(p.providerInstanceId, p.driverKind)) };
-      if (p.providerInstanceId === id && usage.value?.accountKey) row.accountKey = usage.value.accountKey;
       const q = quota[p.providerInstanceId];
       if (q) row.included = { state: "fresh", error: null, source: q.operatorEstimate ? "operator-weekly-target" : row.included.source,
         observedAt: q.observedAt, value: q.windows.map(w => ({ ...w, id: (w as { id?: string }).id ?? w.kind, usedPercent: 100 - w.remainingPercent })) };
