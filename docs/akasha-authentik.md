@@ -9,7 +9,7 @@ Enable with these Akasha JSON configuration keys (camelCase):
 - `authentikIssuer`: exact HTTPS issuer including its trailing slash.
 - `authentikAudience`: exact Akasha resource audience, e.g. `https://akasha.ryzhkov.dev`.
 - `authentikJwksUrl`: pinned HTTPS JWKS endpoint; redirects are refused.
-- `authentikJwksTtlSeconds`: integer 1–300, default 60.
+- `authentikJwksTtlSeconds`: integer 30–300, default 60. It may not be shorter than the 30 s JWKS refresh cooldown.
 
 Issuer, audience and JWKS URL are required when enabled. JWT headers cannot select
 a key URL. JWKS must contain RSA keys with `kid`, `use: "sig"` and either no

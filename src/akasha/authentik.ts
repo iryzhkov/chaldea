@@ -31,7 +31,9 @@ export class AuthentikVerifier {
       ensure(url.protocol === "https:" && !url.username && !url.password && !url.hash, "invalid_authentik_url");
     }
     this.ttl = config.jwksTtlSeconds ?? 60;
-    ensure(Number.isInteger(this.ttl) && this.ttl >= 1 && this.ttl <= 300, "invalid_jwks_ttl");
+    // The cache TTL may not be shorter than the 30 s refresh cooldown, or the
+    // expiry refresh would be refused and cached keys rejected each cycle.
+    ensure(Number.isInteger(this.ttl) && this.ttl >= 30 && this.ttl <= 300, "invalid_jwks_ttl");
   }
   private async refresh(): Promise<void> {
     if (this.pending) return this.pending;

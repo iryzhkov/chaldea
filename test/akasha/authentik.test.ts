@@ -129,7 +129,7 @@ test("failed JWKS refresh backs off until cooldown and recovers without stale-ke
   f.elapsed = 180; f.keys = [{ ...jwk(), use: "enc" }];
   await assert.rejects(f.verifier.verify(original));
   assert.equal(f.calls, 5);
-  for (const jwksTtlSeconds of [0, 301, 1.5, NaN])
+  for (const jwksTtlSeconds of [0, 29, 301, 1.5, NaN])
     assert.throws(() => new AuthentikVerifier({ ...config, jwksTtlSeconds }));
 });
 
