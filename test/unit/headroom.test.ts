@@ -85,7 +85,7 @@ test("T3 projection preserves full windows/reset count and drops identity and re
 test("exact credit units, zero/null, duplicate map, permissions and independent freshness", () => {
   const row = newProvider("codex", "codex"); applyT3(row, provider()); applyCodex(row, response, AT);
   assert.equal(row.credits.value?.balance, "61951.0098125000");
-  assert.equal(row.manualResets.value?.availableCount, 1);
+  assert.equal(row.manualResets.value?.availableCount, 1, "native reset inventory is retained");
   assert.equal(row.ordinaryUsageAllowed.value, false);
   const duplicate = newProvider("alias", "codex");
   const wallet = { credits: { balance: "7.000", hasCredits: true, unlimited: false } };
@@ -325,7 +325,7 @@ test("catalog rejection recovery preserves normal cadence and rate-limit backoff
         m.update([provider()]); await m.tick();
         assert.equal(reads, 1, "availability and enablement flaps must preserve the deadline");
         const row = m.state.providers[0]!;
-        for (const key of ["credits", "ordinaryUsageAllowed", "spendControlReached", "plan", "manualResets"] as const) {
+        for (const key of ["credits", "ordinaryUsageAllowed", "spendControlReached"] as const) {
           const metric = row[key];
           if (!rateLimited) {
             assert.equal(metric.observedAt, AT, key);
@@ -346,8 +346,8 @@ test("catalog rejection recovery preserves normal cadence and rate-limit backoff
           assert.match(human, /observed 2026-10-17T17:57:35\.000Z/);
           assert.equal(row.ordinaryUsageAllowed.value, false);
           assert.equal(row.spendControlReached.value, false);
-          assert.equal(row.plan.value, "pro");
-          assert.equal(row.manualResets.value?.availableCount, 1);
+          assert.equal(row.plan.value, null, "plan is not collected by the wallet adapter");
+          assert.equal(row.manualResets.value?.availableCount, 1, "native reset inventory is retained");
         }
       }
       now = START + COLLECT_EVERY_MS * (rateLimited ? 2 : 1) - 1;

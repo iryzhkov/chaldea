@@ -82,7 +82,7 @@ test("persistent provider picks consume trial shares while Codex wins overall", 
   const scratch = routeScratch();
   try {
     const f = fixture(), codex = newProvider("codex", "codex");
-    codex.credits = { state: "fresh", observedAt: iso(now), source: "fixture", error: null,
+    codex.credits = { state: "fresh", observedAt: iso(now), source: "t3", error: null,
       value: { balance: "1", hasCredits: true, unlimited: false } };
     const data = { ...f, capacity: { codex: classifyCapacity(codex, false, now) },
       quota: { claudeAgent: { observedAt: iso(now), activeStop: false, windows: [
@@ -121,7 +121,7 @@ test("pins override bans/floors/probation but retain review separation, effort s
 test("under-paced Claude precedes Codex credits, then unlimited credits win with no credit floor", () => {
   const f = fixture(), row = newProvider("codex", "codex");
   row.credits = { state: "fresh", observedAt: iso(now), value: { balance: "0.01", hasCredits: true, unlimited: false },
-    source: "fixture", error: null };
+    source: "t3", error: null };
   const credit = classifyCapacity(row, false, now);
   assert.equal(credit.class, "unlimited");
   const unknown = classifyCapacity(newProvider("claudeAgent", "claudeAgent"), false, now);

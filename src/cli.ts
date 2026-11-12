@@ -16,15 +16,14 @@ import { parseArgs } from "node:util";
 
 import { shortHostname } from "./feed/poster.ts";
 import { createLogger } from "./log.ts";
-import { ConfigurationError, EXIT_CONFIG, readToken, runObserver } from "./quota/run.ts";
-import { ProtocolIncompatibleError, discoverServerUrl, setAutoResumeLimitedThreads } from "./t3/adapter.ts";
+import { ConfigurationError, EXIT_CONFIG, runObserver } from "./quota/run.ts";
 
 const USAGE = `Usage:
   chaldea route --role builder|critical-review|bulk-read|general [options]
   chaldea quota observe [options]
   chaldea quota status [--json] [--state-file PATH] [--capacity-config PATH]
   chaldea access --help
-  chaldea t3 restart [options]\n  chaldea t3 set-auto-resume on|off [options]\n  chaldea mcp --help
+  chaldea mcp --help
 
 quota observe: records T3 usage-limit stops and native auto-resumes in the fleet feed.
   --server-url URL     T3 URL (default: origin in <t3-base-dir>/userdata/server-runtime.json)
@@ -35,76 +34,9 @@ quota observe: records T3 usage-limit stops and native auto-resumes in the fleet
   --quota-config PATH  Codex contexts (default: ~/.config/chaldea/quota.json, optional)
   --enable-provider-switch  Continue quota stops on an equivalent provider (default: off)
   --switch-config PATH  JSON { enabled, equivalences: [[Claude model, Codex model], ...] }
-  --restart-config PATH  Planned restart recovery config (enabled by default)\n  --host NAME          Host name for feed records (default: short hostname)
+  --host NAME          Host name for feed records (default: short hostname)
 
-t3 set-auto-resume: turns T3's autoResumeLimitedThreads on or off through server.updateSettings.
-  --server-url URL     As above
-  --t3-base-dir DIR    As above
-  --token-file PATH    Short-lived settings:write token, mode 0600 (default: ~/.config/chaldea/t3-settings-token)
 `;
-
-async function restart(rest: ReadonlyArray<string>): Promise<number> {
-  const { values, positionals } = parseArgs({ args: [...rest], options: {
-    "server-url": { type: "string" }, "t3-base-dir": { type: "string" },
-    "token-file": { type: "string" }, "restart-config": { type: "string" },
-    "feed-command": { type: "string" },
-    help: { type: "boolean", short: "h" },
-  }, allowPositionals: true, strict: true });
-  if (values.help) { process.stdout.write("chaldea t3 restart [--t3-base-dir DIR] [--token-file PATH] [--restart-config PATH] [--server-url URL]\n"); return 0; }
-  if (positionals.length) throw new Error("t3 restart takes no positional arguments");
-  const { restartConfig, restartT3 } = await import("./t3/restart.ts");
-  try {
-    await restartT3({
-      t3BaseDir: values["t3-base-dir"] ?? join(homedir(), ".t3"),
-      ...(values["server-url"] === undefined ? {} : { serverUrl: values["server-url"] }),
-      tokenFile: values["token-file"] ?? join(paths().config, "t3-token"),
-      ...(values["feed-command"] === undefined ? {} : { feedCommand: values["feed-command"] }),
-      config: restartConfig(values["restart-config"]), logger: createLogger(),
-    });
-    return 0;
-  } catch (error) {
-    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
-    return error instanceof ConfigurationError ? EXIT.config : EXIT.failure;
-  }
-}
-
-async function setAutoResume(rest: ReadonlyArray<string>): Promise<number> {
-  const { values, positionals } = parseArgs({
-    args: [...rest],
-    options: {
-      "server-url": { type: "string" },
-      "t3-base-dir": { type: "string" },
-      "token-file": { type: "string" },
-      help: { type: "boolean", short: "h" },
-    },
-    strict: true,
-    allowPositionals: true,
-  });
-  const [mode, ...extra] = positionals;
-  if (values.help) {
-    process.stdout.write(USAGE);
-    return 0;
-  }
-  if ((mode !== "on" && mode !== "off") || extra.length > 0) {
-    process.stderr.write(USAGE);
-    return 64;
-  }
-  const home = homedir();
-  const serverUrl = values["server-url"] ?? discoverServerUrl(values["t3-base-dir"] ?? join(home, ".t3"));
-  if (serverUrl === null) {
-    process.stderr.write("chaldea: T3 is not running (no server-runtime.json)\n");
-    return 69;
-  }
-  try {
-    const token = readToken(values["token-file"] ?? join(paths().config, "t3-settings-token"));
-    const now = await setAutoResumeLimitedThreads({ serverUrl, token }, mode === "on");
-    process.stdout.write(`autoResumeLimitedThreads is ${now ? "on" : "off"}\n`);
-    return now === (mode === "on") ? 0 : 1;
-  } catch (error) {
-    createLogger().error("chaldea operation failed", { ...configFailure(error), error: error instanceof Error ? error.message : String(error) });
-    return error instanceof ConfigurationError || error instanceof ProtocolIncompatibleError ? EXIT_CONFIG : 1;
-  }
-}
 
 async function observe(rest: ReadonlyArray<string>): Promise<number> {
   const { values, positionals } = parseArgs({
@@ -150,7 +82,6 @@ async function observe(rest: ReadonlyArray<string>): Promise<number> {
         const switching = switchConfig(values["switch-config"] || config.switchConfig ? readJson((values["switch-config"] ?? config.switchConfig)!) : {});
         return { ...switching, enabled: values["enable-provider-switch"] === true || config.enableProviderSwitch || switching.enabled };
       })(),
-      restart: (await import("./t3/restart.ts")).restartConfig(values["restart-config"] ?? config.restartConfig),
       host: values.host ?? config.host ?? shortHostname(),
       logger: createLogger(),
       signal: controller.signal,
@@ -212,8 +143,6 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     }
     if (group === "quota" && command === "status") return await quotaStatus(rest);
     if (group === "quota" && command === "observe") return await observe(rest);
-    if (group === "t3" && command === "restart") return await restart(rest);
-    if (group === "t3" && command === "set-auto-resume") return await setAutoResume(rest);
   } catch (error) {
     if (error instanceof ConfigurationError) { createLogger().error("configuration unavailable", { file: error.file, reason: error.reason }); return EXIT.config; }
     // parseArgs rejects unknown options.

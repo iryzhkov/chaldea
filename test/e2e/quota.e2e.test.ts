@@ -190,52 +190,6 @@ test("a hard limit without a reset stays parked with exactly one quota_reset_unk
   assertNothingLeaked(h, "Start the work.");
 });
 
-test("chaldea t3 set-auto-resume enables native resume without a restart or losing other settings", { skip, timeout: 120_000 }, async () => {
-  // The reset is far enough ahead that recovery is armed well before it.
-  const h = await harness({ scenario: "reset", autoResume: false, resetDelaySeconds: 25 });
-  assert.equal((await readSettings(h.t3, h.operateToken)).autoResumeLimitedThreads, false);
-  await dispatchMessage(h.t3, h.operateToken, h.threadId, `Start the work. ${h.t3.trigger}`, "1");
-  const stopped = await waitFor("the usage-limit stop", () => {
-    const thread = h.watcher.threads.get(h.threadId);
-    return thread?.lastErrorClass === "usage_limit" ? thread : null;
-  }, 30_000);
-  const resetMs = Date.parse(stopped.usageLimitResetAt!);
-  // With the setting off, a sweep passes without arming recovery.
-  await sleep(6_000);
-  assert.equal(h.watcher.threads.get(h.threadId)?.limitRecovery, null);
-
-  // Another client changes an unrelated setting first; it must survive.
-  await updateSettings(h.t3, h.operateToken, { sidebarAutoSettleOnMerge: false });
-
-  // The documented procedure: a token with only settings:write, used once.
-  const settingsToken = join(h.dir, "t3-settings-token");
-  writePrivateFile(settingsToken, `${h.t3.issueToken(["settings:write"])}\n`);
-  const enabled = await runCli(["t3", "set-auto-resume", "on", "--server-url", h.t3.serverUrl, "--token-file", settingsToken], h.dir);
-  assert.equal(enabled.code, 0, enabled.stderr);
-  assert.equal(enabled.stdout, "autoResumeLimitedThreads is on\n");
-
-  await waitFor("the continuation run", () => (h.watcher.runs.get(h.threadId)?.size ?? 0) >= 2, 45_000);
-  const after = await readSettings(h.t3, h.operateToken);
-  assert.equal(after.autoResumeLimitedThreads, true);
-  assert.equal(after.sidebarAutoSettleOnMerge, false);
-  const runs = [...h.watcher.runs.get(h.threadId)!];
-  const lateness = (Date.parse(h.watcher.runStarts.get(runs[1]!)!) - resetMs) / 1000;
-  process.stdout.write(`# set-auto-resume after the stop: continuation ${lateness.toFixed(3)} s after reset\n`);
-  assert.ok(lateness >= 0 && lateness <= MAX_LATENESS_SECONDS, `lateness ${lateness}`);
-  assert.equal(turns(h.t3, "completed", true), 1);
-
-  // T3 persisted it with its own writer, alongside the other change.
-  const persisted = JSON.parse(readFileSync(h.t3.settingsPath, "utf8"));
-  assert.equal(persisted.autoResumeLimitedThreads, true);
-  assert.equal(persisted.sidebarAutoSettleOnMerge, false);
-
-  const disabled = await runCli(["t3", "set-auto-resume", "off", "--server-url", h.t3.serverUrl, "--token-file", settingsToken], h.dir);
-  assert.equal(disabled.code, 0, disabled.stderr);
-  assert.equal(disabled.stdout, "autoResumeLimitedThreads is off\n");
-  assert.equal((await readSettings(h.t3, h.operateToken)).autoResumeLimitedThreads, false);
-  assert.ok(!enabled.stdout.includes("token") && !enabled.stderr.includes("token"));
-});
-
 test("the observer starts before T3, and a T3 restart while parked neither loses nor repeats records", { skip, timeout: 240_000 }, async () => {
   const dir = scratchDir("e2e");
   cleanups.push(dir.remove);
@@ -277,6 +231,6 @@ test("the observer starts before T3, and a T3 restart while parked neither loses
   assert.equal(resumed.body.trigger, "auto_resume");
   assert.equal(turns(t3, "limited"), 1);
   assert.equal(turns(t3, "completed", true), 1);
-  process.stdout.write(`# after a T3 restart: continuation ${resumed.body.latenessSeconds} s after reset\n`);
+  process.stdout.write(`# after restarting T3: continuation ${resumed.body.latenessSeconds} s after reset\n`);
   assert.ok(Number(resumed.body.latenessSeconds) >= 0 && Number(resumed.body.latenessSeconds) <= MAX_LATENESS_SECONDS);
 });

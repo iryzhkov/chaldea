@@ -2,7 +2,7 @@
 import { spawn } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
-import { claudeContexts, type ClaudeContext } from "./claude-contexts.ts";
+import type { ClaudeContext } from "./claude-contexts.ts";
 import { quotaConfig } from "../config/quota.ts";
 
 export interface CodexContext {
@@ -56,7 +56,17 @@ export function headroomConfig(raw: unknown = {}, home = homedir()): HeadroomCon
     const key = JSON.stringify([contextKey(ctx), ctx.assertRuntimeHome, ctx.accountKey]), previous = grouped.get(key);
     grouped.set(key, { ...ctx, providers: [...(previous?.providers ?? []), ...ctx.providers] });
   }
-  const claude = claudeContexts(c.claudeContexts);
+  // Retired token-source fields are ignored, but explicit account binding stays strict.
+  if (c.claudeContexts !== undefined && (!Array.isArray(c.claudeContexts) || c.claudeContexts.length > 16))
+    throw new Error("invalid Claude account bindings");
+  const aliases = new Set<string>();
+  const claude: ClaudeContext[] = (c.claudeContexts as Record<string, unknown>[] | undefined ?? []).map(v => {
+    if (!v || typeof v.providerInstanceId !== "string" || !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(v.providerInstanceId) ||
+        aliases.has(v.providerInstanceId) || v.accountKey !== undefined &&
+        (typeof v.accountKey !== "string" || !/^[a-f0-9]{64}$/.test(v.accountKey))) throw new Error("invalid Claude account binding");
+    aliases.add(v.providerInstanceId);
+    return { providerInstanceId: v.providerInstanceId, ...(typeof v.accountKey === "string" ? { accountKey: v.accountKey } : {}) };
+  });
   if (claude.some(ctx => seen.has(ctx.providerInstanceId))) throw new Error("duplicate provider alias");
   return { contexts: [...grouped.values()], lowHeadroomPercent: low, claudeContexts: claude };
 }
@@ -142,7 +152,14 @@ export function readCodexBalance(context: CodexContext, signal: AbortSignal, tim
             params: { excludeResetCreditDetails: true, supportsLunaReserve: false } });
         } else if (message.id === 2 && initialized && Object.hasOwn(message, "result")) {
           const a = account as Record<string, unknown> | null;
-          result = { ...message.result, accountId: message.result?.accountId ?? a?.accountId ?? a?.id };
+          // Only fields missing from native usage limits cross this boundary.
+          const raw = message.result;
+          const wallet = (b: any) => b && { credits: b.credits, spendControlReached: b.spendControlReached };
+          result = { accountId: raw?.accountId ?? a?.accountId ?? a?.id,
+            ordinaryUsageAllowed: raw?.ordinaryUsageAllowed,
+            rateLimits: wallet(raw?.rateLimits),
+            ...(raw?.rateLimitsByLimitId ? { rateLimitsByLimitId: Object.fromEntries(
+              Object.entries(raw.rateLimitsByLimitId).map(([id, b]) => [id, wallet(b)])) } : {}) };
           received = true; stop();
         }
       }

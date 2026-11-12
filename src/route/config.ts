@@ -4,15 +4,12 @@ import { hostname } from "node:os";
 import type { ScoreTransport } from "./snapshot.ts";
 import { join } from "node:path";
 import { DEFAULT_POLICY, type Role } from "./types.ts";
-import type { PolicyConfig, QuotaWindow } from "./types.ts";
-import { tokenSource, type ClaudeTokenSource } from "./claude-usage.ts";
+import type { PolicyConfig } from "./types.ts";
 
 export interface RouteConfig extends PolicyConfig {
   scores: ScoreTransport;
   announceHost: string; routeStateFile: string;
   stateFile: string; cacheDir: string; t3BaseDir: string; tokenFile: string; capacityConfigFile: string; quotaConfigFile: string | undefined;
-  claudeUsage: ClaudeTokenSource & { enabled: boolean; providerInstanceId: string };
-  claudeWeeklyTarget: { observedAt: string; window: QuotaWindow } | null;
 }
 export function loadRouteConfig(home: string, path = join(home, ".config/chaldea/route.json")): RouteConfig {
   const defaults: RouteConfig = {
@@ -24,12 +21,10 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
     stateFile: join(home, ".local/state/chaldea/quota-observer.json"),
     cacheDir: join(home, ".cache/chaldea/route"),
     t3BaseDir: join(home, ".t3"), tokenFile: join(home, ".config/chaldea/t3-token"),
-    claudeUsage: { enabled: false, providerInstanceId: "claudeAgent", credentialFile: join(home, ".claude/.credentials.json") },
-    claudeWeeklyTarget: null,
   };
   const r = readJson(path, true, undefined, { maxBytes: 64 * 1024 });
   if (!r || typeof r !== "object" || Array.isArray(r) ||
-    Object.keys(r).some(k => !Object.hasOwn(defaults, k))) throw new Error("Invalid route configuration keys");
+    Object.keys(r).some(k => !Object.hasOwn(defaults, k) && !["claudeUsage", "claudeWeeklyTarget"].includes(k))) throw new Error("Invalid route configuration keys");
   const c = { ...defaults };
   for (const key of ["paceMargin", "minimumRemaining", "failureMargin", "probationShare"] as const) {
     if (r[key] !== undefined) {
@@ -100,24 +95,7 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
       if (u.protocol !== "https:" || u.username || u.password || u.search || u.hash || !t.tokenHelper.startsWith("/")) throw new Error("Invalid score transport");
     }
   }
-  if (r.claudeUsage !== undefined) {
-    const v = r.claudeUsage as Record<string, unknown>;
-    if (!v || typeof v !== "object" || Array.isArray(v) || Object.keys(v).some(k => !["enabled", "providerInstanceId", "credentialFile", "envFile", "envVar"].includes(k)) ||
-      v.enabled !== undefined && typeof v.enabled !== "boolean" ||
-      v.providerInstanceId !== undefined && (typeof v.providerInstanceId !== "string" || !v.providerInstanceId.length) ||
-      v.credentialFile !== undefined && (typeof v.credentialFile !== "string" || !v.credentialFile.startsWith("/"))) throw new Error("Invalid Claude collector configuration");
-    c.claudeUsage = { enabled: c.claudeUsage.enabled, providerInstanceId: c.claudeUsage.providerInstanceId, ...v,
-      ...tokenSource(v as ClaudeTokenSource, home) } as RouteConfig["claudeUsage"];
-  }
-  if (r.claudeWeeklyTarget !== undefined && r.claudeWeeklyTarget !== null) {
-    const v = r.claudeWeeklyTarget as Record<string, unknown>;
-    if (!v || typeof v !== "object" || Object.keys(v).some(k => !["observedAt", "remainingPercent", "resetsAt"].includes(k)) ||
-      typeof v.observedAt !== "string" || !Number.isFinite(Date.parse(v.observedAt)) ||
-      typeof v.resetsAt !== "string" || !Number.isFinite(Date.parse(v.resetsAt)) ||
-      typeof v.remainingPercent !== "number" || !Number.isFinite(v.remainingPercent) || v.remainingPercent < 0 || v.remainingPercent > 100) throw new Error("Invalid Claude weekly target");
-    c.claudeWeeklyTarget = { observedAt: v.observedAt, window: { kind: "weekly", remainingPercent: v.remainingPercent,
-      resetsAt: v.resetsAt, windowDurationMins: 10080 } };
-  }
+  // Retired collector and estimate keys are accepted but ignored.
   const capacity = loadCapacityConfig(home, c.capacityConfigFile);
   if (r.paceMargin === undefined) c.paceMargin = capacity.paceMargin;
   if (r.minimumRemaining === undefined) c.minimumRemaining = capacity.minimumRemaining;

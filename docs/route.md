@@ -139,13 +139,12 @@ from the observer's `quota.json`. Use `--config PATH` for CLI or
   "failureMargin": 0.10,
   "minimumTurns": 100,
   "quotaMaxAgeMs": 900000,
-  "analyticsMaxAgeMs": 1814400000,
-  "claudeUsage": { "enabled": false, "providerInstanceId": "claudeAgent" }
+  "analyticsMaxAgeMs": 1814400000
 }
 ```
 
 Optional absolute paths are `stateFile`, `cacheDir`, `t3BaseDir`, `tokenFile`, `quotaConfigFile`,
-`capacityConfigFile` and `claudeUsage.credentialFile`. Defaults use the normal
+`capacityConfigFile`. Defaults use the normal
 Chaldea observer state, local T3, the shared observer token at
 `~/.config/chaldea/t3-token`, and `~/.cache/chaldea/route/`. That token may include
 `orchestration:operate` for the observer; routing only calls `server.getConfig`.
@@ -179,77 +178,11 @@ process, which reads this token and owns its collection caches. Capacity configu
 or used to classify Codex credits. Refill and credit expiry settings are operator
 assertions, never an automatic source of Claude reserves.
 
-When Claude collection is off or unavailable, optionally set
-`claudeWeeklyTarget` in route.json:
+## Native usage
 
-```json
-{
-  "claudeWeeklyTarget": {
-    "observedAt": "2026-10-17T12:00:00Z",
-    "remainingPercent": 62,
-    "resetsAt": "2026-10-20T07:12:00Z"
-  }
-}
-```
-
-This estimate lasts until the stated reset, at most seven days after observation.
-Its real age appears in the output. Without it, Claude pacing stays unknown.
-
-## Optional Claude collector
-
-T3 0.1.0 marks Claude windows unsupported. Opt in with
-`claudeUsage.enabled: true` on the host whose local Claude credential belongs
-to the configured instance. Select exactly one token source: `credentialFile`
-defaults to `~/.claude/.credentials.json`; or set `envFile` plus optional
-`envVar`, defaulting to `~/.config/claude/oauth.env` and
-`CLAUDE_CODE_OAUTH_TOKEN`. Paths in configuration must be absolute. For example:
-
-```json
-{
-  "claudeUsage": {
-    "enabled": true,
-    "providerInstanceId": "claudeAgent",
-    "envFile": "/home/igor/.config/claude/oauth.env",
-    "envVar": "CLAUDE_CODE_OAUTH_TOKEN"
-  }
-}
-```
-
-The same source fields are accepted on quota.json `claudeContexts`. JSON and
-env-file sources are mutually exclusive; there is no implicit fallback to another
-login. The env reader requires an owner-owned regular 0600 file, bounded at 64 KiB,
-with exactly one assignment to the selected variable. Bare, single-quoted and
-double-quoted values and optional `export` are accepted. It extracts that value
-only, ignores other variables, performs no shell expansion and never populates
-the process environment. Tokens containing expansion syntax or unmatched quotes
-are rejected. Cache keys include the source path and selected variable.
-
-The collector reads the selected source read-only and sends one GET to
-`https://api.anthropic.com/api/oauth/usage`, the endpoint used by Claude usage
-monitoring. This is an undocumented OAuth endpoint; authentication or schema
-changes degrade to cached data or the operator target.
-
-The reader accepts only a regular, bounded file, refuses symlinks and expired
-tokens, and never refreshes or writes credentials. Requests use the OAuth bearer
-and `anthropic-beta: oauth-2025-04-20`, a fixed HTTPS origin, no redirects, a
-five-second timeout and a 64 KiB response cap. Failure text is sanitized.
-Only 5-hour and 7-day utilization/deadlines and a hashed account identity are
-cached, with mode 0600. A GET of the OAuth profile endpoint supplies identity
-when the usage response omits it.
-A persistent reservation plus cross-process lock limits attempts, including
-failures, to once per five minutes. HTTP 429 records `rate_limited` and honors
-`Retry-After` seconds or HTTP date, with the five-minute minimum cadence still
-applying. Without a valid header, consecutive 429s back off for 5, 10, 20, 40
-then 60 minutes, capped at an hour; success resets the backoff. JSON expiry at
-zero or in the past records `credential_expired` without an HTTP request.
-A 401 records `unauthorized`. Other credential failures record
-`credential_unavailable`; other collection failures use `collection_failed`.
-The mode-0600 cache records `attemptedAt`, `failureReason`, `failureCount` and
-`retryAt`, keeping the last good value and original `fetchedAt`. Route reasons
-show the failure and cached age; quota status retains the sanitized diagnostic
-on the included metric for the board. No raw response/error or credential field
-is persisted. Collector off means no credential read.
-An old lock can be cleared after its cadence; lock contention skips collection.
+Included windows come only from T3. Missing or stale data stays unknown for routing;
+no direct OAuth request or operator estimate supplies a fallback. Legacy collector
+and weekly estimate config keys are accepted and ignored.
 
 ## Slopalytics
 

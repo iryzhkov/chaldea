@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
-import { parseClaudeUsage, collectClaudeUsage } from "../../src/route/claude-usage.ts";
 import { writeJson } from "../../src/route/cache.ts";
 import { recommend } from "../../src/route/policy.ts";
 import { route } from "../../src/route/runtime.ts";
@@ -15,41 +14,13 @@ import type { SwitchProvider } from "../../src/t3/adapter.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
 
-const raw = (fable = 100) => ({ five_hour: { utilization: 10, resets_at: iso(now + 3600000) },
-  seven_day: { utilization: 20, resets_at: iso(now + 86400000) },
-  seven_day_fable: { utilization: fable, resets_at: iso(now + 86400000) } });
-test("direct parser and successful-cache path retain distinct native window IDs", async () => {
-  const d = routeScratch();
-  try {
-    const value = parseClaudeUsage(raw(), now);
-    assert.deepEqual(value.windows.map(w => w.id), ["five_hour", "seven_day", "seven_day_fable"]);
-    assert.equal(parseClaudeUsage({ ...raw(), seven_day_fable: null }, now).windows.length, 2);
-    assert.throws(() => parseClaudeUsage({ ...raw(), seven_day_fable: { utilization: "bad" } }, now));
-    const cacheFile = join(d.path, "usage.json");
-    writeJson(cacheFile, { attemptedAt: now, fetchedAt: iso(now), value });
-    const cached = await collectClaudeUsage({ enabled: true, credentialFile: "/must-not-read",
-      cacheFile, now, fetcher: async () => { throw new Error("must not collect"); } });
-    assert.deepEqual(cached.value?.windows, value.windows);
-  } finally { d.remove(); }
-});
-test("direct Claude observer fallback preserves the optional scoped native ID", async () => {
-  const accountKey = "b".repeat(64), usage = { ...parseClaudeUsage(raw(), now), accountKey };
-  const m = new HeadroomMonitor({ state: emptyHeadroom(), local: true, now: () => now, save() {},
-    config: headroomConfig({ claudeContexts: [{ enabled: true, providerInstanceId: "claude-fallback",
-      credentialFile: "/must-not-read" }] }),
-    claudeRead: async () => ({ value: usage, fetchedAt: iso(now), reason: null }) });
-  try {
-    m.update([{ instanceId: "claude-fallback", driver: "claudeAgent", quotaAccountKey: accountKey,
-      enabled: true, installed: true, status: "ready", auth: { status: "authenticated" }, models: [],
-      usageLimits: { checkedAt: iso(now), windows: [], unavailable: { reason: "unsupported" } } }]);
-    await m.tick();
-    assert.equal(m.state.providers[0]!.included.source, "claude-usage");
-    assert.deepEqual(m.state.providers[0]!.included.value!.map(w => w.id), ["five_hour", "seven_day", "seven_day_fable"]);
-  } finally { await m.close(); }
-});
-
+const nativeQuota = () => ({ observedAt: iso(now), windows: [
+  { id: "five_hour", kind: "session", remainingPercent: 90, resetsAt: iso(now + 3600000), windowDurationMins: 300 },
+  { id: "seven_day", kind: "weekly", remainingPercent: 80, resetsAt: iso(now + 86400000), windowDurationMins: 10080 },
+  { id: "seven_day_fable", kind: "weekly", remainingPercent: 0, resetsAt: iso(now + 86400000), windowDurationMins: 10080 },
+] });
 test("common windows constrain every Claude model; scoped limit constrains only normalized Fable", () => {
-  const q = { ...parseClaudeUsage(raw(), now), activeStop: false };
+  const q = { ...nativeQuota(), activeStop: false };
   const data = { catalog, now, quota: { claudeAgent: q }, analytics: null };
   assert.equal(recommend({ role: "builder" }, data).model, "claude-opus-5-5");
   assert.equal(recommend({ role: "critical-review" }, data).model, "gpt-6-astra");
@@ -67,7 +38,7 @@ test("common windows constrain every Claude model; scoped limit constrains only 
   assert.equal(recommend({ role: "builder" }, { ...data, quota: { claudeAgent: commonLow } }).providerInstanceId, "codex");
 });
 test("scoped windows cannot establish provider capacity; missing scoped data stays unknown", () => {
-  const q = parseClaudeUsage(raw(), now), p = newProvider("claudeAgent", "claudeAgent");
+  const q = nativeQuota(), p = newProvider("claudeAgent", "claudeAgent");
   p.included = { value: q.windows.map(w => ({ ...w, id: w.id!, usedPercent: 100 - w.remainingPercent })),
     observedAt: iso(now), state: "fresh", error: null, source: "fixture" };
   assert.equal(classifyCapacity(p, false, now).class, "use-it");

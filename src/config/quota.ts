@@ -11,7 +11,7 @@ export function quotaConfig(home?: string, path?: string) {
   return {
     serverUrl: string("serverUrl"), t3BaseDir: string("t3BaseDir"), tokenFile: string("tokenFile"),
     stateFile: string("stateFile"), feedCommand: string("feedCommand"), host: string("host"),
-    switchConfig: string("switchConfig"), restartConfig: string("restartConfig"),
+    switchConfig: string("switchConfig"),
     claudeContexts: c.claudeContexts,
     contexts: c.contexts, lowHeadroomPercent: c.lowHeadroomPercent, enableProviderSwitch: c.enableProviderSwitch === true,
   };

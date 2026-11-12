@@ -1,6 +1,4 @@
 // Sanitized, independently timestamped quota observations. No provider/account payload is persisted wholesale.
-import { homedir } from "node:os";
-import { collectClaudeUsage, claudeCacheFile, claudeSourceId } from "../route/claude-usage.ts";
 import { accountKey } from "./account.ts";
 import { retainBurnSample } from "./capacity.ts";
 import type { BurnSample } from "./capacity.ts";
@@ -58,10 +56,10 @@ const unknown = <T>(source: string, state: MetricState = "unknown", error: strin
   ({ value: null, state, source, observedAt: null, error });
 const observed = <T>(value: T, source: string, at: string): Metric<T> =>
   ({ value, state: "fresh", source, observedAt: at, error: null });
-export function metricNow<T>(m: Metric<T>, nowMs: number): Metric<T> & { ageSeconds: number | null } {
+export function metricNow<T>(m: Metric<T>, nowMs: number): Metric<T> & { ageSeconds: number | null; checkedAt: string | null } {
   const age = m.observedAt === null ? Number.NaN : nowMs - Date.parse(m.observedAt);
   const valid = Number.isFinite(age) && age >= 0;
-  return { ...m, state: m.value !== null && (!valid || age >= STALE_AFTER_MS) ? "stale" : m.state,
+  return { ...m, checkedAt: m.source === "t3" ? m.observedAt : null, state: m.value !== null && (!valid || age >= STALE_AFTER_MS) ? "stale" : m.state,
     ageSeconds: valid ? Math.floor(age / 1000) : null };
 }
 export function newProvider(alias: string, driver: string): ProviderHeadroom {
@@ -108,6 +106,15 @@ export function validateHeadroom(value: unknown): HeadroomState {
       throw new Error("invalid_headroom_state");
     }
   }
+  // Retired collectors cannot remain quota inputs through an old observer cache.
+  for (const p of s.providers) {
+    if (p.included.source !== "t3") {
+      p.included = unknown("t3");
+      delete p.burnHistory;
+    }
+    if (p.manualResets.source === "codex-app-server") p.manualResets = newProvider(p.alias, p.driver).manualResets;
+    if (p.plan.source === "codex-app-server") p.plan = unknown("t3");
+  }
   return value as HeadroomState;
 }
 
@@ -138,7 +145,6 @@ export function applyT3(row: ProviderHeadroom, p: SwitchProvider): void {
   }
 }
 
-const PLANS = new Set(["free", "go", "plus", "pro", "team", "business", "enterprise", "edu", "unknown"]);
 export function applyCodex(row: ProviderHeadroom, raw: unknown, at: string): void {
   const result = object(raw);
   if (!result) throw new BalanceReadError("protocol");
@@ -167,13 +173,8 @@ export function applyCodex(row: ProviderHeadroom, raw: unknown, at: string): voi
     row.credits = { ...observed({ balance: c.balance ?? null, hasCredits: c.hasCredits, unlimited: c.unlimited }, source, at),
       state: c.balance == null && !c.unlimited ? "unknown" : "fresh" };
   } else row.credits = unknown(source);
-  const resets = object(result.rateLimitResetCredits);
-  if (resets && count(resets.availableCount)) {
-    row.manualResets = observed({ availableCount: resets.availableCount, nextExpiresAt: null }, source, at);
-  } // A missing count never refreshes an earlier count.
   if (typeof result.ordinaryUsageAllowed === "boolean") row.ordinaryUsageAllowed = observed(result.ordinaryUsageAllowed, source, at);
   if (typeof bucket?.spendControlReached === "boolean") row.spendControlReached = observed(bucket.spendControlReached, source, at);
-  if (typeof bucket?.planType === "string" && PLANS.has(bucket.planType)) row.plan = observed(bucket.planType, source, at);
 }
 export function failCodex(row: ProviderHeadroom, error: string): void {
   for (const key of ["credits", "ordinaryUsageAllowed", "spendControlReached", "plan"] as const) {
@@ -246,7 +247,6 @@ export interface HeadroomMonitorOptions {
   state: HeadroomState; config: HeadroomConfig; local: boolean;
   save: (records: ReadonlyArray<QuotaRecord>) => void;
   activeStops?: () => ReadonlySet<string>;
-  claudeRead?: typeof collectClaudeUsage;
   read?: BalanceReader; now?: () => number; random?: () => number;
   diagnostic?: (detail: { provider: string; reason: BalanceReason; binding?: "asserted" }) => void;
 }
@@ -273,7 +273,7 @@ export class HeadroomMonitor {
   }
   update(providers: ReadonlyArray<SwitchProvider>): void {
     const before = JSON.stringify(this.state.providers);
-    const identity = (p: SwitchProvider) => JSON.stringify([p.runtimeHome, p.quotaContextBlocked, p.quotaAccountKey, p.auth.status, p.auth.type]);
+    const identity = (p: SwitchProvider) => JSON.stringify([p.runtimeHome, p.quotaContextBlocked, p.quotaAccountKey, p.usageLimits?.credentialFingerprint, p.auth.status, p.auth.type]);
     const priorContexts = new Map(this.#providers.map(p => [p.instanceId, identity(p)]));
     this.#providers = providers;
     const previous = new Map(this.state.providers.map(p => [p.alias, p]));
@@ -289,7 +289,7 @@ export class HeadroomMonitor {
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;
-        if (p.driver === "claudeAgent") {
+        if (p.driver === "claudeAgent" || p.driver === "codex") {
           // Native windows/reset inventory belong to this instance's account only.
           next.included = clean.included; next.manualResets = clean.manualResets;
         }
@@ -300,7 +300,7 @@ export class HeadroomMonitor {
         next.manualResets = newProvider(p.instanceId, p.driver).manualResets;
         return next;
       }
-      if (p.driver === "claudeAgent" && p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
+      if (p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
       applyT3(next, p);
       if (p.driver === "claudeAgent" && !p.quotaAccountKey) {
         if (next.included.source === "t3") delete next.accountKey;
@@ -385,44 +385,6 @@ export class HeadroomMonitor {
   }
   async #collect(): Promise<void> {
     this.#diagnose();
-    for (const ctx of this.options.config.claudeContexts ?? []) {
-      if (!ctx.enabled || this.#abort.signal.aborted || !this.options.local) continue;
-      const row = this.state.providers.find(p => p.alias === ctx.providerInstanceId);
-      if (!row || row.driver !== "claudeAgent") continue;
-      const nativeKey = () => this.#providers.find(p => p.instanceId === ctx.providerInstanceId && p.driver === "claudeAgent")?.quotaAccountKey;
-      const freshNative = () => nativeKey() && row.accountKey === nativeKey() && row.included.source === "t3" && metricNow(row.included, this.now()).state === "fresh";
-      const rejectNativeMismatch = () => {
-        if (!ctx.accountKey || !nativeKey() || ctx.accountKey === nativeKey()) return false;
-        delete row.accountKey; row.included = unknown("t3", "error", "context_mismatch");
-        this.#changed = true; return true;
-      };
-      if (rejectNativeMismatch() || freshNative()) continue;
-      const usage = await (this.options.claudeRead ?? collectClaudeUsage)({ ...ctx, enabled: true,
-        cacheFile: claudeCacheFile(homedir(), claudeSourceId(ctx)),
-        now: this.now() });
-      if (rejectNativeMismatch() || freshNative()) continue; // Native auth may have changed during HTTP.
-      if (usage.value && !usage.value.accountKey && (ctx.accountKey || nativeKey())) continue;
-      const error = usage.reason;
-      if ((!row.included.value || row.included.source !== "t3") && row.included.error !== error) {
-        row.included = { ...row.included, source: "claude-usage", error,
-          state: row.included.value ? row.included.state : error ? "error" : "unknown" };
-        this.#changed = true;
-      }
-      if (!usage.value) continue;
-      if (ctx.accountKey && usage.value.accountKey !== ctx.accountKey || nativeKey() && usage.value.accountKey !== nativeKey()) {
-        delete row.accountKey;
-        row.included = unknown("claude-usage", "error", "context_mismatch");
-        this.#changed = true;
-        continue;
-      }
-      const u = usage.value;
-      if (!row.included.observedAt || Date.parse(u.observedAt) > Date.parse(row.included.observedAt) || row.included.source === "t3" && !nativeKey()) {
-        retainBurnSample(row, u.observedAt);
-        row.included = { ...observed(u.windows.map(w => ({ ...w, id: w.id ?? w.kind, usedPercent: 100 - w.remainingPercent })), "claude-usage", u.observedAt), error };
-        if (u.accountKey) row.accountKey = u.accountKey; else delete row.accountKey;
-        this.#changed = true;
-      }
-    }
     // Policies may differ across aliases sharing one executable/HOME tuple.
     const contexts = new Map(this.options.config.contexts.map(ctx => [contextKey(ctx), ctx]));
     if (this.options.local) for (const [key, ctx] of contexts) {
