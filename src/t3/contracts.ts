@@ -111,9 +111,11 @@ const configEvent = S.Union([
 ]);
 const authError = S.Struct({ _tag: S.Literal("EnvironmentAuthorizationError"), message: S.String });
 const taggedError = <T extends string>(tag: T) => S.Struct({
-  _tag: S.Literal(tag), message: S.String, detail: opt(S.String),
+  _tag: S.Literal(tag), message: opt(S.String), detail: opt(S.String),
+  settingsPath: opt(S.String), configPath: opt(S.String), operation: opt(S.String),
+  cause: opt(S.Unknown),
 });
-const configError = S.Union([authError, taggedError("KeybindingsConfigError"), taggedError("ServerSettingsError")]);
+const configError = S.Union([authError, taggedError("KeybindingsConfigParseError"), taggedError("ServerSettingsError")]);
 export const WsRpcGroup = RpcGroup.make(
   Rpc.make("server.getConfig", { payload: S.Struct({}), success: config, error: configError }),
   Rpc.make("subscribeServerConfig", { payload: S.Struct({}), success: configEvent, error: configError, stream: true }),

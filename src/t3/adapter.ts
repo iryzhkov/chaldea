@@ -472,18 +472,20 @@ export async function withClient<A>(
     const failure = refusal as HandshakeFailure | null;
     if (failure !== null) throw classifyRefusal(failure);
     const text = describe(cause);
-    if (/EnvironmentAuthorizationError|insufficient_scope|forbidden/i.test(text)) {
-      throw new AuthenticationError(`T3 refused the request: ${text}`);
-    }
+    // SchemaError text includes every union tag, including authorization errors.
     if (isContractFailure(cause)) {
       throw new ProtocolIncompatibleError(`T3 sent data the pinned contracts reject: ${text}`);
+    }
+    if (typeof cause === "object" && cause !== null &&
+        "_tag" in cause && cause._tag === "EnvironmentAuthorizationError") {
+      throw new AuthenticationError(`T3 refused the request: ${text}`);
     }
     throw new TransientConnectionError(text);
   }
 }
 
 /**
- * The sole wake delivery seam. Pinned 0.1.0 rewrites createdBy to user at WS
+ * The sole wake delivery seam. Official 0.1.6 and 0.1.9 rewrite createdBy to user at WS
  * intake and rejects notification payloads. Igor explicitly approved one marked,
  * queued user message per item. Keep the journal's command bytes immutable:
  * RPC success confirms the durable receipt; ambiguous calls replay the same ID.

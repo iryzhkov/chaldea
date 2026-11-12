@@ -1,13 +1,18 @@
 #!/bin/sh
 # Official release only. Verify the published checksum manifest and archive.
 set -eu
-version=0.1.9
-destination=${1:?usage: install-t3 DIRECTORY}
+destination=${1:?usage: install-t3 DIRECTORY [0.1.6|0.1.9]}
+version=${2:-0.1.9}
+case "$version" in
+  0.1.6) manifest=b89ef2501444b646774f9a0adfe965d4be284ab1fa97e686954be8c71802925d ;;
+  0.1.9) manifest=89d5d9670bfc47db44c991a06d461f5b8f5fd0b18649d34b6d38939b6ff71a2e ;;
+  *) echo "Unsupported T3 version: $version" >&2; exit 1 ;;
+esac
 mkdir -p "$destination"
 name="t3-$version-linux-x64.tar.gz"
 base="https://github.com/pingdotgg/t3code/releases/download/v$version"
 curl --fail --location --retry 3 "$base/SHA256SUMS" --output "$destination/SHA256SUMS"
-echo "89d5d9670bfc47db44c991a06d461f5b8f5fd0b18649d34b6d38939b6ff71a2e  $destination/SHA256SUMS" | sha256sum --check
+echo "$manifest  $destination/SHA256SUMS" | sha256sum --check
 curl --fail --location --retry 3 "$base/$name" --output "$destination/$name"
 (cd "$destination" && grep "  $name$" SHA256SUMS | sha256sum --check)
 tar --no-same-owner --strip-components=1 -xzf "$destination/$name" -C "$destination"

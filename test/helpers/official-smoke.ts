@@ -12,7 +12,8 @@ import { ShellWatcher, waitFor, dispatchMessage } from "./e2e.ts";
 import { emptyState, saveState } from "../../src/quota/state.ts";
 import { writeJson } from "../../src/route/cache.ts";
 
-assert.equal(homedir(), "/work/.scratch/home");
+assert.equal(homedir(), process.env.CHALDEA_TRUST_TEST_HOME);
+assert.notEqual(homedir(), "/home/igor");
 assert.equal(t3Version(), "t3 v" + (process.env.CHALDEA_SMOKE_VERSION ?? "0.1.6"));
 const packaged = resolve(process.argv[2]!);
 const base = join(homedir(), "official-smoke"); mkdirSync(base, { recursive: true });
