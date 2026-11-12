@@ -14,7 +14,7 @@ import { restartMessageId, restartProjection } from "../../src/t3/restart-port.t
 import { withClient } from "../../src/t3/adapter.ts";
 import type { QuotaRecord } from "../../src/quota/observer.ts";
 
-const skip = t3Version() === "t3 v0.1.0" ? false : "needs pinned T3";
+const skip = t3Version() === "t3 v0.1.9" ? false : "needs pinned T3";
 if (skip && process.env.CHALDEA_REQUIRE_E2E === "1") throw new Error(skip);
 const logger = createLogger(() => {});
 
@@ -246,7 +246,7 @@ for (const native of [false, true]) test(`Chaldea never admits a secret card (na
     const p = await withClient({ serverUrl: f.t3.serverUrl, token: f.token },
       c => c["orchestration.getThreadProjection"]({ threadId: f.thread } as never));
     if (!native) assert.equal(p.runs.length, 1);
-    // Native 0.1.0 can race secret cancellation against shutdown; any linked
+    // Native 0.1.9 can race secret cancellation against shutdown; any linked
     // continuation here is native: Chaldea has no captured row or feed record.
     assert.equal(f.journal.entries(f.t3.baseDir).length, 0, "no Chaldea intent exists to dispatch");
     console.log(JSON.stringify({ nativeSecretProbe: native, runsAfterRestart: p.runs.length }));

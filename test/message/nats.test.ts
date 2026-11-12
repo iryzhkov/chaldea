@@ -19,7 +19,7 @@ import { withClient,dispatchChaldeaWake } from "../../src/t3/adapter.ts";
 const delay=(ms:number)=>new Promise(r=>setTimeout(r,ms));
 test("production messaging: pinned broker/T3 identity, recovery, concurrency and lifecycle",{timeout:240000},async t=>{
  assert.notEqual(homedir(),"/home/igor");assert.notEqual(homedir(),"/root");
- assert.ok(process.env.NATS_SERVER);assert.equal(t3Version(),"t3 v0.1.0");
+ assert.ok(process.env.NATS_SERVER);assert.equal(t3Version(),"t3 v0.1.9");
  const root=mkdtempSync(join(homedir(),"message-nats-"));
  const keys={a:nkeys.createUser(),b:nkeys.createUser(),receiver:nkeys.createUser(),attacker:nkeys.createUser()};
  const listener=createServer();listener.listen(0,"127.0.0.1");await once(listener,"listening");

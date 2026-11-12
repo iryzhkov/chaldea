@@ -6,7 +6,7 @@ import { ShellWatcher, dispatchMessage, sleep, waitFor } from "../helpers/e2e.ts
 import { SCRATCH_ROOT } from "../helpers/scratch.ts";
 import { switchPort, withClient } from "../../src/t3/adapter.ts";
 
-const skip = t3Version() === "t3 v0.1.0" ? false : "needs pinned T3";
+const skip = t3Version() === "t3 v0.1.9" ? false : "needs pinned T3";
 if (skip && process.env.CHALDEA_REQUIRE_E2E === "1") throw new Error(skip);
 test("record pinned T3 restart, interrupt, quota and provider-exit outcomes", { skip, timeout: 180_000 }, async () => {
   for (const mode of ["SIGTERM", "SIGKILL", "interrupt", "stop", "quota", "provider"] as const) {

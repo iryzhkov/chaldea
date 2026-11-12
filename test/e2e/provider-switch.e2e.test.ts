@@ -9,7 +9,7 @@ import { startDisposableT3, t3Version } from "../helpers/disposable-t3.ts";
 import { ObserverProcess, ShellWatcher, dispatchMessage, readFeed, sleep, waitFor, writePrivateFile } from "../helpers/e2e.ts";
 import { SCRATCH_ROOT, scratchDir } from "../helpers/scratch.ts";
 
-const version = t3Version(), skip = version === "t3 v0.1.0" ? false : `needs t3 v0.1.0, found ${version}`;
+const version = t3Version(), skip = version === "t3 v0.1.9" ? false : `needs t3 v0.1.9, found ${version}`;
 if (skip && process.env.CHALDEA_REQUIRE_E2E === "1") throw new Error(skip);
 for (const scenario of ["available", "exhausted", "crash", "crash-before-reset", "expired-archived", "read-only"] as const) {
   test(`provider switch: ${scenario}`, { skip, timeout: 180_000 }, async () => {

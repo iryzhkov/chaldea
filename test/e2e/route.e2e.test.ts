@@ -39,7 +39,7 @@ test("route CLI fixture gives native delegate target without services or credent
     }
   } finally { d.remove(); }
 });
-const skip = t3Version() === "t3 v0.1.0" ? false : "Needs pinned disposable T3 0.1.0";
+const skip = t3Version() === "t3 v0.1.9" ? false : "Needs pinned disposable T3 0.1.9";
 if (skip && process.env.CHALDEA_REQUIRE_E2E === "1") throw new Error(skip);
 test("CLI and existing MCP route against real T3 cached catalog; no wait service or child launch", { skip, timeout: 120000 }, async () => {
   const d = routeScratch();

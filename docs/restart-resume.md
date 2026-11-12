@@ -2,8 +2,7 @@
 
 Investigated 2026-10-17 against the vendored contracts at T3
 `81493efb71e8e8244f95d3e9f71d8369654ab151` and the official v0.1.0 executable.
-The archive and executable checksums are verified by
-`scripts/ci/install-t3`; see `vendor/t3-contracts/PROVENANCE.md`.
+This is historical v0.1.0 investigation evidence. Current CI verifies official v0.1.9 through `scripts/ci/install-t3`; the vendor snapshot has been removed.
 
 ## What the pinned release actually does
 

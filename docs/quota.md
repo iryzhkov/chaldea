@@ -684,7 +684,7 @@ while a thread is parked still yields exactly one continuation and one
 already in `settings.json` exercise the stopped-server fallback.
 
 CI runs on GitHub-hosted Ubuntu 24.04. It downloads the checksum-pinned T3
-from `vendor/t3-contracts/PROVENANCE.md` and keeps HOME, TMPDIR and fixtures
+through `scripts/ci/install-t3` and keeps HOME, TMPDIR and fixtures
 in the job's isolated scratch directories.
 
 Codex stops reach the observer through the same shell fields. The separate

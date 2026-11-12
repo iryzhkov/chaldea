@@ -26,7 +26,8 @@ import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
 export function routeCatalog(providers: ReadonlyArray<SwitchProvider>, preferences?: CatalogModelPreferences | null): CatalogProvider[] {
   return providers.map(p => ({
     providerInstanceId: p.instanceId, ...(p.quotaAccountKey ? { accountKey: p.quotaAccountKey } : {}), driverKind: p.driver,
-    canRunChildTask: p.enabled && p.installed && p.availability !== "unavailable" &&
+    canRunChildTask: ["codex", "claudeAgent"].includes(p.driver) && p.enabled && p.installed &&
+      (p.availability === undefined || p.availability === "available") &&
       ["ready", "warning"].includes(p.status) && p.auth.status === "authenticated",
     models: p.models.filter(m => !preferences?.[p.instanceId]?.hiddenModels.includes(m.slug))
       .map(m => ({ id: m.slug, options: m.capabilities?.optionDescriptors ?? [] })),

@@ -49,7 +49,7 @@ export async function restartProjection(options: ConnectOptions, threadId: strin
         waitingForUser: p.runtimeRequests.some(r => p.nodes.some(n => n.id === r.nodeId && n.runId === run?.id) &&
           r.kind !== "dynamic_tool_call" && r.kind !== "auth_refresh" &&
           (r.status === "pending" || r.status === "expired" || r.status === "cancelled")) ||
-          p.turnItems.some(i => i.runId === run?.id && i.type === "secret_request" &&
+          p.turnItems.some(i => i.runId === run?.id && i.type === "secret_request" && "secretStatus" in i &&
             ["pending", "cancelled"].includes(i.secretStatus)),
       };
     }),

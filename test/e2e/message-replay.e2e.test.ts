@@ -8,7 +8,7 @@ import { ShellWatcher, waitFor, dispatchMessage } from "../helpers/e2e.ts";
 import { withClient, dispatchChaldeaWake } from "../../src/t3/adapter.ts";
 
 test("message qualification: successful identical RPC replay survives a lost response and T3 restart", {timeout:120_000}, async () => {
-  assert.equal(t3Version(), "t3 v0.1.0", "pinned T3 is a build gate, never a passing skip");
+  assert.equal(t3Version(), "t3 v0.1.9", "pinned T3 is a build gate, never a passing skip");
   assert.notEqual(homedir(),"/home/igor");assert.notEqual(homedir(),"/root");
   const base=join(homedir(),"message-replay-tests");mkdirSync(base,{recursive:true,mode:0o700});
   const fixture=mkdtempSync(join(base,"t-"));
