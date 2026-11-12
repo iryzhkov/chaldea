@@ -76,16 +76,6 @@ matches issuer/source/host plus owning profile/project. Duplicate subject IDs or
 identities fail startup. Registry kinds restrict append. Every grant resource in
 an Akasha token must equal its source.
 
-Registry modes: `report` is append-only and cannot read even if an issuer mistakenly
-grants read; `service` may read its own source/profile/project/host if granted;
-`operator` with explicit `global_read:true` may read globally. All source scope
-conditions are in SQL before rows, cursor or show results leave the process.
-Receipts always require their exact owning principal and logical key, even for operators.
-A quota service registration may opt into quota_fleet_read:true. This permits
-only quota_headroom_snapshot reads across hosts in its same source quota,
-profile and project, with no global read or foreign-receipt access. Snapshot
-data uses the closed [fleet capacity schema](quota-fleet.md).
-
 Structured POST `/api/v1/events` requires `Idempotency-Key` (1–256 printable ASCII)
 and `{v:1,kind,title,...}`. Optional host/source/run_id/project assertions must match
 verified claims. Caller issuer/profile/source_id/received_at/provenance are rejected.
@@ -102,16 +92,6 @@ length-delimited issuer/profile/project/source/host/kind/key tuple (plus report 
 Normalization happens before receive time and authorization-run attribution.
 Same tuple/hash returns the original receipt, changed payload returns 409, including
 pending retries. Every retry reauthorizes; expired requests create no new receipt.
-
-The closed kinds are feed_post/report, quota_parked/quota_reset_unknown/quota_resumed/restart_resumed/
-provider_switched/provider_switch_failed, tool_call, deployment_finished/job_finished,
-task_started/task_finished, review_verdict/review_note and agent_status. Registry
-enablement is required for actual producers; emitting a kind conveys no command authority.
-`schema.ts` defines the exact allowlist and types for every kind's data. Tool records
-require ts/session/proc/seq/client/tool/args/outcome/ok/tool_source/raw_line_hash;
-optional err is a bounded class, exit/ms are integers, root requires registry approval.
-Argument values, raw error prose, tool output and transcripts are rejected. The legacy
-unknown-option name `?` is preserved. Tool prose fields must be empty.
 
 Structured request and canonical envelope <=64 KiB, data <=48 KiB, title <=500 Unicode
 characters, <=32 tags/2 KiB, link <=2 KiB. Legacy request <=256 KiB, canonical feed
@@ -134,18 +114,6 @@ upload. Keep logical keys when retrying 429/503.
 | GET /api/v1/receipts?kind=K&key=KEY | exact own append principal/key, no listing |
 | GET /api/v1/health | operator-only pending/byte/cursor/alarm diagnostics |
 
-Legacy row keys remain id/created_at/host/source/severity/title/body/tags/link;
-tags remain comma-separated and new metadata stays in the v1 API. Sort is created_at
-DESC then id DESC. Preserve duration/ISO since, host/source/severity/tag and SQLite
-LIKE title/body grep (including LIKE wildcards, max 256 characters); time/scope/equality/tag filters run in candidate SQL. Remaining LIKE grep scans return 503 before headers if they exceed 10,000 candidates, 32 MiB of nonmatching bodies or 250ms SQLite work; only <=1000 matching IDs are preflighted. Invalid/negative limits return 400,
-zero returns an empty array. Rows are read individually without a SQLite reader
-spanning a network wait. Serialized feed JSON, HTML and native events coalesce into
-at most 64 KiB UTF-8 network chunks, retaining only one pending chunk and one bounded
-row rather than the response body. A single oversized legacy row retains its
-existing bound (including HTML escaping). Full authorization rechecks before every
-network chunk and after backpressure waits; clocks, revocation, expiry and the 10s
-response deadline remain unchanged. No bearer/payload/request URL logging.
-
 Every JWT in a query string is rejected, including operator-profile JWTs. This slice chooses scoped operator-profile tokens and bearer-header HTML authentication; it implements no static operator credential fallback. Lane L must refuse scoped feed open/url before printing a URL. Responses disable caching and referrers; proxy logging
 must redact query strings/Authorization. No link is fetched by Akasha.
 
@@ -161,32 +129,10 @@ continues to require scoped credentials.
 
 ## Durable delivery, capacity and recovery
 
-Admission commits immutable receipt/envelope/outbox with FULL synchronous SQLite
-before publishing. No transaction spans NATS waits. Publisher sets Nats-Msg-Id to
-event_id, expects AKASHA_EVENTS and awaits PubAck. Consumer commits event, projection,
-receipt state and stream cursor atomically before ACK. Lost PubAck/ACK and redelivery
-are covered by SQL uniqueness, independently of broker dedup. A late consumer may
-complete an accepted event after the original bearer expires; caller access still
-requires a fresh valid bearer. Ingress waits up to 1800 ms for an in-process
-notification after the store commits projection or quarantine, then rechecks
-authorization and reads the scoped receipt again. It does not poll or hold a read
-transaction while waiting. A pending POST returns 503 with pending:true/event_id/
-state/feed_id, never a fabricated legacy success. Tombstones return 410.
-
 When homelab restarts, the durable outbox drains. NATS outage does not remove already
 accepted events. Admission stops at protected-state limits. Producer-side buffering
 during Akasha/host unavailability belongs to lane P. A single homelab process/disk is
 not HA; no zero-loss disaster recovery is claimed.
-
-Main DB max 4 GiB with SQLite page limits, WAL max 64 MiB, outbox 128 MiB and bounded
-quarantine 16 MiB within main. Writes reserve WAL space, checkpoint before crossing
-the limit and refuse if a reader blocks reclamation. Read statements end before
-HTTP waits. Byte estimates reserve pages for bounded writes; SQLITE_FULL preserves
-pending work and pauses intake. Logical outbox/quarantine limits are checked before
-commit. Index-ordered expiry and receive-time selection avoids table scans/sorts during cleanup. Pruning at startup/hourly catches up through yielding byte-bounded transactions, including expired receipts, with admission-triggered pressure cleanup: expiry first, oldest terminal
-payloads under pressure, protecting pending intents and unexpired receipts. Incremental
-vacuum/free-page reuse/checkpoints reclaim space without a full vacuum copy. Receipt
-tombstones remain 180d; no retry recreates a retained tombstone.
 
 Prune reservations count the selected records' UTF-8 data, repeated index keys,
 feed cascades, receipt tombstoning, floor updates and bounded per-kind prune generation marks. Before the atomic event

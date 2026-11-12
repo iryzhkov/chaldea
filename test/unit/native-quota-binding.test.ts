@@ -4,7 +4,6 @@ import { join } from "node:path";
 import { writeFileSync } from "node:fs";
 import { HeadroomMonitor, emptyHeadroom, STALE_AFTER_MS } from "../../src/quota/headroom.ts";
 import { headroomConfig } from "../../src/quota/codex-balance.ts";
-import { capacitySnapshot } from "../../src/quota/fleet.ts";
 import { emptyState, saveState } from "../../src/quota/state.ts";
 import { route } from "../../src/route/runtime.ts";
 import type { SwitchProvider } from "../../src/t3/adapter.ts";
@@ -24,7 +23,7 @@ const provider = (key: string | null = account): SwitchProvider => ({
 const monitor = () => new HeadroomMonitor({ state: emptyHeadroom(), config: headroomConfig(),
   local: true, now: () => now, save() {} });
 
-test("native Claude binding reaches account snapshot and route with HTTP collection disabled", async () => {
+test("native Claude binding reaches route with HTTP collection disabled", async () => {
   const d = routeScratch(), m = monitor();
   try {
     m.update([provider()]); await m.tick();
@@ -32,9 +31,6 @@ test("native Claude binding reaches account snapshot and route with HTTP collect
     assert.equal(row.accountKey, account);
     assert.equal(row.included.source, "t3");
     assert.equal(row.included.error, null);
-    const snapshot = capacitySnapshot("fixture-host", m.state.providers, new Set(), now);
-    assert.equal(snapshot.accounts[0]?.accountKey, account);
-    assert.equal(snapshot.accounts[0]?.windows.find(w => w.kind === "weekly")?.usedPercent, 69);
     const state = emptyState(); state.headroom = m.state;
     const stateFile = join(d.path, "observer.json"), configPath = join(d.path, "route.json");
     saveState(stateFile, state, now);
@@ -64,7 +60,6 @@ test("native Claude account changes or disappears without inheriting prior accou
     m.update([{ ...provider(null), usageLimits: unavailable }]); await m.tick();
     assert.equal(m.state.providers[0]?.accountKey, undefined);
     assert.equal(m.state.providers[0]?.included.value, null);
-    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), now).accounts.length, 0);
   } finally { await m.close(); }
 });
 
@@ -74,12 +69,10 @@ test("unbound native observations remain unshared and stale native windows retai
     m.update([provider(null), { ...provider(other), instanceId: "claude-other" }]); await m.tick();
     assert.equal(m.state.providers[0]?.accountKey, undefined);
     assert.equal(m.state.providers[1]?.accountKey, other);
-    assert.deepEqual(capacitySnapshot("fixture-host", m.state.providers, new Set(), now).accounts.map(a => a.accountKey), [other]);
     m.update([{ ...provider(), usageLimits: { ...provider().usageLimits!, checkedAt: iso(now - STALE_AFTER_MS) } }]);
     await m.tick();
     assert.equal(m.state.providers[0]?.accountKey, account);
     assert.equal(m.state.providers[0]?.included.observedAt, iso(now - STALE_AFTER_MS));
-    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), now).accounts.length, 0);
   } finally { await m.close(); }
 });
 
@@ -100,7 +93,6 @@ test("native quota is authoritative and HTTP fallback cannot relabel another acc
     assert.equal(row().included.source, "t3"); assert.equal(row().included.error, null);
     m.update([unavailable()]); await m.tick();
     assert.equal(row().included.error, "context_mismatch"); assert.equal(row().included.value, null);
-    assert.ok(capacitySnapshot("fixture-host", m.state.providers, new Set(), clock).accounts.every(a => a.accountKey !== other));
     reply = { value: null, fetchedAt: null, reason: "rate_limited; no successful cache" };
     m.update([provider()]); await m.tick();
     clock += STALE_AFTER_MS;
@@ -118,18 +110,16 @@ test("native quota is authoritative and HTTP fallback cannot relabel another acc
   } finally { await m.close(); }
 });
 
-test("configured Claude binding rejects a different native account before HTTP or publication", async () => {
+test("configured Claude binding rejects a different native account before HTTP", async () => {
   const m = new HeadroomMonitor({ state: emptyHeadroom(), local: true, now: () => now, save() {},
     config: headroomConfig({ claudeContexts: [{ enabled: true, providerInstanceId: alias,
       accountKey: other, credentialFile: "/unused" }] }),
     claudeRead: async () => { throw new Error("binding mismatch must not read credentials"); } });
   try {
     m.update([provider()]);
-    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), now).accounts.length, 0);
     await m.tick();
     assert.equal(m.state.providers[0]?.included.error, "context_mismatch");
     assert.equal(m.state.providers[0]?.accountKey, undefined);
-    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), now).accounts.length, 0);
   } finally { await m.close(); }
 });
 
@@ -169,18 +159,15 @@ for (const configured of [false, true]) test(`unbound native updates never inher
     clock++;
     m.update([native()]);
     assert.equal(row().accountKey, undefined, "unbound native data must lose the prior HTTP key before async collection");
-    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), clock).accounts.length, 0);
     await m.tick();
     assert.equal(row().included.source, "t3"); assert.equal(row().included.observedAt, iso(clock));
     assert.equal(row().included.error, null); assert.equal(row().manualResets.value, null);
     reply = { value: { observedAt: iso(clock), windows: http.windows }, fetchedAt: iso(clock), reason: null };
     await m.tick();
     assert.notEqual(row().included.error, "context_mismatch", "missing HTTP identity is unknown, not a conflicting account");
-    assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), clock).accounts.length, 0);
     reply = { value: http, fetchedAt: http.observedAt, reason: null };
     for (let repeat = 0; repeat < 2; repeat++) {
       clock++; m.update([native()]);
-      assert.equal(capacitySnapshot("fixture-host", m.state.providers, new Set(), clock).accounts.length, 0);
       await m.tick();
       assert.equal(row().accountKey, other); assert.equal(row().included.source, "claude-usage");
       assert.equal(row().included.value?.[0]?.usedPercent, 20);

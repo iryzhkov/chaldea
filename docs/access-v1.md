@@ -76,18 +76,6 @@ offsets = **870 seconds (<15 minutes)** after real issuance. Ordinary cancellati
 disables mint/renew immediately; offline verification cannot learn it instantly.
 Optional service denylists can shorten that delay, but are outside v1.
 
-Verify every HTTP/MCP request, replayed receipt, stream operation and reconnect.
-`verifyToken` returns claims, a conservative validUntil (no expiry leeway) and
-`recheck()`. Service integration MUST cancel sessions/streams and running operations
-at validUntil, using a monotonic deadline, and recheck before each operation/chunk and
-after waits. Never authorize an unbounded connection at initialization alone.
-A concurrent trust installation can return trust_changed; services may retry the
-whole verification once against the new bundle, without using the old result.
-SQLite waits up to five seconds for shared-state writers. A service may retry once
-on SQLITE_BUSY; sustained contention parks access rather than skipping durable checks.
-A newly installed bundle or key removal affects the next recheck. The package supplies
-the check/deadline; each service owns transport cancellation and bounded work.
-
 ## Trust publication, freshness, and rotation
 
 An independent deployment authority publishes a compact Ed25519 JWS with exact
@@ -157,15 +145,6 @@ parent directory, and requires Ed25519. It generates no key, reads no credential
 from environment/keyrings, and never exports private bytes. Trusted deployment must
 also protect ancestor paths and exclude the issuer UID/key/state from mounts, env,
 FDs and model-accessible endpoints. This package cannot establish OS isolation.
-
-`RunLeases.admit` takes a trusted fleet-config/run record with an immutable run ID,
-profile, project, deadline and per-audience grants/source. Deadline is at most 24h;
-package 3 owns the first report's 10-minute deadline and concurrency-one lifecycle;
-this general lease library permits multiple admitted runs. There is no renewal endpoint in the
-sandbox. Host code calls renew only for an active lifecycle lease. Each renewal
-requires current external admission/profile authorization, may narrow its deadline
-and grants, never increase them, and uses fresh trust and clock checks. Denial
-persists cancellation. Successful narrowing is durable before releasing the token.
 
 Cancellation/end is an atomic synchronous FULL SQLite commit before acknowledgment,
 works even when clock/trust is unhealthy, and is terminal. Renewal checks the durable

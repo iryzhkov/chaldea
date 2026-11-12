@@ -174,13 +174,6 @@ invocations. A killed operator may leave it behind. Do not remove a stale lock
 until the exact former invocation/process and service state are reconciled.
 No stale-lock takeover or automatic retry exists.
 
-Stop waits at most 35 seconds and uses only systemd's named unit. The native
-unit uses TERM, TimeoutStopSec=30s and SendSIGKILL=no. If an incomplete upload
-prevents exit, this run fails with publication fenced; backup and restart never
-follow. No automatic KILL, success claim or forced-stop backup is allowed.
-The previous experiment required fixture KILL, so graceful drain under arbitrary
-active load remains unqualified.
-
 Backups remain on the existing local service-state filesystem. Each run gets a
 new UUID directory and never rotates, deletes or overwrites a previous pair.
 A partial destination is retained on failure. Copies include metadata and data,

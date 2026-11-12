@@ -11,7 +11,6 @@ import { modelWindowPolicy, windowPolicy, fableModel } from "../../src/quota/win
 import { HeadroomMonitor, emptyHeadroom, newProvider } from "../../src/quota/headroom.ts";
 import { headroomConfig } from "../../src/quota/codex-balance.ts";
 import { emptyState, saveState } from "../../src/quota/state.ts";
-import { capacitySnapshot } from "../../src/quota/fleet.ts";
 import type { SwitchProvider } from "../../src/t3/adapter.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
@@ -78,29 +77,4 @@ test("scoped windows cannot establish provider capacity; missing scoped data sta
   assert.equal(missing.scopeKnown, false); assert.equal(missing.pace, null);
   const long = q.windows.filter(w => w.kind === "weekly").map(w => ({ ...w, id: "account-" + w.id }));
   assert.ok(windowPolicy(long, now, .1, .1).limit, "a second weekly window cannot hide a binding limit");
-});
-test("native T3 IDs cross observer, fleet and runtime candidate boundaries with collection disabled", async () => {
-  const d = routeScratch(), accountKey = "a".repeat(64);
-  const m = new HeadroomMonitor({ state: emptyHeadroom(), config: headroomConfig(), local: true, now: () => now, save() {} });
-  try {
-    const usage = parseClaudeUsage(raw(), now);
-    const p: SwitchProvider = { instanceId: "claudeAgent", driver: "claudeAgent", quotaAccountKey: accountKey,
-      enabled: true, installed: true, status: "ready", auth: { status: "authenticated" }, models: [],
-      usageLimits: { checkedAt: iso(now), windows: usage.windows.map(w => ({ id: w.id!, kind: w.kind,
-        usedPercent: 100 - w.remainingPercent, windowDurationMins: w.windowDurationMins!, resetsAt: w.resetsAt! })) } };
-    m.update([p]); await m.tick();
-    assert.deepEqual(capacitySnapshot("fixture", m.state.providers, new Set(), now).accounts[0]!.windows.map(w => w.id),
-      ["five_hour", "seven_day", "seven_day_fable"]);
-    const state = emptyState(); state.headroom = m.state;
-    const stateFile = join(d.path, "observer.json"), configPath = join(d.path, "route.json");
-    saveState(stateFile, state, now);
-    writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(d.path, "cache"),
-      claudeUsage: { enabled: false }, scores: { enabled: false } }));
-    const result = await route({ role: "critical-review" }, { home: d.path, configPath, now,
-      catalog: async () => catalog.map(p => p.providerInstanceId === "claudeAgent" ? { ...p, accountKey } : p),
-      fetcher: async () => { throw new Error("fixture offline"); } });
-    assert.equal(result.model, "gpt-6-astra");
-    assert.equal(result.diagnostics?.fleet?.readiness, "absent");
-    assert.equal(result.diagnostics?.quality_source, "fixed_policy");
-  } finally { await m.close(); d.remove(); }
 });

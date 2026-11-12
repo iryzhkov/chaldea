@@ -63,7 +63,7 @@ test("pair runtime collects once, keeps route projection compact and reports cat
     assert.equal(pair.status, "complete"); assert.equal(collections, 1);
     const result = compactRoute(await route({ role: "builder" }, options));
     assert.equal(result.model, result.target.model); assert.equal(result.quality_source, "fixed_policy");
-    assert.equal(result.fleet!.readiness, "absent"); assert.ok(result.reasons.length <= 2);
+    assert.ok(result.reasons.length <= 2);
     await assert.rejects(route({ role: "builder" }, { ...options, catalog: async () => { throw new Error("offline"); } }),
       { code: "catalog_unavailable" });
     writeFileSync(configPath, "{broken");

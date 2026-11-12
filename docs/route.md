@@ -52,17 +52,6 @@ default, including custom IDs containing Sonnet. Haiku is allowed. Models withou
 the requested effort option are held. With no eligible candidate it returns an error, including for a review
 whose required other provider is unavailable.
 
-Results include `alternatives`, human-readable `reasons` and `dataAges`.
-`byProvider` is keyed by catalog driver, such as `claudeAgent` or `codex`, and
-returns each provider's best eligible `{providerInstanceId, model, options, eligible, reasons}`
-under the same quota, review, pin and probation gates. A provider with no eligible
-model remains present with `eligible: false`, null model/options and its rejection
-reasons. Provider picks also consume probation recommendation shares. The overall
-winner and alternatives remain available; no eligible model overall still returns an error.
-Ages are seconds, or null for unknown/future timestamps. Fresh Codex credits classify as unlimited even with no native window; credits
-near expiry classify as use-it. Identified results also include accountKey.
-See [fleet quota accounts](quota-fleet.md) for account binding and shared snapshots.
-
 ## Capacity and preference
 
 `chaldea quota status --json` includes a `capacity` object keyed by provider
@@ -81,16 +70,6 @@ constraint always applies. The base pacing rule prefers Claude when remaining
 fraction minus fraction of native window time left is at least 0.10; otherwise
 it prefers Codex. Missing/stale pacing keeps the role default unless capacity
 preference or usable Slopalytics statistics decide the comparison.
-
-Only the weekly window, or the longest included window when there is no weekly
-window, determines pacing and native quota projections. A session/5-hour window
-never creates use-it capacity because its reset is close. Its only effect is a
-temporary gate: under `minimumRemaining` left, default strictly under 10%, is tight;
-zero left is stopped. These gates override advisory credits and reserves until the
-short reset; they do not gate the proven credit-funded lane described below. An
-active usage stop is always stopped. A short window alone leaves pacing
-unknown. Reasons show both windows, for example "weekly 62% left with 40% of
-window left: under-paced; 5h window 35% left".
 
 The observer keeps up to 288 previous window observations per provider, sampled
 at least five minutes apart and retained for 48 hours, with a 16 KiB per-provider
@@ -603,14 +582,3 @@ reserve expiry before useful redemption, collector safety and rate bounds. E2E c
 existing MCP server against disposable pinned T3 with fake providers.
 
 This repository ships no Chaldea SKILL.md. Follow-ups belong in fleet-config:
-
-- Render route.json, quota.json contexts per host/account, and capacity.json.
-- Render `envFile: /home/igor/.config/claude/oauth.env` for omarchy-pc in both
-  route `claudeUsage` and quota `claudeContexts`, after this client is available;
-  keep laptop on its current JSON credential source. Enable only matching logins.
-- Register quota sources and R7 helper grants on Akasha before enabling shared publishing.
-  See [fleet activation requirements](quota-fleet.md#activation-follow-ups).
-- Add "call chaldea_route before delegate_task, then delegate natively" to the
-  distributed CLAUDE.md and Chaldea skill.
-- Distribute a validated client release and verify hosts manually. This PR does
-  not deploy or change any host configuration.

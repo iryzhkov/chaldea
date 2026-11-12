@@ -7,19 +7,18 @@ Defaults work without XDG variables; setting them intentionally relocates the co
 
 | Component | Default config | Required |
 |---|---|---|
-| Waits service, waits/decision CLI, MCP | `$XDG_CONFIG_HOME/chaldea/waits.json` | Yes |
 | Quota observer and status | `$XDG_CONFIG_HOME/chaldea/quota.json` | No |
 | Exec client, including show/list/fetch | `$XDG_CONFIG_HOME/chaldea/exec.json` | No |
 | Opt-in exec artifact custody | `$XDG_CONFIG_HOME/chaldea/blob.json` | No; see [artifact custody](blob-artifacts.md) |
 | Akasha gateway | `$XDG_CONFIG_HOME/chaldea/akasha.json` | Yes |
 | Collector and in-process event publishers | `$XDG_CONFIG_HOME/chaldea/events.json` | No |
 | T3 restart/recovery support | `$XDG_CONFIG_HOME/chaldea/restart.json` | No |
-| Messaging sender, CLI and MCP discovery | `$XDG_CONFIG_HOME/chaldea/message.json` | For messaging |
+| Messaging sender and CLI | `$XDG_CONFIG_HOME/chaldea/message.json` | For messaging |
 | Messaging receiver (explicit system boundary) | `/etc/chaldea/message-receiver.json` | For receiver |
 
 An absent optional file selects the old defaults. An explicitly selected missing file,
 invalid JSON, or an unsafe file fails closed. Unknown config keys are rejected except
-in the pre-existing waits/restart schemas. Akasha keeps its strict JSON parser,
+in the restart schema. Akasha keeps its strict JSON parser,
 including duplicate-key rejection. Config readers never include file contents in errors.
 
 The sudo token helper is a system security boundary, with a fixed root-owned
@@ -68,13 +67,6 @@ redirects them into the scratch HOME.
 
 ## Config keys and compatibility
 
-Waits keys remain unchanged: `environment`, `t3BaseDir`, `serverUrl`, `tokenFile`,
-`database`, `socket`, `listenAddress`, `port`, `answerBaseUrl`, `answerTokenFile`,
-`logFile`. Its config/tokens, database/log and socket defaults now use the XDG bases.
-The optional `sessionPolicy` key names an absolute, operator-owned fixed-preset policy;
-without it sessions are disabled (see [sessions.md](sessions.md)). That policy's optional
-`enrollments` map holds public Authentik enrollment fields only; each names an owner-only
-secret file and never contains the secret.
 
 Quota's existing `contexts`, nested `assertRuntimeHome`, and
 `lowHeadroomPercent` remain unchanged. The same file can also supply
@@ -140,23 +132,7 @@ Existing domain result statuses remain unchanged.
 | 255 | Exec local/transport failure before a confirmed remote command status |
 | Remote status | Exec returns the remote program's status unchanged, even if it matches a row above |
 
-Configuration-read failures in waits, Akasha and exec now use 78 rather than
-waits' generic 64, Akasha's 1 or exec's 255. Missing/invalid Akasha config keys
-also use 78. Quota already used 78.
-Akasha's command-count usage error uses 64. Service-specific authorization,
-replay and storage errors still use 1. Exec argument errors retain 255.
-Unsafe Akasha adapter, trust and seed files at startup retain exit 1.
-Akasha adapter authorization failures retain their existing runtime status 1 and
-request-time HTTP error contract. Human help and command results are unchanged;
-diagnostic formatting and these exit statuses are the intentional operational
-behavior changes.
-
 ## Fleet-config follow-up
-
-The `chaldea_client` role already installs the units, from fleet PR #37.
-This change edits no units and performs no deployment. Existing rendered
-`waits.json` and `quota.json`, including `assertRuntimeHome` and
-`lowHeadroomPercent`, work without a fleet change.
 
 Future fleet cleanup can render `exec.json` instead of `exec-hosts` and render
 `events.json` instead of the AKASHA environment settings. Migrate Akasha's

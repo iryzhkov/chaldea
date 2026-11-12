@@ -1,10 +1,5 @@
 # Quota resilience (plan step 3)
 
-Account identity, opt-in Claude collection on any host, shared Akasha snapshots
-and the Codex credit policy are documented in [fleet quota accounts](quota-fleet.md).
-The credit policy there supersedes the earlier reporting-only credit limitation
-below for FATE routing advice. Provider switching remains unchanged.
-
 When a provider stops a T3 turn on a usage limit, T3 itself resumes the thread
 at the reported reset time. `chaldea quota observe` records stops and resumes
 in the fleet feed. Optional B3 provider switching can continue the same thread
@@ -58,21 +53,6 @@ session to refresh a catalog. Native auto-resume remains the fallback.
 A quota reset never moves a working thread. If a later run on the replacement
 provider itself stops on quota, it is a new stop and may switch back when the
 other provider has fresh quota.
-
-The same policy applies to interactive, delegated and scheduled threads. A
-failed usage-limit stop must still be blocking: its reset is in the future.
-A resetless stop must be less than two minutes old and first seen live, or
-completed after this observer process started. Old abandoned stops are never
-admitted on startup or reconnect. A human's per-thread `autoResume:false`
-choice wins over switching. Chaldea distinguishes its deterministic hold ID
-and T3's exact `limit-arm:<thread>:<run>:<resetMs>` snooze-only arm from a human
-cancellation. A native arm with `autoResume:false, snooze:true` does not opt out
-of switching, and its false auto-resume choice is preserved on release. There
-must be no active run, pending runtime request, archival, deletion or explicit
-settlement. Switching
-waits for shell catch-up before acting. When enabled (or when saved intents
-exist), reconnect begins with a current snapshot so stops remain discoverable
-across observer and server restarts. No periodic Chaldea scan is introduced.
 
 ### Hold, guarded dispatch and restart behavior
 

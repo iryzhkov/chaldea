@@ -23,9 +23,8 @@ const USAGE = `Usage:
   chaldea route --role builder|critical-review|bulk-read|general [options]
   chaldea quota observe [options]
   chaldea quota status [--json] [--state-file PATH] [--capacity-config PATH]
-  chaldea davinci serve --config PATH
   chaldea access --help
-  chaldea t3 restart [options]\n  chaldea t3 set-auto-resume on|off [options]\n  chaldea wait|decision|waits|mcp|session --help
+  chaldea t3 restart [options]\n  chaldea t3 set-auto-resume on|off [options]\n  chaldea mcp --help
 
 quota observe: records T3 usage-limit stops and native auto-resumes in the fleet feed.
   --server-url URL     T3 URL (default: origin in <t3-base-dir>/userdata/server-runtime.json)
@@ -198,11 +197,12 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
     return 0;
   }
   try {
-    if (group && ["waits","wait","decision","mcp","session"].includes(group)) {
-      const { waitsCli } = await import("./waits/cli.ts");
-      return await waitsCli(argv);
+    if (group === "mcp") {
+      if (command === "--help" || command === "-h") { process.stdout.write("chaldea mcp: routing MCP stdio server\n"); return 0; }
+      if (command) return 64;
+      await (await import("./mcp.ts")).runMcp();
+      return 0;
     }
-    if (group === "davinci") return await (await import("./davinci/service.ts")).davinciCli(argv.slice(1));
     if (group === "message") return await (await import("./message.ts")).messageCli(argv.slice(1));
     if (group === "route") return await (await import("./route/cli.ts")).routeCli(argv.slice(1));
     if (group === "access") {

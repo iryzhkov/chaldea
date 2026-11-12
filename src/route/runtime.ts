@@ -1,9 +1,7 @@
 import { homedir } from "node:os";
-import { isDeepStrictEqual } from "node:util";
 import { join } from "node:path";
 import { loadState, emptyState } from "../quota/state.ts";
 import { loadHeadroomConfig } from "../quota/codex-balance.ts";
-import { capacitySnapshot, mergeSnapshots, readSnapshotsDetailed, snapshotProvider } from "../quota/fleet.ts";
 import { capacityKey } from "../quota/account.ts";
 import { classifyCapacity } from "../quota/capacity.ts";
 import { loadCapacityConfig } from "../quota/capacity-config.ts";
@@ -139,40 +137,13 @@ async function collectContext(options: RouteOptions) {
   }
   const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.accountKey && quota[p.alias]?.activeStop)
     .map(p => capacityKey(p.driver, p.accountKey!)));
-  const localHost = reporting.fleet?.host ?? "local";
-  const localStops = new Set(Object.entries(quota).filter(([, q]) => q.activeStop).map(([id]) => id));
-  // Keep aliases separate until reconciliation so local conflicts survive the wire
-  // snapshot's account deduplication. Conflict advice never enters the closed schema.
-  const localSnapshots = capacityState.headroom.providers.map(p => capacitySnapshot(localHost, [p], localStops, now));
-  const fleet = await readSnapshotsDetailed(reporting.fleet, now, options.fetcher);
-  const merged = mergeSnapshots([...fleet.snapshots, ...localSnapshots], now);
   const capacity: Record<string, ReturnType<typeof classifyCapacity>> = {};
   const boundCatalog = catalog.map(p => {
     let row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
     const key = mappings.get(p.providerInstanceId) ?? p.accountKey ?? row?.accountKey;
-    const account = key ? merged.get(capacityKey(p.driverKind, key)) : undefined;
     const stop = !!quota[p.providerInstanceId]?.activeStop || !!key && stoppedAccounts.has(capacityKey(p.driverKind, key));
-    if (account) {
-      const observed = row;
-      row = snapshotProvider(account, p.providerInstanceId);
-      // All aliases use reconciled capacity. Spend-control admission remains local:
-      // remote credits cannot create or refresh the proof of a funded lane.
-      if (observed?.accountKey === account.accountKey && observed.driver === account.provider) {
-        row.ordinaryUsageAllowed = observed.ordinaryUsageAllowed;
-        if (observed.burnHistory) row.burnHistory = observed.burnHistory;
-        if (observed.spendControlReached.value === true) row.spendControlReached = observed.spendControlReached;
-        if (metricNow(observed.credits, now).state === "fresh" &&
-            isDeepStrictEqual(observed.credits.value, account.credits) && observed.creditExpiresAt === account.creditExpiresAt) {
-          row.credits = observed.credits;
-          row.spendControlReached = observed.spendControlReached;
-        }
-      }
-      quota[p.providerInstanceId] = { observedAt: account.observedAt, windows: account.windows, activeStop: account.activeStop || stop,
-        incomplete: account.conflicts.some(c => c.includes("reset epoch") && !/^seven_day_/.test(c)) };
-      reasons.push(p.providerInstanceId + " account " + key + " observed on " + account.host + "; age " + account.ageSeconds + "s");
-    }
     if (row) {
-      const classified = classifyCapacity(row, account?.activeStop || stop, now, capacityConfig);
+      const classified = classifyCapacity(row, stop, now, capacityConfig);
       if (quota[p.providerInstanceId]?.incomplete) {
         classified.reasons.push("conflicting reset epoch; included capacity unknown");
         if (!classified.creditFunded && !["tight", "stopped"].includes(classified.class)) classified.class = "unknown";
@@ -182,13 +153,12 @@ async function collectContext(options: RouteOptions) {
     return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId), ...(key ? { accountKey: key } : {}) };
   });
   const data: PolicyData = { catalog: boundCatalog, quota, analytics: analytics.value, scores: scores.value, now, config, capacity };
-  return { data, config, reasons, fleet: { readiness: fleet.readiness, freshAccounts: mergeSnapshots(fleet.snapshots, now).size },
+  return { data, config, reasons,
     provenance: Object.fromEntries(boundCatalog.map(p => {
       const row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
-      const account = p.accountKey ? merged.get(capacityKey(p.driverKind, p.accountKey)) : undefined;
-      return [p.providerInstanceId, { source: account && account.host !== localHost ? "fleet:" + account.host : row?.included.source ?? "unknown",
+      return [p.providerInstanceId, { source: row?.included.source ?? "unknown",
         bindingSource: mappings.has(p.providerInstanceId) ? "configured" : catalog.find(c => c.providerInstanceId === p.providerInstanceId)?.accountKey ? "catalog" : row?.accountKey ? "observer" : "unbound",
-        conflicts: account?.conflicts ?? [] }];
+        conflicts: [] }];
     })) };
 }
 export async function routeReviewPair(value: unknown, options: RouteOptions = {}): Promise<ReviewPairResult> {
@@ -212,7 +182,6 @@ export async function route(value: unknown, options: RouteOptions = {}): Promise
     }
     if (!config.scores.enabled && routing.pending()) reasons.push("Route-change event queued; snapshot transport not configured");
     if (result.diagnostics) {
-      result.diagnostics.fleet = context.fleet;
       for (const [key, q] of Object.entries(result.diagnostics.quota)) {
         const id = data.catalog.find(p => key.startsWith(p.providerInstanceId + ":"))?.providerInstanceId;
         if (id) Object.assign(q, context.provenance[id]);

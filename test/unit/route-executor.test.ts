@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { spawnSync } from "node:child_process";
 import { recommend } from "../../src/route/policy.ts";
 import { loadRouteConfig } from "../../src/route/config.ts";
-import { WAIT_TOOLS } from "../../src/mcp.ts";
+import { ROUTE_TOOLS } from "../../src/mcp.ts";
 import { fixture, now, iso } from "../fixtures/route/targets.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
 
@@ -67,7 +67,7 @@ test("executor is exposed through config, MCP and CLI", () => {
   const scratch = routeScratch();
   try {
     assert.equal(loadRouteConfig(scratch.path).floors.executor, 48);
-    const schema = WAIT_TOOLS.find(t => t.name === "chaldea_route")!.inputSchema;
+    const schema = ROUTE_TOOLS.find(t => t.name === "chaldea_route")!.inputSchema;
     assert.ok((schema.properties.role as { enum: string[] }).enum.includes("executor"));
     const result = spawnSync(process.execPath, ["bin/chaldea", "route", "--role", "executor",
       "--fixture", "test/fixtures/route/builder.json"], { encoding: "utf8", env: { ...process.env, HOME: scratch.path } });

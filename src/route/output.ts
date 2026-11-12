@@ -14,7 +14,6 @@ export function compactRoute(result: RouteResult) {
   if (!reasons.length) reasons.push("Selected eligible target under role, quota and separation policy");
   return { ...target, target, reasons, reasonCodes, quota,
     quality_source: result.diagnostics?.quality_source ?? "fixed_policy",
-    fleet: result.diagnostics?.fleet ?? null,
     ...(result.diagnostics?.benchmarkCoverage ? { benchmarkCoverage: result.diagnostics.benchmarkCoverage } : {}),
     dataAges: { quota: { [result.providerInstanceId]: result.dataAges.quota[result.providerInstanceId] ?? null },
       artificialAnalysis: result.dataAges.artificialAnalysis ?? null, slopalytics: result.dataAges.slopalytics,

@@ -184,34 +184,13 @@ export class EventSink {
     }
   }
 
-  #discardHeadroom(key: string): void {
-    this.#outbox.discard(key);
-    const index = this.#pending.findIndex(r => quotaKey(r) === key);
-    if (index >= 0) this.#pending.splice(index, 1);
-    else this.#discarded.add(key); // Only already-enqueued keys need poster removal (bounded by its queue).
-  }
-
   record(records: ReadonlyArray<QuotaRecord>): void {
     for (const record of records) {
       this.logger.info("quota record", { kind: record.kind, thread: record.threadId, run: record.runId, provider: record.provider, resetAt: record.resetAt });
       const key = quotaKey(record);
       if (this.#outbox.has(key)) continue;
-      const advisory = this.#outbox.entries().filter(([, r]) => r.headroom !== undefined);
-      if (record.headroom) {
-        for (const [oldKey, old] of advisory) {
-          if (old.kind === record.kind) this.#discardHeadroom(oldKey);
-        }
-      }
-      // Advisory reporting never consumes capacity needed by a transition. Keep at most
-      // 3 advisory intents (one host record per kind) and evict them first on either the count or byte bound.
       const overflow = () => this.#outbox.size >= MAX_QUEUED_RECORDS ||
         Buffer.byteLength(JSON.stringify([...this.#outbox.values(), record])) > MAX_PENDING_BYTES;
-      const headroom = () => this.#outbox.entries().filter(([, r]) => r.headroom !== undefined);
-      while (overflow() || record.headroom !== undefined && headroom().length >= 3) {
-        const oldest = headroom()[0];
-        if (!oldest) break;
-        this.#discardHeadroom(oldest[0]);
-      }
       if (overflow()) {
         this.state.deliveryDropped++;
         this.logger.error("pending record dropped: durable delivery queue capacity exceeded", { kind: record.kind, thread: record.threadId, run: record.runId });

@@ -15,8 +15,8 @@ test("socket path guard enforces the byte limit, including UTF-8", () => {
   assert.throws(() => testSocketPath("é".repeat(50)), /under 100 bytes/);
 });
 
-test("native-decisions socket fits below 100 bytes and actually listens", async () => {
-  const dir = scratchDir("native-decisions"), server = createServer();
+test("service-socket socket fits below 100 bytes and actually listens", async () => {
+  const dir = scratchDir("service-socket"), server = createServer();
   try {
     const socket = testSocketPath(join(dir.path, "service.sock"));
     await new Promise<void>((resolve, reject) => {

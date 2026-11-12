@@ -118,7 +118,9 @@ export function loadState(path: string, nowMs: number): ObserverState {
     headroom: raw.headroom === undefined ? emptyHeadroom() : validateHeadroom(raw.headroom),
     posted: new Map(Object.entries(raw.posted ?? {}).filter((entry): entry is [string, number] => typeof entry[1] === "number")),
     parked: new Map(Object.entries(raw.parked ?? {}) as Array<[string, ParkedThread]>),
-    pendingDelivery: new Map(Object.entries(raw.pendingDelivery ?? {}) as Array<[string, QuotaRecord]>),
+    // Discard retired headroom publication intents; never retry them after upgrade.
+    pendingDelivery: new Map((Object.entries(raw.pendingDelivery ?? {}) as Array<[string, QuotaRecord]>)
+      .filter(([, record]) => !String(record.kind).startsWith("quota_headroom_"))),
     deliveryDropped: Number.isSafeInteger(raw.deliveryDropped) ? raw.deliveryDropped : 0,
     switches: new Map(Object.entries(raw.switches ?? {}) as Array<[string, SwitchIntent]>),
     evictedThrough: typeof raw.evictedThrough === "number" ? raw.evictedThrough : null,

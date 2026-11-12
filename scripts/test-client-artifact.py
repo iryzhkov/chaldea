@@ -31,9 +31,8 @@ with tempfile.TemporaryDirectory(dir=scratch, prefix="client-smoke-") as tempora
         tar.extractall(root, filter="data")
     assert not (root / "node_modules/esbuild").exists()
     assert not (root / "node_modules/typescript").exists()
-    assert (root / "src/waits/calendar.py").is_file()
     assert (root / "src/exec/blob_pair.py").is_file()
-    for arguments in (["quota", "observe", "--help"], ["wait", "--help"], ["access", "--help"], ["mcp", "--help"]):
+    for arguments in (["quota", "observe", "--help"], ["access", "--help"], ["mcp", "--help"]):
         result = subprocess.run(["node", str(root / "bin/chaldea"), *arguments],
                                 cwd=home, text=True, capture_output=True)
         assert result.returncode == 0, result.stdout + result.stderr
