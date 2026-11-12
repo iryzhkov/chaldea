@@ -15,8 +15,11 @@ Issuer, audience and JWKS URL are required when enabled. JWT headers cannot sele
 a key URL. JWKS must contain RSA keys with `kid`, `use: "sig"` and either no
 `alg` or `alg: "RS256"`. Requests time out after five seconds; responses are
 limited to 256 KiB and 128 keys. The in-memory cache uses elapsed monotonic time;
-expiry and unknown kids cause a refresh. Fetch failure never falls back to stale
-keys or PKI. Cached known keys remain usable until cache expiry.
+expiry and unknown kids cause a refresh. Concurrent refreshes share one fetch.
+A 30-second monotonic cooldown after every completed fetch attempt, successful or
+failed, prevents further fetches. Unresolved keys and expired caches are rejected
+during the cooldown. Fetch failure never falls back to stale keys or PKI.
+Cached known keys remain usable until cache expiry.
 
 ## Claim contract for homelab-infra
 
@@ -24,15 +27,20 @@ The later Authentik application/provider must issue RS256 JWTs containing:
 
 - `iss`: exactly the configured issuer.
 - `aud`: exactly the configured Akasha audience (a one-element array also works).
-  Tokens with additional audiences are refused.
+  Tokens with additional audiences are refused. Authentik defaults to the OAuth2
+  client_id as audience; homelab-infra must override `aud` with a scope mapping.
 - `sub`: nonempty Authentik user subject. If opaque, also supply
   `preferred_username: "chaldea-HOST"`. Alternatively `sub` itself can be
   `chaldea-HOST` with no preferred_username. A host-shaped sub must agree.
 - `host: "HOST"`: must match that username.
-- `iat`, `nbf`, `exp`: required nonnegative integer Unix seconds,
-  `iat <= nbf < exp`, `exp - iat <= 300`. Time checks allow 60 seconds skew.
-- `run_id`: a stable producer run identifier, 1–128 ASCII identifier characters
-  (letters, digits, dot, underscore, colon, hyphen; first character alphanumeric).
+- `iat`, `exp`: required nonnegative integer Unix seconds. Optional `nbf`
+  defaults to `iat`; if supplied, it must also be a nonnegative integer.
+  Require `iat <= nbf < exp` and `exp - iat <= 300`. Time checks allow 60 seconds
+  skew. Omit a custom `nbf` mapping unless it can guarantee `nbf >= iat`.
+- `run_id`: a stable identifier per host account, not per run, with 1–128 ASCII
+  identifier characters (letters, digits, dot, underscore, colon, hyphen; first
+  character alphanumeric). Provenance `run_id` and compatibility `jti` therefore
+  repeat across requests and runs for that host; neither is a unique run ID.
 - Optional `source`: a signed source selector. If supplied, it must match the
   request's selector. It never supplies grants.
 

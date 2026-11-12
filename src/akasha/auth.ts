@@ -76,7 +76,6 @@ export class Authorization {
         checkCommit() { ensure(checked, "recheck_required", 401); proof.checkCurrent(); },
       };
     }
-    ensure(Buffer.byteLength(token) <= 16384, "invalid_token", 401);
     // Unverified source is only a selector for package C; no identity is used until verification.
     const hint = validateClaims(strictJson(compactParts(token).payload, true));
     ensure(typeof hint.source === "string", "missing_source", 401);
