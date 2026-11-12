@@ -75,10 +75,14 @@ export function httpServer(ingress: Ingress) {
         const receiptLookup = req.method === "GET" && path === "/api/v1/receipts";
         const action = req.method === "POST" || receiptLookup ? "append" : "read";
         let p: Principal;
-        try { p = await ingress.auth.authorize(token, action); }
+        try {
+          const source = req.headers["x-akasha-source"];
+          ensure(source === undefined || typeof source === "string", "invalid_source");
+          p = await ingress.auth.authorize(token, action, source);
+        }
         catch (e) { if (e instanceof HttpError) throw e; throw new HttpError(401, "authorization_denied"); }
         await p.recheck();
-        const deadline = setTimeout(() => res.destroy(), Math.max(1, Math.min(10_000, (p.access.validUntil - ingress.now()) * 1000)));
+        const deadline = setTimeout(() => res.destroy(), Math.max(1, Math.min(10_000, (p.access.validUntil - (p.now?.() ?? ingress.now())) * 1000)));
         res.once("close", () => clearTimeout(deadline)); res.once("finish", () => clearTimeout(deadline));
         if (req.method === "POST") {
           ensure(path === "/api/entries" || path === "/api/v1/events", "no_such_path", 404);
@@ -115,7 +119,7 @@ export function httpServer(ingress: Ingress) {
         if (path === "/api/entries" || path === "/" || path === "/index.html") {
           const page = path !== "/api/entries"; limit(url.searchParams);
           if (page && !url.searchParams.has("since")) url.searchParams.set("since", "14d");
-          const rows = feedRows(ingress.store, url.searchParams, p.scope, ingress.now());
+          const rows = feedRows(ingress.store, url.searchParams, p.scope, (p.now?.() ?? ingress.now()));
           // Preflight only IDs (<=1000), so a LIKE budget failure returns complete error JSON.
           const ids: number[] = []; for (const row of rows) ids.push(row.id);
           await p.recheck();
@@ -132,7 +136,7 @@ export function httpServer(ingress: Ingress) {
           await fragments(res, p, values()); res.end(); return;
         }
         if (path === "/api/v1/events") {
-          const page = eventPage(ingress.store, url.searchParams, p.scope, ingress.now());
+          const page = eventPage(ingress.store, url.searchParams, p.scope, (p.now?.() ?? ingress.now()));
           res.writeHead(200, { "content-type": "application/json" });
           function* values(): Generator<string> {
             yield '{"events":['; let first = true;

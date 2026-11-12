@@ -32,7 +32,7 @@ export class Ingress {
     const old = this.store.ownedReceipt(id, p.scope);
     await p.recheck();
     if (old) { ensure(old.request_hash === requestHash, "idempotency_conflict", 409); return this.visible(p, old); }
-    const now = this.now(), time = new Date(now * 1000).toISOString();
+    const now = (p.now?.() ?? this.now()), time = new Date(now * 1000).toISOString();
     const event: Envelope = { ...input, ...p.identity, v: 1, event_id: id, received_at: time,
       occurred_at: input.occurred_at ?? time, provenance: { type: "verified", request_hash: requestHash, feed_id: null } };
     ensure(Buffer.byteLength(canonical(event)) <= (legacy ? MAX_ENVELOPE : MAX_EVENT) - 32, "event_too_large", 413);

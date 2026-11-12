@@ -6,6 +6,7 @@ import { EXIT } from "../config/exit.ts";
 import { parseArgs } from "node:util";
 import { AccessState, TrustStore, TRUST_POLL_SECONDS } from "../access/trust.ts";
 import type { TrustAnchor } from "../access/trust.ts";
+import { AuthentikVerifier } from "./authentik.ts";
 import { Authorization } from "./auth.ts";
 import type { Registration } from "./auth.ts";
 import { DeliveryWorker, NatsBus } from "./bus.ts";
@@ -72,7 +73,12 @@ export async function main(args: string[]): Promise<number> {
     const seed = c.natsSeedFile ? trustedFile(string("natsSeedFile"), 256, true) : undefined;
     const open = () => NatsBus.open(string("natsUrl"), seed ? Buffer.from(seed.toString("utf8").trim()) : undefined);
     if (!Array.isArray(c.registry)) throw new ConfigurationError("registry_required");
-    const auth = new Authorization(c.registry as Registration[], trust, clock);
+    if (c.authentikEnabled !== undefined && typeof c.authentikEnabled !== "boolean") throw new ConfigurationError("invalid_authentik_enabled");
+    const authentik = c.authentikEnabled === true ? new AuthentikVerifier({
+      issuer: string("authentikIssuer"), audience: string("authentikAudience"), jwksUrl: string("authentikJwksUrl"),
+      jwksTtlSeconds: c.authentikJwksTtlSeconds as number | undefined,
+    }) : undefined;
+    const auth = new Authorization(c.registry as Registration[], trust, clock, authentik);
     worker = new DeliveryWorker(store, () => clock.check(), open, e => auth.validateDelivery(e));
     if (command === "replay") {
       const from = Number(v.from), to = Number(v.to);
