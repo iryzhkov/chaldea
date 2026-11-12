@@ -443,26 +443,7 @@ Claude prepaid wallet. If a future feature-detected control read succeeds, its s
 and cap must retain currency **minor units**; cap remainder is not prepaid cash.
 Unsupported money metrics are distinguished from an unknown observation.
 
-The existing durable feed queue/poster carries one combined host
-`quota_headroom_snapshot` per 15-minute UTC bucket while connected, including
-startup. Its body contains all enabled, installed providers with at least one
-fresh metric; unavailable or failed probes are excluded even if cached values
-remain. Unknown-only and stale-only providers produce no feed records. The first
-usable observation after startup establishes the change/low baseline silently.
-Afterwards `quota_headroom_changed` reports metric availability, wallet availability,
-permission or reset-count transitions, and `quota_headroom_low` reports a changed
-nonempty set below the configured included-window remaining-percent threshold.
-Each kind is combined per host per evaluation. Refresh timestamps and catalog
-ordering do not trigger records. An empty eligible catalog produces no records.
-Cached status retains per-metric stale/unknown diagnostics.
-
-Each provider carries at most 32 windows, with at most 64 provider aliases. Claims,
-snapshot slot and pending delivery are saved together before enqueue,
-with at most the newest pending headroom intent per host/kind (3 total);
-headroom intents are evicted before a transition can be rejected for capacity, so observer
-restarts replay durable delivery intents through the existing poster path.
-Legacy feed attempts retain their existing at-most-once semantics; scoped Akasha
-delivery retains its receipt/retry behavior. Status does not post feed records.
+Quota headroom is cached locally for status and routing. It is not published to the feed.
 
 Routing receives these three lanes as read-only inputs. Automatic provider
 switching never uses the credit-funded lane, so `creditFunded.admissionAllowed`

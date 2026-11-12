@@ -581,4 +581,4 @@ capacity scenarios including native resets in 1 hour, 3 days and 6 days,
 reserve expiry before useful redemption, collector safety and rate bounds. E2E checks the CLI and
 existing MCP server against disposable pinned T3 with fake providers.
 
-This repository ships no Chaldea SKILL.md. Follow-ups belong in fleet-config:
+This repository ships no Chaldea SKILL.md; fleet guidance lives in fleet-config.
