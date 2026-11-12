@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as S from "effect/Schema";
+import * as DateTime from "effect/DateTime";
 import { ServerProvider, OrchestrationV2ThreadShell, OrchestrationV2ThreadProjection,
   OrchestrationV2ShellStreamItem } from "../../src/t3/contracts.ts";
 import { toSwitchProvider } from "../../src/t3/adapter.ts";
@@ -69,11 +70,11 @@ test("projection decoding rejects missing arrays and malformed error variants", 
     assert.throws(() => S.decodeUnknownSync(OrchestrationV2ThreadProjection)(bad), key);
   }
   const errorItem = { id: "i", runId: null, nodeId: null, type: "error", status: "failed",
-    ordinal: 0, updatedAt: "2026-11-12T00:00:00Z", failure: { class: "usage_limit", resetAt: null } };
+    ordinal: 0, updatedAt: DateTime.makeUnsafe("2026-11-12T00:00:00Z"), failure: { class: "usage_limit", resetAt: null } };
   const decoded = S.decodeUnknownSync(OrchestrationV2ThreadProjection)({ ...projection, turnItems: [errorItem] });
   assert.equal("failure" in decoded.turnItems[0]! && decoded.turnItems[0].failure.resetAt, null);
   assert.throws(() => S.decodeUnknownSync(OrchestrationV2ThreadProjection)({
     ...projection, turnItems: [{ id: "i", runId: null, nodeId: null, type: "error", status: "failed",
-      ordinal: 0, updatedAt: "2026-11-12T00:00:00Z" }],
+      ordinal: 0, updatedAt: DateTime.makeUnsafe("2026-11-12T00:00:00Z") }],
   }));
 });
