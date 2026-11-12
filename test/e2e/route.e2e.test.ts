@@ -23,7 +23,7 @@ test("route CLI fixture gives native delegate target without services or credent
     const state = emptyState(), p = newProvider("codex", "codex"), at = Date.now();
     p.included = { value: [{ id: "weekly", kind: "weekly", usedPercent: 20, remainingPercent: 80,
       windowDurationMins: 10080, resetsAt: new Date(at + .4 * 7 * 86400000).toISOString() }],
-      state: "fresh", source: "fixture", observedAt: new Date(at).toISOString(), error: null };
+      state: "fresh", source: "t3", observedAt: new Date(at).toISOString(), error: null };
     state.headroom.providers.push(p);
     const stateFile = join(d.path, "quota.json"); saveState(stateFile, state, at);
     for (const json of [false, true]) {
