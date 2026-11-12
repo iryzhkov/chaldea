@@ -124,7 +124,7 @@ test("HTTP JWT producers append registered kinds and read route scores with sour
           ...scoreFixture, version: 2, metric: "aa-intelligence-cost-per-task", fetchedAt: new Date(N * 1000).toISOString(),
           models: scoreFixture.models.map(m => ({ ...m, coding: null, benchmarkCostUSDPerTask: .5 })) } } : {};
       const res = await fetch(base + "/api/v1/events", { method: "POST",
-        headers: { authorization: "Bearer " + jwt, "x-akasha-source": registration.source, "idempotency-key": "event-" + i },
+        headers: { "content-type": "application/json", authorization: "Bearer " + jwt, "x-akasha-source": registration.source, "idempotency-key": "event-" + i },
         body: JSON.stringify({ v: 1, kind, ...(kind === "tool_call" ? {} : { title: kind }), data }) });
       assert.equal(res.status, 201, await res.text());
       const pending = r.store.db.prepare("SELECT envelope FROM events WHERE source = ?").get(registration.source) as { envelope: string } | undefined;
