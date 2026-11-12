@@ -60,10 +60,6 @@ type PublicationResult = "visible" | "expired" | "deferred";
 export async function publish(event: Publication, options: PublisherOptions = {}): Promise<boolean> {
   return await publicationResult(event,options) !== "deferred";
 }
-/** Status expiry is a gap, never a fresh delivery. One request, same frozen key. */
-export async function publishStatus(event: Publication, options: PublisherOptions = {}): Promise<PublicationResult> {
-  return publicationResult(event,options);
-}
 async function publicationResult(event: Publication, options: PublisherOptions): Promise<PublicationResult> {
   try {
     if (!/^[\x20-\x7e]{1,256}$/.test(event.key)) return "deferred";

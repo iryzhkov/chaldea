@@ -23,7 +23,6 @@ const USAGE = `Usage:
   chaldea route --role builder|critical-review|bulk-read|general [options]
   chaldea quota observe [options]
   chaldea quota status [--json] [--state-file PATH] [--capacity-config PATH]
-  chaldea mission-control serve [--fixture] [--port 7392]
   chaldea davinci serve --config PATH
   chaldea access --help
   chaldea t3 restart [options]\n  chaldea t3 set-auto-resume on|off [options]\n  chaldea wait|decision|waits|mcp|session --help
@@ -203,7 +202,6 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
       const { waitsCli } = await import("./waits/cli.ts");
       return await waitsCli(argv);
     }
-    if (group === "mission-control") return await (await import("./mission-control/serve.ts")).missionCli(argv.slice(1));
     if (group === "davinci") return await (await import("./davinci/service.ts")).davinciCli(argv.slice(1));
     if (group === "message") return await (await import("./message.ts")).messageCli(argv.slice(1));
     if (group === "route") return await (await import("./route/cli.ts")).routeCli(argv.slice(1));
