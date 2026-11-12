@@ -32,70 +32,6 @@ const provider = (alias = "codex", runtimeHome = "/scratch/codex"): SwitchProvid
     resetCredits: { availableCount: 1, nextExpiresAt: "2026-11-01T00:00:00Z" } },
 });
 
-for (const asserted of [false, true]) test(`host startup with 18 instances and asserted=${asserted} stays at one combined snapshot per quarter-hour`, async () => {
-  let now = Math.floor(START / STALE_AFTER_MS) * STALE_AFTER_MS;
-  const records: QuotaRecord[] = [];
-  const config = headroomConfig({ contexts: [{ providers: ["p0", "p1"], home: "/scratch/home", codexHome: "/scratch/codex", assertRuntimeHome: asserted }] });
-  const m = new HeadroomMonitor({ state: emptyHeadroom(), config, local: true,
-    now: () => now, random: () => 0.5, read: async () => response, save: batch => records.push(...batch) });
-  const catalog = () => Array.from({ length: 18 }, (_, i) => {
-    const { runtimeHome, ...p } = provider("p" + i);
-    return { ...p, ...(asserted ? {} : { runtimeHome: runtimeHome! }), enabled: i < 2,
-      usageLimits: { ...provider().usageLimits!, checkedAt: new Date(now).toISOString() } };
-  });
-  try {
-    m.update(catalog()); await m.tick();
-    assert.equal(records.length, 1, "startup establishes a silent change/low baseline");
-    assert.equal(records[0]?.kind, "quota_headroom_snapshot");
-    assert.deepEqual(records[0]?.headroom?.providers.map(p => p.alias), ["p0", "p1"]);
-    assert.equal(records[0]?.headroom?.providers[0]?.creditFunded.credits.value?.balance, "61951.0098125000");
-    for (let minute = 1; minute <= 45; minute++) {
-      now += 60_000; m.update(catalog()); await m.tick();
-      assert.equal(records.length, 1 + Math.floor(minute / 15));
-      assert.ok(records.every(r => r.headroom?.providers.length === 2));
-      assert.ok(records.every(r => r.headroom?.providers.every(p => p.binding === (asserted ? "asserted" : "verified"))));
-    }
-    assert.ok(records.every(r => r.kind === "quota_headroom_snapshot"));
-  } finally { await m.close(); }
-});
-
-test("host reports exclude failed/uninstalled/stale rows and combine real transitions", async () => {
-  const records: QuotaRecord[] = [], state = emptyHeadroom();
-  const m = new HeadroomMonitor({ state, config: headroomConfig(), local: true,
-    now: () => START, save: batch => records.push(...batch) });
-  const good = ["a", "b"].map(alias => ({ ...provider(alias),
-    usageLimits: { checkedAt: AT, windows: [{ usedPercent: 20 }], resetCredits: { availableCount: 1 } } }));
-  const excluded = [
-    { ...provider("disabled"), enabled: false },
-    { ...provider("uninstalled"), installed: false },
-    { ...provider("failed"), usageLimits: { checkedAt: AT, windows: [], unavailable: { reason: "probeFailed" } } },
-    { ...provider("stale"), usageLimits: { checkedAt: new Date(START - STALE_AFTER_MS).toISOString(), windows: [{ usedPercent: 100 }] } },
-    { ...provider("unknown"), usageLimits: { checkedAt: AT, windows: [] } },
-  ];
-  try {
-    m.update(excluded); await m.tick(); assert.equal(records.length, 0);
-    m.update([...good, ...excluded]); await m.tick();
-    applyCodex(state.providers.find(p => p.alias === "failed")!, response, AT);
-    m.emit();
-    assert.equal(records.length, 1);
-    assert.deepEqual(records[0]?.headroom?.providers.map(p => p.alias), ["a", "b"]);
-    m.update([...good.slice().reverse(), ...excluded]); await m.tick();
-    assert.equal(records.length, 1, "catalog ordering is not a transition");
-    m.update([...good.map(p => ({ ...p, usageLimits: { checkedAt: AT,
-      windows: [{ usedPercent: 100 }], resetCredits: { availableCount: 2 } } })), ...excluded]); await m.tick();
-    assert.deepEqual(records.map(r => r.kind), ["quota_headroom_snapshot", "quota_headroom_changed", "quota_headroom_low"]);
-    assert.ok(records.every(r => r.headroom?.providers.length === 2));
-    m.update([...good.map(p => ({ ...p, usageLimits: { checkedAt: AT,
-      windows: [{ usedPercent: 100 }], resetCredits: { availableCount: 2 } } })), ...excluded]); await m.tick();
-    assert.equal(records.length, 3);
-  } finally { await m.close(); }
-  const restarted: QuotaRecord[] = [];
-  const restart = new HeadroomMonitor({ state, config: headroomConfig(), local: true, now: () => START,
-    save: batch => restarted.push(...batch) });
-  try { restart.update(good); await restart.tick(); assert.deepEqual(restarted, []); }
-  finally { await restart.close(); }
-});
-
 test("quota config defaults to the observer user's .config/chaldea/quota.json", () => {
   const f = scratchDir("quota-config");
   const previousXdg = process.env.XDG_CONFIG_HOME;
@@ -115,6 +51,24 @@ test("quota config defaults to the observer user's .config/chaldea/quota.json", 
     if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME; else process.env.XDG_CONFIG_HOME = previousXdg;
     f.remove();
   }
+});
+
+test("legacy fleet quota config is ignored by file and raw loaders", () => {
+  const d = scratchDir("legacy-fleet");
+  try {
+    const raw = { lowHeadroomPercent: 17, contexts: [{ providers: ["codex"], home: d.path, codexHome: join(d.path, ".codex") }] };
+    const expected = headroomConfig(raw, d.path);
+    const fleet = { enabled: true, endpoint: "https://retired.invalid", tokenHelper: "/must-not-run" };
+    assert.deepEqual(headroomConfig({ ...raw, fleet }, d.path), expected);
+    for (const name of ["quota.json", "quota-sharing.json", "quota-fleet-reader.json"]) {
+      const path = join(d.path, name);
+      writeFileSync(path, JSON.stringify({ ...raw, fleet }));
+      assert.deepEqual(loadHeadroomConfig(d.path, path), expected);
+      writeFileSync(path, JSON.stringify({ ...raw, unknown: true }));
+      assert.throws(() => loadHeadroomConfig(d.path, path), /Unknown configuration key/);
+    }
+    assert.throws(() => headroomConfig({ ...raw, unknown: true }), /unknown quota reporting option/);
+  } finally { d.remove(); }
 });
 
 test("T3 projection preserves full windows/reset count and drops identity and redemption fields", () => {
@@ -398,10 +352,7 @@ test("catalog rejection recovery preserves normal cadence and rate-limit backoff
       }
       now = START + COLLECT_EVERY_MS * (rateLimited ? 2 : 1) - 1;
       await m.tick(); assert.equal(reads, 1);
-      const transitions = records.filter(r => r.kind === "quota_headroom_changed").length;
       now++; await m.tick(); assert.equal(reads, 2);
-      if (!rateLimited) assert.equal(records.filter(r => r.kind === "quota_headroom_changed").length, transitions,
-        "the due read must not correct an invented fresh wallet state");
     } finally { await m.close(); }
   }
 });
@@ -448,61 +399,6 @@ test("unmatched/remote/disabled contexts never launch a collector and reconfigur
   assert.equal(wrongAccount.state.providers[0]?.credits.error, "context_mismatch");
   assert.doesNotMatch(JSON.stringify(statusSnapshot(wrongAccount.state, START)), /does-not-match|PRIVATE|quotaAccountKey/);
   await wrongAccount.close();
-});
-test("headroom records survive restart via the existing durable sink; quarter-hour and threshold crossings", async () => {
-  const f = scratchDir("headroom-feed"), state = emptyState(), delivered: QuotaRecord[] = [];
-  const path = join(f.path, "state.json");
-  const sink = new EventSink(state, path, { enqueue: r => delivered.push(r) }, logger);
-  let now = START;
-  const m = new HeadroomMonitor({ state: state.headroom, config: headroomConfig(), local: true, now: () => now,
-    save: records => { sink.record(records); sink.save(); } });
-  try {
-    m.update([provider()]); await m.tick();
-    assert.equal(delivered.filter(r => r.kind === "quota_headroom_snapshot").length, 1);
-    assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 0);
-    await m.tick(); assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 0);
-    m.update([{ ...provider(), usageLimits: { checkedAt: AT, windows: [{ usedPercent: 0 }] } }]);
-    m.update([provider()]); await m.tick();
-    assert.equal(delivered.filter(r => r.kind === "quota_headroom_low").length, 1);
-    now = Math.floor(START / STALE_AFTER_MS + 1) * STALE_AFTER_MS;
-    await m.tick(); assert.equal(delivered.filter(r => r.kind === "quota_headroom_snapshot").length, 2);
-    const loaded = loadState(path, now); assert.equal(loaded.headroom.snapshotSlot, state.headroom.snapshotSlot);
-    assert.ok(loaded.pendingDelivery.size > 0);
-    const replayed: QuotaRecord[] = [];
-    const restored = new EventSink(loaded, path, { enqueue: r => replayed.push(r) }, logger);
-    restored.save(); assert.equal(replayed.length, loaded.pendingDelivery.size); restored.close();
-    for (const record of replayed) {
-      const p = quotaPublication(record, "agent-a");
-      normalize(p.payload, { issuer: "i", profile: "p", project: "x", source: p.source, host: "agent-a", run_id: "r", source_id: "s" }, false);
-      assert.ok(Buffer.byteLength(body(record, "agent-a")) < 48 * 1024);
-      assert.doesNotMatch(body(record, "agent-a"), /PRIVATE|credentialFingerprint|nextCreditId|runtimeHome/);
-    }
-  } finally { await m.close(); sink.close(); f.remove(); }
-});
-test("headroom coalescing and eviction preserve the full transition queue during a delivery outage", () => {
-  const f = scratchDir("headroom-priority"), state = emptyState(), queued = new Map<string, QuotaRecord>();
-  const path = join(f.path, "state.json");
-  const sink = new EventSink(state, path, { enqueue: r => queued.set(r.runId, r),
-    discard: key => { for (const [id, r] of queued) if (quotaPublication(r, "test").key === key) queued.delete(id); } }, logger);
-  const advisory = (alias: string, i: number): QuotaRecord => ({
-    kind: "quota_headroom_snapshot", severity: "info", threadId: "headroom", runId: String(i), provider: "all", resetAt: null, subagent: false,
-    headroom: statusSnapshot({ ...emptyHeadroom(), providers: [newProvider(alias, "codex")] }, START),
-  });
-  try {
-    for (let i = 0; i < 300; i++) { sink.record([advisory("alias", i)]); sink.save(); }
-    assert.equal(state.pendingDelivery.size, 1); assert.equal(queued.size, 1);
-    for (let i = 0; i < 220; i++) { sink.record([advisory("p" + i, i + 300)]); sink.save(); }
-    assert.equal(state.pendingDelivery.size, 1); assert.equal(queued.size, 1);
-    for (let i = 0; i < 256; i++) {
-      sink.record([{ kind: "quota_parked", severity: "warn", threadId: "t" + i, runId: "run" + i,
-        provider: "codex", resetAt: AT, subagent: false }]); sink.save();
-    }
-    assert.equal(state.pendingDelivery.size, 256);
-    assert.equal([...state.pendingDelivery.values()].filter(r => r.kind === "quota_parked").length, 256);
-    assert.equal([...queued.values()].filter(r => r.kind === "quota_parked").length, 256);
-    assert.equal(state.deliveryDropped, 0);
-    assert.equal(loadState(path, START).pendingDelivery.size, 256);
-  } finally { sink.close(); f.remove(); }
 });
 test("idle scheduler ticks do not write state and malformed persisted headroom fails closed at load", async () => {
   let writes = 0, now = START;

@@ -98,7 +98,9 @@ function assertNothingLeaked(h: Harness, transcript: string): void {
 }
 
 function transitionFeed(feedLog: string) {
-  return readFeed(feedLog).filter(entry => !String(entry.body.kind).startsWith("quota_headroom_"));
+  const entries = readFeed(feedLog);
+  assert.ok(entries.every(entry => !String(entry.body.kind).startsWith("quota_headroom_")));
+  return entries;
 }
 
 function kinds(feedLog: string): Array<string> {
@@ -112,18 +114,9 @@ function turns(t3: DisposableT3, outcome: string, continuation?: boolean): numbe
 }
 
 test("a known reset resumes natively once and the observer records park and resume once", { skip, timeout: 180_000 }, async () => {
-  // Claude's fixture has no usage metrics. The existing fake Codex supplies fresh
-  // windows, so the startup snapshot has one eligible provider and skips the rest.
   const h = await harness({ scenario: "reset", autoResume: true, resetDelaySeconds: 10, codex: "available" });
   const first = await h.startObserver();
-  await waitFor("combined startup headroom snapshot", () =>
-    readFeed(h.feedLog).some(entry => entry.body.kind === "quota_headroom_snapshot"), 30_000);
-  const startup = readFeed(h.feedLog).filter(entry => String(entry.body.kind).startsWith("quota_headroom_"));
-  assert.deepEqual(startup.map(entry => entry.body.kind), ["quota_headroom_snapshot"]);
-  assert.equal(startup[0]!.body.provider, "all");
-  const headroom = startup[0]!.body.headroom as ReturnType<typeof statusSnapshot>;
-  assert.deepEqual(headroom.providers.map(p => p.alias), ["codex"]);
-  assert.equal(headroom.providers[0]!.included.windows.state, "fresh");
+  assert.deepEqual(readFeed(h.feedLog), [], "startup caches quota without publishing headroom");
   await dispatchMessage(h.t3, h.operateToken, h.threadId, `Start the work. ${h.t3.trigger}`, "1");
 
   await waitFor("quota_parked", () => kinds(h.feedLog).includes("quota_parked"), 30_000);

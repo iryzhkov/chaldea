@@ -75,8 +75,7 @@ export function eventPage(store: EventStore, q: URLSearchParams, scope: Scope, n
 } {
   const count = limit(q), query = new URLSearchParams(q); query.delete("cursor");
   const binding = hash([scope, [...query.entries()].sort()]);
-  const kind = q.get("kind") || (scope.routeScores && scope.source === "route" ? "route_score_snapshot" :
-    scope.quotaFleet && scope.source === "quota" ? "quota_headroom_snapshot" : undefined);
+  const kind = q.get("kind") || (scope.routeScores && scope.source === "route" ? "route_score_snapshot" : undefined);
   const generation = store.pruneGeneration();
   const fresh = (g: number, position: number) => {
     ensure(store.cursorFresh(kind, g, position), "cursor_expired_reset", 410);

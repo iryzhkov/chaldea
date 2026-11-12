@@ -24,10 +24,6 @@ function shortId(id: string): string {
 export function title(record: QuotaRecord): string {
   const thread = shortId(record.threadId);
   switch (record.kind) {
-    case "quota_headroom_snapshot":
-    case "quota_headroom_changed":
-    case "quota_headroom_low":
-      return `${record.kind}: ${record.headroom?.providers.map(p => p.alias).join(", ") ?? "unknown"}`;
     case "restart_resumed":
       return `restart_resumed: ${record.provider} thread ${thread}`;
     case "quota_parked":
@@ -58,7 +54,7 @@ export function quotaKey(record: QuotaRecord): string {
 }
 export function quotaPublication(record: QuotaRecord, host: string): Publication {
   const transition = quotaKey(record);
-  const data: Record<string, unknown> = record.headroom ? { transition_id: transition } : { thread_id: record.threadId, run_id: record.runId,
+  const data: Record<string, unknown> = { thread_id: record.threadId, run_id: record.runId,
     provider: record.toProvider ?? record.provider, transition_id: transition };
   if (record.kind === "quota_parked" && record.resetAt) data.reset_at = record.resetAt;
   if (record.kind === "provider_switched" || record.kind === "provider_switch_failed") {
@@ -125,18 +121,12 @@ export class FeedPoster {
   enqueue(record: QuotaRecord, ack?: () => boolean | void): void {
     const key = quotaKey(record);
     if (this.#queue.has(key)) return;
-    if (!record.headroom && this.#queue.size >= MAX_QUEUED_RECORDS) {
-      const advisory = this.#queue.entries().find(([, item]) => item.record.headroom !== undefined);
-      if (advisory) this.#queue.discard(advisory[0]); // Its owner retains/coalesces the durable advisory intent.
-    }
     if (this.#queue.size >= MAX_QUEUED_RECORDS) {
       this.#options.logger.warn("feed worker full; durable intent retained"); return;
     }
     this.#queue.enqueue(key, { record, ...(ack ? { ack } : {}) });
     this.#kick();
   }
-  /** Remove a superseded advisory intent after its replacement is durable. */
-  discard(key: string): void { this.#queue.discard(key); }
   #kick(): void {
     if (this.#closed || this.#draining) return;
     this.#draining = this.#drain().finally(() => {
@@ -154,7 +144,7 @@ export class FeedPoster {
     const attempted = new Set<string>();
     while (!this.#closed) {
       const pending = this.#queue.entries().filter(([key]) => !attempted.has(key));
-      const next = pending.find(([, item]) => !item.record.headroom) ?? pending[0];
+      const next = pending[0];
       if (!next) return;
       const [key, item] = next;
       attempted.add(key);

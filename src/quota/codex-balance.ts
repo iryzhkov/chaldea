@@ -2,7 +2,7 @@
 import { spawn } from "node:child_process";
 import { isAbsolute, resolve } from "node:path";
 import { homedir } from "node:os";
-import { claudeContexts, fleetConfig, type ClaudeContext, type FleetConfig } from "./fleet.ts";
+import { claudeContexts, type ClaudeContext } from "./claude-contexts.ts";
 import { quotaConfig } from "../config/quota.ts";
 
 export interface CodexContext {
@@ -17,12 +17,12 @@ export interface HeadroomConfig {
   readonly contexts: ReadonlyArray<CodexContext>;
   readonly lowHeadroomPercent: number;
   readonly claudeContexts?: ReadonlyArray<ClaudeContext>;
-  readonly fleet?: FleetConfig;
 }
 export function headroomConfig(raw: unknown = {}, home = homedir()): HeadroomConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid quota reporting config");
   const c = raw as Record<string, unknown>;
-  if (Object.keys(c).some(k => !["contexts", "claudeContexts", "fleet", "lowHeadroomPercent"].includes(k))) throw new Error("unknown quota reporting option");
+  // Ignore legacy fleet sharing config until hosts remove it.
+  if (Object.keys(c).some(k => !["fleet", "contexts", "claudeContexts", "lowHeadroomPercent"].includes(k))) throw new Error("unknown quota reporting option");
   const contexts = c.contexts ?? [];
   if (!Array.isArray(contexts) || contexts.length > 16) throw new Error("quota contexts must contain at most 16 entries");
   const seen = new Set<string>();
@@ -58,15 +58,12 @@ export function headroomConfig(raw: unknown = {}, home = homedir()): HeadroomCon
   }
   const claude = claudeContexts(c.claudeContexts);
   if (claude.some(ctx => seen.has(ctx.providerInstanceId))) throw new Error("duplicate provider alias");
-  // Omission means no fleet configuration. Explicit null/{} retain the legacy
-  // disabled defaults; fleetConfig itself still accepts omitted input.
-  return { contexts: [...grouped.values()], lowHeadroomPercent: low, claudeContexts: claude,
-    ...(c.fleet === undefined ? {} : { fleet: fleetConfig(c.fleet, home) }) };
+  return { contexts: [...grouped.values()], lowHeadroomPercent: low, claudeContexts: claude };
 }
 /** Missing default config leaves balance unknown; explicit paths and malformed files fail closed. */
 export function loadHeadroomConfig(home: string, path?: string): HeadroomConfig {
   const c = quotaConfig(home, path);
-  return headroomConfig({ contexts: c.contexts, claudeContexts: c.claudeContexts, fleet: c.fleet, lowHeadroomPercent: c.lowHeadroomPercent }, home);
+  return headroomConfig({ contexts: c.contexts, claudeContexts: c.claudeContexts, lowHeadroomPercent: c.lowHeadroomPercent }, home);
 }
 export const contextKey = (c: CodexContext): string => JSON.stringify([c.home, c.codexHome, c.command]);
 

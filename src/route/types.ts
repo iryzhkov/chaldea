@@ -36,7 +36,6 @@ export type ProviderPick = (Target & { eligible: true; reasons: string[] }) |
 export interface RouteDiagnostics {
   quality_source: "fixed_policy" | "AA";
   benchmarkCoverage?: Record<string, { complete: boolean; models: number; covered: number; missing: string[] }>;
-  fleet?: { readiness: "absent" | "disabled" | "ready" | "empty" | "unavailable"; freshAccounts: number };
   quota: Record<string, { accountKey: string | null; bindingSource: string; source: string; ageSeconds: number | null;
     freshness: "fresh" | "stale" | "unknown"; bindingWindow: string | null; scopedKnown: boolean; conflicts?: string[] }>;
 }

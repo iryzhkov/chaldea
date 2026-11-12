@@ -1,7 +1,7 @@
 // Static discovery metadata. Importing this module never loads a service or config.
 export const description = {
   "name": "chaldea",
-  "summary": "Fleet compute, quota observation, durable waits, decisions and access trust.",
+  "summary": "Fleet compute, quota observation, access trust.",
   "help": "chaldea --help",
   "commands": [
     { "name": "route", "summary": "Recommend a native T3 delegate target using quota pacing and model statistics", "access": "write" },
@@ -46,58 +46,8 @@ export const description = {
       "access": "write"
     },
     {
-      "name": "wait time",
-      "summary": "Register a durable time wait",
-      "access": "write"
-    },
-    {
-      "name": "wait thread",
-      "summary": "Register a thread completion wait",
-      "access": "write"
-    },
-    {
-      "name": "wait status",
-      "summary": "Read a durable wait",
-      "access": "read"
-    },
-    {
-      "name": "wait cancel",
-      "summary": "Cancel a durable wait",
-      "access": "write"
-    },
-    {
-      "name": "decision prepare",
-      "summary": "Register native decision policy",
-      "access": "write"
-    },
-    {
-      "name": "decision track",
-      "summary": "Track a native decision",
-      "access": "write"
-    },
-    {
-      "name": "decision ask",
-      "summary": "Create a decision request",
-      "access": "write"
-    },
-    {
-      "name": "decision answer",
-      "summary": "Answer a decision request",
-      "access": "write"
-    },
-    {
-      "name": "decision status",
-      "summary": "Read a decision request",
-      "access": "read"
-    },
-    {
-      "name": "waits serve",
-      "summary": "Run the durable waits service",
-      "access": "write"
-    },
-    {
       "name": "mcp",
-      "summary": "Serve waits and decision MCP operations",
+      "summary": "Serve advisory routing MCP operations",
       "access": "write"
     },
     {

@@ -10,17 +10,14 @@ from pathlib import Path
 # e2e-1: 204.285 s; e2e-2: 211.898 s; e2e-3: 208.279 s.
 GROUPS = {
     "e2e-1": [
-        "test/e2e/native-decisions.e2e.test.ts",
         "test/e2e/quota.e2e.test.ts",
     ],
     "e2e-2": [
         "test/e2e/message-replay.e2e.test.ts",
         "test/e2e/provider-switch.e2e.test.ts",
         "test/e2e/route.e2e.test.ts",
-        "test/e2e/waits.e2e.test.ts",
     ],
     "e2e-3": [
-        "test/e2e/multiwait.e2e.test.ts",
         "test/e2e/restart-investigation.e2e.test.ts",
         "test/e2e/restart.e2e.test.ts",
         "test/e2e/token-helper.e2e.test.ts",

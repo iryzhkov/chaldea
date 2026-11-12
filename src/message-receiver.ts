@@ -7,7 +7,7 @@ import { MessageStore, WINDOW, type Receipt } from "./message-store.ts";
 import { object, name, path, field, threads, requireMessage, decodeRequest, identity, requestHash, inWindow, type Request } from "./message.ts";
 import { brokerConfig, mapping, distinctMappings, publicKey, MAPPING_KEYS, mappingBinding, connection, pull, publish, acknowledge, attempt, type BrokerConfig, type Mapping } from "./message-broker.ts";
 import { backoff, sleep } from "./retry.ts";
-import { boundedLog } from "./config/waits-log.ts";
+import { boundedLog } from "./config/bounded-log.ts";
 export interface Caller extends Mapping {sourceHost:string;publisherKey:string;threads:string[]}
 export interface ReceiverConfig {host:string;environment:string;loopbackT3Url:string;tokenFile:string;database:string;logFile:string;broker:BrokerConfig;callers:Record<string,Caller>}
 export const receiverBinding=(c:ReceiverConfig)=>JSON.stringify(["receiver",c.host,c.environment]);

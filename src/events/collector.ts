@@ -4,8 +4,6 @@ import { parseArgs } from "node:util";
 import { closeSync, openSync, readSync, fstatSync, lstatSync, unlinkSync, opendirSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { hostname } from "node:os";
-import { readTrustedFile } from "../config/files.ts";
-import { strictJson } from "../access/token.ts";
 import { eventsConfig } from "../config/events.ts";
 import { createLogger } from "../config/log.ts";
 import { ConfigurationError } from "../config/files.ts";

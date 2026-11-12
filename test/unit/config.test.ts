@@ -8,12 +8,10 @@ import { scratchDir } from "../helpers/scratch.ts";
 import { paths, configPath } from "../../src/config/paths.ts";
 import { privateFile, readJson, readTrustedFile, ConfigurationError } from "../../src/config/files.ts";
 import { createLogger, MAX_LINES_PER_MINUTE } from "../../src/config/log.ts";
-import { boundedLog } from "../../src/config/waits-log.ts";
 import { aliases } from "../../src/config/compat.ts";
 import { akashaConfig } from "../../src/config/akasha.ts";
 import { execConfig } from "../../src/config/exec.ts";
 import { eventsConfig } from "../../src/config/events.ts";
-import { loadConfig } from "../../src/waits/config.ts";
 import { loadHeadroomConfig } from "../../src/quota/codex-balance.ts";
 import { quotaConfig } from "../../src/config/quota.ts";
 import { main } from "../../src/cli.ts";
@@ -63,16 +61,11 @@ test("optional config accepts absence only and never exposes invalid input in er
     writeFileSync(path, "{}"); chmodSync(path, 0o666); assert.throws(() => readJson(path, true));
   } finally { f.remove(); }
 });
-test("fleet waits/quota files keep camelCase and reporting keys under XDG", () => {
+test("quota files keep camelCase and reporting keys under XDG", () => {
   const f = scratchDir("fleet-config");
   try {
     environment({ XDG_CONFIG_HOME: f.path, XDG_STATE_HOME: join(f.path, "state"), XDG_RUNTIME_DIR: join(f.path, "run") }, () => {
       mkdirSync(join(f.path, "chaldea"));
-      writeFileSync(configPath("waits"), JSON.stringify({ environment: "fixture", t3BaseDir: "/fixture/t3", answerBaseUrl: "http://127.0.0.1:7385" }));
-      const waits = loadConfig();
-      assert.equal(waits.t3BaseDir, "/fixture/t3");
-      assert.equal(waits.database, join(f.path, "state/chaldea/waits.sqlite"));
-      assert.equal(waits.socket, join(f.path, "run/chaldea-waits.sock"));
       writeFileSync(configPath("quota"), JSON.stringify({ tokenFile: "/fixture/token", stateFile: "/fixture/state", contexts: [
         { providers: ["codex"], home: "/fixture/home", codexHome: "/fixture/codex", assertRuntimeHome: true }
       ], lowHeadroomPercent: 17 }));
@@ -102,7 +95,7 @@ test("legacy keys log names only and canonical keys win; Akasha retains strict J
     writeFileSync(path, '{"database":"a","database":"b"}'); assert.throws(() => akashaConfig(path));
   } finally { f.remove(); }
 });
-test("JSON logger owns timestamp/level/message; waits rotates old numeric and ISO records", () => {
+test("JSON logger owns timestamp/level/message", () => {
   const lines: string[] = [], logger = createLogger(line => lines.push(line));
   logger.info("event", { at: "bad", level: "bad", message: "bad" });
   const record = JSON.parse(lines[0]!);
@@ -110,17 +103,7 @@ test("JSON logger owns timestamp/level/message; waits rotates old numeric and IS
   assert.equal(new Date(record.at).toISOString(), record.at);
   for (let n = 0; n < MAX_LINES_PER_MINUTE + 5; n++) logger.warn("bounded");
   logger.error("fatal"); assert.equal(JSON.parse(lines.at(-1)!).message, "fatal");
-  const f = scratchDir("waits-log");
-  try {
-    const path = join(f.path, "waits.log");
-    for (const at of [1, "1970-01-01T00:00:00.001Z"]) {
-      writeFileSync(path, JSON.stringify({ at, event: "expired" }) + "\n", { mode: 0o600 });
-      boundedLog(path)("started");
-      const text = readFileSync(path, "utf8"), record = JSON.parse(text);
-      assert.equal(record.event, "started"); assert.equal(record.level, "info");
-      assert.ok(!text.includes("expired")); assert.equal(typeof record.at, "string");
-    }
-  } finally { f.remove(); }
+
 });
 test("test wrapper ignores inherited desktop XDG bases", () => {
   const f = scratchDir("xdg-scratch");
@@ -132,19 +115,10 @@ test("test wrapper ignores inherited desktop XDG bases", () => {
     assert.equal(result.status, 0, result.stderr);
   } finally { f.remove(); }
 });
-test("Akasha trusted adapter keeps unsafe_input and waits failures use error level", () => {
+test("Akasha trusted adapter keeps unsafe_input", () => {
   const f = scratchDir("adapter-error");
   try {
     const path = join(f.path, "unsafe"); writeFileSync(path, "not-a-secret", { mode: 0o600 }); chmodSync(path, 0o666);
     assert.throws(() => trustedFile(path, 1024), (error: any) => error.status === 400 && error.message === "unsafe_input");
-    const log = join(f.path, "log"); boundedLog(log)("watcher_needs_attention");
-    assert.equal(JSON.parse(readFileSync(log, "utf8")).level, "error");
-  } finally { f.remove(); }
-});
-test("waits invalid configuration returns EX_CONFIG", async () => {
-  const f = scratchDir("config-exit");
-  try {
-    const path = join(f.path, "waits.json"); writeFileSync(path, "{broken", { mode: 0o600 });
-    assert.equal(await main(["waits", "serve", "--config", path]), 78);
   } finally { f.remove(); }
 });

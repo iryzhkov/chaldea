@@ -17,7 +17,7 @@ removing this path. An open upstream PR is not a released or installed replaceme
 ## Retained implementation
 
 Source implementation only. No live account, credential, broker configuration,
-service activation or fleet deployment is included. The CLI and MCP expose
+service activation or fleet deployment is included. The CLI exposes
 messaging only when a valid private root-owned sender configuration exists.
 
     chaldea message targets
@@ -25,8 +25,7 @@ messaging only when a valid private root-owned sender configuration exists.
     chaldea message status --host laptop --thread THREAD --request-id EPOCHMS:KEY
     chaldea message recover --host laptop --thread THREAD --request-id EPOCHMS:KEY
 
-The MCP names are chaldea_message_targets, chaldea_message_send,
-chaldea_message_status and chaldea_message_recover. Targets lists configured
+The targets command lists configured
 host/thread routes without contacting the broker; the receiver ACL remains
 authoritative. Status never dispatches. Recover explicitly retries stored original
 bytes, or reads status for a terminal receipt. An identical send is also an
@@ -177,15 +176,6 @@ are at most 8 KiB, text 4 KiB, generated immutable T3 JSON 8 KiB and T3 response
 32 KiB. Unknown fields are refused. IDs bind caller/source/destination/environment/
 thread/request. Text is excluded from identity but included in its immutable hash.
 
-The source commits intent before publishing. A fresh transport attempt nonce
-correlates receipts without changing application IDs. Concurrent sends can consume
-each other's receipts; a bounded SQLite attempt table durably transfers the
-matching result after checking mapping, nonce, command ID and message ID.
-Transport failure preserves local intent and returns uncertainty with original IDs.
-The network exchange has a 35-second deadline, plus short bounded journal
-contention waits. CLI/MCP processes sharing a sender store retry only lock/busy
-transactions for at most two seconds at a time; they never republish automatically.
-
 The receiver holds its existing nonblocking store lock, persists the attempt and
 exact immutable T3 payload before dispatch, and stores the application outcome.
 A dispatch-capable command is ACKed only after storing an attempt result and
@@ -218,17 +208,6 @@ and expire. A separate eight-caller durable request bucket (burst eight,
 The original T3 send bucket remains burst two / ten per minute; terminal
 payloads purge immediately, uncertain payloads after 24 hours and receipts after
 42 days on operations/receiver maintenance. There is no unbounded local spool.
-
-Run one supervised receiver with chaldea message serve. The source-only unit
-packaging/systemd/chaldea-message.service is disabled until separately installed
-and enrolled. The loop uses bounded reconnect backoff up to 30s, cancellation,
-one-second pulls with a five-second subscription timeout, bounded T3 calls and
-minute maintenance. The larger timeout covers broker round-trip margin;
-subscription timeout retries are empty pulls. Caller delivery failures back off
-independently; connection loss reconnects the supervised loop. Malformed poison is
-terminated without T3 dispatch. Fixed event categories use the existing bounded
-10 MiB / 14-day log helper; bodies, seeds, bearers and raw exceptions are not logged.
-Broker failure has no dependency in local waits, exec or same-host T3 operations.
 
 Stores must be initialized explicitly as their owner using
 MessageStore(database, receiverBinding(config), true) or senderBinding(config).

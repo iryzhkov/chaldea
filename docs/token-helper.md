@@ -43,17 +43,6 @@ All issuer fields are required. The example records the original agent-a default
 other hosts must supply their own UID, absolute key path, issuer name and kid.
 These values come only from the root-owned config, never arguments or environment.
 
-Fleet quota snapshots need separate append/read grants for source quota and kind
-quota_headroom_snapshot on each host. Cross-host snapshot reads also require
-Akasha quota_fleet_read source registration. See [fleet quota accounts](quota-fleet.md).
-
-Each request must match exactly one entry on UID and all five flags. Profile and
-project come from that entry; resource is exactly source, with only the requested
-action. Host must also match the issuer. This is a service producer admission
-boundary, not scheduled run admission. Each invocation gets a new run ID and jti.
-Scheduled/model processes must continue through RunLeases and must not receive
-these sudo grants. Removal of a local grant stops subsequent minting immediately.
-
 Kind is a selector for admission, not a JWT claim. The existing Akasha source
 registration remains responsible for allowed payload kinds, roots, read mode and
 global read. Configure that registration consistently; a bearer can append any

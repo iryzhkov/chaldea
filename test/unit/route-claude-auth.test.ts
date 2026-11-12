@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { join } from "node:path";
 import { chmodSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { collectClaudeUsage, CLAUDE_CADENCE_MS, tokenSource, claudeSourceId } from "../../src/route/claude-usage.ts";
-import { claudeContexts } from "../../src/quota/fleet.ts";
+import { claudeContexts } from "../../src/quota/claude-contexts.ts";
 import { loadRouteConfig } from "../../src/route/config.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
 import { now, iso } from "../fixtures/route/catalog.ts";

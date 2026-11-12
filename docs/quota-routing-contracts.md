@@ -5,10 +5,7 @@ top level and under `target`, with the exact live catalog option IDs and values.
 The projection includes up to two short reasons, stable reason codes, the selected
 account binding, observation source and age, freshness, binding window and
 `quality_source`. That source is `AA` only when the policy actually used a
-validated score snapshot, otherwise `fixed_policy`. Fleet diagnostics distinguish
-absent configuration, disabled collection, an empty result, a ready reader and an
-unavailable reader, with the number of fresh shared accounts. No configuration is
-activated by diagnostics.
+validated score snapshot, otherwise `fixed_policy`.
 
 Use `--explain` or `--legacy-full` for the full result, including rejection
 reasons, alternatives and provider diagnostics. `--compact` explicitly selects
@@ -20,8 +17,7 @@ An incomplete review pair returns JSON on stdout and exit code 7.
 ## Claude window identity
 
 Native T3, direct usage collection, cache validation and observer fallback preserve
-`five_hour`, `seven_day` and `seven_day_fable`. The existing snapshot version
-and window `id` carry this distinction. The five-hour and general weekly windows
+`five_hour`, `seven_day` and `seven_day_fable`. The five-hour and general weekly windows
 apply to all Claude models. The additional Fable weekly window applies to Fable
 family model IDs, including namespaced aliases. Missing or invalid scoped evidence
 remains unknown. It cannot establish use-it capacity or under-pacing.
@@ -30,16 +26,6 @@ Provider-wide capacity ignores model-specific weekly windows. Candidate routing
 adds the applicable Fable constraint. Common weekly pacing remains account-wide.
 Every applicable low remaining limit is checked even when another weekly window
 determines pace. There is no new refill, extra-usage or redemption assumption.
-
-## Fleet disagreement
-
-Observations of the same provider and account are deduplicated, never added.
-A newer observation replaces an older one. Equal observation times retain the
-smallest remaining allowance for matching window IDs and reset epochs, with local
-conflict diagnostics. Missing windows or conflicting reset epochs become unknown.
-Credits and reset inventories that disagree become unknown. Host-name ordering
-only chooses the display source, not utilization. Local active stops still gate
-the account. Remote credits never establish local spend-control evidence.
 
 ## One-call review pair
 
@@ -78,4 +64,4 @@ optional `mainRole`, `peerRole`, `mainEffort`, `peerEffort`, and
 `main`, `peer`, `quotaException` and bounded `reasons`. Targets are nullable
 and otherwise use native `providerInstanceId`, `model`, `options` and optional
 `accountKey`. Full single-route diagnostics include per-instance/model quota
-details and fleet readiness. Snapshot wire fields remain unchanged.
+details.

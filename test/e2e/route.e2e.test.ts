@@ -64,11 +64,11 @@ test("CLI and existing MCP route against real T3 cached catalog; no wait service
       { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "chaldea_route_review_pair", arguments: { authorProvider: "codex" } } },
       { jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "chaldea_route", arguments: { role: "builder", responseMode: "invalid" } } }];
     const mcp = spawnSync(process.execPath, ["--input-type=module", "-e",
-      'const {runMcp} = await import(' + JSON.stringify(resolve("src/mcp.ts")) + '); await runMcp("/missing-waits.sock");'],
+      'const {runMcp} = await import(' + JSON.stringify(resolve("src/mcp.ts")) + '); await runMcp();'],
       { env, encoding: "utf8", timeout: 30000, input: frames.map(f => JSON.stringify(f)).join("\n") + "\n" });
     assert.equal(mcp.status, 0, mcp.stderr);
     const replies = mcp.stdout.trim().split("\n").map(line => JSON.parse(line));
-    assert.ok(replies[0].result.tools.some((t: { name: string }) => t.name === "chaldea_route"));
+    assert.deepEqual(replies[0].result.tools.map((t: { name: string }) => t.name), ["chaldea_route", "chaldea_route_review_pair"]);
     assert.equal(replies[1].result.isError, undefined);
     assert.equal(JSON.parse(replies[1].result.content[0].text).model, target.model);
     assert.deepEqual(JSON.parse(replies[1].result.content[0].text).byProvider, target.byProvider);

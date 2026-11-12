@@ -31,8 +31,7 @@ export const MAX_POSTED_KEYS = 10_000;
 /** At most this many parked threads are tracked; an evicted one loses its quota_resumed. */
 export const MAX_PARKED_THREADS = 1_000;
 
-export type RecordKind = "restart_resumed" | "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched" | "provider_switch_failed" |
-  "quota_headroom_snapshot" | "quota_headroom_changed" | "quota_headroom_low";
+export type RecordKind = "restart_resumed" | "quota_parked" | "quota_reset_unknown" | "quota_resumed" | "provider_switched" | "provider_switch_failed";
 
 export interface ParkedThread {
   readonly runId: string;
@@ -118,7 +117,9 @@ export function loadState(path: string, nowMs: number): ObserverState {
     headroom: raw.headroom === undefined ? emptyHeadroom() : validateHeadroom(raw.headroom),
     posted: new Map(Object.entries(raw.posted ?? {}).filter((entry): entry is [string, number] => typeof entry[1] === "number")),
     parked: new Map(Object.entries(raw.parked ?? {}) as Array<[string, ParkedThread]>),
-    pendingDelivery: new Map(Object.entries(raw.pendingDelivery ?? {}) as Array<[string, QuotaRecord]>),
+    // Discard retired headroom publication intents; never retry them after upgrade.
+    pendingDelivery: new Map((Object.entries(raw.pendingDelivery ?? {}) as Array<[string, QuotaRecord]>)
+      .filter(([, record]) => !String(record.kind).startsWith("quota_headroom_"))),
     deliveryDropped: Number.isSafeInteger(raw.deliveryDropped) ? raw.deliveryDropped : 0,
     switches: new Map(Object.entries(raw.switches ?? {}) as Array<[string, SwitchIntent]>),
     evictedThrough: typeof raw.evictedThrough === "number" ? raw.evictedThrough : null,
