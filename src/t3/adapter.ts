@@ -36,7 +36,6 @@ export interface ShellThread {
   readonly modelSelection?: ModelChoice;
   readonly settled?: boolean;
   readonly pendingRequest?: boolean;
-  readonly pendingRequestKind?: string;
   readonly latestRunId: string | null;
   readonly activeRunId: string | null;
   readonly latestRunStartedAt: string | null;
@@ -369,7 +368,6 @@ export function toShellThread(thread: OrchestrationV2ThreadShell): ShellThread {
     settled: thread.settledOverride === "settled",
     pendingRequest: thread.pendingRuntimeRequest !== null || (![null, "fork", "subagent"].includes(thread.lineage.relationshipToParent) ||
         ![null, "settled", "active"].includes(thread.settledOverride)),
-    ...(thread.pendingRuntimeRequest?{pendingRequestKind:thread.pendingRuntimeRequest.kind}:{}),
     latestRunId: thread.latestRunId,
     activeRunId: thread.activeRunId,
     latestRunStartedAt: isoOrNull(thread.latestRunStartedAt),

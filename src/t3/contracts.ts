@@ -41,9 +41,9 @@ const turnItem = S.Union([
   S.Struct({ ...itemBase, type: S.String.check(S.isPattern(/^(?!error$).+/)) }),
 ]);
 export const OrchestrationV2ThreadProjection = S.Struct({
-  thread: S.Struct({ ...threadFields, snoozedUntil: opt(nullableTime) }),
+  thread: S.Struct(threadFields),
   runs: S.Array(S.Struct({
-    id, ordinal: seq, status: S.String, rootNodeId: S.NullOr(id), providerInstanceId: id, modelSelection: model,
+    id, ordinal: seq, status: S.String, rootNodeId: S.NullOr(id),
     startedAt: nullableTime, completedAt: nullableTime,
     userMessageId: id,
   })),
