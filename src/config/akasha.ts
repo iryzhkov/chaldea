@@ -8,6 +8,6 @@ export function akashaConfig(path = configPath("akasha")) {
     access_state: "accessState", bundle_file: "bundleFile", clock_health_file: "clockHealthFile",
     nats_url: "natsUrl", nats_seed_file: "natsSeedFile",
   });
-  onlyKeys(c, ["database", "accessState", "anchors", "bundleFile", "clockHealthFile", "registry", "natsUrl", "natsSeedFile", "bind", "port"]);
+  onlyKeys(c, ["database", "accessState", "anchors", "bundleFile", "clockHealthFile", "registry", "natsUrl", "natsSeedFile", "bind", "port", "authentikEnabled", "authentikIssuer", "authentikAudience", "authentikJwksUrl", "authentikJwksTtlSeconds"]);
   return c;
 }
