@@ -1,0 +1,16 @@
+#!/bin/sh
+# Reproduce release compatibility with the packaged production client.
+# Invoke inside Chaldea with an isolated HOME and TMPDIR, after npm ci.
+set -eu
+version=${1:-0.1.6}
+test -n "${CHALDEA_TRUST_TEST_HOME:-}"
+test "$HOME" = "$CHALDEA_TRUST_TEST_HOME"
+test "$HOME" != /home/igor
+test -n "${TMPDIR:-}"
+case "$TMPDIR" in /tmp|/tmp/*) exit 1 ;; esac
+root="$TMPDIR/official-$version"
+mkdir -p "$root/package"
+sh scripts/ci/install-t3 "$root/t3" "$version"
+python3 scripts/package-client.py client-v0.0.0 "$root/release"
+tar --no-same-owner -xzf "$root/release/chaldea-client.tar.gz" -C "$root/package"
+CHALDEA_T3_BIN="$root/t3/t3" CHALDEA_SMOKE_VERSION="$version" node test/helpers/official-smoke.ts "$root/package"

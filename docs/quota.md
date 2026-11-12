@@ -684,7 +684,7 @@ while a thread is parked still yields exactly one continuation and one
 already in `settings.json` exercise the stopped-server fallback.
 
 CI runs on GitHub-hosted Ubuntu 24.04. It downloads the checksum-pinned T3
-from `vendor/t3-contracts/PROVENANCE.md` and keeps HOME, TMPDIR and fixtures
+through `scripts/ci/install-t3` and keeps HOME, TMPDIR and fixtures
 in the job's isolated scratch directories.
 
 Codex stops reach the observer through the same shell fields. The separate
@@ -697,10 +697,10 @@ Upstream is pingdotgg/t3code at tag `v0.1.0`, commit
 embedded in the installed `t3` executable (research copy
 `/home/igor/.cache/chaldea-scratch/laneB/t3-embedded.mjs` on omarchy-pc).
 
-- Settings schema and patch: `vendor/t3-contracts/src/settings.ts:1216-1217`
-  and `:1599-1600`; B:49339-49340, 49567-49568. Patch scopes
-  (`settings:write` unless only providers change):
-  `vendor/t3-contracts/src/settings.ts:1671`; B:48659-48668.
+- Current settings schema and patch: upstream [packages/contracts/src/settings.ts](https://github.com/pingdotgg/t3code/blob/24e77473ecf41bc1f7142529c7911c1c1aae1d76/packages/contracts/src/settings.ts)
+  at official `v0.1.9`, including `autoResumeLimitedThreads` at lines 1430 and 1865.
+  Patch scope selection is in the same file. The embedded references below remain
+  historical evidence from `v0.1.0`.
 - Settings path `<base>/userdata/settings.json`: `apps/server/src/config.ts:161`;
   B:60955-60967. File watch with 100 ms debounce:
   `apps/server/src/serverSettings.ts:1115-1180`; B:64700-64725.

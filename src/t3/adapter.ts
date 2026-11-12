@@ -1,6 +1,6 @@
 // The only module that knows T3's wire protocol.
 //
-// Everything T3-specific lives here: the vendored contracts, the Effect RPC
+// Everything T3-specific lives here: the local contracts, the Effect RPC
 // client, the WebSocket handshake, protocol gating and the mapping of shell
 // stream items to the small domain type the quota observer consumes. The rest
 // of Chaldea sees `connectShell` and the types below, nothing else.
@@ -17,23 +17,15 @@ import { join } from "node:path";
 import WebSocket from "ws";
 
 import {
-  ORCHESTRATION_PROTOCOL_QUERY_PARAM,
-  ORCHESTRATION_PROTOCOL_VERSION,
   WsRpcGroup,
   type OrchestrationV2ShellStreamItem,
   type OrchestrationV2ThreadShell,
   type OrchestrationV2ThreadProjection,
-} from "../../vendor/t3-contracts/src/index.ts";
+} from "./contracts.ts";
 
 /** The orchestration protocol this adapter was written and tested against. */
 export const SUPPORTED_PROTOCOL_VERSION = 2;
 
-if (ORCHESTRATION_PROTOCOL_VERSION !== SUPPORTED_PROTOCOL_VERSION) {
-  // The vendored contracts moved without the adapter being reviewed for it.
-  throw new Error(
-    `Vendored T3 contracts speak orchestration protocol ${ORCHESTRATION_PROTOCOL_VERSION}; the adapter supports ${SUPPORTED_PROTOCOL_VERSION}.`,
-  );
-}
 
 /** A thread as the quota observer needs to see it. Times are ISO strings. */
 export interface ShellThread {
@@ -58,7 +50,7 @@ export interface ShellThread {
     readonly requestId?: string;
     readonly snooze?: boolean;
   } | null;
-  readonly relationshipToParent: "fork" | "subagent" | null;
+  readonly relationshipToParent: string | null;
   readonly archived: boolean;
   readonly deleted: boolean;
 }
@@ -153,7 +145,7 @@ export interface SwitchPort {
 }
 
 /** Safe domain projection; auth labels, identities and reset redemption IDs stay in T3. */
-export function toSwitchProvider(p: import("../../vendor/t3-contracts/src/index.ts").ServerProvider): SwitchProvider {
+export function toSwitchProvider(p: import("./contracts.ts").ServerProvider): SwitchProvider {
   return {
     instanceId: p.instanceId, driver: p.driver, enabled: p.enabled, installed: p.installed,
     status: p.status, auth: { status: p.auth.status,
@@ -166,7 +158,7 @@ export function toSwitchProvider(p: import("../../vendor/t3-contracts/src/index.
         ...(m.capabilities.optionDescriptors === undefined ? {} : {
           optionDescriptors: m.capabilities.optionDescriptors.map((d) => ({
             id: d.id, type: d.type,
-            ...(d.type === "select" ? { options: d.options.map((o) => ({ id: o.id })) } : {}),
+            ...(d.type === "select" && "options" in d ? { options: d.options.map((o) => ({ id: o.id })) } : {}),
           })),
         }),
       },
@@ -201,9 +193,9 @@ export async function connectUsage(
     })));
     publish();
     yield* client.subscribeServerConfig({}).pipe(Stream.runForEach((event) => Effect.sync(() => {
-      if (event.type === "snapshot") { providers = event.config.providers; settings = event.config.settings; }
-      else if (event.type === "providerStatuses") providers = event.payload.providers;
-      else if (event.type === "settingsUpdated") settings = event.payload.settings;
+      if (event.type === "snapshot" && "config" in event) { providers = event.config.providers; settings = event.config.settings; }
+      else if (event.type === "providerStatuses" && "payload" in event) providers = event.payload.providers;
+      else if (event.type === "settingsUpdated" && "payload" in event) settings = event.payload.settings;
       else return;
       publish();
     })));
@@ -271,7 +263,7 @@ export interface ShellSubscription {
 export function socketUrl(serverUrl: string): string {
   const url = new URL("/ws", serverUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set(ORCHESTRATION_PROTOCOL_QUERY_PARAM, String(SUPPORTED_PROTOCOL_VERSION));
+  url.searchParams.set("orchestrationProtocol", String(SUPPORTED_PROTOCOL_VERSION));
   url.searchParams.set("clientSurface", "cli");
   return url.toString();
 }
@@ -336,18 +328,20 @@ export function toSwitchThread(projection: OrchestrationV2ThreadProjection): She
   // Any newer active/queued run prevents a switch, even if the shell still presents a limit.
   const run = projection.runs.reduce<OrchestrationV2ThreadProjection["runs"][number] | null>(
     (latest, candidate) => latest === null || candidate.ordinal > latest.ordinal ? candidate : latest, null);
-  const active = projection.runs.find((r) => ["preparing", "starting", "running", "waiting"].includes(r.status));
+  const active = projection.runs.find((r) => !["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(r.status));
   const errors = projection.turnItems.filter((i) =>
     i.type === "error" && i.status === "failed" && i.runId === run?.id && i.nodeId === run?.rootNodeId);
   const failureItem = errors.toSorted((a, b) =>
     DateTime.toEpochMillis(b.updatedAt) - DateTime.toEpochMillis(a.updatedAt) || b.ordinal - a.ordinal ||
     String(b.id).localeCompare(String(a.id)))[0];
-  const failure = run?.status === "failed" && failureItem?.type === "error" ? failureItem.failure : null;
+  const failure = run?.status === "failed" && failureItem?.type === "error" && "failure" in failureItem ? failureItem.failure : null;
   const recovery = thread.limitRecovery;
   return {
     id: thread.id, status: run?.status ?? "idle", providerInstanceId: thread.providerInstanceId,
     modelSelection: thread.modelSelection, settled: thread.settledOverride === "settled",
-    pendingRequest: projection.runtimeRequests.some((r) => r.status === "pending"),
+    pendingRequest: projection.runtimeRequests.some((r) => !["resolved", "expired", "cancelled"].includes(r.status)) ||
+      (![null, "fork", "subagent"].includes(thread.lineage.relationshipToParent) ||
+        ![null, "settled", "active"].includes(thread.settledOverride)),
     latestRunId: run?.id ?? null, activeRunId: active?.id ?? null,
     latestRunStartedAt: isoOrNull(run?.startedAt), latestRunCompletedAt: isoOrNull(run?.completedAt),
     lastErrorClass: failure?.class ?? null,
@@ -371,7 +365,8 @@ export function toShellThread(thread: OrchestrationV2ThreadShell): ShellThread {
     providerInstanceId: thread.providerInstanceId,
     modelSelection: thread.modelSelection,
     settled: thread.settledOverride === "settled",
-    pendingRequest: thread.pendingRuntimeRequest !== null,
+    pendingRequest: thread.pendingRuntimeRequest !== null || (![null, "fork", "subagent"].includes(thread.lineage.relationshipToParent) ||
+        ![null, "settled", "active"].includes(thread.settledOverride)),
     ...(thread.pendingRuntimeRequest?{pendingRequestKind:thread.pendingRuntimeRequest.kind}:{}),
     latestRunId: thread.latestRunId,
     activeRunId: thread.activeRunId,
@@ -477,18 +472,20 @@ export async function withClient<A>(
     const failure = refusal as HandshakeFailure | null;
     if (failure !== null) throw classifyRefusal(failure);
     const text = describe(cause);
-    if (/EnvironmentAuthorizationError|insufficient_scope|forbidden/i.test(text)) {
-      throw new AuthenticationError(`T3 refused the request: ${text}`);
-    }
+    // SchemaError text includes every union tag, including authorization errors.
     if (isContractFailure(cause)) {
       throw new ProtocolIncompatibleError(`T3 sent data the pinned contracts reject: ${text}`);
+    }
+    if (typeof cause === "object" && cause !== null &&
+        "_tag" in cause && cause._tag === "EnvironmentAuthorizationError") {
+      throw new AuthenticationError(`T3 refused the request: ${text}`);
     }
     throw new TransientConnectionError(text);
   }
 }
 
 /**
- * The sole wake delivery seam. Pinned 0.1.0 rewrites createdBy to user at WS
+ * The sole wake delivery seam. Official 0.1.6 and 0.1.9 rewrite createdBy to user at WS
  * intake and rejects notification payloads. Igor explicitly approved one marked,
  * queued user message per item. Keep the journal's command bytes immutable:
  * RPC success confirms the durable receipt; ambiguous calls replay the same ID.
@@ -497,24 +494,12 @@ export async function withClient<A>(
 export class WakeRejectedError extends Error {
   override readonly name = "WakeRejectedError";
 }
-/** Only a replayed durable rejection is definitive; intake/internal failures are ambiguous. */
-export async function respondChaldeaDecision(options: ConnectOptions, payload: string): Promise<boolean> {
-  return withClient(options,client => client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
-    Effect.map(() => true),
-    Effect.catchTag("OrchestrationV2DispatchCommandError",error =>
-      /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
-        ? Effect.succeed(false) : Effect.fail(error))));
-}
 export async function dispatchChaldeaWake(options: ConnectOptions, payload: string, expectedEnvironment?: string): Promise<void> {
   const accepted = await withClient(options, client => Effect.gen(function* () {
-    const command=JSON.parse(payload);
-    if (expectedEnvironment !== undefined || command.externalWake !== undefined) {
+    if (expectedEnvironment !== undefined) {
       const config = yield* client["server.getConfig"]({});
       if (expectedEnvironment !== undefined && String(config.environment.environmentId) !== expectedEnvironment)
         return yield* Effect.fail(new Error("message_environment"));
-      // Schema acceptance is insufficient: older servers silently drop unknown fields.
-      if (command.externalWake !== undefined && config.externalWakeGuardVersion !== 1)
-        return "unsupported_guard" as const;
     }
     return yield* client["orchestration.dispatchCommand"](JSON.parse(payload)).pipe(
       Effect.map(() => true),
@@ -522,7 +507,6 @@ export async function dispatchChaldeaWake(options: ConnectOptions, payload: stri
         /previously rejected/i.test(error.message + " " + (error.detail ?? ""))
           ? Effect.succeed(false) : Effect.fail(error)));
   }));
-  if (accepted === "unsupported_guard") throw new ProtocolIncompatibleError("T3 external wake admission guard is unsupported");
   if (!accepted) throw new WakeRejectedError("T3 durably rejected this wake; operator attention required");
 }
 

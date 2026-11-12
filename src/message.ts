@@ -5,7 +5,7 @@ import { configPath } from "./config/paths.ts";
 import { parseArgs } from "node:util";
 import { TextDecoder } from "node:util";
 import * as Schema from "effect/Schema";
-import { ThreadId } from "../vendor/t3-contracts/src/index.ts";
+import { ThreadId } from "./t3/contracts.ts";
 import { readJson, onlyKeys } from "./config/files.ts";
 import { senderJournal, WINDOW, type Receipt } from "./message-store.ts";
 

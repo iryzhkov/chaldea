@@ -1,4 +1,4 @@
-// End-to-end: the real pinned t3 (v0.1.0) with a fake Claude CLI, T3's native
+// End-to-end: the real pinned t3 (v0.1.9) with a fake Claude CLI, T3's native
 // auto-resume, and `chaldea quota observe` as a child process writing to a
 // feed recorder. Fixtures live under the scratch directory and are removed
 // whether a test passes or fails. Skipped when the pinned t3 is not installed.
@@ -23,7 +23,7 @@ import {
 import { SCRATCH_ROOT, scratchDir } from "../helpers/scratch.ts";
 import type { statusSnapshot } from "../../src/quota/headroom.ts";
 
-const PINNED_VERSION = "t3 v0.1.0";
+const PINNED_VERSION = "t3 v0.1.9";
 const version = t3Version();
 const skip = version === PINNED_VERSION ? false : `needs ${PINNED_VERSION}, found ${version ?? "none"}`;
 // CI sets this so a missing or wrong t3 fails the run instead of skipping it.

@@ -13,7 +13,7 @@ Restart T3 safely with `chaldea t3 restart`; see [restart continuation](docs/res
 
 Fleet compute v0: `node bin/chaldea exec [--host H] -- CMD...`. Without `--host`, try the ordered hosts in `~/.config/chaldea/exec-hosts` (one fleet inventory name per line; fleet config omits this machine). See [setup, protocol, bounds and tests](docs/exec-v0.md).
 
-Chaldea is a personal project extending T3 Code with quota resilience, fleet compute and agent access control. It targets the pinned T3 Code stable release v0.1.0 (commit `81493ef`); see [the vendored contracts and runtime provenance](vendor/t3-contracts/PROVENANCE.md).
+Chaldea is a personal project extending T3 Code with quota resilience, fleet compute and agent access control. It targets official T3 Code v0.1.9, with compatibility for v0.1.6 during the host upgrade. The small runtime-decoded client is in [src/t3/contracts.ts](src/t3/contracts.ts); CI verifies the official release checksums.
 
 Native delegation routing: `chaldea route --role builder` and MCP `chaldea_route` recommend a T3 delegate target from quota capacity, pacing and Slopalytics. Launch the child through T3 after routing. See [routing, capacity and opt-in Claude usage](docs/route.md).
 

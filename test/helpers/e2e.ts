@@ -172,7 +172,7 @@ export interface SomeSettings {
 
 export async function readSettings(t3: DisposableT3, token: string): Promise<SomeSettings> {
   return withClient({ serverUrl: t3.serverUrl, token }, (client) =>
-    client["server.getSettings"]({}) as Effect.Effect<SomeSettings, unknown>,
+    client["server.getConfig"]({}).pipe(Effect.map(config => config.settings)) as Effect.Effect<SomeSettings, unknown>,
   );
 }
 

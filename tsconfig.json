@@ -19,8 +19,7 @@
   },
   "include": [
     "src",
-    "test",
-    "vendor/t3-contracts/src"
+    "test"
   ],
   "exclude": [
     "src/exec",

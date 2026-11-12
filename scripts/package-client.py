@@ -19,7 +19,7 @@ output = Path(destination).resolve()
 output.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(prefix="client-build-") as temporary:
     stage = Path(temporary)
-    for name in ("src", "bin", "vendor"):
+    for name in ("src", "bin"):
         shutil.copytree(name, stage / name)
     (stage / "host").mkdir()
     shutil.copyfile("host/exec-protocol.json", stage / "host/exec-protocol.json")
