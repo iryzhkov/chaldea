@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { EventStore } from "../../src/akasha/store.ts";
+import { hash } from "../../src/akasha/schema.ts";
 import { Outbox } from "../../src/events/outbox.ts";
 import { event, scratch, N, project } from "./helpers.ts";
 
@@ -21,7 +22,7 @@ test("reopening either database preserves retired projection rows and ordinary d
       try {
         if (db instanceof EventStore) {
           const e = event(1);
-          db.admit(e, "request", N); project(db);
+          db.admit(e, hash(e), N); project(db);
           assert.equal(db.receipt(e.event_id)?.state, "visible");
           assert.equal(db.scalar("SELECT count(*) FROM feed_entries"), 1);
         } else {
