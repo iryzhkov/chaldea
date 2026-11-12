@@ -3,7 +3,8 @@ import { configString, onlyKeys, readJson, ConfigurationError } from "./files.ts
 
 export function quotaConfig(home?: string, path?: string) {
   const c = readJson(path ?? configPath("quota", home), path === undefined);
-  onlyKeys(c, ["contexts", "claudeContexts", "lowHeadroomPercent", "serverUrl", "t3BaseDir", "tokenFile", "stateFile", "feedCommand", "host", "switchConfig", "restartConfig", "enableProviderSwitch"]);
+  // Ignore legacy fleet sharing config until hosts remove it.
+  onlyKeys(c, ["fleet", "contexts", "claudeContexts", "lowHeadroomPercent", "serverUrl", "t3BaseDir", "tokenFile", "stateFile", "feedCommand", "host", "switchConfig", "restartConfig", "enableProviderSwitch"]);
   if (c.enableProviderSwitch !== undefined && typeof c.enableProviderSwitch !== "boolean")
     throw new ConfigurationError("enableProviderSwitch must be boolean");
   const string = (key: string) => c[key] === undefined ? undefined : configString(c[key], key, "");

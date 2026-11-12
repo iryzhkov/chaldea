@@ -24,7 +24,7 @@ export class Authorization {
     const ids = new Set<string>(), identities = new Set<string>();
     for (const entry of registry) {
       const e = record(entry);
-      fields(e, ["issuer", "source", "host", "source_id", "profile", "project", "mode", "kinds", "global_read", "route_scores_read", "roots"]);
+      fields(e, ["issuer", "source", "host", "source_id", "profile", "project", "mode", "kinds", "global_read", "route_scores_read", "quota_fleet_read", "roots"]);
       for (const k of ["issuer", "source", "host", "profile", "project"]) text(e[k], 128, true);
       ensure(entry.issuer === "chaldea:" + entry.host, "registry_host_mismatch");
       ensure(/^[a-z0-9][a-z0-9_-]{0,127}$/.test(entry.source_id) && entry.source_id !== "legacy-feed" &&
@@ -34,6 +34,8 @@ export class Authorization {
       ensure(["report", "service", "operator"].includes(entry.mode) &&
         Array.isArray(entry.kinds) && entry.kinds.length > 0 && entry.kinds.every(k => KINDS.includes(k)), "invalid_registry");
       ensure(entry.route_scores_read === undefined || (entry.route_scores_read === true && entry.mode === "service" && entry.source === "route"), "invalid_route_scores_read");
+      // Ignore quota_fleet_read until enrollment stops emitting it; it grants nothing.
+      ensure(e.quota_fleet_read === undefined || typeof e.quota_fleet_read === "boolean", "invalid_quota_fleet_read");
       ensure(entry.global_read === undefined || (entry.global_read === true && entry.mode === "operator"), "invalid_global_read");
       ensure(entry.roots === undefined || (Array.isArray(entry.roots) && entry.roots.length <= 32 &&
         entry.roots.every(r => typeof r === "string" && r.startsWith("/") && r.length <= 512)), "invalid_roots");

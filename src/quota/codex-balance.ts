@@ -21,7 +21,8 @@ export interface HeadroomConfig {
 export function headroomConfig(raw: unknown = {}, home = homedir()): HeadroomConfig {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("invalid quota reporting config");
   const c = raw as Record<string, unknown>;
-  if (Object.keys(c).some(k => !["contexts", "claudeContexts", "lowHeadroomPercent"].includes(k))) throw new Error("unknown quota reporting option");
+  // Ignore legacy fleet sharing config until hosts remove it.
+  if (Object.keys(c).some(k => !["fleet", "contexts", "claudeContexts", "lowHeadroomPercent"].includes(k))) throw new Error("unknown quota reporting option");
   const contexts = c.contexts ?? [];
   if (!Array.isArray(contexts) || contexts.length > 16) throw new Error("quota contexts must contain at most 16 entries");
   const seen = new Set<string>();

@@ -53,6 +53,24 @@ test("quota config defaults to the observer user's .config/chaldea/quota.json", 
   }
 });
 
+test("legacy fleet quota config is ignored by file and raw loaders", () => {
+  const d = scratchDir("legacy-fleet");
+  try {
+    const raw = { lowHeadroomPercent: 17, contexts: [{ providers: ["codex"], home: d.path, codexHome: join(d.path, ".codex") }] };
+    const expected = headroomConfig(raw, d.path);
+    const fleet = { enabled: true, endpoint: "https://retired.invalid", tokenHelper: "/must-not-run" };
+    assert.deepEqual(headroomConfig({ ...raw, fleet }, d.path), expected);
+    for (const name of ["quota.json", "quota-sharing.json", "quota-fleet-reader.json"]) {
+      const path = join(d.path, name);
+      writeFileSync(path, JSON.stringify({ ...raw, fleet }));
+      assert.deepEqual(loadHeadroomConfig(d.path, path), expected);
+      writeFileSync(path, JSON.stringify({ ...raw, unknown: true }));
+      assert.throws(() => loadHeadroomConfig(d.path, path), /Unknown configuration key/);
+    }
+    assert.throws(() => headroomConfig({ ...raw, unknown: true }), /unknown quota reporting option/);
+  } finally { d.remove(); }
+});
+
 test("T3 projection preserves full windows/reset count and drops identity and redemption fields", () => {
   const raw = { ...provider(), auth: { status: "authenticated", email: "PRIVATE_EMAIL", workspaceId: "PRIVATE_WORKSPACE" },
     runtimePaths: { homePath: "/scratch/codex", shadowHomePath: null },

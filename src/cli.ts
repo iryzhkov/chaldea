@@ -198,8 +198,9 @@ export async function main(argv: ReadonlyArray<string>): Promise<number> {
   }
   try {
     if (group === "mcp") {
-      if (command === "--help" || command === "-h") { process.stdout.write("chaldea mcp: routing MCP stdio server\n"); return 0; }
-      if (command) return 64;
+      if ((command === "--help" || command === "-h") && rest.length === 0) { process.stdout.write("chaldea mcp: routing MCP stdio server\n"); return 0; }
+      // Fleet registrations still pass the retired MCP service config path.
+      if (command !== undefined && !(command === "--config" && rest.length === 1 && rest[0]!.length > 0 && !rest[0]!.startsWith("-") && !rest[0]!.includes("\0"))) return 64;
       await (await import("./mcp.ts")).runMcp();
       return 0;
     }
