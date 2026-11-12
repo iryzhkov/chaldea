@@ -2,7 +2,7 @@
 
 CLI defaults to a bounded compact projection. Use `--explain` or `--legacy-full`
 for the full result described below. The [route and quota contracts](quota-routing-contracts.md)
-describe scoped Claude windows, conservative fleet conflicts, typed errors and
+describe scoped Claude windows, typed errors and
 the `review-pair` command and callable API.
 
 Call `chaldea route --role builder` or MCP `chaldea_route` before T3's
@@ -114,8 +114,7 @@ use-it capacity and under-paced Claude. Review separation, bans, pins, quality
 floors and catalog effort checks still apply. Without that proof, the included
 lane decides: a fresh ordinary-usage denial is tight, short gates exclude the
 account, and a fresh `spendControlReached: true` means credits add no capacity.
-Unknown, stale or errored spend control, and credits from fleet snapshots (which
-do not carry spend control), never establish the credit-funded lane. This is a
+Unknown, stale or errored spend control never establishes the credit-funded lane. This is a
 recommendation input only; automatic provider switching still admits only the
 included lane.
 
