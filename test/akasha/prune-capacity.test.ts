@@ -68,7 +68,7 @@ test("spread receipt prune stays inside minimum WAL during writes/commit and mak
     assert.equal(store.scalar("SELECT count(*) FROM receipts WHERE state='visible'"), 24000 - count);
     assert.equal(store.receipt(event(90000).event_id)?.state, "pending");
     assert.equal(store.pending(N).length, 1);
-    assert.equal(store.scalar("PRAGMA user_version"), 2);
+    assert.equal(store.scalar("PRAGMA user_version"), 1);
     assert.equal(store.scalar("PRAGMA synchronous"), 2);
     assert.equal(store.db.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
   } finally { store.close(); dir.remove(); }
@@ -177,7 +177,7 @@ for (const wal of [4 * MAX_ENVELOPE, 3 * 1024 ** 2]) {
       assert.equal(store.pending(N).length, 1);
       assert.equal(store.cursor("nats"), count);
       assert.equal(Number(store.get("floor")), count);
-      assert.equal(store.scalar("PRAGMA user_version"), 2);
+      assert.equal(store.scalar("PRAGMA user_version"), 1);
       assert.equal(store.scalar("PRAGMA synchronous"), 2);
       assert.equal(store.db.prepare("PRAGMA foreign_key_check").all().length, 0);
       assert.equal(store.db.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");
@@ -338,7 +338,7 @@ test("deep 30k-event database makes bounded prune progress at 3 MiB", { skip: pr
     assert.equal(store.cursor("nats"), total);
     assert.equal(store.pending(N).length, 1);
     assert.equal(store.receipt(event(299999).event_id)?.state, "pending");
-    assert.equal(store.scalar("PRAGMA user_version"), 2);
+    assert.equal(store.scalar("PRAGMA user_version"), 1);
     assert.equal(store.scalar("PRAGMA synchronous"), 2);
     assert.equal(db.prepare("PRAGMA foreign_key_check").all().length, 0);
     assert.equal(db.prepare("PRAGMA integrity_check").get()!.integrity_check, "ok");

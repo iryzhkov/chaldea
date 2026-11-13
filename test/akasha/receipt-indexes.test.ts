@@ -69,7 +69,7 @@ for (const [count, wal, accepts] of [
       if (accepts) {
         const reopened = new EventStore(path, { budget: { wal } });
         assert.equal(reopened.scalar("SELECT count(*) FROM receipts"), count + 2);
-        assert.equal(reopened.scalar("PRAGMA user_version"), 2);
+        assert.equal(reopened.scalar("PRAGMA user_version"), 1);
         reopened.close();
       } else {
         assert.throws(() => new EventStore(path, { budget: { wal } }), /wal_capacity/);

@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import type { SQLInputValue } from "node:sqlite";
 import { EventStore } from "../../src/akasha/store.ts";
+import { migrate } from "../../src/store/sqlite.ts";
 import { eventPage } from "../../src/akasha/compat.ts";
 import { scratch, event, N, registration } from "./helpers.ts";
 
@@ -10,7 +11,7 @@ const index = "events_host_kind_seq_time";
 const scope = { ...registration, global: true };
 
 for (const prebuilt of [false, true]) {
-  test(`host/kind index migration preserves populated v1 store, prebuilt=${prebuilt}`, () => {
+  test(`host/kind index bootstrap preserves populated v1 store, prebuilt=${prebuilt}`, () => {
     const dir = scratch(), path = join(dir.path, "events.db");
     let store = new EventStore(path, { initialize: true });
     try {
@@ -29,13 +30,17 @@ for (const prebuilt of [false, true]) {
       const epoch = store.get("epoch");
       store.close();
       store = new EventStore(path);
-      assert.equal(store.scalar("PRAGMA user_version"), 2);
+      assert.equal(store.scalar("PRAGMA user_version"), 1);
+      // host-v0.2.20's one-step upgrade list must accept the indexed database.
+      assert.doesNotThrow(() => migrate(store.db, [() => {}]));
+      assert.equal(store.scalar("PRAGMA user_version"), 1);
       assert.equal(store.get("epoch"), epoch);
       assert.deepEqual(store.db.prepare("SELECT * FROM events ORDER BY seq").all(), before);
       assert.deepEqual(store.db.prepare("PRAGMA index_info(" + index + ")").all().map(r => r.name),
         ["host", "kind", "seq", "occurred_at"]);
       store.close();
-      store = new EventStore(path); // v2 reopen is idempotent too.
+      store = new EventStore(path); // Indexed v1 reopen is idempotent too.
+      assert.equal(store.scalar("PRAGMA user_version"), 1);
       assert.equal(store.scalar("SELECT count(*) FROM events"), 40);
     } finally { if (store.db.isOpen) store.close(); dir.remove(); }
   });

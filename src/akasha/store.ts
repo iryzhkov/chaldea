@@ -143,12 +143,12 @@ export class EventStore {
       ensure(this.scalar("PRAGMA page_size") === 4096 && this.scalar("PRAGMA page_count") * 4096 <= this.budget.main, "database_capacity", 503);
       this.db.exec("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=64; PRAGMA journal_size_limit=0;");
       this.db.exec("PRAGMA max_page_count=" + Math.floor(this.budget.main / 4096));
-      migrate(this.db, [() => {}, () => {
-        // Keep seq before the timestamp for ascending keyset pagination. The
-        // trailing timestamp covers time filtering without loading event payloads.
-        this.db.exec("CREATE INDEX IF NOT EXISTS events_host_kind_seq_time ON events(host,kind,seq,occurred_at)");
-      }]);
-      // Receipt indices remain an idempotent bootstrap on initialization and reopen.
+      migrate(this.db, [() => {}]);
+      // Add query indices on both initialization and reopen. Keep version 1 so
+      // the previous runtime can reopen the same receipts database for rollback.
+      // Keep seq before the timestamp for ascending keyset pagination. The
+      // trailing timestamp covers time filtering without loading event payloads.
+      this.db.exec("CREATE INDEX IF NOT EXISTS events_host_kind_seq_time ON events(host,kind,seq,occurred_at)");
       this.bootstrapReceiptIndices();
     } catch (e) { this.db.close(); throw e; }
     this.outbox = new Outbox(sqliteOutbox(this.db, {
