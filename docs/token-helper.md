@@ -1,5 +1,19 @@
 # Token helper for host service producers
 
+PKI remains the default. Optional root-owned config key
+`authentik: {host: "laptop", home: "/home/igor", uid: 1001}`
+selects the host credential exchange. Host is the inventory identity; selectors
+still use the registry hostname. In this mode the fixed sudo wrapper must run as
+root to read that user's existing private host credential. Exact sudo caller and
+five-selector grants still apply before exchange. Only root and the configured host
+producer UID may receive a host JWT; narrower callers are refused before reading
+the credential because the JWT permits replay across that host's sources/actions.
+No credential copy, cache or
+PKI fallback is used. Responses require a current lifetime of at most 300 seconds.
+All publishers/readers must send X-Akasha-Source; updated clients do so for both
+token formats. Full operator packet: chaldea-fleet-config
+docs/akasha-producer-auth.md. Other sections below describe retained PKI mode.
+
 Implements architecture audit R7, jocasta:54e226f1232b50b25fb47b8d630f46bf@1.
 The shared invocation is:
 

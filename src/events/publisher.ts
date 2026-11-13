@@ -17,7 +17,7 @@ export async function helperToken(helper: string, event: Publication, action: "a
       { env, stdio: ["ignore", "pipe", "ignore"], detached: true });
     let output = "", done = false;
     const kill = () => { try { process.kill(-child.pid!, "SIGKILL"); } catch {} };
-    const timer = setTimeout(() => { kill(); finish(false); }, 2000);
+    const timer = setTimeout(() => { kill(); finish(false); }, 6000);
     const finish = (ok: boolean) => {
       if (done) return; done = true; clearTimeout(timer);
       const token = output.trim();
@@ -72,7 +72,7 @@ async function publicationResult(event: Publication, options: PublisherOptions):
     const bytes = JSON.stringify(event.payload);
     if (Buffer.byteLength(bytes) > 64 * 1024) return "deferred";
     const response = await (options.fetch ?? fetch)(url, { method: "POST", redirect: "error",
-      headers: { authorization: "Bearer " + token, "content-type": "application/json", "Idempotency-Key": event.key },
+      headers: { "X-Akasha-Source": event.source, authorization: "Bearer " + token, "content-type": "application/json", "Idempotency-Key": event.key },
       body: bytes, signal: AbortSignal.timeout(options.timeoutMs ?? 5000) });
     // Bound even an unexpected proxy response.
     const reader = response.body?.getReader();
