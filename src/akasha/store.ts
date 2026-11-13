@@ -146,6 +146,9 @@ export class EventStore {
       migrate(this.db, [() => {}]);
       // Add query indices on both initialization and reopen. Keep version 1 so
       // the previous runtime can reopen the same receipts database for rollback.
+      // Keep seq before the timestamp for ascending keyset pagination. The
+      // trailing timestamp covers time filtering without loading event payloads.
+      this.db.exec("CREATE INDEX IF NOT EXISTS events_host_kind_seq_time ON events(host,kind,seq,occurred_at)");
       this.bootstrapReceiptIndices();
     } catch (e) { this.db.close(); throw e; }
     this.outbox = new Outbox(sqliteOutbox(this.db, {
@@ -440,8 +443,8 @@ export class EventStore {
     const eventBytes = this.db.prepare(`SELECT
       length(CAST(envelope AS BLOB))+512+length(CAST(json_array(
         event_id,event_id,issuer,issuer,profile,profile,project,project,project,
-        source,source,source,source,host,host,host,host,kind,kind,received_at,received_at,
-        occurred_at,occurred_at,occurred_at,expiry,expiry,session,session,tool,tool,client,client
+        source,source,source,source,host,host,host,host,host,kind,kind,kind,received_at,received_at,
+        occurred_at,occurred_at,occurred_at,occurred_at,expiry,expiry,session,session,tool,tool,client,client
       ) AS BLOB)) AS bytes
       FROM events WHERE seq=?`);
     const feedBytes = this.db.prepare(`SELECT length(CAST(body AS BLOB))+512+
