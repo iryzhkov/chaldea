@@ -84,6 +84,8 @@ export async function tokenHelperCli(args: readonly string[], io = {
     requireAccess(config.grants.some(g => g.uid === uid && TOKEN_FLAGS.every(f => g[f] === request[f])),
       "producer_not_authorized");
     if (config.authentik) {
+      // Resource JWTs carry host-wide authority, never a narrow caller lease.
+      requireAccess(uid === 0 || uid === config.authentik.uid, "producer_not_authorized");
       requireAccess(config.issuer.name === "chaldea:" + request.host, "producer_not_authorized");
       const { authentikToken } = await import("./authentik-client.ts");
       io.out(await authentikToken(config.authentik, request.host) + "\n");

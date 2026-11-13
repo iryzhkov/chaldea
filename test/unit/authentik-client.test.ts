@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, symlinkSync, linkSync, unlinkSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { hostPassword, authentikToken } from "../../src/access/authentik-client.ts";
 import { tokenHelperCli } from "../../src/access/helper.ts";
 
@@ -51,6 +53,31 @@ test("exchange pins resource, username, scope, redirect policy and lifetime; no 
     { preferred_username: "foreign" }, { run_id: "foreign" }, { scope: "goauthentik.io/api" }])
     await assert.rejects(authentikToken(identity, claims.host, async () => response(change), () => "fixture", () => 101));
   await assert.rejects(authentikToken(identity, claims.host, async () => new Response("secret", { status: 400 }), () => "fixture"));
+});
+test("narrow callers cannot obtain a host JWT for read-to-append or cross-source replay", async t => {
+  const read = { audience: "akasha", action: "read", source: "mission-control-reader",
+    host: "omarchy-normandy", kind: "report" };
+  const config = { authentik: { host: "normandy", home: "/unused", uid: 1000 },
+    issuer: { uid: 995, name: "chaldea:omarchy-normandy", key_file: "/unused", kid: "key" },
+    state_file: "/unused", bundle_file: "/unused", anchor_file: "/unused",
+    clock_health_file: "/unused", grants: [{ ...read, uid: 940, profile: "mission-control-reader", project: "chaldea" }] };
+  let reads = 0, exchanges = 0;
+  const opened = t.mock.method(fs, "openSync", () => { reads++; throw new Error("credential read"); });
+  t.mock.method(globalThis, "fetch", async () => { exchanges++; return response(); });
+  syncBuiltinESMExports();
+  try {
+    for (const request of [read, { ...read, action: "append" },
+      { ...read, action: "append", source: "backup", kind: "feed_post" }]) {
+      // Even an exact matching narrow caller grant cannot release a host token.
+      config.grants = [{ ...request, uid: 940, profile: "mission-control-reader", project: "chaldea" }];
+      let out = "", err = "";
+      const flags = Object.entries(request).flatMap(([k, v]) => ["--" + k, v]);
+      assert.equal(await tokenHelperCli(flags, { out: s => { out += s; }, err: s => { err += s; } },
+        { uid: 0, caller: "940", config: () => config }), 1);
+      assert.equal(out, ""); assert.equal(err, "chaldea token helper: denied\n");
+    }
+    assert.equal(reads, 0); assert.equal(exchanges, 0);
+  } finally { opened.mock.restore(); syncBuiltinESMExports(); }
 });
 test("selected exchange failure is redacted and cannot fall through to PKI", async () => {
   const request = { audience: "akasha", action: "append", source: "feed", host: "agent-a", kind: "feed_post" };

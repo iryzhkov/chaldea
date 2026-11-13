@@ -5,7 +5,10 @@ PKI remains the default. Optional root-owned config key
 selects the host credential exchange. Host is the inventory identity; selectors
 still use the registry hostname. In this mode the fixed sudo wrapper must run as
 root to read that user's existing private host credential. Exact sudo caller and
-five-selector grants still apply before exchange. No credential copy, cache or
+five-selector grants still apply before exchange. Only root and the configured host
+producer UID may receive a host JWT; narrower callers are refused before reading
+the credential because the JWT permits replay across that host's sources/actions.
+No credential copy, cache or
 PKI fallback is used. Responses require a current lifetime of at most 300 seconds.
 All publishers/readers must send X-Akasha-Source; updated clients do so for both
 token formats. Full operator packet: chaldea-fleet-config
