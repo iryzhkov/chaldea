@@ -100,6 +100,7 @@ test("helper absence and all HTTP errors retain intents; no shared-key fallback;
         fetch: async (_u, init) => {
           calls++; assert.equal((init!.headers as Record<string, string>)["Idempotency-Key"], e.key);
           assert.equal((init!.headers as Record<string, string>).authorization, "Bearer lease-" + tokens);
+          assert.equal((init!.headers as Record<string, string>)["X-Akasha-Source"], e.source);
           return new Response(JSON.stringify({ event_id: "a".repeat(64), state: status === 503 ? "pending" : "visible" }), { status });
         } });
       assert.equal(ok, status === 201);

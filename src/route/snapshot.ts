@@ -92,7 +92,7 @@ export async function collectScores(config: ScoreTransport, cacheFile: string, n
     url.searchParams.set("to", new Date(now).toISOString());
     let best: ScoreSnapshot | null = null;
     for (let page = 0; page < 8; page++) {
-      const r = await getJson(url.toString(), { headers: { authorization: "Bearer " + token } }, fetcher) as Record<string, any>;
+      const r = await getJson(url.toString(), { headers: { "X-Akasha-Source": "route", authorization: "Bearer " + token } }, fetcher) as Record<string, any>;
       if (!Array.isArray(r.events)) throw new Error();
       for (const e of r.events) {
         if (e.source !== "route" || e.host !== "homelab" || e.kind !== "route_score_snapshot" || e.provenance?.type !== "verified") continue;

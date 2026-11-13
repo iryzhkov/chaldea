@@ -11,6 +11,7 @@ export const TOKEN_FLAGS = ["audience", "action", "source", "host", "kind"] as c
 export interface TokenRequest { audience: "akasha"; action: "append" | "read"; source: string; host: string; kind: string }
 export interface ProducerGrant extends TokenRequest { uid: number; profile: string; project: string }
 export interface HelperConfig {
+  authentik?: { host: string; home: string; uid: number };
   issuer: { uid: number; key_file: string; name: string; kid: string };
   state_file: string; bundle_file: string; anchor_file: string; clock_health_file: string; grants: ProducerGrant[];
 }
@@ -29,7 +30,12 @@ function validateRequest(value: unknown): TokenRequest {
   return r as unknown as TokenRequest;
 }
 export function helperConfig(value: unknown): HelperConfig {
-  const c = object(value); exact(c, ["issuer", "state_file", "bundle_file", "anchor_file", "clock_health_file", "grants"]);
+  const c = object(value); exact(c, ["issuer", "state_file", "bundle_file", "anchor_file", "clock_health_file", "grants", ...(c.authentik === undefined ? [] : ["authentik"])]);
+  if (c.authentik !== undefined) {
+    const a = object(c.authentik); exact(a, ["host", "home", "uid"]);
+    identifier(a.host); seconds(a.uid);
+    requireAccess(Number(a.uid) > 0 && Number(a.uid) < 4294967295 && typeof a.home === "string" && /^\/[A-Za-z0-9/_.-]+$/.test(a.home) && !a.home.split("/").some(p => p === "." || p === ".."), "invalid_authentik_identity");
+  }
   const i = object(c.issuer); exact(i, ["uid", "key_file", "name", "kid"]);
   seconds(i.uid); requireAccess(Number(i.uid) > 0 && Number(i.uid) < 4294967295, "invalid_issuer_uid");
   requireAccess(typeof i.key_file === "string" && i.key_file.startsWith("/"), "absolute_path_required");
@@ -73,10 +79,16 @@ export async function tokenHelperCli(args: readonly string[], io = {
     requireAccess(typeof runtime.caller === "string" &&
       /^(0|[1-9][0-9]{0,9})$/.test(runtime.caller), "issuer_identity_required");
     const config = helperConfig(runtime.config());
-    requireAccess(runtime.uid === config.issuer.uid, "issuer_identity_required");
+    requireAccess(runtime.uid === (config.authentik ? 0 : config.issuer.uid), "issuer_identity_required");
     const uid = Number(runtime.caller);
     requireAccess(config.grants.some(g => g.uid === uid && TOKEN_FLAGS.every(f => g[f] === request[f])),
       "producer_not_authorized");
+    if (config.authentik) {
+      requireAccess(config.issuer.name === "chaldea:" + request.host, "producer_not_authorized");
+      const { authentikToken } = await import("./authentik-client.ts");
+      io.out(await authentikToken(config.authentik, request.host) + "\n");
+      return 0;
+    }
     state = new AccessState(config.state_file);
     const clock = healthClock(state, config.clock_health_file);
     const anchors = strictJson(trustedBytes(config.anchor_file, 16384));

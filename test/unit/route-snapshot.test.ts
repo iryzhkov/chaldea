@@ -171,6 +171,7 @@ test("authenticated readers accept only verified homelab route scores and preser
       assert.equal(new URL(String(url)).searchParams.get("host"), "homelab");
       assert.equal(new URL(String(url)).searchParams.get("from"), iso(now - 90 * 86400000));
       assert.equal((init?.headers as Record<string,string>).authorization, "Bearer fixture-token");
+      assert.equal((init?.headers as Record<string,string>)["X-Akasha-Source"], "route");
       return new Response(JSON.stringify({ events: [
         { ...event, data: { scores: { ...scores, fetchedAt: iso(now + 1000) } } },
         { ...event, host: "attacker" }, { ...event, provenance: { type: "legacy-feed" } }, event,
