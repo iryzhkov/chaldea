@@ -163,7 +163,7 @@ export function toSwitchProvider(p: import("./contracts.ts").ServerProvider): Sw
         }),
       },
     })),
-    ...(p.usageLimits === undefined ? {} : { usageLimits: {
+    ...(p.usageLimits == null ? {} : { usageLimits: {
       checkedAt: p.usageLimits.checkedAt,
       ...(p.usageLimits.credentialFingerprint ? { credentialFingerprint: createHash("sha256").update(p.usageLimits.credentialFingerprint).digest("hex") } : {}),
       windows: p.usageLimits.windows.map((w) => ({

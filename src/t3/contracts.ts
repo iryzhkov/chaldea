@@ -78,7 +78,7 @@ export const ServerProvider = S.Struct({
   models: S.Array(S.Struct({ slug: id, capabilities: S.NullOr(S.Struct({
     optionDescriptors: opt(S.Array(descriptor)),
   })) })),
-  usageLimits: opt(S.Struct({
+  usageLimits: opt(S.NullOr(S.Struct({
     checkedAt: S.String,
     credentialFingerprint: opt(S.String),
     windows: S.Array(S.Struct({
@@ -88,7 +88,7 @@ export const ServerProvider = S.Struct({
     })),
     resetCredits: opt(S.Struct({ availableCount: seq, nextExpiresAt: opt(S.String) })),
     unavailable: opt(S.Struct({ reason: S.String })),
-  })),
+  }))),
 });
 export type ServerProvider = typeof ServerProvider.Type;
 const settings = S.Struct({

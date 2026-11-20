@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
 import * as Stream from "effect/Stream";
-import { withClient, connectUsage, TransientConnectionError, AuthenticationError,
+import { withClient, switchPort, connectUsage, TransientConnectionError, AuthenticationError,
   ProtocolIncompatibleError, AbortedError, type SwitchProvider } from "../../src/t3/adapter.ts";
 
 // Raw Effect RPC frames deliberately bypass our schemas to exercise official encoded errors.
@@ -34,6 +34,33 @@ const provider = (percent: number) => ({
     resetCredits: { availableCount: 2, redemptionId: "private-redemption" } },
 });
 const config = { environment: { environmentId: "e" }, settings, providers: [provider(10)] };
+test("catalog accepts null usage limits alongside populated, unsupported and missing limits", async () => {
+  const checkedAt = "2026-11-20T00:00:00Z", resetsAt = "2026-11-27T00:00:00Z";
+  const { usageLimits: _, ...base } = provider(1);
+  const codexLimits = { checkedAt, windows: [
+    { id: "primary", kind: "weekly", label: "Weekly", usedPercent: 1, resetsAt, windowDurationMins: 10080 },
+  ], resetCredits: { availableCount: 3, nextExpiresAt: resetsAt } };
+  const unsupported = { checkedAt, windows: [], unavailable: { reason: "unsupported" } };
+  const providers = [
+    { ...base, usageLimits: codexLimits },
+    ...["claudeAgent", "opencode"].map(driver => ({
+      ...base, instanceId: driver, driver, usageLimits: unsupported,
+    })),
+    { ...base, instanceId: "antigravity", driver: "antigravity",
+      auth: { status: "unauthenticated" }, usageLimits: null },
+    { ...base, instanceId: "disabled", enabled: false },
+  ];
+  await fake(request => [exit(request, { ...config, providers })], async serverUrl => {
+    const catalog = await switchPort({ serverUrl, token: "t", signal: AbortSignal.timeout(5000) }).catalog();
+    assert.deepEqual(catalog.providers.map(p => p.instanceId),
+      ["codex", "claudeAgent", "opencode", "antigravity", "disabled"]);
+    const { label: _, ...window } = codexLimits.windows[0]!;
+    assert.deepEqual(catalog.providers[0]?.usageLimits, { ...codexLimits, windows: [window] });
+    for (const p of catalog.providers.slice(1, 3)) assert.deepEqual(p.usageLimits, unsupported);
+    for (const p of catalog.providers.slice(3)) assert.equal("usageLimits" in p, false);
+    assert.equal(catalog.autoResume, false);
+  });
+});
 const errors = [
   { _tag: "ServerSettingsError", settingsPath: "/scratch/settings.json", operation: "read-file",
     cause: { _tag: "Error", message: "EIO" } },
