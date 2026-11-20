@@ -25,6 +25,11 @@ export const MODEL_MAP: ReadonlyArray<{ model: string; effort: Effort; aaSlug: s
     ["claude-opus-5-5", "claude-opus-5-5", "Opus 5.5", "claudeAgent", ["low"]],
     ["claude-fable-5-1", "claude-fable-5-1", "Fable 5.1", "claudeAgent", ["low", "high"]],
     ["claude-haiku-5-5", "claude-haiku-5-5", "Haiku 5.5", "claudeAgent", ["low", "high", "xhigh"]],
+    // Reviewed 2026-11-20 against AA rows labelled GPT-6.2 Sol/Astra (Low/Medium/High) and
+    // Claude Fable 5.2 (Low/Medium/High). The unsuffixed AA slugs are Max and stay unmapped.
+    ["gpt-6.2-sol", "gpt-6-2-sol", "GPT-6.2 Sol", "codex", ["low", "medium", "high"]],
+    ["gpt-6.2-astra", "gpt-6-2-astra", "GPT-6.2 Astra", "codex", ["low", "medium", "high"]],
+    ["claude-fable-5-2", "claude-fable-5-2", "Fable 5.2", "claudeAgent", ["low", "medium", "high"]],
   ] as const).flatMap(([model, slug, analytics, harness, efforts]) => efforts.map(effort => ({
     model, effort, aaSlug: slug + "-" + effort, analytics, harness,
   }))),

@@ -32,6 +32,13 @@ test("AA collector uses a fixed HTTPS API, header key, bounded pagination and pu
     e => String(e) === "Error: aa_fetch_failed");
   await assert.rejects(fetchScores(now, async () => response([row], 1, true), () => "fixture-key"), /aa_fetch_failed/);
 });
+test("AA map covers GPT-6.2 Sol/Astra and Fable 5.2 at benchmark efforts, never their unsuffixed Max rows", () => {
+  for (const [model, slug] of [["gpt-6.2-sol", "gpt-6-2-sol"], ["gpt-6.2-astra", "gpt-6-2-astra"], ["claude-fable-5-2", "claude-fable-5-2"]]) {
+    for (const effort of ["low", "medium", "high"])
+      assert.ok(MODEL_MAP.some(m => m.model === model && m.effort === effort && m.aaSlug === slug + "-" + effort), model + ":" + effort);
+    assert.ok(!MODEL_MAP.some(m => m.aaSlug === slug), slug + " is Max and stays unmapped");
+  }
+});
 test("v2 publisher preserves nullable coding and measured task cost through the existing API", async () => {
   const scratch = routeScratch();
   try {
