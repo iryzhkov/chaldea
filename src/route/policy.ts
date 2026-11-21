@@ -1,6 +1,6 @@
 import { benchmarkCoverage, benchmarkEfforts, compareBenchmark, targetEffort } from "./benchmark.ts";
 import { RouteError } from "./errors.ts";
-import { modelWindowPolicy } from "../quota/window-policy.ts";
+import { modelWindowPolicy, antigravityExhaustion } from "../quota/window-policy.ts";
 import type { Capacity } from "../quota/capacity.ts";
 import { banned, compareScores, emptyHistory, inProbation, driverPickKey, roleKey, scoreFor, targetEligible, trialAvailable } from "./targets.ts";
 import type { RoutingHistory } from "./targets.ts";
@@ -126,6 +126,8 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     if (capacity) reasons.push(`${p.providerInstanceId} capacity ${capacity.class}: ${capacity.reasons.join("; ")}`);
     if (capacity && ["tight", "stopped"].includes(capacity.class)) { reasons.push(`${p.providerInstanceId}: avoid ${capacity.class}`); continue; }
     if (q?.activeStop) { reasons.push(`${p.providerInstanceId}: active usage stop, avoid`); continue; }
+    const exhausted = p.driverKind === "antigravity" && antigravityExhaustion([...(q?.knownWindows ?? []), ...(q?.windows ?? [])], model, data.now, config.minimumRemaining);
+    if (exhausted) { reasons.push(p.providerInstanceId + ": known " + (exhausted.id ?? exhausted.kind) + " exhausted until " + exhausted.resetsAt); continue; }
     const fresh = age !== null && age * 1000 < (q?.operatorEstimate ? 7 * 86_400_000 : config.quotaMaxAgeMs);
     const windows = fresh ? (q?.windows ?? []).filter(w => Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 &&
       w.remainingPercent <= 100 && (w.resetsAt === null || Date.parse(w.resetsAt) > data.now)) : [];

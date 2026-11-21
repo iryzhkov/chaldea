@@ -1,6 +1,7 @@
 // Sanitized, independently timestamped quota observations. No provider/account payload is persisted wholesale.
 import { createHash } from "node:crypto";
 import { accountKey } from "./account.ts";
+import { mergeAntigravityWindows } from "./window-policy.ts";
 import { retainBurnSample } from "./capacity.ts";
 import type { BurnSample } from "./capacity.ts";
 import { resolve } from "node:path";
@@ -37,6 +38,8 @@ export interface ProviderHeadroom {
   /** Antigravity stays inadmissible after a context change until a newer attributed observation. */
   antigravityContext?: { identity: string; fingerprint?: string; changedAt: string; admitted: boolean };
   antigravityHold?: string;
+  /** Retained constraints, separate from live pacing; the standard metric stays main-readable. */
+  antigravityWindows?: ReadonlyArray<Window & { observedAt: string }>;
   creditExpiresAt?: string;
   burnHistory?: ReadonlyArray<BurnSample>;
   binding?: "asserted" | "verified";
@@ -102,6 +105,9 @@ export function validateHeadroom(value: unknown): HeadroomState {
             p.antigravityContext.fingerprint !== undefined && !/^[a-f0-9]{64}$/.test(p.antigravityContext.fingerprint) ||
             !iso(p.antigravityContext.changedAt) || typeof p.antigravityContext.admitted !== "boolean") ||
           p.antigravityHold !== undefined && typeof p.antigravityHold !== "string") ||
+        p.driver === "antigravity" && p.antigravityWindows !== undefined && (!Array.isArray(p.antigravityWindows) || p.antigravityWindows.length > 4096 ||
+          !p.antigravityWindows.every((w: any) => object(w) && safeId(w.id) && iso(w.observedAt) && percent(w.usedPercent) && percent(w.remainingPercent) &&
+            (w.resetsAt === null || iso(w.resetsAt)))) ||
         p.burnHistory !== undefined && (!Array.isArray(p.burnHistory) || p.burnHistory.length > 288 ||
           !p.burnHistory.every((s: any) => object(s) && iso(s.observedAt) && Array.isArray(s.windows) && s.windows.length <= 32 &&
             s.windows.every((w: any) => object(w) && safeId(w.id) && percent(w.remainingPercent) && percent(w.usedPercent) &&
@@ -127,7 +133,7 @@ export function validateHeadroom(value: unknown): HeadroomState {
   return value as HeadroomState;
 }
 
-export function applyT3<T extends { readonly usageLimits?: SwitchProvider["usageLimits"] }>(row: ProviderHeadroom, p: T): void {
+export function applyT3<T extends { readonly usageLimits?: SwitchProvider["usageLimits"] }>(row: ProviderHeadroom, p: T, now?: number): void {
   const u = p.usageLimits;
   if (!u) return;
   const at = iso(u.checkedAt);
@@ -137,14 +143,19 @@ export function applyT3<T extends { readonly usageLimits?: SwitchProvider["usage
   if (u.unavailable !== undefined && newer(row.included)) {
     if (reason === "unsupported") row.included = unknown("t3", "unsupported");
     else row.included = { ...row.included, error: "probe_failed", state: "error" };
-  } else if (u.unavailable === undefined && newer(row.included)) {
-    const windows = u.windows.slice(0, 32).map((w, i): Window => ({ id: safeId(w.id) ?? `window_${i}`,
+  } else if (u.unavailable === undefined && (newer(row.included) || row.driver === "antigravity")) {
+    const windows = u.windows.slice(0, row.driver === "antigravity" ? 4096 : 32).map((w, i): Window => ({ id: safeId(w.id) ?? `window_${i}`,
       kind: ["session", "weekly", "monthly", "other"].includes(w.kind ?? "") ? w.kind! : "other",
       usedPercent: w.usedPercent, remainingPercent: 100 - w.usedPercent,
       windowDurationMins: count(w.windowDurationMins) ? w.windowDurationMins : null, resetsAt: iso(w.resetsAt) }));
     if (windows.every(w => percent(w.usedPercent)) && windows.length > 0) {
-      retainBurnSample(row, at);
-      row.included = observed(windows, "t3", at);
+      if (row.driver !== "antigravity" || newer(row.included)) retainBurnSample(row, at);
+      if (row.driver === "antigravity") {
+        const retained = mergeAntigravityWindows(row.antigravityWindows ?? row.included.value ?? [],
+          windows, row.included.observedAt, at, now ?? Date.now());
+        row.antigravityWindows = retained;
+        if (newer(row.included)) row.included = observed(windows.slice(0, 32), "t3", at);
+      } else row.included = observed(windows, "t3", at);
     }
   }
   // A window-only event must not advance reset inventory's successful observation time.
@@ -263,7 +274,7 @@ export interface HeadroomMonitorOptions {
 const fingerprintHash = (fingerprint: string) => createHash("sha256").update(fingerprint).digest("hex");
 function antigravityUsageHold(usage: SwitchProvider["usageLimits"], now: number): string | undefined {
   if (!usage?.credentialFingerprint) return "Antigravity held: current verified login fingerprint is unavailable";
-  if (usage.unavailable !== undefined || !usage.windows.length ||
+  if (usage.unavailable !== undefined || !usage.windows.length || usage.windows.length > 4096 ||
       !usage.windows.every(w => Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent <= 100))
     return "Antigravity held: current login has no usable T3 usage windows";
   const at = iso(usage.checkedAt);
@@ -337,7 +348,7 @@ export class HeadroomMonitor {
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;
-        if (p.driver === "claudeAgent" || p.driver === "codex" || p.driver === "antigravity") {
+        if (p.driver === "claudeAgent" || p.driver === "codex") {
           // Native windows/reset inventory belong to this instance's account only.
           next.included = clean.included; next.manualResets = clean.manualResets;
         }
@@ -349,7 +360,7 @@ export class HeadroomMonitor {
         return next;
       }
       if (p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
-      if (!antigravity?.blocked) applyT3(next, p);
+      if (!antigravity?.blocked) applyT3(next, p, this.now());
       if (p.driver === "claudeAgent" && !p.quotaAccountKey) {
         if (next.included.source === "t3") delete next.accountKey;
         next.manualResets = newProvider(p.instanceId, p.driver).manualResets;

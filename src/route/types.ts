@@ -22,6 +22,8 @@ export interface Quota {
   observedAt: string | null;
   windows: ReadonlyArray<QuotaWindow>;
   activeStop: boolean;
+  /** Antigravity constraints retained until newer recovery or reset; never used for pacing. */
+  knownWindows?: ReadonlyArray<QuotaWindow>;
   operatorEstimate?: boolean;
   incomplete?: boolean;
 }

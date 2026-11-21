@@ -101,11 +101,12 @@ test("S-3: a settled Antigravity incumbent has a persistent separate driver slot
     h.picks[key] = { providerInstanceId: "codex", model: "gpt-6.1-sol", options: { reasoningEffort: "medium" } };
     db.prepare("INSERT INTO history VALUES(?,?)").run(key, JSON.stringify(h)); db.close();
     f.analytics = { ...f.analytics!, fetchedAt: iso(f.now), sourceFetchedAt: iso(f.now), endExclusive: iso(f.now) };
+    const native = recommend({ role: "general" }, { ...f, history: h, catalog: f.catalog.filter(p => p.driverKind !== "antigravity") });
     assert.equal(routing.recommend({ role: "general" }, f, "fixture", false).model, "gemini-3.8-flash");
     const inspect = new DatabaseSync(path);
     const saved = JSON.parse(String(inspect.prepare("SELECT value FROM history WHERE role=?").get(key)!.value));
     inspect.close();
-    assert.equal(saved.picks[key].model, "gpt-6.1-sol");
+    assert.equal(saved.picks[key].model, native.model);
     assert.equal(saved.picks[driverPickKey(key, "antigravity")].model, "gemini-3.8-flash");
     // Loss of Neon analytics cannot prevent the settled Flash incumbent from routing.
     f.analytics = null;

@@ -157,7 +157,7 @@ test("R6-2: Antigravity-only activity preserves primary counters and discards ne
   } finally { routing.close(); d.remove(); }
 });
 
-test("R6-2: an Antigravity review slot persists only its prefixed history", () => {
+test("R6-2: Antigravity review accounting layers onto independent primary slots", () => {
   const d = routeScratch(), path = join(d.path, "history.sqlite"), routing = new RouteState(path);
   try {
     const data = duplicateData();
@@ -166,7 +166,14 @@ test("R6-2: an Antigravity review slot persists only its prefixed history", () =
     assert.equal(pair.status, "complete"); assert.equal(pair.main?.providerInstanceId, "ag");
     const h = history(path, "general:claudeAgent:benchmark:5");
     assert.ok(Object.keys(h.seen).length);
-    assert.ok(Object.keys(h.seen).every(k => k.startsWith("antigravity:")));
-    assert.ok(Object.keys(h.allocations).every(k => k.startsWith("antigravity:")));
+    const baseline = new RouteState(join(d.path, "native.sqlite"));
+    try {
+      baseline.reviewPair({ authorProvider: "claudeAgent", mainRole: "general", peerRole: "general" },
+        { ...data, catalog: data.catalog.filter(p => p.driverKind !== "antigravity") });
+      const expected = history(join(d.path, "native.sqlite"), "general:claudeAgent:benchmark:5");
+      for (const field of ["seen", "allocations"]) assert.deepEqual(
+        Object.fromEntries(Object.entries(h[field]).filter(([k]) => !k.startsWith("antigravity:"))), expected[field]);
+    } finally { baseline.close(); }
+    assert.ok(Object.hasOwn(h.seen, "antigravity:" + terra));
   } finally { routing.close(); d.remove(); }
 });

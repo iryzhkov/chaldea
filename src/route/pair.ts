@@ -3,7 +3,7 @@ import { benchmarkCoverage } from "./benchmark.ts";
 import { RouteError } from "./errors.ts";
 import { ageSeconds, DEFAULT_POLICY, ROUTED_DRIVERS, routeInput } from "./types.ts";
 import type { Effort, Role, RouteInput, Target } from "./types.ts";
-import { modelWindowPolicy } from "../quota/window-policy.ts";
+import { modelWindowPolicy, antigravityExhaustion } from "../quota/window-policy.ts";
 
 export interface ReviewPairInput {
   authorProvider: "codex" | "claudeAgent" | "antigravity";
@@ -128,6 +128,7 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
     return primaries.length + targets.length > 0 && targets.every(target => {
       const q = data.quota[target.providerInstanceId], c = data.capacity?.[target.providerInstanceId];
       if (q?.activeStop || c?.class === "stopped" && c.reasons.some(r => r.startsWith("active usage stop"))) return true;
+      if (antigravityExhaustion([...(q?.knownWindows ?? []), ...(q?.windows ?? [])], target.model, data.now, config.minimumRemaining)) return true;
       const age = ageSeconds(q?.observedAt, data.now);
       if (age === null || age * 1000 >= config.quotaMaxAgeMs || q?.incomplete || c?.creditFunded) return false;
       const advice = modelWindowPolicy(q!.windows, target.model, data.now, config.minimumRemaining, config.paceMargin);

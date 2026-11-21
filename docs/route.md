@@ -380,6 +380,17 @@ exhausted windows. At route time the live T3 fingerprint must match the saved
 context, and routing uses the live snapshot windows, including exhausted limits.
 Missing fingerprints, empty windows, unsupported or failed probes never admit
 Antigravity or release a hold. The observer requires usable windows too.
+Known exhausted windows remain binding for their model family until reset,
+regardless of cache age, account-key availability, credits or reserves. Omitted
+windows and failed probes preserve them. Only a strictly newer attributed
+observation can replace a known limit with recovered capacity. Each retained
+window keeps its own observation time, so updates to another family cannot
+reset its recovery clock or make old replays supersede recovery. A later snapshot
+that is still below the configured floor cannot shorten an older future limit,
+even if its reset metadata changes or disappears. The retained
+inventory preserves every known future-reset window in an Antigravity-only field.
+These retained constraints never establish pacing; only live windows do. The
+ordinary metric stays within the 32-window format accepted by main.
 Credential strings are not stored.
 Active stops and tight/stopped capacity still exclude the driver.
 Without AA scores the fixed Claude/Codex pairs above stay unchanged.
@@ -405,8 +416,13 @@ uses the existing Opus rows. Operational evidence and baseline exemptions remain
 scoped to the driver: native Opus is not automatically a calibrated Antigravity
 baseline. An Antigravity driver allowlist can calibrate it; its exemptions apply
 only to Antigravity accounting keys. Native benchmark anchors retain main's rules,
-including configured anchors without a MODEL_MAP entry. Fallback picks never
-replace primary history incumbents, so primary routing can recover after a stop.
+including configured anchors without a MODEL_MAP entry. Every route and review
+call independently evaluates the catalog with Antigravity removed. All primary
+history writes come only from that evaluation: first-seen, calls, trials,
+returned review slots, rollback and the shared primary incumbent. They advance
+exactly as a primary-only call would, even when the returned target is Antigravity.
+The primary pick ledger and announcement budget are independent too; Antigravity
+uses its own prefixed ledger and budget.
 Settled Antigravity picks have a separate incumbent slot. Codex and Claude retain
 main's shared incumbent slot; separating those primary slots is a follow-up,
 outside this change. Claude/Codex first-seen times and trial allocations retain
@@ -419,8 +435,9 @@ exceed that share if a caller counts them as recommendations. This is pre-existi
 main behavior, including with mixed-version writers, and is outside this change.
 Primary call counting includes saved plain keys even while their models are
 hidden. Primary first-seen, reservations and rollback follow main's path.
-Refused or unused probes may persist only Antigravity first-seen entries over
-the original history, without spending trials. This lets a sole Antigravity
+When the primary-only evaluation refuses or probes an unused slot, only
+Antigravity first-seen entries may be layered over that unchanged primary history,
+without spending trials. This lets a sole Antigravity
 candidate age out of probation without persisting primary probe state.
 For Claude-authored reviews, Antigravity excludes `claude-*` models; for
 Codex-authored reviews it excludes `gpt-*` models, including allowlisted models.
@@ -460,8 +477,8 @@ prevents a valid independent peer. A missing provider or unknown quota never
 authorizes a same-driver exception. Primary quota pressure retains main's rule:
 every runnable instance must show fresh pressure, even a Haiku-only instance
 that cannot supply the requested role anchor. For Antigravity, only targets
-admissible apart from quota count as alternatives, and fresh pressure must cover
-every routable model. An incomplete Antigravity benchmark catalog or the
+admissible apart from quota count as alternatives. Every routable model must
+show pressure through fresh applicable windows or retained unexpired exhaustion. An incomplete Antigravity benchmark catalog or the
 fixed-pair exclusion cannot block an otherwise valid primary quota exception.
 A stopped Antigravity cannot authorize a primary waiver when the primary
 counterpart is absent.

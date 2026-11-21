@@ -44,15 +44,22 @@ function reserveAntigravity(history: RoutingHistory, role: Role, data: PolicyDat
   }
 }
 
-/** An Antigravity-only result cannot commit primary probe initialization. */
-function restorePrimaryHistory(history: RoutingHistory, original: RoutingHistory): void {
-  for (const field of ["seen", "allocations"] as const) {
-    for (const key of Object.keys(history[field])) if (!antigravityKey(key)) delete history[field][key];
-    Object.assign(history[field], Object.fromEntries(Object.entries(original[field]).filter(([key]) => !antigravityKey(key))));
+/** Primary state is derived only from an independent Antigravity-free evaluation. */
+const privatePick = (key: string) => key.startsWith("antigravity:") || key.endsWith(":driver:antigravity");
+function primaryHistory(history: RoutingHistory): RoutingHistory {
+  return { seen: Object.fromEntries(Object.entries(history.seen).filter(([k]) => !antigravityKey(k))),
+    allocations: Object.fromEntries(Object.entries(history.allocations).filter(([k]) => !antigravityKey(k))),
+    picks: Object.fromEntries(Object.entries(history.picks).filter(([k]) => !privatePick(k))) };
+}
+function mergePrimary(history: RoutingHistory, primary: RoutingHistory): void {
+  for (const field of ["seen", "allocations", "picks"] as const) {
+    const privateKey = field === "picks" ? privatePick : antigravityKey;
+    for (const key of Object.keys(history[field])) if (!privateKey(key)) delete history[field][key];
+    Object.assign(history[field], primary[field]);
   }
 }
-const primaryTarget = (target: Target, data: PolicyData) =>
-  data.catalog.find(p => p.providerInstanceId === target.providerInstanceId)?.driverKind !== "antigravity";
+const primaryData = (data: PolicyData): PolicyData => ({ ...data,
+  catalog: data.catalog.filter(p => p.driverKind !== "antigravity") });
 
 export const MAX_ROUTE_EVENTS = 128;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
@@ -84,39 +91,61 @@ export class RouteState {
     const key = roleKey(input.role, input.authorProvider, input.effortOverride, data.config?.benchmark?.indexVersion);
     const attempt = tx(this.db, () => {
       const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
-      const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
+      const original: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
       const config = { ...DEFAULT_POLICY, ...data.config };
-      const original = structuredClone(history);
-      initializeHistory(history, data);
-      let result: RouteResult;
-      try { result = recommend(input, { ...data, history }); }
-      catch (error) {
-        if (!(error instanceof RouteError) || error.code !== "no_candidate" || !antigravitySeen(original, history)) throw error;
-        this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
-          .run(key, JSON.stringify(original));
-        return { error };
-      }
-      const primaryPicks = [result, ...Object.values(result.byProvider).filter(p => p.eligible)]
-        .filter(t => primaryTarget(t, data));
-      if (!primaryPicks.length) restorePrimaryHistory(history, original);
-      for (const [model, allocation] of Object.entries(history.allocations)) {
-        if (primaryPicks.length && !antigravityKey(model) && inProbation(model, input.role, history, config, data.now)) {
-          allocation.calls++;
-          if (primaryPicks.some(p => p.model === model)) allocation.trials++;
+      const primary = structuredClone(primaryHistory(original)), native = primaryData(data);
+      let primaryResult: RouteResult | undefined;
+      try {
+        initializeHistory(primary, native);
+        primaryResult = recommend(input, { ...native, history: primary });
+        // Main's reservation and incumbent rules, applied to its independent result.
+        for (const [model, allocation] of Object.entries(primary.allocations)) {
+          if (inProbation(model, input.role, primary, config, data.now)) {
+            allocation.calls++;
+            if (model === primaryResult.model || Object.values(primaryResult.byProvider).some(p => p.eligible && p.model === model)) allocation.trials++;
+          }
         }
-      }
-      reserveAntigravity(history, input.role, data, Object.values(result.byProvider).filter(p => p.eligible), 1);
-      const driver = data.catalog.find(p => p.providerInstanceId === result.providerInstanceId)!.driverKind;
-      const pickKey = driver === "antigravity" ? driverPickKey(key, driver) : key;
-      if (!inProbation(result.model, input.role, history, config, data.now, driver === "antigravity" ? driver : undefined)) history.picks[pickKey] = {
-        providerInstanceId: result.providerInstanceId, model: result.model, options: result.options,
-      };
-      this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(history));
-      return { result };
+        if (!inProbation(primaryResult.model, input.role, primary, config, data.now))
+          primary.picks[key] = { providerInstanceId: primaryResult.providerInstanceId,
+            model: primaryResult.model, options: primaryResult.options };
+      } catch (error) { if (!(error instanceof RouteError)) throw error; }
+      const history = structuredClone(original);
+      initializeHistory(history, data);
+      let result: RouteResult | undefined, failure: RouteError | undefined;
+      try { result = recommend(input, { ...data, history }); }
+      catch (error) { if (!(error instanceof RouteError)) throw error; failure = error; }
+      const committed = structuredClone(original);
+      if (primaryResult) mergePrimary(committed, primary);
+      let antigravityChanged = false;
+      if (result) {
+        reserveAntigravity(history, input.role, data, Object.values(result.byProvider).filter(p => p.eligible), 1);
+        const driver = data.catalog.find(p => p.providerInstanceId === result!.providerInstanceId)!.driverKind;
+        if (driver === "antigravity" && !inProbation(result.model, input.role, history, config, data.now, driver))
+          history.picks[driverPickKey(key, driver)] = { providerInstanceId: result.providerInstanceId,
+            model: result.model, options: result.options };
+        mergePrimary(history, primaryHistory(committed));
+        Object.assign(committed, history);
+        antigravityChanged = data.catalog.some(p => p.driverKind === "antigravity");
+      } else if (failure?.code === "no_candidate") antigravityChanged = antigravitySeen(committed, history);
+      if (primaryResult || antigravityChanged)
+        this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
+          .run(key, JSON.stringify(committed));
+      return { result, failure, primaryResult };
     });
-    if ("error" in attempt) throw attempt.error;
-    const result = attempt.result;
-    if (input.effortOverride) return result;
+    // The shared pick ledger follows the primary-only call too; Antigravity has its own key.
+    if (!input.effortOverride && attempt.primaryResult) {
+      const before = attempt.primaryResult.reasons.length;
+      this.recordPick(attempt.primaryResult, key, host, announce);
+      attempt.result?.reasons.push(...attempt.primaryResult.reasons.slice(before));
+    }
+    if (attempt.failure) throw attempt.failure;
+    const result = attempt.result!;
+    const driver = data.catalog.find(p => p.providerInstanceId === result.providerInstanceId)!.driverKind;
+    if (!input.effortOverride && driver === "antigravity") this.recordPick(result, "antigravity:" + key, host, announce);
+    return result;
+  }
+  private recordPick(result: RouteResult, key: string, host: string, announce: boolean): void {
+    const antigravity = key.startsWith("antigravity:");
     try {
       tx(this.db, () => {
         const top = result.topPick ?? { providerInstanceId: result.providerInstanceId, model: result.model, options: result.options };
@@ -131,14 +160,15 @@ export class RouteState {
           // A transient change that returned to the last announced model needs no event.
           if (top.model !== previous) {
             const event: Publication = {
-              key: "route-pick:" + createHash("sha256").update(this.epoch + ":" + host + ":" + key + ":" + sequence).digest("hex"),
+              key: (antigravity ? "antigravity:" : "") + "route-pick:" + createHash("sha256").update(this.epoch + ":" + host + ":" + key + ":" + sequence).digest("hex"),
               source: "route", host, payload: { v: 1, kind: "route_pick_changed",
                 title: "routing changed: " + top.model + " replaces " + previous + " for " + key,
                 body: [...result.reasons.slice(-1), ...result.reasons.slice(0, -1)].join("; ").slice(0, 16000),
                 data: { role: key, model: top.model, previous_model: previous, transition_id: String(sequence) } },
             };
             const bytes = JSON.stringify(event);
-            const size = this.db.prepare("SELECT count(*) AS n,coalesce(sum(length(CAST(event AS BLOB))),0) AS bytes FROM pending").get()!;
+            const size = this.db.prepare("SELECT count(*) AS n,coalesce(sum(length(CAST(event AS BLOB))),0) AS bytes FROM pending WHERE " +
+              (antigravity ? "role LIKE 'antigravity:%'" : "role NOT LIKE 'antigravity:%'")).get()!;
             if (Number(size.n) >= MAX_ROUTE_EVENTS || Number(size.bytes) + Buffer.byteLength(bytes) > MAX_EVENT_BYTES)
               throw new Error("route_outbox_full");
             this.db.prepare("INSERT INTO pending(key,event,role,attempted) VALUES(?,?,?,0)").run(event.key, bytes, key);
@@ -151,59 +181,71 @@ export class RouteState {
       // Event storage cannot undo a reserved recommendation or stop routing.
       result.reasons.push("Route-change announcement deferred: event storage unavailable or at capacity");
     }
-    return result;
   }
   reviewPair(value: ReviewPairInput, data: PolicyData): ReviewPairResult {
     const input = reviewPairInput(value);
     return tx(this.db, () => {
-      const histories = new Map<string, RoutingHistory>();
-      const originals = new Map<string, RoutingHistory>();
-      const historyFor = (request: RouteInput) => {
-        const key = roleKey(request.role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
-        if (!histories.has(key)) {
-          const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
-          const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
-          originals.set(key, structuredClone(history));
-          initializeHistory(history, data);
-          histories.set(key, history);
-        }
-        return histories.get(key)!;
-      };
-      const result = recommendReviewPair(input, data, historyFor);
       const config = { ...DEFAULT_POLICY, ...data.config };
-      const slots = new Map<string, { request: RouteInput; models: string[]; targets: Target[] }>();
-      for (const [target, role, main] of [[result.main, input.mainRole ?? "builder", true],
-        [result.peer, input.peerRole ?? "builder", false]] as const) {
-        if (!target) continue;
-        const driver = data.catalog.find(p => p.providerInstanceId === target.providerInstanceId)!.driverKind;
-        const request = pairRequest(role, driver, main ? input.mainEffort : input.peerEffort,
-          input.authorProvider, main, !!config.benchmark && !config.pins[role]);
-        const key = roleKey(role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
-        const slot = slots.get(key) ?? { request, models: [], targets: [] };
-        slot.targets.push(target);
-        slot.models.push(target.model); slots.set(key, slot);
-      }
-      for (const [key, slot] of slots) {
-        const history = historyFor(slot.request);
-        const primaryPicks = slot.targets.filter(t => primaryTarget(t, data));
-        if (!primaryPicks.length) restorePrimaryHistory(history, originals.get(key)!);
+      const originals = new Map<string, RoutingHistory>();
+      const read = (key: string) => {
+        if (!originals.has(key)) {
+          const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
+          originals.set(key, row ? JSON.parse(String(row.value)) : emptyHistory());
+        }
+        return originals.get(key)!;
+      };
+      const evaluate = (snapshot: PolicyData, native: boolean) => {
+        const histories = new Map<string, RoutingHistory>();
+        const historyFor = (request: RouteInput) => {
+          const key = roleKey(request.role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
+          if (!histories.has(key)) {
+            const history = structuredClone(native ? primaryHistory(read(key)) : read(key));
+            initializeHistory(history, snapshot); histories.set(key, history);
+          }
+          return histories.get(key)!;
+        };
+        const result = recommendReviewPair(input, snapshot, historyFor);
+        const slots = new Map<string, { request: RouteInput; targets: Target[] }>();
+        for (const [target, role, main] of [[result.main, input.mainRole ?? "builder", true],
+          [result.peer, input.peerRole ?? "builder", false]] as const) {
+          if (!target) continue;
+          const driver = snapshot.catalog.find(p => p.providerInstanceId === target.providerInstanceId)!.driverKind;
+          const request = pairRequest(role, driver, main ? input.mainEffort : input.peerEffort,
+            input.authorProvider, main, !!config.benchmark && !config.pins[role]);
+          const key = roleKey(role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
+          const slot = slots.get(key) ?? { request, targets: [] };
+          slot.targets.push(target); slots.set(key, slot);
+        }
+        return { result, slots, histories, historyFor };
+      };
+      const primary = evaluate(primaryData(data), true);
+      const final = evaluate(data, false);
+      const writes = new Map<string, RoutingHistory>();
+      for (const [key, slot] of primary.slots) {
+        const history = primary.historyFor(slot.request);
+        // Main persists only returned slots, with one opportunity per slot.
         for (const [model, allocation] of Object.entries(history.allocations)) {
-          if (primaryPicks.length && !antigravityKey(model) && inProbation(model, slot.request.role, history, config, data.now)) {
-            allocation.calls += primaryPicks.length;
-            allocation.trials += primaryPicks.filter(t => t.model === model).length;
+          if (inProbation(model, slot.request.role, history, config, data.now)) {
+            allocation.calls += slot.targets.length;
+            allocation.trials += slot.targets.filter(t => t.model === model).length;
           }
         }
-        reserveAntigravity(history, slot.request.role, data, slot.targets, slot.models.length);
+        const combined = structuredClone(read(key));
+        mergePrimary(combined, history); writes.set(key, combined);
+      }
+      for (const [key, observed] of final.histories) {
+        const combined = writes.get(key) ?? structuredClone(read(key));
+        const slot = final.slots.get(key);
+        if (slot) {
+          reserveAntigravity(observed, slot.request.role, data, slot.targets, slot.targets.length);
+          mergePrimary(observed, primaryHistory(combined));
+          writes.set(key, observed);
+        } else if (antigravitySeen(combined, observed)) writes.set(key, combined);
+      }
+      for (const [key, history] of writes)
         this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
           .run(key, JSON.stringify(history));
-      }
-      for (const [key, history] of histories) if (!slots.has(key)) {
-        const original = originals.get(key)!;
-        if (antigravitySeen(original, history))
-          this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
-            .run(key, JSON.stringify(original));
-      }
-      return result;
+      return final.result;
     });
   }
   async flush(options: PublisherOptions = {}): Promise<void> {

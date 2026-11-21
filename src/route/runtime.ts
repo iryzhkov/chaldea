@@ -84,10 +84,12 @@ async function collectContext(options: RouteOptions) {
       const original = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
       const row = { ...(original ?? newProvider(p.providerInstanceId, p.driverKind)) };
       if (p.driverKind === "antigravity") {
-        // The live fingerprint's windows are authoritative; never retain saved login windows.
-        row.included = newProvider(row.alias, row.driver).included;
-        if (!admissionHolds.get(p.providerInstanceId)) applyT3(row, p);
-        quota[p.providerInstanceId] = { observedAt: row.included.observedAt, windows: row.included.value ?? [],
+        // Valid live data can recover known windows; omissions and failed probes cannot.
+        const live = newProvider(row.alias, row.driver);
+        if (!admissionHolds.get(p.providerInstanceId)) { applyT3(row, p, now); applyT3(live, p, now); }
+        quota[p.providerInstanceId] = { observedAt: live.included.observedAt,
+          windows: live.antigravityWindows ?? live.included.value ?? [],
+          knownWindows: row.antigravityWindows ?? row.included.value ?? [],
           activeStop: quota[p.providerInstanceId]?.activeStop ?? false };
         return row;
       }
@@ -124,7 +126,7 @@ async function collectContext(options: RouteOptions) {
       reasons.push(p.providerInstanceId + ": configured account does not match the observed provider login; excluded");
     }
     const key = configured ?? p.accountKey ?? row.accountKey;
-    if (key && row.accountKey !== key) {
+    if (key && row.accountKey !== key && p.driverKind !== "antigravity") {
       const clean = newProvider(row.alias, row.driver);
       clean.accountKey = key;
       capacityState.headroom.providers[capacityState.headroom.providers.indexOf(row)] = clean;

@@ -27,6 +27,40 @@ export function modelWindowPolicy(input: ReadonlyArray<IncludedWindow>, model: s
       ? "seven_day_fable " + fableScoped!.remainingPercent + "% left; applies to Fable"
       : "seven_day_fable unknown; additional Fable capacity not established"] };
 }
+/** Known Antigravity exhaustion outlives observation freshness, but never its reset. */
+export function antigravityExhaustion(input: ReadonlyArray<IncludedWindow>, model: string, now: number, minimum: number) {
+  const applies = (id: string) => id === "gemini-argon-wtu-weekly" ? model === "gemini-4-argon"
+    : id.startsWith("gemini-") ? model.startsWith("gemini-")
+    : id.startsWith("3p-") ? /^(claude-|gpt-)/.test(model)
+    : id.startsWith("seven_day_") ? id === "seven_day_fable" && fableModel(model) : true;
+  return input.find(w => Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 &&
+    w.remainingPercent / 100 < minimum && w.resetsAt !== null && Date.parse(w.resetsAt) > now && applies(w.id ?? w.kind));
+}
+/** Omitted windows cannot erase known limits. Only a newer attributed observation replaces them. */
+export function mergeAntigravityWindows<T extends IncludedWindow & { usedPercent: number }>(
+  prior: ReadonlyArray<T & { observedAt?: string }>, incoming: ReadonlyArray<T>,
+  previousAt: string | null, observedAt: string, now: number): Array<T & { observedAt: string }> {
+  const key = (w: IncludedWindow) => w.id ?? w.kind;
+  let limits = prior.filter(w => w.resetsAt !== null && Date.parse(w.resetsAt) > now)
+    .map(w => ({ ...w, observedAt: w.observedAt ?? previousAt ?? observedAt }));
+  for (const w of incoming) {
+    const peers = limits.filter(old => key(old) === key(w));
+    const latest = Math.max(-Infinity, ...peers.map(old => Date.parse(old.observedAt)));
+    if (Date.parse(observedAt) < latest) continue;
+    if (Date.parse(observedAt) > latest) {
+      // Recovery cancels every threshold at or below the new remaining percentage.
+      // Below-threshold updates cannot shorten an older limit's future deadline.
+      limits = limits.map(old => key(old) !== key(w) ? old : { ...old,
+        remainingPercent: Math.max(old.remainingPercent, w.remainingPercent),
+        usedPercent: 100 - Math.max(old.remainingPercent, w.remainingPercent), observedAt });
+    }
+    if (w.resetsAt !== null && Date.parse(w.resetsAt) > now) limits.push({ ...w, observedAt });
+  }
+  // Keep the threshold/deadline envelope: a stricter, longer limit subsumes another.
+  return limits.filter((w, i) => !limits.some((other, j) => i !== j && key(other) === key(w) &&
+    other.remainingPercent <= w.remainingPercent && Date.parse(other.resetsAt!) >= Date.parse(w.resetsAt!) &&
+    (other.remainingPercent < w.remainingPercent || Date.parse(other.resetsAt!) > Date.parse(w.resetsAt!) || j < i)));
+}
 export function windowPolicy<T extends IncludedWindow>(input: ReadonlyArray<T>, now: number, minimumRemaining: number, paceMargin: number, includeFamily = false) {
   const windows = input.filter(w => (!modelScopedWindow(w) || includeFamily && /^(gemini-|3p-)/.test(w.id ?? "")) && Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 && w.remainingPercent <= 100 &&
     (w.resetsAt === null || Number.isFinite(Date.parse(w.resetsAt)) && Date.parse(w.resetsAt) > now));
