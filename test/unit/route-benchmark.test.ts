@@ -158,3 +158,27 @@ test("v2 cost and nullable coding round-trip without inventing cost, coding, dat
   assert.throws(() => validateScores({ ...result, models: [...result.models, ...result.models] }), /invalid_route_scores/);
   assert.throws(() => validateScores({ ...result, indexVersion: "unversioned" }), /invalid_route_scores/);
 });
+test("Antigravity routes only to allowlisted Gemini 4 Neon by thought_level, after every eligible primary", () => {
+  const f = data();
+  const level = { id: "thought_level", type: "select", options: ["low", "medium", "high"].map(id => ({ id })) };
+  const antigravity = { providerInstanceId: "antigravity", driverKind: "antigravity", canRunChildTask: true,
+    models: ["gemini-4-neon", "gemini-4-argon", "claude-opus-5-5"].map(id => ({ id, options: [level] })) };
+  const scores = { ...f.scores, models: [...f.scores.models,
+    score("gemini-4-neon", "low", 44.1, .75), score("gemini-4-neon", "medium", 54.9, 1.9), score("gemini-4-neon", "high", 59.6, 3.74)] };
+  const g = { ...f, catalog: [...f.catalog, antigravity], scores };
+  // Unmapped Argon and Antigravity's Claude are outside the allowlist, so coverage stays complete.
+  const primary = recommend({ role: "general" }, g);
+  assert.notEqual(primary.providerInstanceId, "antigravity");
+  assert.equal(compactRoute(primary).benchmarkCoverage?.antigravity?.complete, true);
+  assert.equal(primary.byProvider.antigravity?.model, "gemini-4-neon");
+  assert.deepEqual(primary.byProvider.antigravity?.options, { thought_level: "medium" });
+  // A Claude-authored review with Codex stopped falls back to Antigravity rather than failing.
+  const quota = { codex: { observedAt: iso(now), activeStop: true, windows: [] } };
+  const fallback = recommend({ role: "builder", authorProvider: "claudeAgent" }, { ...g, quota });
+  assert.equal(fallback.providerInstanceId, "antigravity");
+  assert.equal(fallback.model, "gemini-4-neon");
+  assert.deepEqual(fallback.options, { thought_level: "medium" });
+  // An explicit allowlist override replaces the default.
+  const argonOnly = recommend({ role: "general" }, { ...g, config: { ...g.config, driverModels: { antigravity: ["gemini-4-argon"] } } });
+  assert.equal(compactRoute(argonOnly).benchmarkCoverage?.antigravity?.complete, false);
+});

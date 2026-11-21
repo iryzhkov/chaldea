@@ -351,6 +351,21 @@ The measured role floor, required cost, catalog availability, bans, quota and
 review separation still apply. Other models retain normal operational evidence
 and probation. No calibration anchors are added automatically or in legacy mode.
 
+### Fallback drivers and the driver model allowlist
+
+Claude and Codex are the primary drivers. Antigravity is also routed, as a
+fallback: it ranks after every eligible primary candidate, so it is chosen only
+when quota, capacity, stops or review separation exclude both primaries. Its
+effort is the ACP `thought_level` option.
+
+`driverModels` restricts a driver kind to operator-chosen models. The default is
+`{"antigravity": ["gemini-4-neon"]}`, so Antigravity routes only to Gemini 4 Neon
+and its other catalog models (Argon, Flash, and the Claude models Antigravity
+proxies) neither count toward benchmark coverage nor get selected. Allowlisted
+models are calibrated baselines: they skip probation, and the first one is the
+driver's incumbent. A `driverModels` key in route.json replaces the default as a
+whole. Review pairs (`chaldea_route_review_pair`) remain Claude and Codex only.
+
 Version 2 adds `metric: "aa-intelligence-cost-per-task"` and
 `benchmarkCostUSDPerTask` from AA's
 `artificial_analysis_intelligence_index_cost.cost_per_task.total_cost`.

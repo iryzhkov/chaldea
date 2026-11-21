@@ -6,7 +6,7 @@ import { banned, compareScores, emptyHistory, inProbation, roleKey, scoreFor, ta
 import type { RoutingHistory } from "./targets.ts";
 import { validateScores } from "./scores.ts";
 import type { ScoreSnapshot } from "./scores.ts";
-import { ageSeconds, DEFAULT_POLICY, PAIRS, routeInput } from "./types.ts";
+import { ageSeconds, DEFAULT_POLICY, EFFORT_OPTION_IDS, PAIRS, PRIMARY_DRIVERS, routeInput } from "./types.ts";
 import type { Analytics, CatalogProvider, PolicyConfig, Provider, Quota, RouteInput, RouteResult, Target } from "./types.ts";
 
 export interface PolicyData {
@@ -30,6 +30,11 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   const pair = PAIRS[input.role];
   const history = data.history ?? emptyHistory();
   const pin = config.pins[input.role];
+  // An allowlisted driver exposes only its operator-chosen models to coverage and selection.
+  const catalog = data.catalog.map(p => {
+    const allowed = config.driverModels?.[p.driverKind];
+    return allowed ? { ...p, models: p.models.filter(m => allowed.includes(m.id)) } : p;
+  });
   let scores: ScoreSnapshot | null = null;
   try { if (data.scores && ageSeconds(data.scores.fetchedAt, data.now) !== null) scores = validateScores(data.scores); } catch {}
   const scoreAge = ageSeconds(scores?.fetchedAt, data.now);
@@ -49,13 +54,13 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   if (scores?.unmapped.length) reasons.push("AA models unmapped, held: " + scores.unmapped.join(", "));
   diagnostics.quality_source = scores && !pin ? "AA" : "fixed_policy";
   if (benchmark) {
-    diagnostics.benchmarkCoverage = benchmarkCoverage(data.catalog, scores, config.bans, input.effortOverride);
+    diagnostics.benchmarkCoverage = benchmarkCoverage(catalog, scores, config.bans, input.effortOverride);
     reasons.push("Benchmark selection uses minimum measured USD per task above the role floor within each provider; quota admission and provider pacing still apply");
   }
   const policyReasons = [...reasons];
   const providerReasons = new Map<Provider, string[]>();
   const candidates: Array<Target & { driver: Provider; pace: number | null; scopeKnown: boolean }> = [];
-  for (const p of [...data.catalog].sort((a, b) => a.providerInstanceId.localeCompare(b.providerInstanceId))) {
+  for (const p of [...catalog].sort((a, b) => a.providerInstanceId.localeCompare(b.providerInstanceId))) {
     const scoped = providerReasons.get(p.driverKind) ?? [];
     providerReasons.set(p.driverKind, scoped);
     const reject = (reason: string) => { scoped.push(reason); reasons.push(reason); };
@@ -81,9 +86,10 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
       reasons.push(model + ": outside fixed role pair while AA unavailable"); continue;
     }
     for (const effort of benchmark ? benchmarkEfforts(model, input.effortOverride) : [input.effortOverride ?? (input.role === "builder" ? "high" : "medium")]) {
-    const incumbent = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride, config.benchmark?.indexVersion)]?.model ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
+    const incumbent = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride, config.benchmark?.indexVersion)]?.model ??
+      config.driverModels?.[p.driverKind]?.[0] ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
     if (!pin && scores && !targetEligible(model, effort, input.role, scores, data.analytics, config, data.now, incumbent, reasons)) continue;
-    const option = m.options?.find(o => ["reasoningEffort", "effort", "variant"].includes(o.id) &&
+    const option = m.options?.find(o => EFFORT_OPTION_IDS.includes(o.id) &&
       o.type === "select" && o.options?.some(v => v.id === effort))?.id;
     if (!option) { reasons.push(model + ": required effort unavailable"); continue; }
     if (!p.canRunChildTask || !p.models.find(m => m.id === model)?.options?.some(o =>
@@ -158,6 +164,9 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
       if (preferCodex && (x.driver === "codex") !== (y.driver === "codex"))
         return Number(y.driver === "codex") - Number(x.driver === "codex");
+      // Fallback drivers such as Antigravity rank after every eligible primary driver.
+      const fallback = (c: typeof x) => !PRIMARY_DRIVERS.includes(c.driver);
+      if (fallback(x) !== fallback(y)) return Number(fallback(x)) - Number(fallback(y));
       const rank = (c: typeof x) => {
         if (!c.scopeKnown && !data.capacity?.[c.providerInstanceId]?.creditFunded) return data.capacity ? 2 : null;
         const kind = data.capacity?.[c.providerInstanceId]?.class;

@@ -1,3 +1,4 @@
+import { EFFORT_OPTION_IDS } from "./types.ts";
 import type { CatalogProvider, Effort, RouteDiagnostics, Target } from "./types.ts";
 import type { ScoreSnapshot } from "./scores.ts";
 import { banned, scoreFor } from "./targets.ts";
@@ -19,7 +20,7 @@ export function benchmarkCoverage(catalog: readonly CatalogProvider[], scores: S
     for (const m of p.models) {
       if (banned(m.id, bans)) continue;
       const offered = benchmarkEfforts(m.id, exact).filter(effort =>
-        m.options?.some(o => ["reasoningEffort", "effort", "variant"].includes(o.id) &&
+        m.options?.some(o => EFFORT_OPTION_IDS.includes(o.id) &&
           o.type === "select" && o.options?.some(v => v.id === effort)));
       if (!offered.length) continue;
       const covered = offered.some(effort => scoreFor(scores, m.id, effort)?.benchmarkCostUSDPerTask != null);

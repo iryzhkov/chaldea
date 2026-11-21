@@ -61,13 +61,22 @@ export interface PolicyConfig {
   bans: string[];
   pins: Partial<Record<Role, { model: string; providerInstanceId?: string }>>;
   floors: Record<Role, number>;
+  /** Operator allowlist per driver kind. A listed driver is routed only to these models, which
+   * count as calibrated baselines: no probation, and the first one is the driver's incumbent. */
+  driverModels: Record<string, string[]>;
 }
+/** Claude and Codex are the primary drivers; any other routed driver is a fallback. */
+export const PRIMARY_DRIVERS: readonly string[] = ["claudeAgent", "codex"];
+export const ROUTED_DRIVERS: readonly string[] = [...PRIMARY_DRIVERS, "antigravity"];
+/** Catalog option ids that carry a reasoning effort; Antigravity uses ACP thought_level. */
+export const EFFORT_OPTION_IDS: readonly string[] = ["reasoningEffort", "effort", "variant", "thought_level"];
 export const DEFAULT_POLICY: PolicyConfig = {
   paceMargin: 0.10, minimumRemaining: 0.10, failureMargin: 0.10, minimumTurns: 100,
   quotaMaxAgeMs: 15 * 60_000, analyticsMaxAgeMs: 21 * 86_400_000,
   scoreMaxAgeMs: 3 * 86_400_000, probationMs: 7 * 86_400_000, probationShare: 0.10,
   bans: ["*sonnet*"], pins: {}, benchmark: null,
   floors: { builder: 50, "critical-review": 49, "bulk-read": 30, general: 48, executor: 48 },
+  driverModels: { antigravity: ["gemini-4-neon"] },
 };
 export const PAIRS = {
   builder: ["claude-opus-5-5", "gpt-6.1-sol"],

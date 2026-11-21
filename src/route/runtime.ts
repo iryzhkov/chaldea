@@ -16,7 +16,7 @@ import { RouteState } from "./state.ts";
 import { reviewPairInput, type ReviewPairResult } from "./pair.ts";
 import { RouteError, routeFailure } from "./errors.ts";
 import type { PolicyData } from "./policy.ts";
-import { routeInput } from "./types.ts";
+import { ROUTED_DRIVERS, routeInput } from "./types.ts";
 import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
 
 /** The same cached provider/model descriptors used by orchestrator_capabilities.
@@ -25,7 +25,7 @@ import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
 export function routeCatalog(providers: ReadonlyArray<SwitchProvider>, preferences?: CatalogModelPreferences | null): CatalogProvider[] {
   return providers.map(p => ({
     providerInstanceId: p.instanceId, ...(p.quotaAccountKey ? { accountKey: p.quotaAccountKey } : {}), driverKind: p.driver,
-    canRunChildTask: ["codex", "claudeAgent"].includes(p.driver) && p.enabled && p.installed &&
+    canRunChildTask: ROUTED_DRIVERS.includes(p.driver) && p.enabled && p.installed &&
       (p.availability === undefined || p.availability === "available") &&
       ["ready", "warning"].includes(p.status) && p.auth.status === "authenticated",
     models: p.models.filter(m => !preferences?.[p.instanceId]?.hiddenModels.includes(m.slug))

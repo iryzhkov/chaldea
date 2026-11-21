@@ -30,6 +30,9 @@ export const MODEL_MAP: ReadonlyArray<{ model: string; effort: Effort; aaSlug: s
     ["gpt-6.2-sol", "gpt-6-2-sol", "GPT-6.2 Sol", "codex", ["low", "medium", "high"]],
     ["gpt-6.2-astra", "gpt-6-2-astra", "GPT-6.2 Astra", "codex", ["low", "medium", "high"]],
     ["claude-fable-5-2", "claude-fable-5-2", "Fable 5.2", "claudeAgent", ["low", "medium", "high"]],
+    // Reviewed 2026-11-20 against AA rows labelled Gemini 4 Neon (Low/Medium/High).
+    // The unsuffixed AA slug is Xhigh and stays unmapped.
+    ["gemini-4-neon", "gemini-4-neon", "Gemini 4 Neon", "antigravity", ["low", "medium", "high"]],
   ] as const).flatMap(([model, slug, analytics, harness, efforts]) => efforts.map(effort => ({
     model, effort, aaSlug: slug + "-" + effort, analytics, harness,
   }))),
