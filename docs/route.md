@@ -360,12 +360,19 @@ windows flow through the observer into routing with their supplied durations and
 resets. `gemini-5h` and `gemini-weekly` apply only to Gemini; `3p-5h` and
 `3p-weekly` apply only to Claude/GPT. `gemini-argon-wtu-weekly` applies only to
 Argon. Provider-wide classification excludes these scoped windows; candidate
-admission and pacing use only the matching windows. Other family-scoped IDs
-remain excluded pending a reviewed mapping, and missing durations never establish
-pacing. Active stops and tight/stopped capacity still exclude the driver.
+admission and pacing use only the matching windows. Unknown `gemini-*` or
+`3p-*` window IDs conservatively constrain that family. Missing durations never
+establish pacing. Models outside the Gemini/Claude/GPT families have no inferred
+family quota and use only common windows. A parked Antigravity stop is
+provider-wide: a stop from a third-party model also blocks Gemini. Its verified
+account identity is retained with the stop, so removing an instance or changing
+its login cannot release another instance on the stopped account before recovery
+or reset. Credential-context changes discard cached included windows.
+Active stops and tight/stopped capacity still exclude the driver.
 Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 
-`providerPreference` is an ordered array of driver kinds, for example
+`providerPreference` is an ordered array drawn from `antigravity`, `codex` and
+`claudeAgent`; unknown driver names are rejected. For example
 `["antigravity", "codex", "claudeAgent"]`. Listed drivers rank before unlisted
 drivers, in that order, after eligibility checks. This replaces the executor's
 Codex preference too. An empty or omitted list preserves Claude/Codex quota and
@@ -383,6 +390,13 @@ uses the existing Opus rows. Operational evidence and baseline exemptions remain
 scoped to the driver: native Opus is not automatically a calibrated Antigravity
 baseline. Explicit driver allowlists can calibrate it. Fallback picks never
 replace primary history incumbents, so primary routing can recover after a stop.
+Settled Antigravity picks have a separate incumbent slot. Codex and Claude retain
+main's shared incumbent slot; separating those primary slots is a follow-up,
+outside this change. First-seen times and trial allocations use driver/model
+keys. Probation alternatives appear only when that driver/model is a reserved
+provider pick, so alternatives cannot spend an unreserved trial.
+For Claude-authored reviews, Antigravity excludes `claude-*` models; for
+Codex-authored reviews it excludes `gpt-*` models, including allowlisted models.
 Sonnet remains banned by default.
 
 Benchmark coverage requires measured scores for every unbanned catalog model.
@@ -413,8 +427,12 @@ allowlists restrict coverage and selection together.
 Both route and review-pair inputs accept `authorProvider: "antigravity"`.
 Review pairs try eligible different drivers for the main and peer, honoring
 provider preference. Defaults preserve the Claude/Codex pair, then try
-Antigravity. A missing provider or unknown quota never authorizes a same-driver
-exception; fresh quota pressure on all available alternatives is required.
+Antigravity. Selection tries another eligible main when the preferred main
+prevents a valid independent peer. A missing provider or unknown quota never
+authorizes a same-driver exception. Only targets admissible apart from quota
+count as alternatives, and fresh pressure must cover every routable model on
+each alternative driver. An incomplete Antigravity benchmark catalog or the
+fixed-pair exclusion cannot block an otherwise valid primary quota exception.
 
 Version 2 adds `metric: "aa-intelligence-cost-per-task"` and
 `benchmarkCostUSDPerTask` from AA's

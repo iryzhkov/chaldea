@@ -149,6 +149,10 @@ export function classifyCapacities(state: Pick<ObserverState, "headroom" | "park
     !Number.isFinite(Date.parse(s.resetAt)) || Date.parse(s.resetAt) > now).map(s => s.provider));
   const id = (p: ProviderHeadroom) => p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias;
   const stoppedAccounts = new Set(state.headroom.providers.filter(p => stopped.has(p.alias)).map(id));
+  for (const stop of state.parked.values()) {
+    if (stopped.has(stop.provider) && stop.driver && stop.accountKey && /^[a-f0-9]{64}$/.test(stop.accountKey))
+      stoppedAccounts.add(capacityKey(stop.driver, stop.accountKey));
+  }
   const result: Record<string, Capacity> = {};
   for (const p of state.headroom.providers) {
     const key = id(p), next = classifyCapacity(p, stoppedAccounts.has(key), now, config), prior = result[key];

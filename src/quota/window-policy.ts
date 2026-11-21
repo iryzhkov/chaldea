@@ -7,10 +7,10 @@ export const modelScopedWindow = (w: IncludedWindow) => /^(seven_day_|gemini-|3p
 export const fableModel = (model: string) => /(?:^|[-_/:])(?:claude[-_])?fable(?:[-_.:/]|$)/i.test(model);
 export function modelWindowPolicy(input: ReadonlyArray<IncludedWindow>, model: string, now: number, minimum: number, margin: number) {
   // Antigravity family windows must never gate a different model family.
-  // Recognize only reviewed IDs; other scoped IDs stay unavailable for pacing.
+  // Unknown family IDs still constrain that family; never infer a duration.
   const family = model.startsWith("gemini-") ? "gemini" : /^(claude-|gpt-)/.test(model) ? "3p" : null;
-  const scoped = input.filter(w => w.id === family + "-5h" || w.id === family + "-weekly" ||
-    model === "gemini-4-argon" && w.id === "gemini-argon-wtu-weekly");
+  const scoped = input.filter(w => w.id === "gemini-argon-wtu-weekly"
+    ? model === "gemini-4-argon" : family !== null && w.id?.startsWith(family + "-"));
   input = input.filter(w => !/^(gemini-|3p-)/.test(w.id ?? "") || scoped.includes(w));
   const common = windowPolicy(input, now, minimum, margin, true);
   if (!fableModel(model)) return { ...common, scopedLimit: undefined as IncludedWindow | undefined, scopeKnown: true,

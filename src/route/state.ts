@@ -7,10 +7,41 @@ import type { Publication, PublisherOptions } from "../events/publisher.ts";
 import { recommendReviewPair, reviewPairInput, pairRequest, type ReviewPairInput, type ReviewPairResult } from "./pair.ts";
 import { recommend } from "./policy.ts";
 import type { PolicyData } from "./policy.ts";
-import { emptyHistory, inProbation, roleKey } from "./targets.ts";
+import { emptyHistory, inProbation, roleKey, historyModelKey, driverPickKey } from "./targets.ts";
 import type { RoutingHistory } from "./targets.ts";
 import { DEFAULT_POLICY, PRIMARY_DRIVERS } from "./types.ts";
-import type { RouteInput, RouteResult, Target } from "./types.ts";
+import type { Role, RouteInput, RouteResult, Target } from "./types.ts";
+
+
+/** Migrate primary history without lending native evidence to proxy models. */
+function initializeHistory(history: RoutingHistory, data: PolicyData) {
+  const models = new Map<string, { driver: string; model: string }>();
+  for (const p of data.catalog) for (const m of p.models) {
+    const key = historyModelKey(p.driverKind, m.id);
+    models.set(key, { driver: p.driverKind, model: m.id });
+    const legacy = PRIMARY_DRIVERS.includes(p.driverKind);
+    history.seen[key] ??= (legacy ? history.seen[m.id] : undefined) ?? data.now;
+    history.allocations[key] ??= { ...((legacy ? history.allocations[m.id] : undefined) ?? { calls: 0, trials: 0 }) };
+  }
+  return models;
+}
+function reserve(history: RoutingHistory, data: PolicyData, role: Role, targets: Target[]) {
+  const config = { ...DEFAULT_POLICY, ...data.config };
+  for (const [key, { driver, model }] of initializeHistory(history, data)) {
+    const allocation = history.allocations[key]!;
+    if (inProbation(model, role, history, config, data.now, driver)) {
+      allocation.calls += targets.length ? 1 : 0;
+      // Each exposed driver/model is reserved once, even across instances or efforts.
+      allocation.trials += Number(targets.some(t => t.model === model &&
+        data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)?.driverKind === driver));
+    }
+    // Keep legacy primary readers compatible; canonical accounting uses driver/model keys.
+    if (PRIMARY_DRIVERS.includes(driver)) {
+      history.seen[model] = history.seen[key]!;
+      history.allocations[model] = { ...allocation };
+    }
+  }
+}
 
 export const MAX_ROUTE_EVENTS = 128;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
@@ -44,23 +75,14 @@ export class RouteState {
       const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
       const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
       const config = { ...DEFAULT_POLICY, ...data.config };
-      for (const p of data.catalog) for (const m of p.models) {
-        history.seen[m.id] ??= data.now;
-        history.allocations[m.id] ??= { calls: 0, trials: 0 };
-      }
+      initializeHistory(history, data);
       const result = recommend(input, { ...data, history });
-      for (const [model, allocation] of Object.entries(history.allocations)) {
-        if (data.catalog.some(p => p.models.some(m => m.id === model) &&
-            inProbation(model, input.role, history, config, data.now, p.driverKind))) {
-          allocation.calls++;
-          if (Object.values(result.byProvider).some(p => p.eligible && p.model === model &&
-              inProbation(model, input.role, history, config, data.now,
-                data.catalog.find(c => c.providerInstanceId === p.providerInstanceId)!.driverKind))) allocation.trials++;
-        }
-      }
+      const exposed = Object.values(result.byProvider).filter(p => p.eligible);
+      reserve(history, data, input.role, exposed);
       const driver = data.catalog.find(p => p.providerInstanceId === result.providerInstanceId)!.driverKind;
-      // Fallbacks must not displace a primary incumbent across stop/recovery.
-      if (PRIMARY_DRIVERS.includes(driver) && !inProbation(result.model, input.role, history, config, data.now, driver)) history.picks[key] = {
+      // Preserve the shared primary slot; fallback drivers keep their own settled incumbent.
+      const pickKey = PRIMARY_DRIVERS.includes(driver) ? key : driverPickKey(key, driver);
+      if (!inProbation(result.model, input.role, history, config, data.now, driver)) history.picks[pickKey] = {
         providerInstanceId: result.providerInstanceId, model: result.model, options: result.options,
       };
       this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(history));
@@ -112,10 +134,7 @@ export class RouteState {
         if (!histories.has(key)) {
           const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
           const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
-          for (const p of data.catalog) for (const m of p.models) {
-            history.seen[m.id] ??= data.now;
-            history.allocations[m.id] ??= { calls: 0, trials: 0 };
-          }
+          initializeHistory(history, data);
           histories.set(key, history);
         }
         return histories.get(key)!;
@@ -135,14 +154,8 @@ export class RouteState {
       }
       for (const [key, slot] of slots) {
         const history = historyFor(slot.request);
-        for (const [model, allocation] of Object.entries(history.allocations)) {
-          if (data.catalog.some(p => p.models.some(m => m.id === model) &&
-              inProbation(model, slot.request.role, history, config, data.now, p.driverKind))) {
-            allocation.calls += slot.models.length;
-            allocation.trials += slot.models.filter(t => t.model === model && inProbation(model, slot.request.role, history, config, data.now,
-              data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)!.driverKind)).length;
-          }
-        }
+        // Slots are separate recommendation opportunities, as in the primary policy.
+        for (const target of slot.models) reserve(history, data, slot.request.role, [target]);
         this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
           .run(key, JSON.stringify(history));
       }

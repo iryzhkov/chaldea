@@ -37,6 +37,9 @@ export interface ParkedThread {
   readonly runId: string;
   readonly resetAt: string | null;
   readonly provider: string;
+  /** Verified identity at the stop, retained even if the instance disappears or logs in again. */
+  readonly driver?: string;
+  readonly accountKey?: string;
   /** Stop time of the parked run (see `stopTime` in observer.ts), epoch milliseconds. */
   readonly stopAt: number;
   /** When the observer first saw this stop, epoch milliseconds. */

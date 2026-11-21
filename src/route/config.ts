@@ -3,7 +3,7 @@ import { loadCapacityConfig } from "../quota/capacity-config.ts";
 import { hostname } from "node:os";
 import type { ScoreTransport } from "./snapshot.ts";
 import { join } from "node:path";
-import { DEFAULT_POLICY, type Role } from "./types.ts";
+import { DEFAULT_POLICY, ROUTED_DRIVERS, type Role } from "./types.ts";
 import type { PolicyConfig } from "./types.ts";
 
 export interface RouteConfig extends PolicyConfig {
@@ -72,7 +72,7 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
   if (r.providerPreference !== undefined) {
     if (!Array.isArray(r.providerPreference) || r.providerPreference.length > 20 ||
         new Set(r.providerPreference).size !== r.providerPreference.length ||
-        r.providerPreference.some(d => typeof d !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(d)))
+        r.providerPreference.some(d => typeof d !== "string" || !ROUTED_DRIVERS.includes(d)))
       throw new Error("Invalid provider preference");
     c.providerPreference = r.providerPreference;
   }

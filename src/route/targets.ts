@@ -7,6 +7,12 @@ export interface RoutingHistory {
   picks: Record<string, Target>;
   allocations: Record<string, { calls: number; trials: number }>;
 }
+/** Primary legacy keys remain readable; proxy models never inherit native history. */
+export const historyModelKey = (driver: string, model: string) => driver + ":" + model;
+export const historySeen = (history: RoutingHistory, driver: string | undefined, model: string) =>
+  (driver ? history.seen[historyModelKey(driver, model)] : undefined) ??
+  (!driver || driver !== "antigravity" ? history.seen[model] : undefined);
+export const driverPickKey = (key: string, driver: string) => key + ":driver:" + driver;
 export const emptyHistory = (): RoutingHistory => ({ seen: {}, picks: {}, allocations: {} });
 export const roleKey = (role: Role, author?: string, effort?: Effort, benchmarkIndex?: string) => role +
   ((role === "critical-review" || benchmarkIndex) && author ? ":" + author : "") +
@@ -63,9 +69,10 @@ export function targetEligible(model: string, effort: Effort, role: Role, scores
   return true;
 }
 export function inProbation(model: string, role: Role, history: RoutingHistory, config: PolicyConfig, now: number, driver?: string): boolean {
-  return !roleAnchors(role, config, driver).includes(model) && now - (history.seen[model] ?? now) < config.probationMs;
+  return !roleAnchors(role, config, driver).includes(model) && now - (historySeen(history, driver, model) ?? now) < config.probationMs;
 }
-export function trialAvailable(history: RoutingHistory, config: PolicyConfig, model: string): boolean {
-  const a = history.allocations[model] ?? { calls: 0, trials: 0 };
+export function trialAvailable(history: RoutingHistory, config: PolicyConfig, model: string, driver?: string): boolean {
+  const a = (driver ? history.allocations[historyModelKey(driver, model)] : undefined) ??
+    (!driver || driver !== "antigravity" ? history.allocations[model] : undefined) ?? { calls: 0, trials: 0 };
   return a.trials + 1 <= Math.floor((a.calls + 1) * config.probationShare + 1e-9);
 }

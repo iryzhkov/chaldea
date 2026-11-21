@@ -117,6 +117,11 @@ async function collectContext(options: RouteOptions) {
   }
   const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.accountKey && quota[p.alias]?.activeStop)
     .map(p => capacityKey(p.driver, p.accountKey!)));
+  for (const stop of state.parked.values()) {
+    if (stop.driver && stop.accountKey && /^[a-f0-9]{64}$/.test(stop.accountKey) &&
+        (stop.resetAt === null || !Number.isFinite(Date.parse(stop.resetAt)) || Date.parse(stop.resetAt) > now))
+      stoppedAccounts.add(capacityKey(stop.driver, stop.accountKey));
+  }
   const capacity: Record<string, ReturnType<typeof classifyCapacity>> = {};
   const boundCatalog = catalog.map(p => {
     let row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);

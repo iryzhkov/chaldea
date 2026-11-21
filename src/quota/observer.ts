@@ -71,6 +71,13 @@ export function claim(state: ObserverState, kind: RecordKind, threadId: string, 
   return true;
 }
 
+function parkedIdentity(state: ObserverState, provider: string) {
+  const row = state.headroom.providers.find(p => p.alias === provider);
+  return row?.accountKey && /^[a-f0-9]{64}$/.test(row.accountKey) &&
+    row.binding !== "asserted" && row.included.error !== "context_mismatch"
+    ? { driver: row.driver, accountKey: row.accountKey } : {};
+}
+
 function isUsageLimitStop(thread: ShellThread): boolean {
   return thread.status === "failed" && thread.lastErrorClass === "usage_limit" && thread.latestRunId !== null;
 }
@@ -173,6 +180,8 @@ export function observeThread(
       runId,
       resetAt,
       provider: thread.providerInstanceId,
+      ...(current?.runId === runId ? current.driver && current.accountKey ? { driver: current.driver, accountKey: current.accountKey } : {}
+        : parkedIdentity(state, thread.providerInstanceId)),
       stopAt,
       seenAt: current?.runId === runId ? current.seenAt : nowMs,
     });
@@ -213,7 +222,8 @@ function seed(state: ObserverState, thread: ShellThread, nowMs: number): Array<Q
   const resetAt = thread.usageLimitResetAt;
   const stopAt = stopTime(resetAt, thread.latestRunCompletedAt, nowMs);
   if (nowMs - stopAt > MAX_STOP_AGE_MS) return [];
-  state.parked.set(thread.id, { runId, resetAt, provider: thread.providerInstanceId, stopAt, seenAt: nowMs });
+  state.parked.set(thread.id, { runId, resetAt, provider: thread.providerInstanceId,
+    ...parkedIdentity(state, thread.providerInstanceId), stopAt, seenAt: nowMs });
   if (resetAt !== null) {
     claim(state, "quota_parked", thread.id, runId, stopAt, nowMs);
     return [];

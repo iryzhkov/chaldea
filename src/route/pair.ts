@@ -1,4 +1,5 @@
 import { recommend, type PolicyData } from "./policy.ts";
+import { benchmarkCoverage } from "./benchmark.ts";
 import { RouteError } from "./errors.ts";
 import { ageSeconds, DEFAULT_POLICY, ROUTED_DRIVERS, routeInput } from "./types.ts";
 import type { Effort, Role, RouteInput, Target } from "./types.ts";
@@ -51,58 +52,88 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
   const others = order([legacyOther, ...ROUTED_DRIVERS.filter(d => d !== legacyOther && d !== input.authorProvider)]);
   const driverOf = (t: Target) => data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)!.driverKind;
   const mainRole = input.mainRole ?? "builder", peerRole = input.peerRole ?? "builder";
-  const choose = (driver: string, role: Role, effort: Effort | undefined, main: boolean, excluded?: string, alternate = false) => {
+  const select = (driver: string, role: Role, effort: Effort | undefined, main: boolean,
+    excluded: readonly string[] = [], alternate = false, withoutQuota = false) => {
     const pin = config.pins[role], benchmark = !!config.benchmark && !pin;
     const request = pairRequest(role, driver, effort, input.authorProvider, main, benchmark);
+    if (driver === "antigravity" && benchmark) {
+      const full = data.catalog.filter(p => p.driverKind === driver).map(p => ({ ...p,
+        models: p.models.filter(m => !config.driverModels[driver] || config.driverModels[driver]!.includes(m.id)) }));
+      if (!benchmarkCoverage(full, data.scores ?? null, config.bans, effort)[driver]?.complete) return null;
+    }
     const model = driver === "codex" ? "gpt-6.1-sol" : "claude-opus-5-5";
     const catalog = data.catalog.filter(p => p.driverKind === driver).map(p => ({ ...p,
-      models: p.models.filter(m => m.id !== excluded && (benchmark || pin || alternate || driver === "antigravity" || m.id === model)) }));
+      models: p.models.filter(m => !excluded.includes(m.id) &&
+        !(driver === "antigravity" && (input.authorProvider === "codex" && m.id.startsWith("gpt-") ||
+          input.authorProvider === "claudeAgent" && m.id.startsWith("claude-"))) &&
+        (benchmark || pin || alternate || driver === "antigravity" || m.id === model)) }));
     try {
       const history = historyFor?.(request) ?? data.history;
-      const result = recommend(request, { ...data, catalog, ...(history ? { history } : {}) });
-      return pairTarget(result);
+      return recommend(request, { ...data, catalog, ...(history ? { history } : {}),
+        ...(withoutQuota ? { quota: {}, capacity: {} } : {}) });
     } catch (error) {
       if (!(error instanceof RouteError) || error.code !== "no_candidate") throw error;
       return null;
     }
   };
-  // A waiver requires live-catalog presence and fresh quota refusal on every
-  // runnable instance. Missing catalog, unknown quota and HTTP 429 are insufficient.
-  const pressure = (driver: string) => {
-    const providers = data.catalog.filter(p => p.driverKind === driver && p.canRunChildTask && p.models.length);
-    return providers.length > 0 && providers.every(p => {
-      const q = data.quota[p.providerInstanceId], age = ageSeconds(q?.observedAt, data.now);
-      if (age === null || age * 1000 >= config.quotaMaxAgeMs || q?.incomplete) return false;
-      if (q?.activeStop) return true;
-      const c = data.capacity?.[p.providerInstanceId];
-      if (c?.creditFunded) return false;
-      const advice = modelWindowPolicy(q!.windows, driver === "claudeAgent" ? "claude-opus-5-5" : "", data.now,
-        config.minimumRemaining, config.paceMargin);
-      return !!advice.gate || !!advice.limit;
-    });
+  // Enumerate models only after the full catalog has passed coverage and admission.
+  // Removing a previously considered model must never rescue incomplete coverage.
+  const choices = (driver: string, role: Role, effort: Effort | undefined, main: boolean,
+    excluded: readonly string[] = [], alternate = false, withoutQuota = false): Target[] => {
+    const result: Target[] = [], omitted = [...excluded];
+    const bound = data.catalog.filter(p => p.driverKind === driver).reduce((n, p) => n + p.models.length, 0);
+    for (let i = 0; i < bound; i++) {
+      const next = select(driver, role, effort, main, omitted, alternate, withoutQuota);
+      if (!next) break;
+      result.push(...[next, ...next.alternatives].filter(t => t.model === next.model).map(pairTarget));
+      omitted.push(next.model);
+    }
+    return result;
   };
-  const first = (drivers: string[], role: Role, effort: Effort | undefined, main: boolean, excluded?: string) => {
+  const first = (drivers: string[], role: Role, effort: Effort | undefined, main: boolean, excluded: string[] = []) => {
     for (const driver of drivers) {
-      const target = choose(driver, role, effort, main, excluded);
-      if (target) return target;
+      const result = select(driver, role, effort, main, excluded);
+      if (result) return pairTarget(result);
     }
     return null;
   };
-  let main = first(others, mainRole, input.mainEffort, true);
-  let peer: Target | null = null, quotaException = false;
-  if (main) peer = first(order([input.authorProvider, ...others.filter(d => d !== driverOf(main!))]),
-    peerRole, input.peerEffort, false, main.model);
-  const pressured = (drivers: string[]) => {
-    const present = drivers.filter(d => data.catalog.some(p => p.driverKind === d && p.canRunChildTask && p.models.length));
-    return present.length > 0 && present.every(pressure);
+  let main: Target | null = null, peer: Target | null = null, quotaException = false;
+  // Search for a complete independent pair before keeping a partial or considering a waiver.
+  outer: for (const driver of others) {
+    for (const candidate of choices(driver, mainRole, input.mainEffort, true)) {
+      const partner = first(order([input.authorProvider, ...others.filter(d => d !== driver)]),
+        peerRole, input.peerEffort, false, [candidate.model]);
+      main ??= candidate;
+      if (partner) { main = candidate; peer = partner; break outer; }
+    }
+  }
+  const pressured = (drivers: string[], role: Role, effort: Effort | undefined, isMain: boolean, excluded: string[] = []) => {
+    const targets = drivers.flatMap(d => choices(d, role, effort, isMain, excluded, !isMain, true));
+    // Missing models/coverage are not alternatives. Unknown quota on a real alternative is no waiver.
+    return targets.length > 0 && targets.every(target => {
+      const p = data.catalog.find(p => p.providerInstanceId === target.providerInstanceId)!;
+      const q = data.quota[p.providerInstanceId], c = data.capacity?.[p.providerInstanceId];
+        if (p.driverKind === "antigravity" && (q?.activeStop || c?.class === "stopped" &&
+          c.reasons.some(r => r.startsWith("active usage stop")))) return true;
+        const age = ageSeconds(q?.observedAt, data.now);
+        if (age === null || age * 1000 >= config.quotaMaxAgeMs || q?.incomplete || c?.creditFunded) return false;
+        if (q?.activeStop) return true;
+        const advice = modelWindowPolicy(q!.windows,
+          p.driverKind === "antigravity" ? target.model : p.driverKind === "claudeAgent" ? "claude-opus-5-5" : "",
+          data.now, config.minimumRemaining, config.paceMargin);
+      return !!advice.gate || !!advice.limit;
+    });
   };
-  if (input.allowQuotaException && (!main && pressured(others) ||
-      main && !peer && pressured(ROUTED_DRIVERS.filter(d => d !== driverOf(main!))))) {
+  if (input.allowQuotaException && (!main && pressured(others, mainRole, input.mainEffort, true) ||
+      main && !peer && pressured(ROUTED_DRIVERS.filter(d => d !== driverOf(main!)),
+        peerRole, input.peerEffort, false, [main.model]))) {
     const driver = main ? driverOf(main) : input.authorProvider;
-    main ??= choose(driver, mainRole, input.mainEffort, true);
+    const chosen = main ?? first([driver], mainRole, input.mainEffort, true);
+    main = chosen;
     if (main) {
-      peer = choose(driver, peerRole, input.peerEffort, false, main.model, true);
-      quotaException = !!main && (!!peer || driver === input.authorProvider);
+      const alternate = select(driver, peerRole, input.peerEffort, false, [main.model], true);
+      peer = alternate ? pairTarget(alternate) : null;
+      quotaException = !!peer || driver === input.authorProvider;
     }
   }
   const status = main && peer ? "complete" : main ? "partial" : "unavailable";

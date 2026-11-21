@@ -2,7 +2,7 @@ import { benchmarkCoverage, benchmarkEfforts, compareBenchmark, targetEffort } f
 import { RouteError } from "./errors.ts";
 import { modelWindowPolicy } from "../quota/window-policy.ts";
 import type { Capacity } from "../quota/capacity.ts";
-import { banned, compareScores, emptyHistory, inProbation, roleKey, scoreFor, targetEligible, trialAvailable } from "./targets.ts";
+import { banned, compareScores, emptyHistory, inProbation, driverPickKey, roleKey, scoreFor, targetEligible, trialAvailable } from "./targets.ts";
 import type { RoutingHistory } from "./targets.ts";
 import { validateScores } from "./scores.ts";
 import type { ScoreSnapshot } from "./scores.ts";
@@ -21,6 +21,9 @@ export interface PolicyData {
 }
 /** Pure policy. No IO, provider launch, feed posting or quota redemption. */
 export function recommend(input: RouteInput, data: PolicyData): RouteResult {
+  return recommendPolicy(input, data);
+}
+function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScores = false): RouteResult {
   routeInput(input);
   const config = { ...DEFAULT_POLICY, ...data.config };
   const reasons: string[] = [];
@@ -42,10 +45,20 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   const benchmark = !!config.benchmark && !pin;
   if (benchmark && (!scores || scores.version !== 2 || scores.indexVersion !== config.benchmark!.indexVersion))
     throw new RouteError("no_candidate", "Benchmark routing requires a version 2 snapshot with configured index " + config.benchmark!.indexVersion);
-  if (!benchmark && scores && input.effortOverride && !pair.some(model => scoreFor(scores, model, effort))) {
-    scores = null;
-    overrideFallback = true;
-    reasons.push("Explicit effort override has no mapped role anchors; use fixed role pairs without an AA quality claim");
+  if (!retainOverrideScores && !benchmark && scores && input.effortOverride && !pair.some(model => scoreFor(scores, model, effort))) {
+    // Probe the extra driver's actual admission, not just its catalog presence.
+    // If it is stopped, banned, separated or otherwise held, keep main's primary fallback.
+    let additionalCandidate = false;
+    const extraCatalog = catalog.filter(p => p.driverKind === "antigravity" && p.canRunChildTask);
+    if (extraCatalog.length) {
+      try { recommendPolicy(input, { ...data, catalog: extraCatalog }, true); additionalCandidate = true; }
+      catch (error) { if (!(error instanceof RouteError) || error.code !== "no_candidate") throw error; }
+    }
+    if (!additionalCandidate) {
+      scores = null;
+      overrideFallback = true;
+      reasons.push("Explicit effort override has no mapped role anchors; use fixed role pairs without an AA quality claim");
+    }
   }
   reasons.push(pin ? "Fleet pin overrides bans, scores, probation and quota preference; availability, effort, active stops and review separation still apply"
     : scores ? scoreAge! * 1000 >= config.scoreMaxAgeMs ? "AA snapshot stale; use last good snapshot" : "AA role target " + input.role + " with intelligence floor " + config.floors[input.role]
@@ -78,6 +91,11 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
 
     for (const m of p.models) {
     const model = m.id;
+    if (p.driverKind === "antigravity" &&
+        (input.authorProvider === "claudeAgent" && model.startsWith("claude-") ||
+         input.authorProvider === "codex" && model.startsWith("gpt-"))) {
+      reasons.push(model + ": review excludes the author's model family"); continue;
+    }
     if (pin ? model !== pin.model : banned(model, config.bans)) {
       reasons.push(model + (pin ? ": fleet pin requires " + pin.model : ": banned"));
       continue;
@@ -86,10 +104,11 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
       reasons.push(model + ": outside fixed role pair while AA unavailable"); continue;
     }
     for (const effort of benchmark ? benchmarkEfforts(model, input.effortOverride) : [input.effortOverride ?? (input.role === "builder" ? "high" : "medium")]) {
-    const prior = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride, config.benchmark?.indexVersion)];
-    const priorDriver = prior && data.catalog.find(p => p.providerInstanceId === prior.providerInstanceId)?.driverKind;
-    const incumbent = (priorDriver === p.driverKind && PRIMARY_DRIVERS.includes(priorDriver) ? prior?.model : undefined) ??
-      config.driverModels?.[p.driverKind]?.[0] ?? (p.driverKind === "antigravity" ? "gemini-4-neon" : pair[p.driverKind === "claudeAgent" ? 0 : 1]);
+    const key = roleKey(input.role, input.authorProvider, input.effortOverride, config.benchmark?.indexVersion);
+    // Preserve main's shared primary incumbent. Fallbacks have separate driver slots.
+    const prior = history.picks[PRIMARY_DRIVERS.includes(p.driverKind) ? key : driverPickKey(key, p.driverKind)];
+    const incumbent = prior?.model ?? config.driverModels?.[p.driverKind]?.[0] ??
+      (p.driverKind === "antigravity" ? "gemini-4-neon" : pair[p.driverKind === "claudeAgent" ? 0 : 1]);
     if (!pin && scores && !targetEligible(model, effort, input.role, scores, data.analytics, config, data.now, incumbent, reasons, p.driverKind)) continue;
     const option = m.options?.find(o => EFFORT_OPTION_IDS.includes(o.id) &&
       o.type === "select" && o.options?.some(v => v.id === effort))?.id;
@@ -231,7 +250,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
   eligible = eligible.filter(c => {
-    const held = scores && !pin && inProbation(c.model, input.role, history, config, data.now, c.driver) && !trialAvailable(history, config, c.model);
+    const held = scores && !pin && inProbation(c.model, input.role, history, config, data.now, c.driver) && !trialAvailable(history, config, c.model, c.driver);
     if (held) {
       const reason = c.model + ": probation recommendation share limited to " + config.probationShare;
       reasons.push(reason); providerReasons.get(c.driver)!.push(reason);
@@ -253,6 +272,8 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     else reasons.push("Role top pick " + topPick.model + ": AA intelligence " + s.intelligence + ", coding " + s.coding +
       ", 3:1 input/output price $" + (s.inputPrice === null || s.outputPrice === null ? "unknown" : (3 * s.inputPrice + s.outputPrice) / 4) + "/M; " + input.role + " objective after quota policy");
   }
-  return { ...target(eligible[0]!), diagnostics, topPick, byProvider, alternatives: eligible.slice(1).map(target), reasons,
+  return { ...target(eligible[0]!), diagnostics, topPick, byProvider, alternatives: eligible.slice(1).filter(c =>
+      !scores || pin || !inProbation(c.model, input.role, history, config, data.now, c.driver) ||
+      byProvider[c.driver]?.eligible && byProvider[c.driver]?.model === c.model).map(target), reasons,
     dataAges: { quota: ages, slopalytics: analyticsAge, slopalyticsWindow: windowAge, artificialAnalysis: scoreAge } };
 }

@@ -282,14 +282,18 @@ export class HeadroomMonitor {
       // Cached balances are not transferable to a newly configured HOME, including the first
       // config after restart (persisted observations have no credential identifiers).
       const next = row?.driver === p.driver ? row : newProvider(p.instanceId, p.driver);
-      if (!priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p)) {
+      const contextChanged = !priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p);
+      const reusedAntigravitySnapshot = p.driver === "antigravity" && contextChanged &&
+        priorContexts.has(p.instanceId) && p.usageLimits && next.included.observedAt !== null &&
+        Date.parse(p.usageLimits.checkedAt) <= Date.parse(next.included.observedAt);
+      if (contextChanged) {
         const clean = newProvider(p.instanceId, p.driver);
         delete next.burnHistory;
         delete next.accountKey;
         next.credits = clean.credits; next.ordinaryUsageAllowed = clean.ordinaryUsageAllowed;
         next.spendControlReached = clean.spendControlReached; next.plan = clean.plan;
         if (next.manualResets.source === "codex-app-server") next.manualResets = clean.manualResets;
-        if (p.driver === "claudeAgent" || p.driver === "codex") {
+        if (p.driver === "claudeAgent" || p.driver === "codex" || p.driver === "antigravity") {
           // Native windows/reset inventory belong to this instance's account only.
           next.included = clean.included; next.manualResets = clean.manualResets;
         }
@@ -301,7 +305,7 @@ export class HeadroomMonitor {
         return next;
       }
       if (p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
-      applyT3(next, p);
+      if (!reusedAntigravitySnapshot) applyT3(next, p);
       if (p.driver === "claudeAgent" && !p.quotaAccountKey) {
         if (next.included.source === "t3") delete next.accountKey;
         next.manualResets = newProvider(p.instanceId, p.driver).manualResets;
