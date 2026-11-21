@@ -69,7 +69,7 @@ const window = (id: string, remainingPercent: number) => ({ id,
   kind: id.endsWith("5h") ? "session" : "weekly", remainingPercent,
   windowDurationMins: id.endsWith("5h") ? 300 : 10080, resetsAt: iso(now + 3600000) });
 test("Antigravity Gemini, third-party and Argon windows gate only matching models", () => {
-  const check = (windows: Parameters<typeof modelWindowPolicy>[0], model: string) => modelWindowPolicy(windows, model, now, .1, .1);
+  const check = (windows: Parameters<typeof modelWindowPolicy>[0], model: string) => modelWindowPolicy(windows, model, now, .1, .1, "antigravity");
   for (const suffix of ["5h", "weekly"]) {
     const windows = [window("3p-" + suffix, 0), window("gemini-" + suffix, 80)];
     assert.equal(check(windows, "gemini-4-neon").gate, null);
@@ -91,6 +91,6 @@ test("Antigravity Gemini, third-party and Argon windows gate only matching model
     windows: [window("gemini-weekly", 80), window("3p-5h", 0)].map(w => ({ ...w, usedPercent: 100 - w.remainingPercent })) } });
   assert.equal(row.included.value?.[0]?.remainingPercent, 80);
   assert.equal(classifyCapacity(row, false, now).class, "unknown");
-  assert.equal(windowPolicy(row.included.value!, now, .1, .1).gate, null);
+  assert.equal(windowPolicy(row.included.value!, now, .1, .1, "antigravity").gate, null);
   assert.equal(check(row.included.value!, "gemini-4-neon").binding?.id, "gemini-weekly");
 });

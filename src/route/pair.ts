@@ -131,7 +131,7 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
       if (antigravityExhaustion([...(q?.knownWindows ?? []), ...(q?.windows ?? [])], target.model, data.now, config.minimumRemaining)) return true;
       const age = ageSeconds(q?.observedAt, data.now);
       if (age === null || age * 1000 >= config.quotaMaxAgeMs || q?.incomplete || c?.creditFunded) return false;
-      const advice = modelWindowPolicy(q!.windows, target.model, data.now, config.minimumRemaining, config.paceMargin);
+      const advice = modelWindowPolicy(q!.windows, target.model, data.now, config.minimumRemaining, config.paceMargin, "antigravity");
       return !!advice.gate || !!advice.limit;
     });
   };

@@ -131,7 +131,7 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     const fresh = age !== null && age * 1000 < (q?.operatorEstimate ? 7 * 86_400_000 : config.quotaMaxAgeMs);
     const windows = fresh ? (q?.windows ?? []).filter(w => Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 &&
       w.remainingPercent <= 100 && (w.resetsAt === null || Date.parse(w.resetsAt) > data.now)) : [];
-    const advice = modelWindowPolicy(windows, ["claudeAgent", "antigravity"].includes(p.driverKind) ? model : "", data.now, config.minimumRemaining, config.paceMargin);
+    const advice = modelWindowPolicy(windows, ["claudeAgent", "antigravity"].includes(p.driverKind) ? model : "", data.now, config.minimumRemaining, config.paceMargin, p.driverKind);
     diagnostics.quota[p.providerInstanceId + ":" + model] = { accountKey: p.accountKey ?? null,
       bindingSource: p.accountKey ? "catalog" : "unbound", source: q?.operatorEstimate ? "operator_estimate" : "observation",
       ageSeconds: age, freshness: fresh ? "fresh" : age === null ? "unknown" : "stale",

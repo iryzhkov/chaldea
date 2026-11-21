@@ -395,6 +395,12 @@ Credential strings are not stored.
 Active stops and tight/stopped capacity still exclude the driver.
 Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 
+**Known limitations.** An exhausted Gemini window observed only during routing
+can be forgotten when a later same-fingerprint snapshot omits it. The observer
+also loses retained exhaustion across a catalog gap where the Antigravity
+instance disappears. Either case can permit routing before reset; both are
+deferred to a follow-up.
+
 `providerPreference` is an ordered array drawn from `antigravity`, `codex` and
 `claudeAgent`; unknown driver names are rejected. For example
 `["antigravity", "codex", "claudeAgent"]`. Listed drivers rank before unlisted

@@ -69,7 +69,7 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   const finish = (kind: CapacityClass, reason: string) => { c.class = kind; c.reasons.push(reason); return c; };
   const maxAge = p.included.source === "operator-weekly-target" ? 7 * 86400000 : config.maxAgeMs;
   const windows = fresh(p.included, now, maxAge) ?? [];
-  const advice = windowPolicy(windows, now, config.minimumRemaining, config.paceMargin);
+  const advice = windowPolicy(windows, now, config.minimumRemaining, config.paceMargin, p.driver);
   c.reasons.push(...advice.reasons);
   // An active usage stop is the provider's own refusal; nothing below overrides it.
   if (activeStop) return finish("stopped", "active usage stop; reserves do not authorize redemption");

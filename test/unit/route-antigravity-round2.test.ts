@@ -176,8 +176,8 @@ test("N-1: review model family separation applies even through explicit driver a
 test("N-2: unknown IDs constrain only their own family; unrelated model families get no invented family quota", () => {
   const windows = [window("gemini-future", 0), window("3p-future", 0)];
   for (const model of ["gemini-4-neon", "claude-opus-5-5", "gpt-oss-120b-medium"])
-    assert.ok(modelWindowPolicy(windows, model, now, .1, .1).limit);
-  assert.equal(modelWindowPolicy(windows, "unclassified-model", now, .1, .1).limit, undefined);
+    assert.ok(modelWindowPolicy(windows, model, now, .1, .1, "antigravity").limit);
+  assert.equal(modelWindowPolicy(windows, "unclassified-model", now, .1, .1, "antigravity").limit, undefined);
 });
 test("N-3: provider preferences accept only routed driver kinds", () => {
   const d = routeScratch();
