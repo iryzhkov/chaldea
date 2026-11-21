@@ -5,7 +5,7 @@ import { loadHeadroomConfig } from "../quota/codex-balance.ts";
 import { capacityKey } from "../quota/account.ts";
 import { classifyCapacity } from "../quota/capacity.ts";
 import { loadCapacityConfig } from "../quota/capacity-config.ts";
-import { metricNow, newProvider } from "../quota/headroom.ts";
+import { metricNow, newProvider, applyT3, antigravityRouteHold } from "../quota/headroom.ts";
 import { discoverServerUrl, switchPort } from "../t3/adapter.ts";
 import type { SwitchProvider, CatalogModelPreferences } from "../t3/adapter.ts";
 import { readToken } from "../quota/run.ts";
@@ -28,6 +28,7 @@ export function routeCatalog(providers: ReadonlyArray<SwitchProvider>, preferenc
     canRunChildTask: ROUTED_DRIVERS.includes(p.driver) && p.enabled && p.installed &&
       (p.availability === undefined || p.availability === "available") &&
       ["ready", "warning"].includes(p.status) && p.auth.status === "authenticated",
+    ...(p.driver === "antigravity" && p.usageLimits ? { usageLimits: p.usageLimits } : {}),
     models: p.models.filter(m => !preferences?.[p.instanceId]?.hiddenModels.includes(m.slug))
       .map(m => ({ id: m.slug, options: m.capabilities?.optionDescriptors ?? [] })),
   }));
@@ -76,10 +77,20 @@ async function collectContext(options: RouteOptions) {
   if (scores.reason) reasons.push("AA " + scores.reason);
   const analytics = await collectAnalytics(join(config.cacheDir, "slopalytics.json"), now, options.fetcher);
   if (analytics.reason) reasons.push("Slopalytics " + analytics.reason);
+  const admissionHolds = new Map(catalog.filter(p => p.driverKind === "antigravity").map(p =>
+    [p.providerInstanceId, antigravityRouteHold(state.headroom.providers.find(r => r.alias === p.providerInstanceId), p.usageLimits, now)]));
   const capacityState = { parked: state.parked, headroom: { ...state.headroom, providers: catalog
     .filter(p => ROUTED_DRIVERS.includes(p.driverKind)).map(p => {
       const original = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
       const row = { ...(original ?? newProvider(p.providerInstanceId, p.driverKind)) };
+      if (p.driverKind === "antigravity") {
+        // The live fingerprint's windows are authoritative; never retain saved login windows.
+        row.included = newProvider(row.alias, row.driver).included;
+        if (!admissionHolds.get(p.providerInstanceId)) applyT3(row, p);
+        quota[p.providerInstanceId] = { observedAt: row.included.observedAt, windows: row.included.value ?? [],
+          activeStop: quota[p.providerInstanceId]?.activeStop ?? false };
+        return row;
+      }
       const q = quota[p.providerInstanceId];
       if (q) row.included = { state: "fresh", error: null, source: q.operatorEstimate ? "operator-weekly-target" : row.included.source,
         observedAt: q.observedAt, value: q.windows.map(w => ({ ...w, id: (w as { id?: string }).id ?? w.kind, usedPercent: 100 - w.remainingPercent })) };
@@ -101,10 +112,10 @@ async function collectContext(options: RouteOptions) {
     if (!row) continue;
     const configured = mappings.get(p.providerInstanceId);
     const observer = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
-    if (p.driverKind === "antigravity" && (!observer?.antigravityContext?.admitted || observer.antigravityHold)) {
+    const hold = admissionHolds.get(p.providerInstanceId);
+    if (hold) {
       blockedInstances.add(p.providerInstanceId);
-      reasons.push(p.providerInstanceId + ": " + (observer?.antigravityHold ??
-        "Antigravity held: no saved verified context; waiting for a fresh attributed T3 snapshot"));
+      reasons.push(p.providerInstanceId + ": " + hold);
     }
     const expected = configured ?? p.accountKey;
     if (observer?.included.error === "context_mismatch" || row.included.error === "context_mismatch" || row.credits.error === "context_mismatch" ||
@@ -135,9 +146,7 @@ async function collectContext(options: RouteOptions) {
       }
       capacity[p.providerInstanceId] = classified;
     }
-    const observer = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
-    const admissionHold = p.driverKind === "antigravity" && (!observer?.antigravityContext?.admitted || observer.antigravityHold)
-      ? observer?.antigravityHold ?? "Antigravity held: no saved verified context; waiting for a fresh attributed T3 snapshot" : undefined;
+    const admissionHold = admissionHolds.get(p.providerInstanceId);
     return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId),
       ...(admissionHold ? { admissionHold } : {}), ...(key ? { accountKey: key } : {}) };
   });

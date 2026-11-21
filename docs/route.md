@@ -376,7 +376,11 @@ to the current verified login fingerprint. Returning to a previous login
 (A to B to A) also waits for a fresh observation; earlier snapshots are never
 restored. Removing and re-adding an alias requires fresh admission too.
 Restarting on the same admitted context preserves its snapshot, including
-exhausted windows. Credential strings are not stored.
+exhausted windows. At route time the live T3 fingerprint must match the saved
+context, and routing uses the live snapshot windows, including exhausted limits.
+Missing fingerprints, empty windows, unsupported or failed probes never admit
+Antigravity or release a hold. The observer requires usable windows too.
+Credential strings are not stored.
 Active stops and tight/stopped capacity still exclude the driver.
 Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 

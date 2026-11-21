@@ -44,6 +44,16 @@ function reserveAntigravity(history: RoutingHistory, role: Role, data: PolicyDat
   }
 }
 
+/** An Antigravity-only result cannot commit primary probe initialization. */
+function restorePrimaryHistory(history: RoutingHistory, original: RoutingHistory): void {
+  for (const field of ["seen", "allocations"] as const) {
+    for (const key of Object.keys(history[field])) if (!antigravityKey(key)) delete history[field][key];
+    Object.assign(history[field], Object.fromEntries(Object.entries(original[field]).filter(([key]) => !antigravityKey(key))));
+  }
+}
+const primaryTarget = (target: Target, data: PolicyData) =>
+  data.catalog.find(p => p.providerInstanceId === target.providerInstanceId)?.driverKind !== "antigravity";
+
 export const MAX_ROUTE_EVENTS = 128;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
 /** Reserve recommendation shares independently of best-effort announcements.
@@ -86,10 +96,13 @@ export class RouteState {
           .run(key, JSON.stringify(original));
         return { error };
       }
+      const primaryPicks = [result, ...Object.values(result.byProvider).filter(p => p.eligible)]
+        .filter(t => primaryTarget(t, data));
+      if (!primaryPicks.length) restorePrimaryHistory(history, original);
       for (const [model, allocation] of Object.entries(history.allocations)) {
-        if (!antigravityKey(model) && inProbation(model, input.role, history, config, data.now)) {
+        if (primaryPicks.length && !antigravityKey(model) && inProbation(model, input.role, history, config, data.now)) {
           allocation.calls++;
-          if (model === result.model || Object.values(result.byProvider).some(p => p.eligible && p.model === model)) allocation.trials++;
+          if (primaryPicks.some(p => p.model === model)) allocation.trials++;
         }
       }
       reserveAntigravity(history, input.role, data, Object.values(result.byProvider).filter(p => p.eligible), 1);
@@ -172,10 +185,12 @@ export class RouteState {
       }
       for (const [key, slot] of slots) {
         const history = historyFor(slot.request);
+        const primaryPicks = slot.targets.filter(t => primaryTarget(t, data));
+        if (!primaryPicks.length) restorePrimaryHistory(history, originals.get(key)!);
         for (const [model, allocation] of Object.entries(history.allocations)) {
-          if (!antigravityKey(model) && inProbation(model, slot.request.role, history, config, data.now)) {
-            allocation.calls += slot.models.length;
-            allocation.trials += slot.models.filter(m => m === model).length;
+          if (primaryPicks.length && !antigravityKey(model) && inProbation(model, slot.request.role, history, config, data.now)) {
+            allocation.calls += primaryPicks.length;
+            allocation.trials += primaryPicks.filter(t => t.model === model).length;
           }
         }
         reserveAntigravity(history, slot.request.role, data, slot.targets, slot.models.length);

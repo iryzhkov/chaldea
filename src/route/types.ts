@@ -1,3 +1,4 @@
+import type { SwitchProvider } from "../t3/adapter.ts";
 import { RouteError } from "./errors.ts";
 import { MODEL_MAP } from "./scores.ts";
 export type Provider = string;
@@ -10,6 +11,8 @@ export interface CatalogProvider {
   driverKind: string;
   canRunChildTask: boolean;
   admissionHold?: string;
+  /** Live Antigravity snapshot, including the nonsecret login fingerprint. */
+  usageLimits?: SwitchProvider["usageLimits"];
   models: ReadonlyArray<{ id: string; options?: ReadonlyArray<{
     id: string; type: string; options?: ReadonlyArray<{ id: string }>
   }> | null }>;

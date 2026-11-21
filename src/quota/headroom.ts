@@ -35,7 +35,7 @@ export interface ProviderHeadroom {
   readonly driver: string;
   accountKey?: string;
   /** Antigravity stays inadmissible after a context change until a newer attributed observation. */
-  antigravityContext?: { identity: string; changedAt: string; admitted: boolean };
+  antigravityContext?: { identity: string; fingerprint?: string; changedAt: string; admitted: boolean };
   antigravityHold?: string;
   creditExpiresAt?: string;
   burnHistory?: ReadonlyArray<BurnSample>;
@@ -99,6 +99,7 @@ export function validateHeadroom(value: unknown): HeadroomState {
         p.creditExpiresAt !== undefined && !iso(p.creditExpiresAt) ||
         p.driver === "antigravity" && (p.antigravityContext !== undefined &&
           (!object(p.antigravityContext) || !/^[a-f0-9]{64}$/.test(p.antigravityContext.identity) ||
+            p.antigravityContext.fingerprint !== undefined && !/^[a-f0-9]{64}$/.test(p.antigravityContext.fingerprint) ||
             !iso(p.antigravityContext.changedAt) || typeof p.antigravityContext.admitted !== "boolean") ||
           p.antigravityHold !== undefined && typeof p.antigravityHold !== "string") ||
         p.burnHistory !== undefined && (!Array.isArray(p.burnHistory) || p.burnHistory.length > 288 ||
@@ -126,7 +127,7 @@ export function validateHeadroom(value: unknown): HeadroomState {
   return value as HeadroomState;
 }
 
-export function applyT3(row: ProviderHeadroom, p: SwitchProvider): void {
+export function applyT3<T extends { readonly usageLimits?: SwitchProvider["usageLimits"] }>(row: ProviderHeadroom, p: T): void {
   const u = p.usageLimits;
   if (!u) return;
   const at = iso(u.checkedAt);
@@ -259,22 +260,39 @@ export interface HeadroomMonitorOptions {
   diagnostic?: (detail: { provider: string; reason: BalanceReason; binding?: "asserted" }) => void;
 }
 
+const fingerprintHash = (fingerprint: string) => createHash("sha256").update(fingerprint).digest("hex");
+function antigravityUsageHold(usage: SwitchProvider["usageLimits"], now: number): string | undefined {
+  if (!usage?.credentialFingerprint) return "Antigravity held: current verified login fingerprint is unavailable";
+  if (usage.unavailable !== undefined || !usage.windows.length ||
+      !usage.windows.every(w => Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent <= 100))
+    return "Antigravity held: current login has no usable T3 usage windows";
+  const at = iso(usage.checkedAt);
+  if (!at || Date.parse(at) > now) return "Antigravity held: current T3 observation timestamp is unavailable or in the future";
+}
+/** Route-time admission never borrows another fingerprint's observer admission or windows. */
+export function antigravityRouteHold(row: ProviderHeadroom | undefined, usage: SwitchProvider["usageLimits"], now: number): string | undefined {
+  const context = row?.antigravityContext;
+  if (!usage?.credentialFingerprint) return antigravityUsageHold(usage, now);
+  if (!context?.fingerprint) return "Antigravity held: no saved verified context; waiting for a fresh attributed T3 snapshot";
+  const unusable = antigravityUsageHold(usage, now);
+  if (unusable) return unusable;
+  if (context.fingerprint !== fingerprintHash(usage!.credentialFingerprint!))
+    return "Antigravity held: live credential fingerprint differs from the saved context";
+  if (Date.parse(usage!.checkedAt) <= Date.parse(context.changedAt))
+    return "Antigravity held: awaiting a T3 snapshot newer than the credential-context change";
+}
 /** No returning-login restoration: every changed or unknown context starts a fresh hold. */
 function antigravityObservation(row: ProviderHeadroom, p: SwitchProvider, identity: string, now: number) {
   const current = createHash("sha256").update(identity).digest("hex");
-  const changed = row.antigravityContext?.identity !== current;
-  if (changed) row.antigravityContext = { identity: current, changedAt: new Date(now).toISOString(), admitted: false };
+  const fingerprint = p.usageLimits?.credentialFingerprint ? fingerprintHash(p.usageLimits.credentialFingerprint) : undefined;
+  const changed = row.antigravityContext?.identity !== current || row.antigravityContext?.fingerprint !== fingerprint;
+  if (changed) row.antigravityContext = { identity: current, ...(fingerprint ? { fingerprint } : {}), changedAt: new Date(now).toISOString(), admitted: false };
   const context = row.antigravityContext!;
-  const at = iso(p.usageLimits?.checkedAt);
-  const verified = p.auth.status === "authenticated" && !!p.usageLimits?.credentialFingerprint;
-  if (!verified) row.antigravityHold = "Antigravity held: current verified login fingerprint is unavailable";
-  else if (!context.admitted && (!at || Date.parse(at) <= Date.parse(context.changedAt) || Date.parse(at) > now))
-    row.antigravityHold = "Antigravity held: awaiting a T3 snapshot newer than the credential-context change";
-  else {
-    context.admitted = true;
-    delete row.antigravityHold;
-  }
-  return { changed, blocked: !context.admitted || !!row.antigravityHold };
+  const hold = p.auth.status !== "authenticated" ? "Antigravity held: current login is not authenticated"
+    : antigravityRouteHold(row, p.usageLimits, now);
+  if (hold) { context.admitted = false; row.antigravityHold = hold; }
+  else { context.admitted = true; delete row.antigravityHold; }
+  return { changed, blocked: !!hold };
 }
 
 export class HeadroomMonitor {

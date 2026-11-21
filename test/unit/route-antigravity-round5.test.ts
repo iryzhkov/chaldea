@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { join } from "node:path";
 import { writeFileSync } from "node:fs";
@@ -36,7 +37,13 @@ async function context(home: string, state: ReturnType<typeof emptyState>, at: n
   const stateFile = join(home, "observer.json"), configPath = join(home, "route.json");
   saveState(stateFile, state, at);
   writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(home, "cache") }));
-  const { data } = await collectRouteContext({ home, configPath, now: at, catalog: async () => catalog,
+  const { data } = await collectRouteContext({ home, configPath, now: at, catalog: async () => catalog.map(p => {
+    const row = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
+    return { ...p, usageLimits: { credentialFingerprint: p.accountKey, checkedAt: row?.included.observedAt ?? iso(at - 500),
+      windows: (row?.included.value ?? [win(80)]).map(w => ({ id: w.id, kind: w.kind, usedPercent: w.usedPercent,
+        ...(w.windowDurationMins !== null ? { windowDurationMins: w.windowDurationMins } : {}),
+        ...(w.resetsAt ? { resetsAt: w.resetsAt } : {}) })) } };
+  }),
     fetcher: async () => { throw new Error("fixture offline"); } });
   return { ...data, scores: snapshot(["gemini-4-neon"]), config: { ...data.config, benchmark: { indexVersion: "5" } } };
 }
@@ -158,7 +165,7 @@ test("S5-2: delayed and legacy stops affect only their Antigravity alias, never 
   try {
     for (const [alias, accountKey] of [["ag", B], ["peer-b", B], ["peer-a", A]]) {
       const row = newProvider(alias!, "antigravity"); row.accountKey = accountKey!;
-      row.antigravityContext = { identity: "c".repeat(64), changedAt: iso(now - 2000), admitted: true };
+      row.antigravityContext = { identity: "c".repeat(64), fingerprint: createHash("sha256").update(accountKey!).digest("hex"), changedAt: iso(now - 2000), admitted: true };
       row.included = { state: "fresh", source: "t3", observedAt: iso(now - 500), value: [win(80)], error: null };
       state.headroom.providers.push(row);
     }
