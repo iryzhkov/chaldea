@@ -354,33 +354,29 @@ and probation. No calibration anchors are added automatically or in legacy mode.
 ### Antigravity and provider preference
 
 Antigravity is eligible through its ACP `thought_level` option. All routed
-drivers participate in capacity classification, account-mismatch exclusion and
-shared-account stops. Missing usage limits classify as unknown. T3 0.1.11 usage
-windows flow through the observer into routing with their supplied durations and
-resets. `gemini-5h` and `gemini-weekly` apply only to Gemini; `3p-5h` and
-`3p-weekly` apply only to Claude/GPT. `gemini-argon-wtu-weekly` applies only to
-Argon. Provider-wide classification excludes these scoped windows; candidate
-admission and pacing use only the matching windows. Unknown `gemini-*` or
-`3p-*` window IDs conservatively constrain that family. Missing durations never
-establish pacing. Models outside the Gemini/Claude/GPT families have no inferred
-family quota and use only common windows. A parked Antigravity stop is
-provider-wide: a stop from a third-party model also blocks Gemini. Its verified
-account identity is retained with the stop, so removing an instance or changing
-its login cannot release another instance on the stopped account before recovery
-or reset. Legacy stops are upgraded once from a verified disk observation that
-is at or before `stopAt`, rather than the later `seenAt`. If that original
-identity cannot be verified, the stop remains alias-only; a later login is never
-used to fill it in. These saved-identity rules apply only to Antigravity;
-Claude/Codex retain main's current-row stop propagation.
+drivers participate in capacity classification and account-mismatch exclusion.
+T3 0.1.11 usage windows flow through the observer into routing with their
+supplied durations and resets. `gemini-5h` and `gemini-weekly` apply only to
+Gemini; `3p-5h` and `3p-weekly` apply only to Claude/GPT.
+`gemini-argon-wtu-weekly` applies only to Argon. Provider-wide classification
+excludes these scoped windows; candidate admission and pacing use only matching
+windows. Unknown `gemini-*` or `3p-*` window IDs conservatively constrain that
+family. Missing durations never establish pacing. Models outside the
+Gemini/Claude/GPT families have no inferred family quota and use only common
+windows. A parked Antigravity stop applies only to its alias/instance, including
+all models on that instance: a third-party stop also blocks Gemini there. Stops
+have no saved account identity or migration. Old stop identity metadata is
+ignored. Claude/Codex retain main's stop handling.
 
-Antigravity stores hashes of verified credential contexts with observation
-watermarks. Restarting on the same verified login preserves a valid snapshot,
-including exhausted windows. Context records survive alias removal and re-addition.
-On a different login, snapshots at or before the retired context's newest
-`checkedAt` stay rejected until a newer observation arrives. The registry retains
-up to 1024 aliases without evicting retired watermarks; further aliases cannot
-supply observations until registry capacity is available. Credential strings
-are not stored.
+Antigravity stores a hash of its verified credential context with the observation.
+Every credential-context change, or a row without a saved context after upgrade,
+holds that instance from routing with a clear reason until T3 supplies an
+observation whose `checkedAt` is strictly newer than the change and attributed
+to the current verified login fingerprint. Returning to a previous login
+(A to B to A) also waits for a fresh observation; earlier snapshots are never
+restored. Removing and re-adding an alias requires fresh admission too.
+Restarting on the same admitted context preserves its snapshot, including
+exhausted windows. Credential strings are not stored.
 Active stops and tight/stopped capacity still exclude the driver.
 Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 
@@ -403,7 +399,9 @@ a calibrated baseline; other new models need operational evidence or explicit
 benchmark anchors. Scores are keyed by model and effort, so Antigravity's Opus
 uses the existing Opus rows. Operational evidence and baseline exemptions remain
 scoped to the driver: native Opus is not automatically a calibrated Antigravity
-baseline. Explicit driver allowlists can calibrate it. Fallback picks never
+baseline. An Antigravity driver allowlist can calibrate it; its exemptions apply
+only to Antigravity accounting keys. Native benchmark anchors retain main's rules,
+including configured anchors without a MODEL_MAP entry. Fallback picks never
 replace primary history incumbents, so primary routing can recover after a stop.
 Settled Antigravity picks have a separate incumbent slot. Codex and Claude retain
 main's shared incumbent slot; separating those primary slots is a follow-up,
@@ -445,9 +443,10 @@ Antigravity's Opus has shared measured scores but still needs driver-specific
 calibration before selection.
 
 `driverModels` optionally restricts drivers to operator-chosen models. Its
-default is `{}`, with no implicit catalog restriction. Allowlisted models count
-as calibrated baselines and the first becomes the driver's incumbent. Explicit
-allowlists restrict coverage and selection together.
+default is `{}`, with no implicit catalog restriction. For Antigravity, allowlisted
+models count as calibrated baselines and the first becomes its incumbent; these
+exemptions never affect native Claude/Codex probation. Explicit allowlists
+restrict coverage and selection together.
 
 Both route and review-pair inputs accept `authorProvider: "antigravity"`.
 Review pairs try eligible different drivers for the main and peer, honoring

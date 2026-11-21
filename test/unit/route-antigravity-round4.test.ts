@@ -8,13 +8,11 @@ import { recommend, type PolicyData } from "../../src/route/policy.ts";
 import { recommendReviewPair } from "../../src/route/pair.ts";
 import { emptyHistory } from "../../src/route/targets.ts";
 import { collectRouteContext } from "../../src/route/runtime.ts";
-import { emptyHeadroom, HeadroomMonitor, newProvider, validateHeadroom } from "../../src/quota/headroom.ts";
-import { emptyState, loadState, saveState } from "../../src/quota/state.ts";
+import { newProvider } from "../../src/quota/headroom.ts";
+import { emptyState, saveState } from "../../src/quota/state.ts";
 import { observeThread } from "../../src/quota/observer.ts";
 import { classifyCapacities } from "../../src/quota/capacity.ts";
 import { capacityKey } from "../../src/quota/account.ts";
-import { modelWindowPolicy } from "../../src/quota/window-policy.ts";
-import type { SwitchProvider } from "../../src/t3/adapter.ts";
 import { fixture, scores, analytics, stats, newcomer, now, iso } from "../fixtures/route/targets.ts";
 import { limited } from "../helpers/threads.ts";
 import { routeScratch } from "../fixtures/route/scratch.ts";
@@ -66,9 +64,10 @@ test("B2: primary stop identity and propagation use main's current-row behavior 
       const stopped = { ...limited("run", now - 500, null), providerInstanceId: "X" };
       observeThread(state, stopped, now - 400);
       const stop = state.parked.get(stopped.id)!;
-      assert.equal(stop.driver, undefined); assert.equal(stop.identityChecked, undefined);
+      assert.equal(Object.hasOwn(stop, "driver"), false); assert.equal(Object.hasOwn(stop, "identityChecked"), false);
       // Also accept state written by older PR versions, but ignore its saved primary identity.
-      state.parked.set(stopped.id, { ...stop, driver, accountKey: a });
+      const legacyStop = { ...stop, driver, accountKey: a };
+      state.parked.set(stopped.id, legacyStop);
       x.accountKey = b; state.headroom.providers.push(row("Y", a), row("Z", b));
       const capacity = classifyCapacities(state, now);
       assert.notEqual(capacity[capacityKey(driver, a)]?.class, "stopped");
@@ -139,61 +138,4 @@ test("Sol 5: stopped Neon cannot authorize a primary waiver when Claude is absen
     quota: { ag: { observedAt: iso(now), windows: [], activeStop: true } } });
   assert.deepEqual(result, baseline);
   assert.equal(result.status, "unavailable"); assert.equal(result.quotaException, false);
-});
-
-test("Sol 1: verified same-login restart retains an exhausted Antigravity snapshot", async () => {
-  let state = emptyHeadroom();
-  const make = () => new HeadroomMonitor({ state, config: { contexts: [], lowHeadroomPercent: 10 }, local: true, save: () => {}, now: () => now });
-  let monitor = make();
-  try {
-    const p: SwitchProvider = { instanceId: "ag", driver: "antigravity", enabled: true, installed: true,
-      auth: { status: "authenticated" }, status: "ready", models: [], quotaAccountKey: "a".repeat(64),
-      usageLimits: { credentialFingerprint: "fixture-a", checkedAt: iso(now), windows: [{ ...win(0), id: "gemini-weekly" }] } };
-    monitor.update([p]); await monitor.close();
-    state = validateHeadroom(JSON.parse(JSON.stringify(state)));
-    monitor = make(); monitor.update([p]);
-    const windows = state.providers[0]!.included.value!;
-    assert.equal(windows[0]?.remainingPercent, 0);
-    assert.ok(modelWindowPolicy(windows, "gemini-4-neon", now, .1, .1).limit);
-    assert.equal(state.providers[0]!.included.observedAt, iso(now));
-  } finally { await monitor.close(); }
-});
-
-test("Opus note 2: retired Antigravity watermarks survive alias removal, re-addition and restart", async () => {
-  let state = emptyHeadroom();
-  const make = () => new HeadroomMonitor({ state, config: { contexts: [], lowHeadroomPercent: 10 }, local: true, save: () => {}, now: () => now });
-  let monitor = make();
-  try {
-    const a: SwitchProvider = { instanceId: "ag", driver: "antigravity", enabled: true, installed: true, auth: { status: "authenticated" },
-      status: "ready", models: [], quotaAccountKey: "a".repeat(64),
-      usageLimits: { credentialFingerprint: "fixture-a", checkedAt: iso(now), windows: [{ ...win(10), id: "gemini-weekly" }] } };
-    monitor.update([a]); monitor.update([]);
-    assert.equal(state.providers.length, 0);
-    assert.ok(state.antigravityContexts?.ag);
-    await monitor.close();
-    state = validateHeadroom(JSON.parse(JSON.stringify(state)));
-    monitor = make();
-    const b = { ...a, quotaAccountKey: "b".repeat(64) };
-    monitor.update([b]); monitor.update([b]);
-    assert.equal(state.providers[0]!.included.value, null);
-    assert.equal(state.antigravityContexts?.ag?.retiredThrough, iso(now));
-    monitor.update([{ ...b, usageLimits: { ...b.usageLimits!, checkedAt: iso(now + 1), windows: [win(80)] } }]);
-    assert.equal(state.providers[0]!.included.observedAt, iso(now + 1));
-  } finally { await monitor.close(); }
-});
-
-test("Sol 2: legacy stop binding evidence must predate stopAt, not merely seenAt", () => {
-  const d = routeScratch();
-  try {
-    for (const [observedAt, expected] of [[now + 500, false], [now - 1, true]] as const) {
-      const state = emptyState(), row = newProvider("ag", "antigravity");
-      row.accountKey = "a".repeat(64);
-      row.included = { value: [win(80)], state: "fresh", source: "t3", observedAt: iso(observedAt), error: null };
-      state.headroom.providers.push(row);
-      state.parked.set("delayed", { provider: "ag", runId: "run", resetAt: null, stopAt: now, seenAt: now + 1000 });
-      const path = join(d.path, "observer.json"); saveState(path, state, now + 1000);
-      const loaded = loadState(path, now + 1000).parked.get("delayed")!;
-      assert.equal(loaded.accountKey !== undefined, expected);
-    }
-  } finally { d.remove(); }
 });

@@ -147,12 +147,8 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
 export function classifyCapacities(state: Pick<ObserverState, "headroom" | "parked">, now: number, config: CapacityConfig = DEFAULT_CAPACITY): Record<string, Capacity> {
   const stopped = new Set([...state.parked.values()].filter(s => s.resetAt === null ||
     !Number.isFinite(Date.parse(s.resetAt)) || Date.parse(s.resetAt) > now).map(s => s.provider));
-  const id = (p: ProviderHeadroom) => p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias;
-  const stoppedAccounts = new Set(state.headroom.providers.filter(p => p.driver !== "antigravity" && stopped.has(p.alias)).map(id));
-  for (const stop of state.parked.values()) {
-    if (stopped.has(stop.provider) && stop.driver === "antigravity" && stop.accountKey && /^[a-f0-9]{64}$/.test(stop.accountKey))
-      stoppedAccounts.add(capacityKey(stop.driver, stop.accountKey));
-  }
+  const id = (p: ProviderHeadroom) => p.driver === "antigravity" ? p.alias : p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias;
+  const stoppedAccounts = new Set(state.headroom.providers.filter(p => stopped.has(p.alias)).map(id));
   const result: Record<string, Capacity> = {};
   for (const p of state.headroom.providers) {
     const key = id(p), next = classifyCapacity(p, stoppedAccounts.has(key), now, config), prior = result[key];

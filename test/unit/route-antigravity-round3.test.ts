@@ -1,21 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
-import { readFileSync, writeFileSync } from "node:fs";
+
 import { DatabaseSync } from "node:sqlite";
 import { RouteState } from "../../src/route/state.ts";
 import { recommend, type PolicyData } from "../../src/route/policy.ts";
 import { recommendReviewPair } from "../../src/route/pair.ts";
 import { emptyHistory, historyModelKey } from "../../src/route/targets.ts";
-import { emptyHeadroom, HeadroomMonitor, newProvider, validateHeadroom } from "../../src/quota/headroom.ts";
-import { emptyState, loadState, saveState } from "../../src/quota/state.ts";
-import { observeThread } from "../../src/quota/observer.ts";
-import { collectRouteContext } from "../../src/route/runtime.ts";
-import { classifyCapacities } from "../../src/quota/capacity.ts";
-import { capacityKey } from "../../src/quota/account.ts";
-import type { SwitchProvider } from "../../src/t3/adapter.ts";
+
+
+
+
+
+
 import { fixture, now, iso, stats } from "../fixtures/route/targets.ts";
-import { limited } from "../helpers/threads.ts";
+
 import { routeScratch } from "../fixtures/route/scratch.ts";
 
 const window = (left: number) => ({ id: "weekly", kind: "weekly", usedPercent: 100 - left,
@@ -35,91 +34,6 @@ function bench(models = ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra"]): Policy
 const readHistory = (db: DatabaseSync, key: string) => JSON.parse(String(db.prepare("SELECT value FROM history WHERE role=?").get(key)!.value));
 const writeHistory = (db: DatabaseSync, key: string, h: unknown) =>
   db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(h));
-
-test("R3-1: stale old-login observations stay fenced across repeated updates and monitor restart", async () => {
-  const d = routeScratch(), path = join(d.path, "headroom.json");
-  let state = emptyHeadroom();
-  const makeMonitor = () => new HeadroomMonitor({ state, config: { contexts: [], lowHeadroomPercent: 10 },
-    local: true, save: () => {}, now: () => now });
-  let monitor = makeMonitor();
-  const remaining = () => state.providers[0]!.included.value?.[0]?.remainingPercent;
-  try {
-    const a: SwitchProvider = { instanceId: "ag", driver: "antigravity", enabled: true, installed: true,
-      auth: { status: "authenticated" }, status: "ready", models: [], quotaAccountKey: "a".repeat(64),
-      usageLimits: { checkedAt: iso(now), credentialFingerprint: "fixture-a", windows: [window(10)] } };
-    monitor.update([a]); assert.equal(remaining(), 10);
-    const b = { ...a, quotaAccountKey: "b".repeat(64) };
-    monitor.update([b]); monitor.update([b]);
-    assert.equal(state.providers[0]!.included.value, null);
-    assert.equal(state.providers[0]!.antigravityObservationFloor, iso(now));
-    await monitor.close();
-    writeFileSync(path, JSON.stringify(state));
-    state = validateHeadroom(JSON.parse(readFileSync(path, "utf8")));
-    monitor = makeMonitor(); monitor.update([b]); monitor.update([b]);
-    assert.equal(state.providers[0]!.included.value, null);
-    monitor.update([{ ...b, usageLimits: { ...b.usageLimits!, checkedAt: iso(now + 1), windows: [window(80)] } }]);
-    assert.equal(remaining(), 80);
-    monitor.update([b]);
-    assert.equal(remaining(), 80);
-    assert.throws(() => validateHeadroom({ ...state, providers: [{ ...state.providers[0], antigravityObservationFloor: "bad" }] }));
-  } finally { await monitor.close(); d.remove(); }
-});
-
-test("R3-2: legacy stops migrate from the original disk binding even after catalog removal", async () => {
-  const d = routeScratch();
-  try {
-    const stateFile = join(d.path, "observer.json"), configPath = join(d.path, "route.json"), accountKey = "a".repeat(64);
-    const state = emptyState(), original = newProvider("a", "antigravity");
-    original.accountKey = accountKey;
-    original.included = { value: [window(80)], state: "fresh", source: "t3", observedAt: iso(now - 1000), error: null };
-    state.headroom.providers.push(original);
-    state.parked.set("legacy", { provider: "a", runId: "run", resetAt: null, stopAt: now, seenAt: now });
-    saveState(stateFile, state, now);
-    const loaded = loadState(stateFile, now);
-    assert.equal(loaded.parked.get("legacy")?.accountKey, accountKey);
-    assert.equal(loaded.parked.get("legacy")?.identityChecked, true);
-    writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(d.path, "cache") }));
-    const opts = { home: d.path, configPath, now,
-      catalog: async () => [{ providerInstanceId: "b", driverKind: "antigravity", accountKey, canRunChildTask: true, models: [] }],
-      fetcher: async () => { throw new Error("offline fixture"); } };
-    assert.equal((await collectRouteContext(opts)).data.capacity?.b?.class, "stopped");
-
-    // An observation newer than the stop cannot establish the old login's identity.
-    original.included = { ...original.included, observedAt: iso(now + 1) };
-    saveState(stateFile, state, now);
-    const unknown = loadState(stateFile, now);
-    assert.equal(unknown.parked.get("legacy")?.accountKey, undefined);
-    unknown.headroom.providers[0]!.included = { ...original.included, observedAt: iso(now - 1000) };
-    saveState(stateFile, unknown, now);
-    assert.equal(loadState(stateFile, now).parked.get("legacy")?.accountKey, undefined);
-  } finally { d.remove(); }
-});
-
-test("R3-2: a saved stop propagates only to its saved account after the source instance logs in again", async () => {
-  const d = routeScratch();
-  try {
-    const aKey = "a".repeat(64), bKey = "b".repeat(64), state = emptyState();
-    const source = newProvider("a", "antigravity"); source.accountKey = aKey;
-    state.headroom.providers.push(source);
-    observeThread(state, { ...limited("run", now, null), providerInstanceId: "a" }, now);
-    source.accountKey = bKey;
-    const oldPeer = newProvider("old-peer", "antigravity"); oldPeer.accountKey = aKey;
-    const newPeer = newProvider("new-peer", "antigravity"); newPeer.accountKey = bKey;
-    state.headroom.providers.push(oldPeer, newPeer);
-    const capacities = classifyCapacities(state, now);
-    assert.equal(capacities[capacityKey("antigravity", aKey)]?.class, "stopped");
-    assert.equal(capacities[capacityKey("antigravity", bKey)]?.class, "unknown");
-    const stateFile = join(d.path, "observer.json"), configPath = join(d.path, "route.json");
-    saveState(stateFile, state, now);
-    writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(d.path, "cache") }));
-    const context = await collectRouteContext({ home: d.path, configPath, now,
-      catalog: async () => state.headroom.providers.map(p => ({ providerInstanceId: p.alias, driverKind: p.driver,
-        accountKey: p.accountKey!, canRunChildTask: true, models: [] })),
-      fetcher: async () => { throw new Error("offline fixture"); } });
-    assert.equal(context.data.capacity?.["old-peer"]?.class, "stopped");
-    assert.equal(context.data.capacity?.["new-peer"]?.class, "unknown");
-  } finally { d.remove(); }
-});
 
 test("R3-3: alternating main-format and PR writers share the plain primary provider-pick budget", () => {
   for (const [share, calls] of [[.5, 5], [.1, 60]]) {

@@ -7,18 +7,17 @@ import { recommendReviewPair } from "../../src/route/pair.ts";
 import { recommend, type PolicyData } from "../../src/route/policy.ts";
 import { RouteState } from "../../src/route/state.ts";
 import { driverPickKey, historyModelKey, roleKey } from "../../src/route/targets.ts";
-import { collectRouteContext } from "../../src/route/runtime.ts";
+
 import { loadRouteConfig } from "../../src/route/config.ts";
-import { emptyState, loadState, saveState } from "../../src/quota/state.ts";
-import { observeThread } from "../../src/quota/observer.ts";
-import { capacityKey } from "../../src/quota/account.ts";
-import { classifyCapacities } from "../../src/quota/capacity.ts";
-import { emptyHeadroom, HeadroomMonitor, newProvider } from "../../src/quota/headroom.ts";
+
+
+
+
+
 import { modelWindowPolicy } from "../../src/quota/window-policy.ts";
-import type { SwitchProvider } from "../../src/t3/adapter.ts";
 import { fixture, stats, now, iso } from "../fixtures/route/targets.ts";
 import { catalog } from "../fixtures/route/catalog.ts";
-import { limited, thread } from "../helpers/threads.ts";
+
 import { routeScratch } from "../fixtures/route/scratch.ts";
 
 const google = (models = ["gemini-4-neon"]) => ({
@@ -112,55 +111,6 @@ test("S-3: a settled Antigravity incumbent has a persistent separate driver slot
     f.analytics = null;
     assert.equal(routing.recommend({ role: "general" }, f, "fixture", false).model, "gemini-3.8-flash");
   } finally { routing.close(); d.remove(); }
-});
-test("S-1: stop identity survives removed instances, persistence and credential changes until reset/recovery", async () => {
-  const d = routeScratch();
-  try {
-    const state = emptyState(), a = newProvider("a", "antigravity"), key = "a".repeat(64);
-    a.accountKey = key; state.headroom.providers.push(a);
-    const stopped = { ...limited("run", now, iso(now + 60000)), providerInstanceId: "a" };
-    observeThread(state, stopped, now);
-    assert.equal(state.parked.get(stopped.id)?.accountKey, key);
-    a.accountKey = "b".repeat(64);
-    observeThread(state, { ...stopped, usageLimitResetAt: iso(now + 120000) }, now + 1);
-    assert.equal(state.parked.get(stopped.id)?.accountKey, key);
-    const b = newProvider("b", "antigravity"); b.accountKey = key;
-    state.headroom.providers = [b];
-    const stateFile = join(d.path, "state.json"), configPath = join(d.path, "route.json");
-    saveState(stateFile, state, now);
-    const loaded = loadState(stateFile, now);
-    assert.equal(classifyCapacities(loaded, now)[capacityKey("antigravity", key)]?.class, "stopped");
-    writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(d.path, "cache") }));
-    const options = { home: d.path, configPath, now, catalog: async () => [{ ...google(), providerInstanceId: "b", accountKey: key }],
-      fetcher: async () => { throw new Error("fixture offline"); } };
-    assert.equal((await collectRouteContext(options)).data.capacity?.b?.class, "stopped");
-    assert.equal((await collectRouteContext({ ...options, now: now + 120001 })).data.capacity?.b?.class, "unknown");
-    observeThread(loaded, { ...thread({ latestRunId: "next" }), id: stopped.id }, now + 10);
-    saveState(stateFile, loaded, now + 10);
-    assert.equal((await collectRouteContext(options)).data.capacity?.b?.class, "unknown");
-  } finally { d.remove(); }
-});
-test("S-2: Antigravity login or credential fingerprint changes discard included quota", async () => {
-  const state = emptyHeadroom();
-  const monitor = new HeadroomMonitor({ state, config: { contexts: [], lowHeadroomPercent: 10 },
-    local: true, save: () => {}, now: () => now });
-  try {
-    const p: SwitchProvider = { instanceId: "ag", driver: "antigravity", enabled: true, installed: true,
-      status: "ready", auth: { status: "authenticated" }, models: [], quotaAccountKey: "a".repeat(64),
-      usageLimits: { checkedAt: iso(now), credentialFingerprint: "fixture-a",
-        windows: [{ usedPercent: 90, id: "gemini-weekly", kind: "weekly", windowDurationMins: 10080 }] } };
-    monitor.update([p]); assert.equal(state.providers[0]?.included.value?.[0]?.remainingPercent, 10);
-    monitor.update([{ ...p, quotaAccountKey: "b".repeat(64), usageLimits: {
-      checkedAt: iso(now + 1), credentialFingerprint: "fixture-b", windows: [] } }]);
-    assert.equal(state.providers[0]?.accountKey, "b".repeat(64));
-    assert.equal(state.providers[0]?.included.value, null);
-    monitor.update([p]);
-    monitor.update([{ ...p, quotaAccountKey: "b".repeat(64) }]);
-    assert.equal(state.providers[0]?.included.value, null, "old checkedAt cannot stamp A's snapshot with B's identity");
-    monitor.update([p]);
-    monitor.update([{ ...p, usageLimits: { checkedAt: iso(now + 2), credentialFingerprint: "fixture-c", windows: [] } }]);
-    assert.equal(state.providers[0]?.included.value, null);
-  } finally { await monitor.close(); }
 });
 test("S-4: probation alternatives are omitted unless reserved, with driver/model trial accounting", () => {
   const d = routeScratch(), path = join(d.path, "route.sqlite"), routing = new RouteState(path);

@@ -9,6 +9,7 @@ export interface CatalogProvider {
   accountKey?: string;
   driverKind: string;
   canRunChildTask: boolean;
+  admissionHold?: string;
   models: ReadonlyArray<{ id: string; options?: ReadonlyArray<{
     id: string; type: string; options?: ReadonlyArray<{ id: string }>
   }> | null }>;

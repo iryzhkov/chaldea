@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { writeFileSync } from "node:fs";
+
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { RouteState } from "../../src/route/state.ts";
 import { recommend } from "../../src/route/policy.ts";
-import { collectRouteContext } from "../../src/route/runtime.ts";
-import { emptyState, saveState } from "../../src/quota/state.ts";
+
+
 import { newProvider, applyT3 } from "../../src/quota/headroom.ts";
 import { DEFAULT_POLICY } from "../../src/route/types.ts";
 import { roleAnchors, inProbation, emptyHistory } from "../../src/route/targets.ts";
@@ -55,9 +55,9 @@ test("native Opus and explicit driver allowlists exempt only their own driver", 
   assert.ok(!roleAnchors("builder", DEFAULT_POLICY, "antigravity").includes("claude-opus-5-5"));
   assert.equal(inProbation("claude-opus-5-5", "builder", h, DEFAULT_POLICY, now, "antigravity"), true);
   assert.equal(inProbation("claude-opus-5-5", "builder", h, DEFAULT_POLICY, now, "claudeAgent"), false);
-  const config = { ...DEFAULT_POLICY, driverModels: { claudeAgent: ["custom"] } };
-  assert.equal(inProbation("custom", "builder", h, config, now, "antigravity"), true);
-  assert.equal(inProbation("custom", "builder", h, config, now, "claudeAgent"), false);
+  const config = { ...DEFAULT_POLICY, driverModels: { antigravity: ["custom"] } };
+  assert.equal(inProbation("custom", "builder", h, config, now, "antigravity"), false);
+  assert.equal(inProbation("custom", "builder", h, config, now, "claudeAgent"), true);
   const f = fixture();
   const google = { providerInstanceId: "google", driverKind: "antigravity", canRunChildTask: true,
     models: [{ id: "claude-opus-5-5", options: [{ id: "thought_level", type: "select", options: [{ id: "high" }] }] }] };
@@ -93,33 +93,4 @@ test("Antigravity Gemini, third-party and Argon windows gate only matching model
   assert.equal(classifyCapacity(row, false, now).class, "unknown");
   assert.equal(windowPolicy(row.included.value!, now, .1, .1).gate, null);
   assert.equal(check(row.included.value!, "gemini-4-neon").binding?.id, "gemini-weekly");
-});
-test("runtime classifies Antigravity, excludes account mismatches and propagates shared stops", async () => {
-  const d = routeScratch();
-  try {
-    const stateFile = join(d.path, "observer.json"), configPath = join(d.path, "route.json");
-    writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(d.path, "cache") }));
-    const state = emptyState();
-    const accountKey = "a".repeat(64), otherKey = "b".repeat(64);
-    const names = ["google", "shared", "mismatch", "unknown"];
-    for (const name of names.slice(0, 3)) {
-      const row = newProvider(name, "antigravity"); row.accountKey = accountKey;
-      row.included = { state: "fresh", source: "t3", error: null, observedAt: iso(now),
-        value: [{ ...window("weekly", 5), usedPercent: 95 }] };
-      state.headroom.providers.push(row);
-    }
-    const catalog = names.map(providerInstanceId => ({ providerInstanceId, driverKind: "antigravity", canRunChildTask: true,
-      ...(providerInstanceId === "unknown" ? {} : { accountKey: providerInstanceId === "mismatch" ? otherKey : accountKey }), models: [] }));
-    const opts = { home: d.path, configPath, now, catalog: async () => catalog,
-      fetcher: async () => { throw new Error("fixture offline"); } };
-    saveState(stateFile, state, now);
-    let result = await collectRouteContext(opts);
-    assert.equal(result.data.capacity?.google?.class, "tight");
-    assert.equal(result.data.capacity?.unknown?.class, "unknown");
-    assert.equal(result.data.catalog.find(p => p.providerInstanceId === "mismatch")?.canRunChildTask, false);
-    state.parked.set("thread", { provider: "google", runId: "r", stopAt: now, seenAt: now, resetAt: null });
-    saveState(stateFile, state, now);
-    result = await collectRouteContext(opts);
-    assert.equal(result.data.capacity?.shared?.class, "stopped");
-  } finally { d.remove(); }
 });

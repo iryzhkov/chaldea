@@ -36,9 +36,11 @@ export function compareScores(role: Role, x: Score, y: Score): number {
   return ((y.intelligence + coding(y)) / 2 - 2 * price(y)) - ((x.intelligence + coding(x)) / 2 - 2 * price(x));
 }
 export const roleAnchors = (role: Role, config: PolicyConfig, driver?: string): readonly string[] => {
-  const native = [...PAIRS[role], "gemini-4-neon", ...(config.benchmark?.anchors?.[role] ?? [])];
-  return [...native.filter(model => !driver || MODEL_MAP.some(m => m.model === model && m.harness === driver)),
-    ...(driver ? config.driverModels?.[driver] ?? [] : Object.values(config.driverModels ?? {}).flat())];
+  // Main's primary anchors accept operator baselines even before MODEL_MAP knows the model.
+  const anchors = [...PAIRS[role], ...(config.benchmark?.anchors?.[role] ?? [])];
+  if (driver !== "antigravity") return anchors;
+  return ["gemini-4-neon", ...(config.driverModels?.antigravity ?? []),
+    ...anchors.filter(model => MODEL_MAP.some(m => m.model === model && m.harness === "antigravity"))];
 };
 export function targetEligible(model: string, effort: Effort, role: Role, scores: ScoreSnapshot,
   analytics: Analytics | null, config: PolicyConfig, now: number,

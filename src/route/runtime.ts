@@ -101,6 +101,11 @@ async function collectContext(options: RouteOptions) {
     if (!row) continue;
     const configured = mappings.get(p.providerInstanceId);
     const observer = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
+    if (p.driverKind === "antigravity" && (!observer?.antigravityContext?.admitted || observer.antigravityHold)) {
+      blockedInstances.add(p.providerInstanceId);
+      reasons.push(p.providerInstanceId + ": " + (observer?.antigravityHold ??
+        "Antigravity held: no saved verified context; waiting for a fresh attributed T3 snapshot"));
+    }
     const expected = configured ?? p.accountKey;
     if (observer?.included.error === "context_mismatch" || row.included.error === "context_mismatch" || row.credits.error === "context_mismatch" ||
         expected && (p.accountKey && expected !== p.accountKey || row.accountKey && expected !== row.accountKey)) {
@@ -117,16 +122,11 @@ async function collectContext(options: RouteOptions) {
   }
   const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.driver !== "antigravity" && p.accountKey && quota[p.alias]?.activeStop)
     .map(p => capacityKey(p.driver, p.accountKey!)));
-  for (const stop of state.parked.values()) {
-    if (stop.driver === "antigravity" && stop.accountKey && /^[a-f0-9]{64}$/.test(stop.accountKey) &&
-        (stop.resetAt === null || !Number.isFinite(Date.parse(stop.resetAt)) || Date.parse(stop.resetAt) > now))
-      stoppedAccounts.add(capacityKey(stop.driver, stop.accountKey));
-  }
   const capacity: Record<string, ReturnType<typeof classifyCapacity>> = {};
   const boundCatalog = catalog.map(p => {
     let row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
     const key = mappings.get(p.providerInstanceId) ?? p.accountKey ?? row?.accountKey;
-    const stop = !!quota[p.providerInstanceId]?.activeStop || !!key && stoppedAccounts.has(capacityKey(p.driverKind, key));
+    const stop = !!quota[p.providerInstanceId]?.activeStop || p.driverKind !== "antigravity" && !!key && stoppedAccounts.has(capacityKey(p.driverKind, key));
     if (row) {
       const classified = classifyCapacity(row, stop, now, capacityConfig);
       if (quota[p.providerInstanceId]?.incomplete) {
@@ -135,7 +135,11 @@ async function collectContext(options: RouteOptions) {
       }
       capacity[p.providerInstanceId] = classified;
     }
-    return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId), ...(key ? { accountKey: key } : {}) };
+    const observer = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
+    const admissionHold = p.driverKind === "antigravity" && (!observer?.antigravityContext?.admitted || observer.antigravityHold)
+      ? observer?.antigravityHold ?? "Antigravity held: no saved verified context; waiting for a fresh attributed T3 snapshot" : undefined;
+    return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId),
+      ...(admissionHold ? { admissionHold } : {}), ...(key ? { accountKey: key } : {}) };
   });
   const data: PolicyData = { catalog: boundCatalog, quota, analytics: analytics.value, scores: scores.value, now, config, capacity };
   return { data, config, reasons,

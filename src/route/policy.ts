@@ -77,6 +77,7 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     const scoped = providerReasons.get(p.driverKind) ?? [];
     providerReasons.set(p.driverKind, scoped);
     const reject = (reason: string) => { scoped.push(reason); reasons.push(reason); };
+    if (p.driverKind === "antigravity" && p.admissionHold) { reject(p.admissionHold); continue; }
     if (input.authorProvider !== undefined && p.driverKind === input.authorProvider) {
       reject(p.providerInstanceId + ": review requires the other provider from " + input.authorProvider); continue;
     }
@@ -245,7 +246,7 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   };
   rankCandidates(eligible, !benchmark);
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
-  if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target" + (benchmark ? "; " + Object.entries(diagnostics.benchmarkCoverage ?? {}).filter(([, c]) => !c.complete).map(([p, c]) => p + " missing benchmark coverage: " + c.missing.join(", ")).join("; ") : ""));
+  if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target" + catalog.filter(p => p.driverKind === "antigravity" && p.admissionHold).map(p => "; " + p.admissionHold).join("") + (benchmark ? "; " + Object.entries(diagnostics.benchmarkCoverage ?? {}).filter(([, c]) => !c.complete).map(([p, c]) => p + " missing benchmark coverage: " + c.missing.join(", ")).join("; ") : ""));
   if (input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
