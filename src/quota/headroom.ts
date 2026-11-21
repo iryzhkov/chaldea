@@ -1,5 +1,7 @@
 // Sanitized, independently timestamped quota observations. No provider/account payload is persisted wholesale.
+import { createHash } from "node:crypto";
 import { accountKey } from "./account.ts";
+import { mergeAntigravityWindows } from "./window-policy.ts";
 import { retainBurnSample } from "./capacity.ts";
 import type { BurnSample } from "./capacity.ts";
 import { resolve } from "node:path";
@@ -33,6 +35,11 @@ export interface ProviderHeadroom {
   readonly alias: string;
   readonly driver: string;
   accountKey?: string;
+  /** Antigravity stays inadmissible after a context change until a newer attributed observation. */
+  antigravityContext?: { identity: string; fingerprint?: string; changedAt: string; admitted: boolean };
+  antigravityHold?: string;
+  /** Retained constraints, separate from live pacing; the standard metric stays main-readable. */
+  antigravityWindows?: ReadonlyArray<Window & { observedAt: string }>;
   creditExpiresAt?: string;
   burnHistory?: ReadonlyArray<BurnSample>;
   binding?: "asserted" | "verified";
@@ -93,6 +100,14 @@ export function validateHeadroom(value: unknown): HeadroomState {
     if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
         p.accountKey !== undefined && !/^[a-f0-9]{64}$/.test(p.accountKey) ||
         p.creditExpiresAt !== undefined && !iso(p.creditExpiresAt) ||
+        p.driver === "antigravity" && (p.antigravityContext !== undefined &&
+          (!object(p.antigravityContext) || !/^[a-f0-9]{64}$/.test(p.antigravityContext.identity) ||
+            p.antigravityContext.fingerprint !== undefined && !/^[a-f0-9]{64}$/.test(p.antigravityContext.fingerprint) ||
+            !iso(p.antigravityContext.changedAt) || typeof p.antigravityContext.admitted !== "boolean") ||
+          p.antigravityHold !== undefined && typeof p.antigravityHold !== "string") ||
+        p.driver === "antigravity" && p.antigravityWindows !== undefined && (!Array.isArray(p.antigravityWindows) || p.antigravityWindows.length > 4096 ||
+          !p.antigravityWindows.every((w: any) => object(w) && safeId(w.id) && iso(w.observedAt) && percent(w.usedPercent) && percent(w.remainingPercent) &&
+            (w.resetsAt === null || iso(w.resetsAt)))) ||
         p.burnHistory !== undefined && (!Array.isArray(p.burnHistory) || p.burnHistory.length > 288 ||
           !p.burnHistory.every((s: any) => object(s) && iso(s.observedAt) && Array.isArray(s.windows) && s.windows.length <= 32 &&
             s.windows.every((w: any) => object(w) && safeId(w.id) && percent(w.remainingPercent) && percent(w.usedPercent) &&
@@ -118,7 +133,7 @@ export function validateHeadroom(value: unknown): HeadroomState {
   return value as HeadroomState;
 }
 
-export function applyT3(row: ProviderHeadroom, p: SwitchProvider): void {
+export function applyT3<T extends { readonly usageLimits?: SwitchProvider["usageLimits"] }>(row: ProviderHeadroom, p: T, now?: number): void {
   const u = p.usageLimits;
   if (!u) return;
   const at = iso(u.checkedAt);
@@ -128,14 +143,19 @@ export function applyT3(row: ProviderHeadroom, p: SwitchProvider): void {
   if (u.unavailable !== undefined && newer(row.included)) {
     if (reason === "unsupported") row.included = unknown("t3", "unsupported");
     else row.included = { ...row.included, error: "probe_failed", state: "error" };
-  } else if (u.unavailable === undefined && newer(row.included)) {
-    const windows = u.windows.slice(0, 32).map((w, i): Window => ({ id: safeId(w.id) ?? `window_${i}`,
+  } else if (u.unavailable === undefined && (newer(row.included) || row.driver === "antigravity")) {
+    const windows = u.windows.slice(0, row.driver === "antigravity" ? 4096 : 32).map((w, i): Window => ({ id: safeId(w.id) ?? `window_${i}`,
       kind: ["session", "weekly", "monthly", "other"].includes(w.kind ?? "") ? w.kind! : "other",
       usedPercent: w.usedPercent, remainingPercent: 100 - w.usedPercent,
       windowDurationMins: count(w.windowDurationMins) ? w.windowDurationMins : null, resetsAt: iso(w.resetsAt) }));
     if (windows.every(w => percent(w.usedPercent)) && windows.length > 0) {
-      retainBurnSample(row, at);
-      row.included = observed(windows, "t3", at);
+      if (row.driver !== "antigravity" || newer(row.included)) retainBurnSample(row, at);
+      if (row.driver === "antigravity") {
+        const retained = mergeAntigravityWindows(row.antigravityWindows ?? row.included.value ?? [],
+          windows, row.included.observedAt, at, now ?? Date.now());
+        row.antigravityWindows = retained;
+        if (newer(row.included)) row.included = observed(windows.slice(0, 32), "t3", at);
+      } else row.included = observed(windows, "t3", at);
     }
   }
   // A window-only event must not advance reset inventory's successful observation time.
@@ -250,6 +270,42 @@ export interface HeadroomMonitorOptions {
   read?: BalanceReader; now?: () => number; random?: () => number;
   diagnostic?: (detail: { provider: string; reason: BalanceReason; binding?: "asserted" }) => void;
 }
+
+const fingerprintHash = (fingerprint: string) => createHash("sha256").update(fingerprint).digest("hex");
+function antigravityUsageHold(usage: SwitchProvider["usageLimits"], now: number): string | undefined {
+  if (!usage?.credentialFingerprint) return "Antigravity held: current verified login fingerprint is unavailable";
+  if (usage.unavailable !== undefined || !usage.windows.length || usage.windows.length > 4096 ||
+      !usage.windows.every(w => Number.isFinite(w.usedPercent) && w.usedPercent >= 0 && w.usedPercent <= 100))
+    return "Antigravity held: current login has no usable T3 usage windows";
+  const at = iso(usage.checkedAt);
+  if (!at || Date.parse(at) > now) return "Antigravity held: current T3 observation timestamp is unavailable or in the future";
+}
+/** Route-time admission never borrows another fingerprint's observer admission or windows. */
+export function antigravityRouteHold(row: ProviderHeadroom | undefined, usage: SwitchProvider["usageLimits"], now: number): string | undefined {
+  const context = row?.antigravityContext;
+  if (!usage?.credentialFingerprint) return antigravityUsageHold(usage, now);
+  if (!context?.fingerprint) return "Antigravity held: no saved verified context; waiting for a fresh attributed T3 snapshot";
+  const unusable = antigravityUsageHold(usage, now);
+  if (unusable) return unusable;
+  if (context.fingerprint !== fingerprintHash(usage!.credentialFingerprint!))
+    return "Antigravity held: live credential fingerprint differs from the saved context";
+  if (Date.parse(usage!.checkedAt) <= Date.parse(context.changedAt))
+    return "Antigravity held: awaiting a T3 snapshot newer than the credential-context change";
+}
+/** No returning-login restoration: every changed or unknown context starts a fresh hold. */
+function antigravityObservation(row: ProviderHeadroom, p: SwitchProvider, identity: string, now: number) {
+  const current = createHash("sha256").update(identity).digest("hex");
+  const fingerprint = p.usageLimits?.credentialFingerprint ? fingerprintHash(p.usageLimits.credentialFingerprint) : undefined;
+  const changed = row.antigravityContext?.identity !== current || row.antigravityContext?.fingerprint !== fingerprint;
+  if (changed) row.antigravityContext = { identity: current, ...(fingerprint ? { fingerprint } : {}), changedAt: new Date(now).toISOString(), admitted: false };
+  const context = row.antigravityContext!;
+  const hold = p.auth.status !== "authenticated" ? "Antigravity held: current login is not authenticated"
+    : antigravityRouteHold(row, p.usageLimits, now);
+  if (hold) { context.admitted = false; row.antigravityHold = hold; }
+  else { context.admitted = true; delete row.antigravityHold; }
+  return { changed, blocked: !!hold };
+}
+
 export class HeadroomMonitor {
   #providers: ReadonlyArray<SwitchProvider> = [];
   #active = false;
@@ -282,7 +338,10 @@ export class HeadroomMonitor {
       // Cached balances are not transferable to a newly configured HOME, including the first
       // config after restart (persisted observations have no credential identifiers).
       const next = row?.driver === p.driver ? row : newProvider(p.instanceId, p.driver);
-      if (!priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p)) {
+      const antigravity = p.driver === "antigravity" ? antigravityObservation(next, p, identity(p), this.now()) : undefined;
+      const contextChanged = antigravity ? antigravity.changed
+        : !priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p);
+      if (contextChanged) {
         const clean = newProvider(p.instanceId, p.driver);
         delete next.burnHistory;
         delete next.accountKey;
@@ -301,7 +360,7 @@ export class HeadroomMonitor {
         return next;
       }
       if (p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
-      applyT3(next, p);
+      if (!antigravity?.blocked) applyT3(next, p, this.now());
       if (p.driver === "claudeAgent" && !p.quotaAccountKey) {
         if (next.included.source === "t3") delete next.accountKey;
         next.manualResets = newProvider(p.instanceId, p.driver).manualResets;

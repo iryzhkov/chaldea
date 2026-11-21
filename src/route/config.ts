@@ -3,7 +3,7 @@ import { loadCapacityConfig } from "../quota/capacity-config.ts";
 import { hostname } from "node:os";
 import type { ScoreTransport } from "./snapshot.ts";
 import { join } from "node:path";
-import { DEFAULT_POLICY, type Role } from "./types.ts";
+import { DEFAULT_POLICY, ROUTED_DRIVERS, type Role } from "./types.ts";
 import type { PolicyConfig } from "./types.ts";
 
 export interface RouteConfig extends PolicyConfig {
@@ -68,6 +68,20 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
     if (!f || typeof f !== "object" || Array.isArray(f) || Object.entries(f).some(([k,v]) =>
       !Object.hasOwn(c.floors, k) || typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 100)) throw new Error("Invalid role floors");
     c.floors = { ...c.floors, ...f };
+  }
+  if (r.providerPreference !== undefined) {
+    if (!Array.isArray(r.providerPreference) || r.providerPreference.length > 20 ||
+        new Set(r.providerPreference).size !== r.providerPreference.length ||
+        r.providerPreference.some(d => typeof d !== "string" || !ROUTED_DRIVERS.includes(d)))
+      throw new Error("Invalid provider preference");
+    c.providerPreference = r.providerPreference;
+  }
+  if (r.driverModels !== undefined) {
+    const d = r.driverModels as Record<string, unknown>;
+    if (!d || typeof d !== "object" || Array.isArray(d) || Object.keys(d).length > 20 || Object.entries(d).some(([k, v]) =>
+      !/^[a-zA-Z0-9_-]{1,100}$/.test(k) || !Array.isArray(v) || !v.length || v.length > 20 || new Set(v).size !== v.length ||
+      v.some(m => typeof m !== "string" || !/^[a-zA-Z0-9_.:/-]{1,160}$/.test(m)))) throw new Error("Invalid driver model allowlist");
+    c.driverModels = d as Record<string, string[]>;
   }
   if (r.pins !== undefined) {
     const pins = r.pins as Record<string, any>;

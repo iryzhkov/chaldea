@@ -69,7 +69,7 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   const finish = (kind: CapacityClass, reason: string) => { c.class = kind; c.reasons.push(reason); return c; };
   const maxAge = p.included.source === "operator-weekly-target" ? 7 * 86400000 : config.maxAgeMs;
   const windows = fresh(p.included, now, maxAge) ?? [];
-  const advice = windowPolicy(windows, now, config.minimumRemaining, config.paceMargin);
+  const advice = windowPolicy(windows, now, config.minimumRemaining, config.paceMargin, p.driver);
   c.reasons.push(...advice.reasons);
   // An active usage stop is the provider's own refusal; nothing below overrides it.
   if (activeStop) return finish("stopped", "active usage stop; reserves do not authorize redemption");
@@ -147,7 +147,7 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
 export function classifyCapacities(state: Pick<ObserverState, "headroom" | "parked">, now: number, config: CapacityConfig = DEFAULT_CAPACITY): Record<string, Capacity> {
   const stopped = new Set([...state.parked.values()].filter(s => s.resetAt === null ||
     !Number.isFinite(Date.parse(s.resetAt)) || Date.parse(s.resetAt) > now).map(s => s.provider));
-  const id = (p: ProviderHeadroom) => p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias;
+  const id = (p: ProviderHeadroom) => p.driver === "antigravity" ? p.alias : p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias;
   const stoppedAccounts = new Set(state.headroom.providers.filter(p => stopped.has(p.alias)).map(id));
   const result: Record<string, Capacity> = {};
   for (const p of state.headroom.providers) {

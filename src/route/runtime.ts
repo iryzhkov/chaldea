@@ -5,7 +5,7 @@ import { loadHeadroomConfig } from "../quota/codex-balance.ts";
 import { capacityKey } from "../quota/account.ts";
 import { classifyCapacity } from "../quota/capacity.ts";
 import { loadCapacityConfig } from "../quota/capacity-config.ts";
-import { metricNow, newProvider } from "../quota/headroom.ts";
+import { metricNow, newProvider, applyT3, antigravityRouteHold } from "../quota/headroom.ts";
 import { discoverServerUrl, switchPort } from "../t3/adapter.ts";
 import type { SwitchProvider, CatalogModelPreferences } from "../t3/adapter.ts";
 import { readToken } from "../quota/run.ts";
@@ -16,7 +16,7 @@ import { RouteState } from "./state.ts";
 import { reviewPairInput, type ReviewPairResult } from "./pair.ts";
 import { RouteError, routeFailure } from "./errors.ts";
 import type { PolicyData } from "./policy.ts";
-import { routeInput } from "./types.ts";
+import { ROUTED_DRIVERS, routeInput } from "./types.ts";
 import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
 
 /** The same cached provider/model descriptors used by orchestrator_capabilities.
@@ -25,9 +25,10 @@ import type { CatalogProvider, Quota, RouteResult } from "./types.ts";
 export function routeCatalog(providers: ReadonlyArray<SwitchProvider>, preferences?: CatalogModelPreferences | null): CatalogProvider[] {
   return providers.map(p => ({
     providerInstanceId: p.instanceId, ...(p.quotaAccountKey ? { accountKey: p.quotaAccountKey } : {}), driverKind: p.driver,
-    canRunChildTask: ["codex", "claudeAgent"].includes(p.driver) && p.enabled && p.installed &&
+    canRunChildTask: ROUTED_DRIVERS.includes(p.driver) && p.enabled && p.installed &&
       (p.availability === undefined || p.availability === "available") &&
       ["ready", "warning"].includes(p.status) && p.auth.status === "authenticated",
+    ...(p.driver === "antigravity" && p.usageLimits ? { usageLimits: p.usageLimits } : {}),
     models: p.models.filter(m => !preferences?.[p.instanceId]?.hiddenModels.includes(m.slug))
       .map(m => ({ id: m.slug, options: m.capabilities?.optionDescriptors ?? [] })),
   }));
@@ -76,10 +77,22 @@ async function collectContext(options: RouteOptions) {
   if (scores.reason) reasons.push("AA " + scores.reason);
   const analytics = await collectAnalytics(join(config.cacheDir, "slopalytics.json"), now, options.fetcher);
   if (analytics.reason) reasons.push("Slopalytics " + analytics.reason);
+  const admissionHolds = new Map(catalog.filter(p => p.driverKind === "antigravity").map(p =>
+    [p.providerInstanceId, antigravityRouteHold(state.headroom.providers.find(r => r.alias === p.providerInstanceId), p.usageLimits, now)]));
   const capacityState = { parked: state.parked, headroom: { ...state.headroom, providers: catalog
-    .filter(p => p.driverKind === "codex" || p.driverKind === "claudeAgent").map(p => {
+    .filter(p => ROUTED_DRIVERS.includes(p.driverKind)).map(p => {
       const original = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
       const row = { ...(original ?? newProvider(p.providerInstanceId, p.driverKind)) };
+      if (p.driverKind === "antigravity") {
+        // Valid live data can recover known windows; omissions and failed probes cannot.
+        const live = newProvider(row.alias, row.driver);
+        if (!admissionHolds.get(p.providerInstanceId)) { applyT3(row, p, now); applyT3(live, p, now); }
+        quota[p.providerInstanceId] = { observedAt: live.included.observedAt,
+          windows: live.antigravityWindows ?? live.included.value ?? [],
+          knownWindows: row.antigravityWindows ?? row.included.value ?? [],
+          activeStop: quota[p.providerInstanceId]?.activeStop ?? false };
+        return row;
+      }
       const q = quota[p.providerInstanceId];
       if (q) row.included = { state: "fresh", error: null, source: q.operatorEstimate ? "operator-weekly-target" : row.included.source,
         observedAt: q.observedAt, value: q.windows.map(w => ({ ...w, id: (w as { id?: string }).id ?? w.kind, usedPercent: 100 - w.remainingPercent })) };
@@ -101,6 +114,11 @@ async function collectContext(options: RouteOptions) {
     if (!row) continue;
     const configured = mappings.get(p.providerInstanceId);
     const observer = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
+    const hold = admissionHolds.get(p.providerInstanceId);
+    if (hold) {
+      blockedInstances.add(p.providerInstanceId);
+      reasons.push(p.providerInstanceId + ": " + hold);
+    }
     const expected = configured ?? p.accountKey;
     if (observer?.included.error === "context_mismatch" || row.included.error === "context_mismatch" || row.credits.error === "context_mismatch" ||
         expected && (p.accountKey && expected !== p.accountKey || row.accountKey && expected !== row.accountKey)) {
@@ -108,20 +126,20 @@ async function collectContext(options: RouteOptions) {
       reasons.push(p.providerInstanceId + ": configured account does not match the observed provider login; excluded");
     }
     const key = configured ?? p.accountKey ?? row.accountKey;
-    if (key && row.accountKey !== key) {
+    if (key && row.accountKey !== key && p.driverKind !== "antigravity") {
       const clean = newProvider(row.alias, row.driver);
       clean.accountKey = key;
       capacityState.headroom.providers[capacityState.headroom.providers.indexOf(row)] = clean;
       quota[row.alias] = { observedAt: null, windows: [], activeStop: quota[row.alias]?.activeStop ?? false };
     } else if (key) row.accountKey = key;
   }
-  const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.accountKey && quota[p.alias]?.activeStop)
+  const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.driver !== "antigravity" && p.accountKey && quota[p.alias]?.activeStop)
     .map(p => capacityKey(p.driver, p.accountKey!)));
   const capacity: Record<string, ReturnType<typeof classifyCapacity>> = {};
   const boundCatalog = catalog.map(p => {
     let row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
     const key = mappings.get(p.providerInstanceId) ?? p.accountKey ?? row?.accountKey;
-    const stop = !!quota[p.providerInstanceId]?.activeStop || !!key && stoppedAccounts.has(capacityKey(p.driverKind, key));
+    const stop = !!quota[p.providerInstanceId]?.activeStop || p.driverKind !== "antigravity" && !!key && stoppedAccounts.has(capacityKey(p.driverKind, key));
     if (row) {
       const classified = classifyCapacity(row, stop, now, capacityConfig);
       if (quota[p.providerInstanceId]?.incomplete) {
@@ -130,7 +148,9 @@ async function collectContext(options: RouteOptions) {
       }
       capacity[p.providerInstanceId] = classified;
     }
-    return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId), ...(key ? { accountKey: key } : {}) };
+    const admissionHold = admissionHolds.get(p.providerInstanceId);
+    return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId),
+      ...(admissionHold ? { admissionHold } : {}), ...(key ? { accountKey: key } : {}) };
   });
   const data: PolicyData = { catalog: boundCatalog, quota, analytics: analytics.value, scores: scores.value, now, config, capacity };
   return { data, config, reasons,

@@ -30,9 +30,18 @@ export const MODEL_MAP: ReadonlyArray<{ model: string; effort: Effort; aaSlug: s
     ["gpt-6.2-sol", "gpt-6-2-sol", "GPT-6.2 Sol", "codex", ["low", "medium", "high"]],
     ["gpt-6.2-astra", "gpt-6-2-astra", "GPT-6.2 Astra", "codex", ["low", "medium", "high"]],
     ["claude-fable-5-2", "claude-fable-5-2", "Fable 5.2", "claudeAgent", ["low", "medium", "high"]],
+    // Reviewed 2026-11-20/21 against AA index 5 names. Neon unsuffixed is Xhigh;
+    // Hydrogen unsuffixed is Xhigh (not offered in T3), Argon/Flash unsuffixed are High.
+    ["gemini-4-neon", "gemini-4-neon", "Gemini 4 Neon", "antigravity", ["low", "medium", "high"]],
+    ["gemini-4-hydrogen", "gemini-4-hydrogen", "Gemini 4 Hydrogen", "antigravity", ["low", "medium", "high"]],
+    ["gemini-4-argon", "gemini-4-argon", "Gemini 4 Argon", "antigravity", ["medium"]],
+    ["gemini-3.8-flash", "gemini-3-8-flash", "Gemini 3.8 Flash", "antigravity", ["low", "medium"]],
   ] as const).flatMap(([model, slug, analytics, harness, efforts]) => efforts.map(effort => ({
     model, effort, aaSlug: slug + "-" + effort, analytics, harness,
   }))),
+  { model: "gemini-4-neon", effort: "xhigh", aaSlug: "gemini-4-neon", analytics: "Gemini 4 Neon", harness: "antigravity" },
+  { model: "gemini-4-argon", effort: "high", aaSlug: "gemini-4-argon", analytics: "Gemini 4 Argon", harness: "antigravity" },
+  { model: "gemini-3.8-flash", effort: "high", aaSlug: "gemini-3-8-flash", analytics: "Gemini 3.8 Flash", harness: "antigravity" },
 ];
 const safe = (v: unknown): v is string => typeof v === "string" && /^[a-zA-Z0-9_.:/ -]{1,160}$/.test(v);
 const number = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
