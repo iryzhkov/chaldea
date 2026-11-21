@@ -351,20 +351,58 @@ The measured role floor, required cost, catalog availability, bans, quota and
 review separation still apply. Other models retain normal operational evidence
 and probation. No calibration anchors are added automatically or in legacy mode.
 
-### Fallback drivers and the driver model allowlist
+### Antigravity and provider preference
 
-Claude and Codex are the primary drivers. Antigravity is also routed, as a
-fallback: it ranks after every eligible primary candidate, so it is chosen only
-when quota, capacity, stops or review separation exclude both primaries. Its
-effort is the ACP `thought_level` option.
+Antigravity is eligible through its ACP `thought_level` option. Its quota pacing
+is unknown because T3 reports unsupported usage limits. It adds no synthetic
+headroom or capacity rows. Active stops and supplied tight/stopped capacity still
+exclude it. Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 
-`driverModels` restricts a driver kind to operator-chosen models. The default is
-`{"antigravity": ["gemini-4-neon"]}`, so Antigravity routes only to Gemini 4 Neon
-and its other catalog models (Argon, Flash, and the Claude models Antigravity
-proxies) neither count toward benchmark coverage nor get selected. Allowlisted
-models are calibrated baselines: they skip probation, and the first one is the
-driver's incumbent. A `driverModels` key in route.json replaces the default as a
-whole. Review pairs (`chaldea_route_review_pair`) remain Claude and Codex only.
+`providerPreference` is an ordered array of driver kinds, for example
+`["antigravity", "codex", "claudeAgent"]`. Listed drivers rank before unlisted
+drivers, in that order, after eligibility checks. This replaces the executor's
+Codex preference too. An empty or omitted list preserves Claude/Codex quota and
+role ordering exactly, with Antigravity after both. Unlisted drivers retain the
+default ordering. Pins, bans, floors, effort validation, probation, stops and
+review separation still apply. Instance IDs never determine cross-driver priority.
+
+The reviewed AA index 5 mappings cover Neon low/medium/high/xhigh, Hydrogen
+low/medium/high, Argon medium/high and Flash low/medium/high. Neon's unsuffixed
+AA slug means Xhigh; Argon's and Flash's mean High. Hydrogen's unsuffixed Xhigh
+row is not mapped because that effort is absent from the T3 catalog. Neon remains
+a calibrated baseline; other new models need operational evidence or explicit
+benchmark anchors. Scores are keyed by model and effort, so Antigravity's Opus
+uses the existing Opus rows. Sonnet remains banned by default.
+
+Benchmark coverage requires measured scores for every unbanned catalog model.
+Orchestrators and gpt-oss have no usable AA rows. Recommended fleet configuration
+to exclude those models and select Neon within Antigravity:
+
+```json
+{
+  "benchmark": {"indexVersion": "5"},
+  "providerPreference": ["antigravity", "codex", "claudeAgent"],
+  "bans": [
+    "*sonnet*", "gemini-pro-orchestrator-*", "gpt-oss-*",
+    "gemini-4-hydrogen*", "gemini-4-argon*", "gemini-3.8-flash*"
+  ]
+}
+```
+
+Ban patterns match the whole model ID, case insensitively, with `*` matching
+any characters. Dots are literal. The last three bans make Neon the Gemini pick;
+Antigravity's Opus remains eligible and competes on measured cost and quality.
+
+`driverModels` optionally restricts drivers to operator-chosen models. Its
+default is `{}`, with no implicit catalog restriction. Allowlisted models count
+as calibrated baselines and the first becomes the driver's incumbent. Explicit
+allowlists restrict coverage and selection together.
+
+Both route and review-pair inputs accept `authorProvider: "antigravity"`.
+Review pairs try eligible different drivers for the main and peer, honoring
+provider preference. Defaults preserve the Claude/Codex pair, then try
+Antigravity. A missing provider or unknown quota never authorizes a same-driver
+exception; fresh quota pressure on all available alternatives is required.
 
 Version 2 adds `metric: "aa-intelligence-cost-per-task"` and
 `benchmarkCostUSDPerTask` from AA's

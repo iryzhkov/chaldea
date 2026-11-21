@@ -165,7 +165,8 @@ test("Antigravity routes only to allowlisted Gemini 4 Neon by thought_level, aft
     models: ["gemini-4-neon", "gemini-4-argon", "claude-opus-5-5"].map(id => ({ id, options: [level] })) };
   const scores = { ...f.scores, models: [...f.scores.models,
     score("gemini-4-neon", "low", 44.1, .75), score("gemini-4-neon", "medium", 54.9, 1.9), score("gemini-4-neon", "high", 59.6, 3.74)] };
-  const g = { ...f, catalog: [...f.catalog, antigravity], scores };
+  const g = { ...f, catalog: [...f.catalog, antigravity], scores,
+    config: { ...f.config, driverModels: { antigravity: ["gemini-4-neon"] } } };
   // Unmapped Argon and Antigravity's Claude are outside the allowlist, so coverage stays complete.
   const primary = recommend({ role: "general" }, g);
   assert.notEqual(primary.providerInstanceId, "antigravity");

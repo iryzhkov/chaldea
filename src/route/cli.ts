@@ -12,11 +12,11 @@ import { recommendReviewPair, reviewPairInput } from "./pair.ts";
 import { compactRoute } from "./output.ts";
 import { RouteError, routeFailure } from "./errors.ts";
 export const ROUTE_USAGE = `chaldea route --role builder|critical-review|bulk-read|general|executor
-  [--author-provider claudeAgent|codex] [--effort low|medium|high|xhigh]
+  [--author-provider claudeAgent|codex|antigravity] [--effort low|medium|high|xhigh]
   [--config PATH] [--fixture PATH] [--explain|--legacy-full]
 Returns compact JSON with exact native target fields. --explain retains full legacy diagnostics.
 --fixture reads injected catalog/quota/analytics/scores/history/now without collection.
-chaldea route review-pair --author-provider codex|claudeAgent
+chaldea route review-pair --author-provider codex|claudeAgent|antigravity
   [--main-role ROLE] [--peer-role ROLE] [--main-effort EFFORT] [--peer-effort EFFORT]
   [--allow-quota-exception] [--config PATH] [--fixture PATH]
 chaldea route fetch-scores --config PATH: daily homelab AA fetch and Akasha publication.

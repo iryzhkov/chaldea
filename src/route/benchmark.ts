@@ -5,7 +5,7 @@ import { banned, scoreFor } from "./targets.ts";
 
 export function benchmarkEfforts(model: string, exact?: Effort): Effort[] {
   const efforts: Effort[] = ["low", "medium", "high"];
-  if (/^(gpt-6-luna|claude-haiku-5-5)$/.test(model)) efforts.push("xhigh");
+  if (/^(gpt-6-luna|claude-haiku-5-5|gemini-4-neon)$/.test(model)) efforts.push("xhigh");
   return exact ? efforts.includes(exact) ? [exact] : [] : efforts;
 }
 export const targetEffort = (target: Target) => Object.values(target.options)[0]!;

@@ -30,7 +30,7 @@ export function compareScores(role: Role, x: Score, y: Score): number {
   return ((y.intelligence + coding(y)) / 2 - 2 * price(y)) - ((x.intelligence + coding(x)) / 2 - 2 * price(x));
 }
 export const roleAnchors = (role: Role, config: PolicyConfig): readonly string[] =>
-  [...PAIRS[role], ...(config.benchmark?.anchors?.[role] ?? []), ...Object.values(config.driverModels ?? {}).flat()];
+  [...PAIRS[role], "gemini-4-neon", ...(config.benchmark?.anchors?.[role] ?? []), ...Object.values(config.driverModels ?? {}).flat()];
 export function targetEligible(model: string, effort: Effort, role: Role, scores: ScoreSnapshot,
   analytics: Analytics | null, config: PolicyConfig, now: number,
   incumbent: string, reasons: string[]): boolean {

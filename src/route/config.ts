@@ -69,6 +69,13 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
       !Object.hasOwn(c.floors, k) || typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 100)) throw new Error("Invalid role floors");
     c.floors = { ...c.floors, ...f };
   }
+  if (r.providerPreference !== undefined) {
+    if (!Array.isArray(r.providerPreference) || r.providerPreference.length > 20 ||
+        new Set(r.providerPreference).size !== r.providerPreference.length ||
+        r.providerPreference.some(d => typeof d !== "string" || !/^[a-zA-Z0-9_-]{1,100}$/.test(d)))
+      throw new Error("Invalid provider preference");
+    c.providerPreference = r.providerPreference;
+  }
   if (r.driverModels !== undefined) {
     const d = r.driverModels as Record<string, unknown>;
     if (!d || typeof d !== "object" || Array.isArray(d) || Object.keys(d).length > 20 || Object.entries(d).some(([k, v]) =>

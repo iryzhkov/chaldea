@@ -64,6 +64,8 @@ export interface PolicyConfig {
   /** Operator allowlist per driver kind. A listed driver is routed only to these models, which
    * count as calibrated baselines: no probation, and the first one is the driver's incumbent. */
   driverModels: Record<string, string[]>;
+  /** Ordered driver kinds, before quota ranking. Empty preserves the default policy. */
+  providerPreference: string[];
 }
 /** Claude and Codex are the primary drivers; any other routed driver is a fallback. */
 export const PRIMARY_DRIVERS: readonly string[] = ["claudeAgent", "codex"];
@@ -76,7 +78,7 @@ export const DEFAULT_POLICY: PolicyConfig = {
   scoreMaxAgeMs: 3 * 86_400_000, probationMs: 7 * 86_400_000, probationShare: 0.10,
   bans: ["*sonnet*"], pins: {}, benchmark: null,
   floors: { builder: 50, "critical-review": 49, "bulk-read": 30, general: 48, executor: 48 },
-  driverModels: { antigravity: ["gemini-4-neon"] },
+  driverModels: {}, providerPreference: [],
 };
 export const PAIRS = {
   builder: ["claude-opus-5-5", "gpt-6.1-sol"],
