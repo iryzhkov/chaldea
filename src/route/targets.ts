@@ -1,6 +1,6 @@
 import { PAIRS, ageSeconds } from "./types.ts";
 import type { Analytics, Effort, PolicyConfig, Role, Target } from "./types.ts";
-import type { Score, ScoreSnapshot } from "./scores.ts";
+import { MODEL_MAP, type Score, type ScoreSnapshot } from "./scores.ts";
 
 export interface RoutingHistory {
   seen: Record<string, number>;
@@ -29,11 +29,14 @@ export function compareScores(role: Role, x: Score, y: Score): number {
   // An extra dollar per million tokens must buy two points of average quality.
   return ((y.intelligence + coding(y)) / 2 - 2 * price(y)) - ((x.intelligence + coding(x)) / 2 - 2 * price(x));
 }
-export const roleAnchors = (role: Role, config: PolicyConfig): readonly string[] =>
-  [...PAIRS[role], "gemini-4-neon", ...(config.benchmark?.anchors?.[role] ?? []), ...Object.values(config.driverModels ?? {}).flat()];
+export const roleAnchors = (role: Role, config: PolicyConfig, driver?: string): readonly string[] => {
+  const native = [...PAIRS[role], "gemini-4-neon", ...(config.benchmark?.anchors?.[role] ?? [])];
+  return [...native.filter(model => !driver || MODEL_MAP.some(m => m.model === model && m.harness === driver)),
+    ...(driver ? config.driverModels?.[driver] ?? [] : Object.values(config.driverModels ?? {}).flat())];
+};
 export function targetEligible(model: string, effort: Effort, role: Role, scores: ScoreSnapshot,
   analytics: Analytics | null, config: PolicyConfig, now: number,
-  incumbent: string, reasons: string[]): boolean {
+  incumbent: string, reasons: string[], driver?: string): boolean {
   const score = scoreFor(scores, model, effort);
   if (!score) { reasons.push(model + ": unmapped or missing AA data for " + effort + "; held"); return false; }
   if (config.benchmark ? score.benchmarkCostUSDPerTask === undefined || score.benchmarkCostUSDPerTask === null
@@ -42,11 +45,14 @@ export function targetEligible(model: string, effort: Effort, role: Role, scores
   }
   if (score.intelligence < config.floors[role]) { reasons.push(model + ": below AA intelligence floor " + config.floors[role]); return false; }
   // The fixed defaults are the bootstrapping incumbents, not new launches.
-  if (model === incumbent || roleAnchors(role, config).includes(model)) {
+  if (model === incumbent || roleAnchors(role, config, driver).includes(model)) {
     if (config.benchmark?.anchors?.[role]?.includes(model)) reasons.push(model + ": operator-calibrated benchmark baseline; measured floor and quota gates still apply");
     return true;
   }
-  const s = analytics?.models[model], peer = analytics?.models[incumbent];
+  // Shared score IDs do not make native-harness operational evidence transferable.
+  const nativeEvidence = !driver || !MODEL_MAP.some(m => m.model === model) ||
+    MODEL_MAP.some(m => m.model === model && m.harness === driver);
+  const s = nativeEvidence ? analytics?.models[model] : undefined, peer = analytics?.models[incumbent];
   if (!usableAnalytics(analytics, now, config) || !s || !peer || s.turns < config.minimumTurns || peer.turns < config.minimumTurns) {
     reasons.push(model + ": probation held; needs fresh Slopalytics and at least " + config.minimumTurns + " turns for candidate and current pick"); return false;
   }
@@ -56,8 +62,8 @@ export function targetEligible(model: string, effort: Effort, role: Role, scores
   reasons.push(model + ": probation evidence passed");
   return true;
 }
-export function inProbation(model: string, role: Role, history: RoutingHistory, config: PolicyConfig, now: number): boolean {
-  return !roleAnchors(role, config).includes(model) && now - (history.seen[model] ?? now) < config.probationMs;
+export function inProbation(model: string, role: Role, history: RoutingHistory, config: PolicyConfig, now: number, driver?: string): boolean {
+  return !roleAnchors(role, config, driver).includes(model) && now - (history.seen[model] ?? now) < config.probationMs;
 }
 export function trialAvailable(history: RoutingHistory, config: PolicyConfig, model: string): boolean {
   const a = history.allocations[model] ?? { calls: 0, trials: 0 };

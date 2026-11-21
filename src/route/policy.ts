@@ -86,9 +86,11 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
       reasons.push(model + ": outside fixed role pair while AA unavailable"); continue;
     }
     for (const effort of benchmark ? benchmarkEfforts(model, input.effortOverride) : [input.effortOverride ?? (input.role === "builder" ? "high" : "medium")]) {
-    const incumbent = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride, config.benchmark?.indexVersion)]?.model ??
-      config.driverModels?.[p.driverKind]?.[0] ?? pair[p.driverKind === "claudeAgent" ? 0 : 1];
-    if (!pin && scores && !targetEligible(model, effort, input.role, scores, data.analytics, config, data.now, incumbent, reasons)) continue;
+    const prior = history.picks[roleKey(input.role, input.authorProvider, input.effortOverride, config.benchmark?.indexVersion)];
+    const priorDriver = prior && data.catalog.find(p => p.providerInstanceId === prior.providerInstanceId)?.driverKind;
+    const incumbent = (priorDriver === p.driverKind && PRIMARY_DRIVERS.includes(priorDriver) ? prior?.model : undefined) ??
+      config.driverModels?.[p.driverKind]?.[0] ?? (p.driverKind === "antigravity" ? "gemini-4-neon" : pair[p.driverKind === "claudeAgent" ? 0 : 1]);
+    if (!pin && scores && !targetEligible(model, effort, input.role, scores, data.analytics, config, data.now, incumbent, reasons, p.driverKind)) continue;
     const option = m.options?.find(o => EFFORT_OPTION_IDS.includes(o.id) &&
       o.type === "select" && o.options?.some(v => v.id === effort))?.id;
     if (!option) { reasons.push(model + ": required effort unavailable"); continue; }
@@ -107,7 +109,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
     const fresh = age !== null && age * 1000 < (q?.operatorEstimate ? 7 * 86_400_000 : config.quotaMaxAgeMs);
     const windows = fresh ? (q?.windows ?? []).filter(w => Number.isFinite(w.remainingPercent) && w.remainingPercent >= 0 &&
       w.remainingPercent <= 100 && (w.resetsAt === null || Date.parse(w.resetsAt) > data.now)) : [];
-    const advice = modelWindowPolicy(windows, p.driverKind === "claudeAgent" ? model : "", data.now, config.minimumRemaining, config.paceMargin);
+    const advice = modelWindowPolicy(windows, ["claudeAgent", "antigravity"].includes(p.driverKind) ? model : "", data.now, config.minimumRemaining, config.paceMargin);
     diagnostics.quota[p.providerInstanceId + ":" + model] = { accountKey: p.accountKey ?? null,
       bindingSource: p.accountKey ? "catalog" : "unbound", source: q?.operatorEstimate ? "operator_estimate" : "observation",
       ageSeconds: age, freshness: fresh ? "fresh" : age === null ? "unknown" : "stale",
@@ -229,7 +231,7 @@ export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
   eligible = eligible.filter(c => {
-    const held = scores && !pin && inProbation(c.model, input.role, history, config, data.now) && !trialAvailable(history, config, c.model);
+    const held = scores && !pin && inProbation(c.model, input.role, history, config, data.now, c.driver) && !trialAvailable(history, config, c.model);
     if (held) {
       const reason = c.model + ": probation recommendation share limited to " + config.probationShare;
       reasons.push(reason); providerReasons.get(c.driver)!.push(reason);

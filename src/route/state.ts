@@ -9,8 +9,8 @@ import { recommend } from "./policy.ts";
 import type { PolicyData } from "./policy.ts";
 import { emptyHistory, inProbation, roleKey } from "./targets.ts";
 import type { RoutingHistory } from "./targets.ts";
-import { DEFAULT_POLICY } from "./types.ts";
-import type { RouteInput, RouteResult } from "./types.ts";
+import { DEFAULT_POLICY, PRIMARY_DRIVERS } from "./types.ts";
+import type { RouteInput, RouteResult, Target } from "./types.ts";
 
 export const MAX_ROUTE_EVENTS = 128;
 const MAX_EVENT_BYTES = 2 * 1024 * 1024;
@@ -50,12 +50,17 @@ export class RouteState {
       }
       const result = recommend(input, { ...data, history });
       for (const [model, allocation] of Object.entries(history.allocations)) {
-        if (inProbation(model, input.role, history, config, data.now)) {
+        if (data.catalog.some(p => p.models.some(m => m.id === model) &&
+            inProbation(model, input.role, history, config, data.now, p.driverKind))) {
           allocation.calls++;
-          if (model === result.model || Object.values(result.byProvider).some(p => p.eligible && p.model === model)) allocation.trials++;
+          if (Object.values(result.byProvider).some(p => p.eligible && p.model === model &&
+              inProbation(model, input.role, history, config, data.now,
+                data.catalog.find(c => c.providerInstanceId === p.providerInstanceId)!.driverKind))) allocation.trials++;
         }
       }
-      if (!inProbation(result.model, input.role, history, config, data.now)) history.picks[key] = {
+      const driver = data.catalog.find(p => p.providerInstanceId === result.providerInstanceId)!.driverKind;
+      // Fallbacks must not displace a primary incumbent across stop/recovery.
+      if (PRIMARY_DRIVERS.includes(driver) && !inProbation(result.model, input.role, history, config, data.now, driver)) history.picks[key] = {
         providerInstanceId: result.providerInstanceId, model: result.model, options: result.options,
       };
       this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(history));
@@ -117,7 +122,7 @@ export class RouteState {
       };
       const result = recommendReviewPair(input, data, historyFor);
       const config = { ...DEFAULT_POLICY, ...data.config };
-      const slots = new Map<string, { request: RouteInput; models: string[] }>();
+      const slots = new Map<string, { request: RouteInput; models: Target[] }>();
       for (const [target, role, main] of [[result.main, input.mainRole ?? "builder", true],
         [result.peer, input.peerRole ?? "builder", false]] as const) {
         if (!target) continue;
@@ -126,14 +131,16 @@ export class RouteState {
           input.authorProvider, main, !!config.benchmark && !config.pins[role]);
         const key = roleKey(role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
         const slot = slots.get(key) ?? { request, models: [] };
-        slot.models.push(target.model); slots.set(key, slot);
+        slot.models.push(target); slots.set(key, slot);
       }
       for (const [key, slot] of slots) {
         const history = historyFor(slot.request);
         for (const [model, allocation] of Object.entries(history.allocations)) {
-          if (inProbation(model, slot.request.role, history, config, data.now)) {
+          if (data.catalog.some(p => p.models.some(m => m.id === model) &&
+              inProbation(model, slot.request.role, history, config, data.now, p.driverKind))) {
             allocation.calls += slot.models.length;
-            allocation.trials += slot.models.filter(m => m === model).length;
+            allocation.trials += slot.models.filter(t => t.model === model && inProbation(model, slot.request.role, history, config, data.now,
+              data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)!.driverKind)).length;
           }
         }
         this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")

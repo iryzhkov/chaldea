@@ -77,7 +77,7 @@ async function collectContext(options: RouteOptions) {
   const analytics = await collectAnalytics(join(config.cacheDir, "slopalytics.json"), now, options.fetcher);
   if (analytics.reason) reasons.push("Slopalytics " + analytics.reason);
   const capacityState = { parked: state.parked, headroom: { ...state.headroom, providers: catalog
-    .filter(p => p.driverKind === "codex" || p.driverKind === "claudeAgent").map(p => {
+    .filter(p => ROUTED_DRIVERS.includes(p.driverKind)).map(p => {
       const original = state.headroom.providers.find(r => r.alias === p.providerInstanceId);
       const row = { ...(original ?? newProvider(p.providerInstanceId, p.driverKind)) };
       const q = quota[p.providerInstanceId];

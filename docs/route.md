@@ -353,10 +353,17 @@ and probation. No calibration anchors are added automatically or in legacy mode.
 
 ### Antigravity and provider preference
 
-Antigravity is eligible through its ACP `thought_level` option. Its quota pacing
-is unknown because T3 reports unsupported usage limits. It adds no synthetic
-headroom or capacity rows. Active stops and supplied tight/stopped capacity still
-exclude it. Without AA scores the fixed Claude/Codex pairs above stay unchanged.
+Antigravity is eligible through its ACP `thought_level` option. All routed
+drivers participate in capacity classification, account-mismatch exclusion and
+shared-account stops. Missing usage limits classify as unknown. T3 0.1.11 usage
+windows flow through the observer into routing with their supplied durations and
+resets. `gemini-5h` and `gemini-weekly` apply only to Gemini; `3p-5h` and
+`3p-weekly` apply only to Claude/GPT. `gemini-argon-wtu-weekly` applies only to
+Argon. Provider-wide classification excludes these scoped windows; candidate
+admission and pacing use only the matching windows. Other family-scoped IDs
+remain excluded pending a reviewed mapping, and missing durations never establish
+pacing. Active stops and tight/stopped capacity still exclude the driver.
+Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 
 `providerPreference` is an ordered array of driver kinds, for example
 `["antigravity", "codex", "claudeAgent"]`. Listed drivers rank before unlisted
@@ -372,7 +379,11 @@ AA slug means Xhigh; Argon's and Flash's mean High. Hydrogen's unsuffixed Xhigh
 row is not mapped because that effort is absent from the T3 catalog. Neon remains
 a calibrated baseline; other new models need operational evidence or explicit
 benchmark anchors. Scores are keyed by model and effort, so Antigravity's Opus
-uses the existing Opus rows. Sonnet remains banned by default.
+uses the existing Opus rows. Operational evidence and baseline exemptions remain
+scoped to the driver: native Opus is not automatically a calibrated Antigravity
+baseline. Explicit driver allowlists can calibrate it. Fallback picks never
+replace primary history incumbents, so primary routing can recover after a stop.
+Sonnet remains banned by default.
 
 Benchmark coverage requires measured scores for every unbanned catalog model.
 Orchestrators and gpt-oss have no usable AA rows. Recommended fleet configuration
@@ -391,7 +402,8 @@ to exclude those models and select Neon within Antigravity:
 
 Ban patterns match the whole model ID, case insensitively, with `*` matching
 any characters. Dots are literal. The last three bans make Neon the Gemini pick;
-Antigravity's Opus remains eligible and competes on measured cost and quality.
+Antigravity's Opus has shared measured scores but still needs driver-specific
+calibration before selection.
 
 `driverModels` optionally restricts drivers to operator-chosen models. Its
 default is `{}`, with no implicit catalog restriction. Allowlisted models count
