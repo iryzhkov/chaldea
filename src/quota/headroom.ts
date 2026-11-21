@@ -1,4 +1,5 @@
 // Sanitized, independently timestamped quota observations. No provider/account payload is persisted wholesale.
+import { createHash } from "node:crypto";
 import { accountKey } from "./account.ts";
 import { retainBurnSample } from "./capacity.ts";
 import type { BurnSample } from "./capacity.ts";
@@ -47,7 +48,13 @@ export interface ProviderHeadroom {
   ordinaryUsageAllowed: Metric<boolean>;
   spendControlReached: Metric<boolean>;
 }
+interface AntigravityContext {
+  context: string | null; binding: string | null;
+  checkedAt: string | null; retiredThrough: string | null;
+}
 export interface HeadroomState {
+  /** Bounded tombstones survive alias removal; no credential strings are retained. */
+  antigravityContexts?: Record<string, AntigravityContext>;
   providers: Array<ProviderHeadroom>;
   snapshotSlot: number;
   signature: string;
@@ -92,12 +99,19 @@ export function validateHeadroom(value: unknown): HeadroomState {
       !Number.isSafeInteger(s.snapshotSlot) || !count(s.sequence) || typeof s.signature !== "string" || typeof s.low !== "string") {
     throw new Error("invalid_headroom_state");
   }
+  if (s.antigravityContexts !== undefined && (!object(s.antigravityContexts) ||
+      Object.keys(s.antigravityContexts).length > 1024 ||
+      Object.entries(s.antigravityContexts).some(([alias, value]) => {
+        const c = object(value);
+        return !safeId(alias) || !c || !["context", "binding"].every(k => c[k] === null || /^[a-f0-9]{64}$/.test(c[k])) ||
+          !["checkedAt", "retiredThrough"].every(k => c[k] === null || iso(c[k]) !== null);
+      }))) throw new Error("invalid_headroom_state");
   for (const p of s.providers) {
     if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
         p.accountKey !== undefined && !/^[a-f0-9]{64}$/.test(p.accountKey) ||
         p.creditExpiresAt !== undefined && !iso(p.creditExpiresAt) ||
-        p.antigravityObservationFloor !== undefined && !iso(p.antigravityObservationFloor) ||
-        p.antigravityCheckedAt !== undefined && !iso(p.antigravityCheckedAt) ||
+        p.driver === "antigravity" && (p.antigravityObservationFloor !== undefined && !iso(p.antigravityObservationFloor) ||
+          p.antigravityCheckedAt !== undefined && !iso(p.antigravityCheckedAt)) ||
         p.burnHistory !== undefined && (!Array.isArray(p.burnHistory) || p.burnHistory.length > 288 ||
           !p.burnHistory.every((s: any) => object(s) && iso(s.observedAt) && Array.isArray(s.windows) && s.windows.length <= 32 &&
             s.windows.every((w: any) => object(w) && safeId(w.id) && percent(w.remainingPercent) && percent(w.usedPercent) &&
@@ -255,6 +269,46 @@ export interface HeadroomMonitorOptions {
   read?: BalanceReader; now?: () => number; random?: () => number;
   diagnostic?: (detail: { provider: string; reason: BalanceReason; binding?: "asserted" }) => void;
 }
+
+/** Only Antigravity has durable credential contexts and retired-observation tombstones. */
+function antigravityObservation(state: HeadroomState, row: ProviderHeadroom, p: SwitchProvider,
+  identity: string): { changed: boolean; blocked: boolean } {
+  const hash = (value: string) => createHash("sha256").update(value).digest("hex");
+  const account = !!p.quotaAccountKey && /^[a-f0-9]{64}$/.test(p.quotaAccountKey);
+  const verified = p.auth.status === "authenticated" && (account || !!p.usageLimits?.credentialFingerprint);
+  // No newly verified identity: retain the old refusal but never apply an unbound observation.
+  if (!verified) return { changed: false, blocked: true };
+  const records = state.antigravityContexts ??= {};
+  let record = Object.hasOwn(records, p.instanceId) ? records[p.instanceId] : undefined;
+  if (!record) {
+    // Never evict retired watermarks to admit another alias.
+    if (Object.keys(records).length >= 1024) return { changed: true, blocked: true };
+    record = { context: null, binding: null, checkedAt: row.antigravityCheckedAt ?? row.included.observedAt,
+      retiredThrough: row.antigravityObservationFloor ?? null };
+    Object.defineProperty(records, p.instanceId, { value: record, enumerable: true, configurable: true, writable: true });
+  }
+  const binding = hash(JSON.stringify([p.runtimeHome, p.quotaContextBlocked, p.quotaAccountKey, p.auth.status, p.auth.type]));
+  // An omitted usage snapshot is not evidence of a different credential when the account is verified.
+  const context = account && !p.usageLimits?.credentialFingerprint && record.binding === binding
+    ? record.context : hash(identity);
+  const changed = record.context !== context || record.binding !== binding;
+  if (changed) {
+    const retired = [record.retiredThrough, record.checkedAt, row.included.observedAt]
+      .filter((at): at is string => !!at && Number.isFinite(Date.parse(at)))
+      .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+    record.retiredThrough = retired ?? null;
+    record.checkedAt = null;
+    record.context = context; record.binding = binding;
+  }
+  const checkedAt = iso(p.usageLimits?.checkedAt);
+  const blocked = !checkedAt || !!record.retiredThrough && Date.parse(checkedAt) <= Date.parse(record.retiredThrough);
+  if (!blocked && (!record.checkedAt || Date.parse(checkedAt!) > Date.parse(record.checkedAt))) record.checkedAt = checkedAt;
+  if (record.retiredThrough) row.antigravityObservationFloor = record.retiredThrough;
+  if (record.checkedAt) row.antigravityCheckedAt = record.checkedAt;
+  else delete row.antigravityCheckedAt;
+  return { changed, blocked };
+}
+
 export class HeadroomMonitor {
   #providers: ReadonlyArray<SwitchProvider> = [];
   #active = false;
@@ -277,7 +331,7 @@ export class HeadroomMonitor {
     this.#timer.unref();
   }
   update(providers: ReadonlyArray<SwitchProvider>): void {
-    const before = JSON.stringify(this.state.providers);
+    const before = JSON.stringify([this.state.providers, this.state.antigravityContexts]);
     const identity = (p: SwitchProvider) => JSON.stringify([p.runtimeHome, p.quotaContextBlocked, p.quotaAccountKey, p.usageLimits?.credentialFingerprint, p.auth.status, p.auth.type]);
     const priorContexts = new Map(this.#providers.map(p => [p.instanceId, identity(p)]));
     this.#providers = providers;
@@ -287,18 +341,9 @@ export class HeadroomMonitor {
       // Cached balances are not transferable to a newly configured HOME, including the first
       // config after restart (persisted observations have no credential identifiers).
       const next = row?.driver === p.driver ? row : newProvider(p.instanceId, p.driver);
-      const contextChanged = !priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p);
-      if (p.driver === "antigravity" && contextChanged) {
-        const previousAt = [next.antigravityObservationFloor, next.antigravityCheckedAt, next.included.observedAt]
-          .filter((at): at is string => !!at && Number.isFinite(Date.parse(at))).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
-        if (previousAt) next.antigravityObservationFloor = previousAt;
-      }
-      const checkedAt = iso(p.usageLimits?.checkedAt);
-      const reusedAntigravitySnapshot = p.driver === "antigravity" && (!checkedAt ||
-        !!next.antigravityObservationFloor && Date.parse(checkedAt) <= Date.parse(next.antigravityObservationFloor));
-      if (p.driver === "antigravity" && checkedAt && !reusedAntigravitySnapshot &&
-          (!next.antigravityCheckedAt || Date.parse(checkedAt) > Date.parse(next.antigravityCheckedAt)))
-        next.antigravityCheckedAt = checkedAt;
+      const antigravity = p.driver === "antigravity" ? antigravityObservation(this.state, next, p, identity(p)) : undefined;
+      const contextChanged = antigravity ? antigravity.changed
+        : !priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p);
       if (contextChanged) {
         const clean = newProvider(p.instanceId, p.driver);
         delete next.burnHistory;
@@ -318,7 +363,7 @@ export class HeadroomMonitor {
         return next;
       }
       if (p.quotaAccountKey) next.accountKey = p.quotaAccountKey;
-      if (!reusedAntigravitySnapshot) applyT3(next, p);
+      if (!antigravity?.blocked) applyT3(next, p);
       if (p.driver === "claudeAgent" && !p.quotaAccountKey) {
         if (next.included.source === "t3") delete next.accountKey;
         next.manualResets = newProvider(p.instanceId, p.driver).manualResets;
@@ -330,7 +375,7 @@ export class HeadroomMonitor {
         this.state.providers.push(previous.get(ctx.providerInstanceId) ?? newProvider(ctx.providerInstanceId, "claudeAgent"));
     }
     this.#diagnose();
-    this.#changed ||= before !== JSON.stringify(this.state.providers);
+    this.#changed ||= before !== JSON.stringify([this.state.providers, this.state.antigravityContexts]);
     this.#active = true;
     // Include the bounded startup balance read in the first snapshot/baseline.
     if (this.#baseline) this.emit();

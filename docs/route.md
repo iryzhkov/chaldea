@@ -368,11 +368,19 @@ provider-wide: a stop from a third-party model also blocks Gemini. Its verified
 account identity is retained with the stop, so removing an instance or changing
 its login cannot release another instance on the stopped account before recovery
 or reset. Legacy stops are upgraded once from a verified disk observation that
-predates the stop. If that original identity cannot be verified, the stop remains
-alias-only; a later login is never used to fill it in. Credential-context changes
-discard cached included windows and persist an observation watermark. Snapshots
-at or before the retired context's newest `checkedAt` remain rejected on repeated
-updates and after monitor restart, until a newer observation arrives.
+is at or before `stopAt`, rather than the later `seenAt`. If that original
+identity cannot be verified, the stop remains alias-only; a later login is never
+used to fill it in. These saved-identity rules apply only to Antigravity;
+Claude/Codex retain main's current-row stop propagation.
+
+Antigravity stores hashes of verified credential contexts with observation
+watermarks. Restarting on the same verified login preserves a valid snapshot,
+including exhausted windows. Context records survive alias removal and re-addition.
+On a different login, snapshots at or before the retired context's newest
+`checkedAt` stay rejected until a newer observation arrives. The registry retains
+up to 1024 aliases without evicting retired watermarks; further aliases cannot
+supply observations until registry capacity is available. Credential strings
+are not stored.
 Active stops and tight/stopped capacity still exclude the driver.
 Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 
@@ -403,9 +411,15 @@ outside this change. Claude/Codex first-seen times and trial allocations retain
 main's plain model keys so mixed-version writers share the same counters. Only
 Antigravity uses driver-prefixed keys. Antigravity probation alternatives appear
 only when that driver/model is a reserved provider pick. Primary alternatives
-stay visible as on main; each distinct exposed primary trial is reserved once.
-A refused route commits first-seen times without spending a trial, so a sole
-candidate can age out of probation instead of restarting its clock on every call.
+stay visible and unreserved as on main. Only the selected primary model and
+eligible driver picks spend primary trial budget; alternatives can therefore
+exceed that share if a caller counts them as recommendations. This is pre-existing
+main behavior, including with mixed-version writers, and is outside this change.
+Primary call counting includes saved plain keys even while their models are
+hidden. Primary first-seen, reservations and rollback follow main's path.
+Refused or unused probes may persist only Antigravity first-seen entries over
+the original history, without spending trials. This lets a sole Antigravity
+candidate age out of probation without persisting primary probe state.
 For Claude-authored reviews, Antigravity excludes `claude-*` models; for
 Codex-authored reviews it excludes `gpt-*` models, including allowlisted models.
 Sonnet remains banned by default.
@@ -446,6 +460,8 @@ that cannot supply the requested role anchor. For Antigravity, only targets
 admissible apart from quota count as alternatives, and fresh pressure must cover
 every routable model. An incomplete Antigravity benchmark catalog or the
 fixed-pair exclusion cannot block an otherwise valid primary quota exception.
+A stopped Antigravity cannot authorize a primary waiver when the primary
+counterpart is absent.
 
 Version 2 adds `metric: "aa-intelligence-cost-per-task"` and
 `benchmarkCostUSDPerTask` from AA's

@@ -121,7 +121,7 @@ test("R3-2: a saved stop propagates only to its saved account after the source i
   } finally { d.remove(); }
 });
 
-test("R3-3: alternating main-format and PR writers spend the same plain primary trial budget", () => {
+test("R3-3: alternating main-format and PR writers share the plain primary provider-pick budget", () => {
   for (const [share, calls] of [[.5, 5], [.1, 60]]) {
     const d = routeScratch(), path = join(d.path, "history.sqlite"), routing = new RouteState(path), db = new DatabaseSync(path);
     try {
@@ -129,13 +129,12 @@ test("R3-3: alternating main-format and PR writers spend the same plain primary 
       f.scores!.models.find(m => m.model === "gpt-6.1-terra")!.benchmarkCostUSDPerTask = .1;
       const key = "general:benchmark:5", h = emptyHistory(), model = "gpt-6.1-terra";
       h.seen[model] = now; h.allocations[model] = { calls: 0, trials: 0 };
-      h.seen["codex:" + model] = now; h.allocations["codex:" + model] = { calls: 100, trials: 0 };
       writeHistory(db, key, h);
       let exposed = 0;
       for (let i = 0; i < calls!; i++) {
         if (i % 2 === 0) {
           const result = routing.recommend({ role: "general" }, f, "fixture", false);
-          if (result.model === model || result.alternatives.some(t => t.model === model)) exposed++;
+          if (result.model === model || Object.values(result.byProvider).some(p => p.eligible && p.model === model)) exposed++;
         } else {
           // A main-format writer reads/writes only the plain model counter in the shared row.
           const legacy = readHistory(db, key), allocation = legacy.allocations[model];
@@ -167,7 +166,7 @@ test("R3-4a: an Antigravity-only preference preserves executor's primary tie-bre
     config: { providerPreference: ["claudeAgent", "codex"] } }).providerInstanceId, "claudeAgent");
 });
 
-test("R3-4b: multiple eligible primary trials remain in alternatives and each receives one reservation", () => {
+test("R3-4b: primary alternatives remain visible and unreserved exactly as on main", () => {
   const d = routeScratch(), path = join(d.path, "history.sqlite"), routing = new RouteState(path), db = new DatabaseSync(path);
   try {
     const f = bench(), key = "general:benchmark:5", history = emptyHistory();
@@ -183,8 +182,8 @@ test("R3-4b: multiple eligible primary trials remain in alternatives and each re
     assert.deepEqual(result.alternatives, pure.alternatives);
     const saved = readHistory(db, key);
     for (const model of ["gpt-6.1-terra", "gpt-6-astra"])
-      assert.deepEqual(saved.allocations[model], { calls: 11, trials: 1 });
-    assert.equal(routing.recommend({ role: "general" }, f, "fixture", false).alternatives.length, 0);
+      assert.deepEqual(saved.allocations[model], { calls: 11, trials: 0 });
+    assert.deepEqual(routing.recommend({ role: "general" }, f, "fixture", false).alternatives, pure.alternatives);
   } finally { db.close(); routing.close(); d.remove(); }
 });
 

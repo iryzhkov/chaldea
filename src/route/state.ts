@@ -10,35 +10,36 @@ import { recommend } from "./policy.ts";
 import type { PolicyData } from "./policy.ts";
 import { emptyHistory, inProbation, roleKey, historyModelKey, driverPickKey } from "./targets.ts";
 import type { RoutingHistory } from "./targets.ts";
-import { DEFAULT_POLICY, PRIMARY_DRIVERS } from "./types.ts";
+import { DEFAULT_POLICY } from "./types.ts";
 import type { Role, RouteInput, RouteResult, Target } from "./types.ts";
 
 
-/** Migrate primary history without lending native evidence to proxy models. */
-function initializeHistory(history: RoutingHistory, data: PolicyData) {
-  const models = new Map<string, { driver: string; model: string }>();
+const antigravityKey = (key: string) => key.startsWith("antigravity:");
+function initializeHistory(history: RoutingHistory, data: PolicyData): void {
   for (const p of data.catalog) for (const m of p.models) {
     const key = historyModelKey(p.driverKind, m.id);
-    if (PRIMARY_DRIVERS.includes(p.driverKind)) {
-      delete history.seen[p.driverKind + ":" + m.id];
-      delete history.allocations[p.driverKind + ":" + m.id];
-    }
-    if (!models.has(key) || PRIMARY_DRIVERS.includes(p.driverKind))
-      models.set(key, { driver: p.driverKind, model: m.id });
     history.seen[key] ??= data.now;
     history.allocations[key] ??= { calls: 0, trials: 0 };
   }
-  return models;
 }
-function reserve(history: RoutingHistory, data: PolicyData, role: Role, targets: Target[]) {
+/** Failed/unused probes can remember only Antigravity's observations, never primary state. */
+function antigravitySeen(original: RoutingHistory, observed: RoutingHistory): boolean {
+  let changed = false;
+  for (const [key, at] of Object.entries(observed.seen)) if (antigravityKey(key) && original.seen[key] === undefined) {
+    original.seen[key] = at;
+    original.allocations[key] ??= { calls: 0, trials: 0 };
+    changed = true;
+  }
+  return changed;
+}
+function reserveAntigravity(history: RoutingHistory, role: Role, data: PolicyData, targets: Target[], opportunities: number): void {
   const config = { ...DEFAULT_POLICY, ...data.config };
-  for (const [key, { driver, model }] of initializeHistory(history, data)) {
-    const allocation = history.allocations[key]!;
-    if (inProbation(model, role, history, config, data.now, driver)) {
-      allocation.calls += targets.length ? 1 : 0;
-      // Each exposed driver/model is reserved once, even across instances or efforts.
-      allocation.trials += Number(targets.some(t => t.model === model &&
-        (data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)?.driverKind === "antigravity") === (driver === "antigravity")));
+  const picks = targets.filter(t => data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)?.driverKind === "antigravity");
+  for (const [key, allocation] of Object.entries(history.allocations)) if (antigravityKey(key)) {
+    const model = key.slice("antigravity:".length);
+    if (inProbation(model, role, history, config, data.now, "antigravity")) {
+      allocation.calls += opportunities;
+      allocation.trials += picks.filter(t => t.model === model).length;
     }
   }
 }
@@ -75,33 +76,26 @@ export class RouteState {
       const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
       const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
       const config = { ...DEFAULT_POLICY, ...data.config };
-      const originalHistory = structuredClone(history);
+      const original = structuredClone(history);
       initializeHistory(history, data);
       let result: RouteResult;
       try { result = recommend(input, { ...data, history }); }
       catch (error) {
-        if (!(error instanceof RouteError) || error.code !== "no_candidate") throw error;
-        // Commit only Antigravity's observed first-seen times. Failed primary-only calls
-        // retain main's rollback behavior, and refusal never spends trial budget.
-        let observedAntigravity = false;
-        for (const p of data.catalog) if (p.driverKind === "antigravity") for (const m of p.models) {
-          observedAntigravity = true;
-          const modelKey = historyModelKey(p.driverKind, m.id);
-          originalHistory.seen[modelKey] ??= history.seen[modelKey]!;
-          originalHistory.allocations[modelKey] ??= { calls: 0, trials: 0 };
-        }
-        if (!observedAntigravity) throw error;
+        if (!(error instanceof RouteError) || error.code !== "no_candidate" || !antigravitySeen(original, history)) throw error;
         this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
-          .run(key, JSON.stringify(originalHistory));
+          .run(key, JSON.stringify(original));
         return { error };
       }
-      const exposed: Target[] = [...Object.values(result.byProvider).filter(p => p.eligible),
-        ...result.alternatives.filter(t => data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)?.driverKind !== "antigravity")];
-      reserve(history, data, input.role, exposed);
+      for (const [model, allocation] of Object.entries(history.allocations)) {
+        if (!antigravityKey(model) && inProbation(model, input.role, history, config, data.now)) {
+          allocation.calls++;
+          if (model === result.model || Object.values(result.byProvider).some(p => p.eligible && p.model === model)) allocation.trials++;
+        }
+      }
+      reserveAntigravity(history, input.role, data, Object.values(result.byProvider).filter(p => p.eligible), 1);
       const driver = data.catalog.find(p => p.providerInstanceId === result.providerInstanceId)!.driverKind;
-      // Preserve the shared primary slot; fallback drivers keep their own settled incumbent.
-      const pickKey = PRIMARY_DRIVERS.includes(driver) ? key : driverPickKey(key, driver);
-      if (!inProbation(result.model, input.role, history, config, data.now, driver)) history.picks[pickKey] = {
+      const pickKey = driver === "antigravity" ? driverPickKey(key, driver) : key;
+      if (!inProbation(result.model, input.role, history, config, data.now, driver === "antigravity" ? driver : undefined)) history.picks[pickKey] = {
         providerInstanceId: result.providerInstanceId, model: result.model, options: result.options,
       };
       this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(history));
@@ -150,11 +144,13 @@ export class RouteState {
     const input = reviewPairInput(value);
     return tx(this.db, () => {
       const histories = new Map<string, RoutingHistory>();
+      const originals = new Map<string, RoutingHistory>();
       const historyFor = (request: RouteInput) => {
         const key = roleKey(request.role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
         if (!histories.has(key)) {
           const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
           const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
+          originals.set(key, structuredClone(history));
           initializeHistory(history, data);
           histories.set(key, history);
         }
@@ -162,7 +158,7 @@ export class RouteState {
       };
       const result = recommendReviewPair(input, data, historyFor);
       const config = { ...DEFAULT_POLICY, ...data.config };
-      const slots = new Map<string, { request: RouteInput; models: Target[] }>();
+      const slots = new Map<string, { request: RouteInput; models: string[]; targets: Target[] }>();
       for (const [target, role, main] of [[result.main, input.mainRole ?? "builder", true],
         [result.peer, input.peerRole ?? "builder", false]] as const) {
         if (!target) continue;
@@ -170,19 +166,28 @@ export class RouteState {
         const request = pairRequest(role, driver, main ? input.mainEffort : input.peerEffort,
           input.authorProvider, main, !!config.benchmark && !config.pins[role]);
         const key = roleKey(role, request.authorProvider, request.effortOverride, data.config?.benchmark?.indexVersion);
-        const slot = slots.get(key) ?? { request, models: [] };
-        slot.models.push(target); slots.set(key, slot);
+        const slot = slots.get(key) ?? { request, models: [], targets: [] };
+        slot.targets.push(target);
+        slot.models.push(target.model); slots.set(key, slot);
       }
       for (const [key, slot] of slots) {
         const history = historyFor(slot.request);
-        // Slots are separate recommendation opportunities, as in the primary policy.
-        for (const target of slot.models) reserve(history, data, slot.request.role, [target]);
+        for (const [model, allocation] of Object.entries(history.allocations)) {
+          if (!antigravityKey(model) && inProbation(model, slot.request.role, history, config, data.now)) {
+            allocation.calls += slot.models.length;
+            allocation.trials += slot.models.filter(m => m === model).length;
+          }
+        }
+        reserveAntigravity(history, slot.request.role, data, slot.targets, slot.models.length);
         this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
           .run(key, JSON.stringify(history));
       }
-      for (const [key, history] of histories) if (!slots.has(key))
-        this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
-          .run(key, JSON.stringify(history));
+      for (const [key, history] of histories) if (!slots.has(key)) {
+        const original = originals.get(key)!;
+        if (antigravitySeen(original, history))
+          this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
+            .run(key, JSON.stringify(original));
+      }
       return result;
     });
   }

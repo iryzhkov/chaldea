@@ -123,7 +123,7 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
     // cannot supply this role's anchor. Only Antigravity uses counterfactual model admission.
     const primaries = drivers.filter(d => d !== "antigravity" &&
       data.catalog.some(p => p.driverKind === d && p.canRunChildTask && p.models.length));
-    if (!primaries.every(primaryPressure)) return false;
+    if (!primaries.length || !primaries.every(primaryPressure)) return false;
     const targets = drivers.includes("antigravity") ? [...choices("antigravity", role, effort, isMain, excluded, !isMain, true)] : [];
     return primaries.length + targets.length > 0 && targets.every(target => {
       const q = data.quota[target.providerInstanceId], c = data.capacity?.[target.providerInstanceId];

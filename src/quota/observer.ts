@@ -73,7 +73,8 @@ export function claim(state: ObserverState, kind: RecordKind, threadId: string, 
 
 function parkedIdentity(state: ObserverState, provider: string) {
   const row = state.headroom.providers.find(p => p.alias === provider);
-  return row?.accountKey && /^[a-f0-9]{64}$/.test(row.accountKey) &&
+  if (row?.driver !== "antigravity") return {};
+  return row.accountKey && /^[a-f0-9]{64}$/.test(row.accountKey) &&
     row.binding !== "asserted" && row.included.error !== "context_mismatch"
     ? { identityChecked: true as const, driver: row.driver, accountKey: row.accountKey } : { identityChecked: true as const };
 }
@@ -180,8 +181,9 @@ export function observeThread(
       runId,
       resetAt,
       provider: thread.providerInstanceId,
-      identityChecked: true,
-      ...(current?.runId === runId ? current.driver && current.accountKey ? { driver: current.driver, accountKey: current.accountKey } : {}
+      ...(current?.runId === runId
+        ? current.driver === "antigravity" ? { identityChecked: true as const, driver: current.driver,
+            ...(current.accountKey ? { accountKey: current.accountKey } : {}) } : {}
         : parkedIdentity(state, thread.providerInstanceId)),
       stopAt,
       seenAt: current?.runId === runId ? current.seenAt : nowMs,

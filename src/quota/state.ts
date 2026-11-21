@@ -81,7 +81,7 @@ function migrateParkedIdentities(state: ObserverState): void {
     }
     const verified = row?.driver === "antigravity" && row.accountKey && /^[a-f0-9]{64}$/.test(row.accountKey) &&
       row.binding !== "asserted" && row.included.source === "t3" && row.included.error === null &&
-      row.included.observedAt !== null && Date.parse(row.included.observedAt) <= stop.seenAt;
+      row.included.observedAt !== null && Date.parse(row.included.observedAt) <= stop.stopAt;
     state.parked.set(id, { ...stop, identityChecked: true,
       ...(verified ? { driver: row.driver, accountKey: row.accountKey! } : {}) });
   }

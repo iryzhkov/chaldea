@@ -150,7 +150,7 @@ export function classifyCapacities(state: Pick<ObserverState, "headroom" | "park
   const id = (p: ProviderHeadroom) => p.accountKey ? capacityKey(p.driver, p.accountKey) : p.alias;
   const stoppedAccounts = new Set(state.headroom.providers.filter(p => p.driver !== "antigravity" && stopped.has(p.alias)).map(id));
   for (const stop of state.parked.values()) {
-    if (stopped.has(stop.provider) && stop.driver && stop.accountKey && /^[a-f0-9]{64}$/.test(stop.accountKey))
+    if (stopped.has(stop.provider) && stop.driver === "antigravity" && stop.accountKey && /^[a-f0-9]{64}$/.test(stop.accountKey))
       stoppedAccounts.add(capacityKey(stop.driver, stop.accountKey));
   }
   const result: Record<string, Capacity> = {};
