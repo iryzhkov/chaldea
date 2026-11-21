@@ -173,8 +173,8 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     });
     reasons.push("Slopalytics compares only the role pair; minimum sample applies to both models");
   }
-  const preferCodex = input.role === "executor" && !pin && !config.providerPreference.length;
-  if (preferCodex) reasons.push("Executor prefers eligible Codex for long-running work and large contexts, ahead of expiring Claude quota");
+  const preferCodex = input.role === "executor" && !pin;
+  if (preferCodex) reasons.push("Executor prefers eligible Codex among equally preferred drivers for long-running work and large contexts");
   if (config.providerPreference.length) reasons.push("Provider preference: " + config.providerPreference.join(", "));
   const rankCandidates = (pool: typeof candidates, explain: boolean) => {
     const claude = pool.filter(c => c.driver === "claudeAgent");
@@ -273,7 +273,7 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       ", 3:1 input/output price $" + (s.inputPrice === null || s.outputPrice === null ? "unknown" : (3 * s.inputPrice + s.outputPrice) / 4) + "/M; " + input.role + " objective after quota policy");
   }
   return { ...target(eligible[0]!), diagnostics, topPick, byProvider, alternatives: eligible.slice(1).filter(c =>
-      !scores || pin || !inProbation(c.model, input.role, history, config, data.now, c.driver) ||
+      c.driver !== "antigravity" || !scores || pin || !inProbation(c.model, input.role, history, config, data.now, c.driver) ||
       byProvider[c.driver]?.eligible && byProvider[c.driver]?.model === c.model).map(target), reasons,
     dataAges: { quota: ages, slopalytics: analyticsAge, slopalyticsWindow: windowAge, artificialAnalysis: scoreAge } };
 }

@@ -33,6 +33,9 @@ export interface ProviderHeadroom {
   readonly alias: string;
   readonly driver: string;
   accountKey?: string;
+  /** Antigravity observations at or before a retired credential context are never reusable. */
+  antigravityObservationFloor?: string;
+  antigravityCheckedAt?: string;
   creditExpiresAt?: string;
   burnHistory?: ReadonlyArray<BurnSample>;
   binding?: "asserted" | "verified";
@@ -93,6 +96,8 @@ export function validateHeadroom(value: unknown): HeadroomState {
     if (!object(p) || !safeId(p.alias) || !safeId(p.driver) ||
         p.accountKey !== undefined && !/^[a-f0-9]{64}$/.test(p.accountKey) ||
         p.creditExpiresAt !== undefined && !iso(p.creditExpiresAt) ||
+        p.antigravityObservationFloor !== undefined && !iso(p.antigravityObservationFloor) ||
+        p.antigravityCheckedAt !== undefined && !iso(p.antigravityCheckedAt) ||
         p.burnHistory !== undefined && (!Array.isArray(p.burnHistory) || p.burnHistory.length > 288 ||
           !p.burnHistory.every((s: any) => object(s) && iso(s.observedAt) && Array.isArray(s.windows) && s.windows.length <= 32 &&
             s.windows.every((w: any) => object(w) && safeId(w.id) && percent(w.remainingPercent) && percent(w.usedPercent) &&
@@ -283,9 +288,17 @@ export class HeadroomMonitor {
       // config after restart (persisted observations have no credential identifiers).
       const next = row?.driver === p.driver ? row : newProvider(p.instanceId, p.driver);
       const contextChanged = !priorContexts.has(p.instanceId) || priorContexts.get(p.instanceId) !== identity(p);
-      const reusedAntigravitySnapshot = p.driver === "antigravity" && contextChanged &&
-        priorContexts.has(p.instanceId) && p.usageLimits && next.included.observedAt !== null &&
-        Date.parse(p.usageLimits.checkedAt) <= Date.parse(next.included.observedAt);
+      if (p.driver === "antigravity" && contextChanged) {
+        const previousAt = [next.antigravityObservationFloor, next.antigravityCheckedAt, next.included.observedAt]
+          .filter((at): at is string => !!at && Number.isFinite(Date.parse(at))).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+        if (previousAt) next.antigravityObservationFloor = previousAt;
+      }
+      const checkedAt = iso(p.usageLimits?.checkedAt);
+      const reusedAntigravitySnapshot = p.driver === "antigravity" && (!checkedAt ||
+        !!next.antigravityObservationFloor && Date.parse(checkedAt) <= Date.parse(next.antigravityObservationFloor));
+      if (p.driver === "antigravity" && checkedAt && !reusedAntigravitySnapshot &&
+          (!next.antigravityCheckedAt || Date.parse(checkedAt) > Date.parse(next.antigravityCheckedAt)))
+        next.antigravityCheckedAt = checkedAt;
       if (contextChanged) {
         const clean = newProvider(p.instanceId, p.driver);
         delete next.burnHistory;

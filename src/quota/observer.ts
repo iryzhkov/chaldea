@@ -75,7 +75,7 @@ function parkedIdentity(state: ObserverState, provider: string) {
   const row = state.headroom.providers.find(p => p.alias === provider);
   return row?.accountKey && /^[a-f0-9]{64}$/.test(row.accountKey) &&
     row.binding !== "asserted" && row.included.error !== "context_mismatch"
-    ? { driver: row.driver, accountKey: row.accountKey } : {};
+    ? { identityChecked: true as const, driver: row.driver, accountKey: row.accountKey } : { identityChecked: true as const };
 }
 
 function isUsageLimitStop(thread: ShellThread): boolean {
@@ -180,6 +180,7 @@ export function observeThread(
       runId,
       resetAt,
       provider: thread.providerInstanceId,
+      identityChecked: true,
       ...(current?.runId === runId ? current.driver && current.accountKey ? { driver: current.driver, accountKey: current.accountKey } : {}
         : parkedIdentity(state, thread.providerInstanceId)),
       stopAt,

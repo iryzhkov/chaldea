@@ -115,7 +115,7 @@ async function collectContext(options: RouteOptions) {
       quota[row.alias] = { observedAt: null, windows: [], activeStop: quota[row.alias]?.activeStop ?? false };
     } else if (key) row.accountKey = key;
   }
-  const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.accountKey && quota[p.alias]?.activeStop)
+  const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.driver !== "antigravity" && p.accountKey && quota[p.alias]?.activeStop)
     .map(p => capacityKey(p.driver, p.accountKey!)));
   for (const stop of state.parked.values()) {
     if (stop.driver && stop.accountKey && /^[a-f0-9]{64}$/.test(stop.accountKey) &&

@@ -7,8 +7,8 @@ export interface RoutingHistory {
   picks: Record<string, Target>;
   allocations: Record<string, { calls: number; trials: number }>;
 }
-/** Primary legacy keys remain readable; proxy models never inherit native history. */
-export const historyModelKey = (driver: string, model: string) => driver + ":" + model;
+/** Share primary counters with main-format writers; only Antigravity has a private namespace. */
+export const historyModelKey = (driver: string, model: string) => driver === "antigravity" ? driver + ":" + model : model;
 export const historySeen = (history: RoutingHistory, driver: string | undefined, model: string) =>
   (driver ? history.seen[historyModelKey(driver, model)] : undefined) ??
   (!driver || driver !== "antigravity" ? history.seen[model] : undefined);

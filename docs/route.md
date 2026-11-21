@@ -367,17 +367,24 @@ family quota and use only common windows. A parked Antigravity stop is
 provider-wide: a stop from a third-party model also blocks Gemini. Its verified
 account identity is retained with the stop, so removing an instance or changing
 its login cannot release another instance on the stopped account before recovery
-or reset. Credential-context changes discard cached included windows.
+or reset. Legacy stops are upgraded once from a verified disk observation that
+predates the stop. If that original identity cannot be verified, the stop remains
+alias-only; a later login is never used to fill it in. Credential-context changes
+discard cached included windows and persist an observation watermark. Snapshots
+at or before the retired context's newest `checkedAt` remain rejected on repeated
+updates and after monitor restart, until a newer observation arrives.
 Active stops and tight/stopped capacity still exclude the driver.
 Without AA scores the fixed Claude/Codex pairs above stay unchanged.
 
 `providerPreference` is an ordered array drawn from `antigravity`, `codex` and
 `claudeAgent`; unknown driver names are rejected. For example
 `["antigravity", "codex", "claudeAgent"]`. Listed drivers rank before unlisted
-drivers, in that order, after eligibility checks. This replaces the executor's
-Codex preference too. An empty or omitted list preserves Claude/Codex quota and
-role ordering exactly, with Antigravity after both. Unlisted drivers retain the
-default ordering. Pins, bans, floors, effort validation, probation, stops and
+drivers, in that order, after eligibility checks. Explicit driver ordering takes
+precedence over executor's Codex preference. Among equally ranked drivers,
+executor still prefers Codex: `["antigravity"]` leaves both primaries tied and
+keeps Codex first when Antigravity is absent or stopped. An empty or omitted list
+preserves Claude/Codex quota and role ordering exactly, with Antigravity after both.
+Unlisted drivers retain the default ordering. Pins, bans, floors, effort validation, probation, stops and
 review separation still apply. Instance IDs never determine cross-driver priority.
 
 The reviewed AA index 5 mappings cover Neon low/medium/high/xhigh, Hydrogen
@@ -392,9 +399,13 @@ baseline. Explicit driver allowlists can calibrate it. Fallback picks never
 replace primary history incumbents, so primary routing can recover after a stop.
 Settled Antigravity picks have a separate incumbent slot. Codex and Claude retain
 main's shared incumbent slot; separating those primary slots is a follow-up,
-outside this change. First-seen times and trial allocations use driver/model
-keys. Probation alternatives appear only when that driver/model is a reserved
-provider pick, so alternatives cannot spend an unreserved trial.
+outside this change. Claude/Codex first-seen times and trial allocations retain
+main's plain model keys so mixed-version writers share the same counters. Only
+Antigravity uses driver-prefixed keys. Antigravity probation alternatives appear
+only when that driver/model is a reserved provider pick. Primary alternatives
+stay visible as on main; each distinct exposed primary trial is reserved once.
+A refused route commits first-seen times without spending a trial, so a sole
+candidate can age out of probation instead of restarting its clock on every call.
 For Claude-authored reviews, Antigravity excludes `claude-*` models; for
 Codex-authored reviews it excludes `gpt-*` models, including allowlisted models.
 Sonnet remains banned by default.
@@ -429,9 +440,11 @@ Review pairs try eligible different drivers for the main and peer, honoring
 provider preference. Defaults preserve the Claude/Codex pair, then try
 Antigravity. Selection tries another eligible main when the preferred main
 prevents a valid independent peer. A missing provider or unknown quota never
-authorizes a same-driver exception. Only targets admissible apart from quota
-count as alternatives, and fresh pressure must cover every routable model on
-each alternative driver. An incomplete Antigravity benchmark catalog or the
+authorizes a same-driver exception. Primary quota pressure retains main's rule:
+every runnable instance must show fresh pressure, even a Haiku-only instance
+that cannot supply the requested role anchor. For Antigravity, only targets
+admissible apart from quota count as alternatives, and fresh pressure must cover
+every routable model. An incomplete Antigravity benchmark catalog or the
 fixed-pair exclusion cannot block an otherwise valid primary quota exception.
 
 Version 2 adds `metric: "aa-intelligence-cost-per-task"` and

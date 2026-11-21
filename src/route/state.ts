@@ -5,6 +5,7 @@ import { openDb, tx } from "../store/sqlite.ts";
 import { publish } from "../events/publisher.ts";
 import type { Publication, PublisherOptions } from "../events/publisher.ts";
 import { recommendReviewPair, reviewPairInput, pairRequest, type ReviewPairInput, type ReviewPairResult } from "./pair.ts";
+import { RouteError } from "./errors.ts";
 import { recommend } from "./policy.ts";
 import type { PolicyData } from "./policy.ts";
 import { emptyHistory, inProbation, roleKey, historyModelKey, driverPickKey } from "./targets.ts";
@@ -18,10 +19,14 @@ function initializeHistory(history: RoutingHistory, data: PolicyData) {
   const models = new Map<string, { driver: string; model: string }>();
   for (const p of data.catalog) for (const m of p.models) {
     const key = historyModelKey(p.driverKind, m.id);
-    models.set(key, { driver: p.driverKind, model: m.id });
-    const legacy = PRIMARY_DRIVERS.includes(p.driverKind);
-    history.seen[key] ??= (legacy ? history.seen[m.id] : undefined) ?? data.now;
-    history.allocations[key] ??= { ...((legacy ? history.allocations[m.id] : undefined) ?? { calls: 0, trials: 0 }) };
+    if (PRIMARY_DRIVERS.includes(p.driverKind)) {
+      delete history.seen[p.driverKind + ":" + m.id];
+      delete history.allocations[p.driverKind + ":" + m.id];
+    }
+    if (!models.has(key) || PRIMARY_DRIVERS.includes(p.driverKind))
+      models.set(key, { driver: p.driverKind, model: m.id });
+    history.seen[key] ??= data.now;
+    history.allocations[key] ??= { calls: 0, trials: 0 };
   }
   return models;
 }
@@ -33,12 +38,7 @@ function reserve(history: RoutingHistory, data: PolicyData, role: Role, targets:
       allocation.calls += targets.length ? 1 : 0;
       // Each exposed driver/model is reserved once, even across instances or efforts.
       allocation.trials += Number(targets.some(t => t.model === model &&
-        data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)?.driverKind === driver));
-    }
-    // Keep legacy primary readers compatible; canonical accounting uses driver/model keys.
-    if (PRIMARY_DRIVERS.includes(driver)) {
-      history.seen[model] = history.seen[key]!;
-      history.allocations[model] = { ...allocation };
+        (data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)?.driverKind === "antigravity") === (driver === "antigravity")));
     }
   }
 }
@@ -71,13 +71,32 @@ export class RouteState {
   }
   recommend(input: RouteInput, data: PolicyData, host: string, announce: boolean): RouteResult {
     const key = roleKey(input.role, input.authorProvider, input.effortOverride, data.config?.benchmark?.indexVersion);
-    const result = tx(this.db, () => {
+    const attempt = tx(this.db, () => {
       const row = this.db.prepare("SELECT value FROM history WHERE role=?").get(key);
       const history: RoutingHistory = row ? JSON.parse(String(row.value)) : emptyHistory();
       const config = { ...DEFAULT_POLICY, ...data.config };
+      const originalHistory = structuredClone(history);
       initializeHistory(history, data);
-      const result = recommend(input, { ...data, history });
-      const exposed = Object.values(result.byProvider).filter(p => p.eligible);
+      let result: RouteResult;
+      try { result = recommend(input, { ...data, history }); }
+      catch (error) {
+        if (!(error instanceof RouteError) || error.code !== "no_candidate") throw error;
+        // Commit only Antigravity's observed first-seen times. Failed primary-only calls
+        // retain main's rollback behavior, and refusal never spends trial budget.
+        let observedAntigravity = false;
+        for (const p of data.catalog) if (p.driverKind === "antigravity") for (const m of p.models) {
+          observedAntigravity = true;
+          const modelKey = historyModelKey(p.driverKind, m.id);
+          originalHistory.seen[modelKey] ??= history.seen[modelKey]!;
+          originalHistory.allocations[modelKey] ??= { calls: 0, trials: 0 };
+        }
+        if (!observedAntigravity) throw error;
+        this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
+          .run(key, JSON.stringify(originalHistory));
+        return { error };
+      }
+      const exposed: Target[] = [...Object.values(result.byProvider).filter(p => p.eligible),
+        ...result.alternatives.filter(t => data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)?.driverKind !== "antigravity")];
       reserve(history, data, input.role, exposed);
       const driver = data.catalog.find(p => p.providerInstanceId === result.providerInstanceId)!.driverKind;
       // Preserve the shared primary slot; fallback drivers keep their own settled incumbent.
@@ -86,8 +105,10 @@ export class RouteState {
         providerInstanceId: result.providerInstanceId, model: result.model, options: result.options,
       };
       this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(history));
-      return result;
+      return { result };
     });
+    if ("error" in attempt) throw attempt.error;
+    const result = attempt.result;
     if (input.effortOverride) return result;
     try {
       tx(this.db, () => {
@@ -159,6 +180,9 @@ export class RouteState {
         this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
           .run(key, JSON.stringify(history));
       }
+      for (const [key, history] of histories) if (!slots.has(key))
+        this.db.prepare("INSERT INTO history VALUES(?,?) ON CONFLICT(role) DO UPDATE SET value=excluded.value")
+          .run(key, JSON.stringify(history));
       return result;
     });
   }

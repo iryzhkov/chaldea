@@ -40,6 +40,8 @@ export interface ParkedThread {
   /** Verified identity at the stop, retained even if the instance disappears or logs in again. */
   readonly driver?: string;
   readonly accountKey?: string;
+  /** Identity was captured or migration was attempted; never infer it from a later login. */
+  readonly identityChecked?: true;
   /** Stop time of the parked run (see `stopTime` in observer.ts), epoch milliseconds. */
   readonly stopAt: number;
   /** When the observer first saw this stop, epoch milliseconds. */
@@ -66,6 +68,23 @@ export const MAX_STATE_BYTES = 8 * 1024 * 1024;
 
 export function emptyState(): ObserverState {
   return { cursor: null, headroom: emptyHeadroom(), posted: new Map(), pendingDelivery: new Map(), deliveryDropped: 0, parked: new Map(), switches: new Map(), evictedThrough: null };
+}
+
+/** Upgrade only from a verified observation that predates the stop, never a later login. */
+function migrateParkedIdentities(state: ObserverState): void {
+  for (const [id, stop] of state.parked) {
+    if (stop.identityChecked) continue;
+    const row = state.headroom.providers.find(p => p.alias === stop.provider);
+    if (stop.driver ? stop.driver !== "antigravity" : row?.driver !== "antigravity") continue;
+    if (stop.driver && stop.accountKey) {
+      state.parked.set(id, { ...stop, identityChecked: true }); continue;
+    }
+    const verified = row?.driver === "antigravity" && row.accountKey && /^[a-f0-9]{64}$/.test(row.accountKey) &&
+      row.binding !== "asserted" && row.included.source === "t3" && row.included.error === null &&
+      row.included.observedAt !== null && Date.parse(row.included.observedAt) <= stop.seenAt;
+    state.parked.set(id, { ...stop, identityChecked: true,
+      ...(verified ? { driver: row.driver, accountKey: row.accountKey! } : {}) });
+  }
 }
 
 export function recordKey(kind: RecordKind, threadId: string, runId: string): string {
@@ -141,6 +160,7 @@ export function loadState(path: string, nowMs: number): ObserverState {
       }
     }
   }
+  migrateParkedIdentities(state);
   prune(state, nowMs);
   return state;
 }
