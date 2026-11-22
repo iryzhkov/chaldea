@@ -10,12 +10,19 @@ export function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   atomicWrite(path, JSON.stringify(value), 0o600);
 }
-const FAILURE_REASONS = ["credential_expired", "credential_unavailable", "rate_limited", "unauthorized", "collection_failed"] as const;
+const FAILURE_REASONS = ["credential_expired", "credential_unavailable", "rate_limited", "unauthorized", "collection_failed",
+  "fetch_failed", "oversized_response", "unsupported_schema", "invalid_metrics"] as const;
 type FailureReason = typeof FAILURE_REASONS[number];
 /** Only allowlisted categories may reach persistent diagnostics. Never persist raw errors. */
 export class CollectionFailure extends Error {
   readonly reason: FailureReason; readonly retryDelayMs: number | null;
-  constructor(reason: FailureReason, retryDelayMs: number | null = null) { super(reason); this.reason = reason; this.retryDelayMs = retryDelayMs; }
+  /** The message is a fixed diagnostic string chosen by the caller, never upstream or request text. */
+  constructor(reason: FailureReason, retryDelayMs: number | null = null, message: string = reason) {
+    super(message); this.reason = reason; this.retryDelayMs = retryDelayMs;
+  }
+}
+export class OversizedResponse extends Error {
+  constructor() { super("Usage response too large"); }
 }
 export class HttpFailure extends Error {
   readonly status: number; readonly retryAfter: string | null;
@@ -94,7 +101,7 @@ export async function getJson(url: string, init: RequestInit = {}, fetcher: type
     let size = 0;
     for await (const chunk of response.body) {
       size += chunk.byteLength;
-      if (size > maxBytes) throw new Error("Usage response too large");
+      if (size > maxBytes) throw new OversizedResponse();
       chunks.push(chunk);
     }
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
