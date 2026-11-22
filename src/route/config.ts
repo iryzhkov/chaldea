@@ -76,6 +76,14 @@ export function loadRouteConfig(home: string, path = join(home, ".config/chaldea
       throw new Error("Invalid provider preference");
     c.providerPreference = r.providerPreference;
   }
+  if (r.roleProviderExclusions !== undefined) {
+    const x = r.roleProviderExclusions as Record<string, unknown>;
+    if (!x || typeof x !== "object" || Array.isArray(x) || Object.entries(x).some(([role, drivers]) =>
+      !Object.hasOwn(c.floors, role) || !Array.isArray(drivers) || drivers.length > 20 ||
+      new Set(drivers).size !== drivers.length || drivers.some(d => typeof d !== "string" || !ROUTED_DRIVERS.includes(d))))
+      throw new Error("Invalid role provider exclusions");
+    c.roleProviderExclusions = x as Partial<Record<Role, string[]>>;
+  }
   if (r.driverModels !== undefined) {
     const d = r.driverModels as Record<string, unknown>;
     if (!d || typeof d !== "object" || Array.isArray(d) || Object.keys(d).length > 20 || Object.entries(d).some(([k, v]) =>

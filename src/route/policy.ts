@@ -78,6 +78,9 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     providerReasons.set(p.driverKind, scoped);
     const reject = (reason: string) => { scoped.push(reason); reasons.push(reason); };
     if (p.driverKind === "antigravity" && p.admissionHold) { reject(p.admissionHold); continue; }
+    if (config.roleProviderExclusions?.[input.role]?.includes(p.driverKind)) {
+      reject(p.providerInstanceId + ": roleProviderExclusions excludes " + p.driverKind + " for role " + input.role); continue;
+    }
     if (input.authorProvider !== undefined && p.driverKind === input.authorProvider) {
       reject(p.providerInstanceId + ": review requires the other provider from " + input.authorProvider); continue;
     }
@@ -135,7 +138,8 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     diagnostics.quota[p.providerInstanceId + ":" + model] = { accountKey: p.accountKey ?? null,
       bindingSource: p.accountKey ? "catalog" : "unbound", source: q?.operatorEstimate ? "operator_estimate" : "observation",
       ageSeconds: age, freshness: fresh ? "fresh" : age === null ? "unknown" : "stale",
-      bindingWindow: advice.binding?.id ?? advice.binding?.kind ?? null, scopedKnown: advice.scopeKnown && !q?.incomplete };
+      bindingWindow: advice.binding?.id ?? advice.binding?.kind ?? null, scopedKnown: advice.scopeKnown && !q?.incomplete,
+      pace: q?.incomplete ? null : advice.pace };
     reasons.push(...advice.reasons.map(reason => p.providerInstanceId + " " + reason));
     // Short windows gate included usage only. The classifier sets creditFunded solely for fresh,
     // account-bound credits with spend control not reached; active stops were excluded above.
@@ -178,8 +182,24 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   }
   const preferCodex = input.role === "executor" && !pin;
   if (preferCodex) reasons.push("Executor prefers eligible Codex among equally preferred drivers for long-running work and large contexts");
-  if (config.providerPreference.length) reasons.push("Provider preference: " + config.providerPreference.join(", "));
+  if (config.providerPreference.length) reasons.push("Provider preference: " + config.providerPreference.join(", ") +
+    "; a candidate ahead of its weekly pace ranks after candidates whose pace is unknown or not ahead");
+  const position = (driver: string) => {
+    const index = config.providerPreference.indexOf(driver);
+    return index < 0 ? config.providerPreference.length : index;
+  };
+  // Pace is remaining fraction minus time-left fraction; below zero burns faster than linear.
+  const aheadOfPace = (c: typeof candidates[number]) => c.pace !== null && c.pace < 0;
   const rankCandidates = (pool: typeof candidates, explain: boolean) => {
+    if (explain && config.providerPreference.length) {
+      for (const driver of config.providerPreference) {
+        const ahead = pool.filter(c => c.driver === driver && aheadOfPace(c));
+        if (!ahead.length || !pool.some(c => c.driver !== driver && !aheadOfPace(c) && position(c.driver) > position(driver))) continue;
+        const worst = ahead.reduce((m, c) => c.pace! < m.pace! ? c : m);
+        const reason = `${worst.providerInstanceId}: preferred provider ${driver} demoted for pace: ${worst.model} weekly pace ${worst.pace!.toFixed(2)} is ahead of linear; ranked after providers whose pace is unknown or not ahead`;
+        reasons.push(reason); providerReasons.get(driver)?.push(reason);
+      }
+    }
     const claude = pool.filter(c => c.driver === "claudeAgent");
     const pacedClaude = claude.filter(c => c.pace !== null);
     const preferred: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent"
@@ -187,12 +207,12 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     const hasPace = pacedClaude.length > 0;
     if (explain && !preferCodex && !config.providerPreference.length) reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
     const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
-      if (x.driver !== y.driver && config.providerPreference.length) {
-        const position = (driver: string) => {
-          const index = config.providerPreference.indexOf(driver);
-          return index < 0 ? config.providerPreference.length : index;
-        };
-        const order = position(x.driver) - position(y.driver);
+      if (config.providerPreference.length) {
+        // Pace demotion applies to every candidate, including same-driver pairs, so the
+        // comparator stays transitive when one driver has both paced and unknown models.
+        const pace = Number(aheadOfPace(x)) - Number(aheadOfPace(y));
+        if (pace) return pace;
+        const order = x.driver === y.driver ? 0 : position(x.driver) - position(y.driver);
         if (order) return order;
       }
       if (preferCodex && (x.driver === "codex") !== (y.driver === "codex"))
