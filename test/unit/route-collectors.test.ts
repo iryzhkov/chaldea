@@ -85,6 +85,49 @@ test("Slopalytics v4 tolerates one-turn outcome rounding and keeps rates bounded
     assert.equal(result.value?.models["claude-fable-5-2"]?.completionRate, .5);
     assert.throws(() => aggregate({ ...payload, metrics: [{ ...row, terminal: 102 }] }, iso(now)), /Invalid/);
     assert.throws(() => aggregate({ ...payload, schemaVersion: 3, metrics: [{ ...row, terminal: 99 }] }, iso(now)), /Invalid/);
+    // Rounding cannot make one outcome exceed terminal: a phantom failure must not inflate rates.
+    const zero = { ...row, terminal: 0, completed: 0, failed: 1, interrupted: 0, timedTurns: 0, durationMs: 0 };
+    for (const bad of [zero, { ...zero, failed: 0, completed: 1 }, { ...zero, failed: 0, interrupted: 1 },
+      { ...row, terminal: 5, completed: 0, failed: 6, interrupted: 0, timedTurns: 0 },
+      { ...row, terminal: 5, completed: 6, failed: 0, interrupted: 0, timedTurns: 5 }])
+      assert.throws(() => aggregate({ ...payload, metrics: [row, bad] }, iso(now)), /Invalid Slopalytics metrics/);
+    const phantom = await collectAnalytics(join(d.path, "phantom.json"), now, async () =>
+      Response.json({ ...payload, metrics: [row, ...Array(30).fill(zero)] }));
+    assert.equal(phantom.value, null);
+    assert.match(phantom.reason ?? "", /^invalid_metrics; no successful cache/);
+    const healthy = aggregate({ ...payload, metrics: [row, { ...row, terminal: 0, completed: 0, failed: 0, interrupted: 0, timedTurns: 0, durationMs: 0 }] }, iso(now));
+    assert.equal(healthy.models["claude-opus-5-5"]?.failedRate, .06);
+  } finally { d.remove(); }
+});
+test("Slopalytics failures persist only fixed diagnostic categories", async () => {
+  const d = routeScratch();
+  try {
+    const cases: Array<[string, typeof fetch]> = [
+      ["unsupported_schema", async () => Response.json({ ...report, schemaVersion: 5 })],
+      ["invalid_metrics", async () => Response.json({ ...report, metrics: [{ ...row, failed: 100 }] })],
+      ["invalid_metrics", async () => Response.json({ ...report, start: "secret-token-in-body" })],
+      ["fetch_failed", async () => { throw new Error("network down https://user:secret@example.invalid"); }],
+      ["fetch_failed", async () => new Response("secret-token-in-body", { status: 500 })],
+      ["fetch_failed", async () => new Response("not json secret-token-in-body")],
+      ["oversized_response", async () => new Response("x".repeat(2 * 1024 * 1024 + 1))],
+    ];
+    for (const [i, [reason, fetcher]] of cases.entries()) {
+      const path = join(d.path, "diag-" + i + ".json");
+      const result = await collectAnalytics(path, now, fetcher);
+      assert.equal(result.value, null);
+      assert.equal(result.reason, reason + "; no successful cache; retry at " + iso(now + 86400000));
+      const disk = readFileSync(path, "utf8");
+      assert.equal(JSON.parse(disk).failureReason, reason);
+      assert.doesNotMatch(disk, /secret|network|example/);
+      // A later read inside the reservation reports the same category without fetching.
+      assert.equal((await collectAnalytics(path, now + 1, async () => { throw new Error("must not fetch"); })).reason, result.reason);
+    }
+    // Retained last-good data keeps its age next to the new category.
+    const path = join(d.path, "retained.json");
+    await collectAnalytics(path, now, async () => Response.json(report));
+    const later = await collectAnalytics(path, now + 86400000, async () => Response.json({ ...report, schemaVersion: 5 }));
+    assert.match(later.reason ?? "", /^unsupported_schema; retained last successful cache, age 86400s; retry at /);
+    assert.ok(later.value?.models["claude-opus-5-5"]);
   } finally { d.remove(); }
 });
 test("Slopalytics caches successes and failures at most daily", async () => {
