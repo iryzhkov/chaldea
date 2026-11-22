@@ -432,7 +432,11 @@ for Gemini models). The capacity classifier ignores family-scoped windows, so
 Antigravity capacity can still read "unknown" while its pace is known.
 `route review-pair` applies the same rule when it orders drivers for the main
 and peer reviewers: a preferred driver whose pick is ahead of pace is tried after
-the others, and the pair reasons name the demoted driver. Without a preference
+the others, and the pair reasons name the demoted driver. Main reviewer
+candidates are searched in two passes: every not-ahead candidate, in preference
+order, is tried before any ahead-of-pace candidate, so backtracking through a
+driver's models cannot pick an ahead-of-pace main while a complete pair with a
+not-ahead main exists. Without a preference
 list the default pacing policy is unchanged.
 
 `roleProviderExclusions` maps a role to driver kinds that are never candidates

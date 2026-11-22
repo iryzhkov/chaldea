@@ -107,6 +107,24 @@ for (const opusCheapest of [true, false]) {
     assert.ok(r.reasons.some(x => x.includes("demoted for pace: gemini-4-neon")));
   });
 }
+test("review pair tries every not-ahead main candidate before an ahead-of-pace one", () => {
+  // AG Opus finds no independent builder peer (codex excluded, native Claude offers the same
+  // model); backtracking to ahead-of-pace AG Gemini must lose to native Claude Opus as main.
+  const f = mixed(false);
+  f.config = { ...f.config, roleProviderExclusions: { builder: ["codex"] } };
+  const r = recommendReviewPair({ authorProvider: "codex", mainRole: "general", peerRole: "builder" }, f);
+  assert.equal(r.status, "complete");
+  assert.deepEqual([r.main?.providerInstanceId, r.main?.model], ["claudeAgent", "claude-opus-5-5"]);
+  assert.deepEqual([r.peer?.providerInstanceId, r.peer?.model], ["antigravity", "gemini-4-neon"]);
+  assert.ok(r.reasons.some(x => x.includes("demoted antigravity for pace")));
+  // Without the ahead-of-pace window the preferred Gemini main is accepted as before.
+  const paced = mixed(false);
+  paced.quota = {};
+  paced.config = { ...paced.config, roleProviderExclusions: { builder: ["codex"] } };
+  const unchanged = recommendReviewPair({ authorProvider: "codex", mainRole: "general", peerRole: "builder" }, paced);
+  assert.equal(unchanged.main?.providerInstanceId, "antigravity");
+  assert.ok(!unchanged.reasons.some(x => x.includes("for pace")));
+});
 test("no_candidate names the role provider exclusions that removed drivers", () => {
   const f = { ...data(null), scores: null };
   f.config = { ...f.config, benchmark: null, roleProviderExclusions: { general: ["codex", "claudeAgent"] } };
