@@ -65,8 +65,26 @@ test("Slopalytics v3 refreshes the real collector cache and keeps exact harness 
     assert.equal(result.reason, null);
     assert.equal(result.value?.models["claude-opus-5-5"]?.turns, 100);
     assert.equal(result.value?.models["claude-opus-5-5"]?.completionRate, .9);
-    assert.throws(() => aggregate({ ...payload, schemaVersion: 4 }, iso(now)), /Invalid/);
+    assert.throws(() => aggregate({ ...payload, schemaVersion: 5 }, iso(now)), /Invalid/);
     assert.throws(() => aggregate({ ...payload, metrics: [{ ...row, terminal: 101 }] }, iso(now)), /Invalid/);
+  } finally { d.remove(); }
+});
+test("Slopalytics v4 tolerates one-turn outcome rounding and keeps rates bounded", async () => {
+  const d = routeScratch();
+  try {
+    // Shapes seen in the live v4 dataset: outcome sums one above and one below terminal.
+    const payload = { ...report, schemaVersion: 4, metrics: [
+      { ...row, terminal: 99, tokenTurns: 99, subagents: 0, estimatedCost: 1 },
+      { ...row, terminal: 101 },
+      { ...row, model: "Fable 5.2", terminal: 1, completed: 1, failed: 1, interrupted: 0, timedTurns: 1 },
+    ] };
+    const result = await collectAnalytics(join(d.path, "v4.json"), now, async () => Response.json(payload));
+    assert.equal(result.reason, null);
+    assert.equal(result.value?.models["claude-opus-5-5"]?.turns, 200);
+    assert.equal(result.value?.models["claude-opus-5-5"]?.completionRate, .9);
+    assert.equal(result.value?.models["claude-fable-5-2"]?.completionRate, .5);
+    assert.throws(() => aggregate({ ...payload, metrics: [{ ...row, terminal: 102 }] }, iso(now)), /Invalid/);
+    assert.throws(() => aggregate({ ...payload, schemaVersion: 3, metrics: [{ ...row, terminal: 99 }] }, iso(now)), /Invalid/);
   } finally { d.remove(); }
 });
 test("Slopalytics caches successes and failures at most daily", async () => {

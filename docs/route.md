@@ -188,10 +188,14 @@ and weekly estimate config keys are accepted and ignored.
 
 The router fetches [the T3 usage dataset](https://slopalytics.com/data/t3-usage.json)
 at most once per day, including failures, retaining last successful aggregate
-data and `fetchedAt`. Schema versions 2 and 3 share the terminal/timing metrics
-used here; additional v3 token and spend fields do not affect routing. It aggregates exact model names and matching native
-harness rows over `start` through `endExclusive`: completion, failed and
-interrupted rates use terminal turns; minutes per turn uses timed turns.
+data and `fetchedAt`. Schema versions 2, 3 and 4 share the terminal/timing metrics
+used here; additional v3 and v4 token, spend and sub-agent fields do not affect routing.
+Schema 4 rounds each outcome count independently, so a row's completed, failed
+and interrupted counts may sum to one more or one fewer than its terminal count;
+larger differences, and any difference in v2 or v3, reject the dataset. It aggregates exact model names and matching native
+harness rows over `start` through `endExclusive`: turn counts use terminal turns;
+completion, failed and interrupted rates divide by the sum of those three outcomes;
+minutes per turn uses timed turns.
 The name-to-T3 mapping lives in one table. Older model generations stay separate.
 
 With at least 100 terminal turns for both peers, a failure plus interrupt rate
