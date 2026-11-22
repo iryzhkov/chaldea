@@ -412,6 +412,43 @@ preserves Claude/Codex quota and role ordering exactly, with Antigravity after b
 Unlisted drivers retain the default ordering. Pins, bans, floors, effort validation, probation, stops and
 review separation still apply. Instance IDs never determine cross-driver priority.
 
+Provider preference is pace-aware. A candidate's pace is its pacing window's
+remaining fraction minus the fraction of that window's time left, the same value
+the explain output prints as "on/ahead of pace" or "under-paced". While a
+preference list is configured, a candidate whose known pace is below zero (it is
+burning faster than linear) ranks after every candidate whose pace is unknown or
+not below zero. Preference order still applies inside each of those two groups.
+Unknown pace never demotes a provider. Under benchmark routing the pace groups
+apply before price and driver grouping: a driver's ahead-of-pace and not-ahead
+models rank as separate groups, so a cheap ahead-of-pace model never outranks a
+not-ahead candidate and a not-ahead model is never pulled down by its driver's
+ahead-of-pace model. When a demotion changes the order, the
+reasons include a line such as `antigravity: preferred provider antigravity
+demoted for pace: gemini-4-neon weekly pace -0.14 is ahead of linear; ranked
+after providers whose pace is unknown or not ahead`. Each candidate's pace is
+also reported as `pace` in its `diagnostics.quota` entry. For Antigravity the
+pace comes from the model family's weekly window (for example `gemini-weekly`
+for Gemini models). The capacity classifier ignores family-scoped windows, so
+Antigravity capacity can still read "unknown" while its pace is known.
+`route review-pair` applies the same rule when it orders drivers for the main
+and peer reviewers: a preferred driver whose pick is ahead of pace is tried after
+the others, and the pair reasons name the demoted driver. Main reviewer
+candidates are searched in two passes: every not-ahead candidate, in preference
+order, is tried before any ahead-of-pace candidate, so backtracking through a
+driver's models cannot pick an ahead-of-pace main while a complete pair with a
+not-ahead main exists. Without a preference
+list the default pacing policy is unchanged.
+
+`roleProviderExclusions` maps a role to driver kinds that are never candidates
+for that role, for example `{"bulk-read": ["antigravity"]}`. Keys must be route
+roles and values unique routed driver kinds (at most 20); anything else is
+rejected. The default is `{}`. An excluded driver gets a reason line and an
+ineligible `byProvider` entry for that role, and stays eligible for every other
+role. When nothing eligible remains, the `no_candidate` error names the
+excluded drivers and the role. Exclusions also apply to pinned roles. `route review-pair` routes each slot
+with its own role (`builder` unless `--main-role`/`--peer-role` say otherwise),
+so an exclusion affects a review slot only when that slot's role is excluded.
+
 The reviewed AA index 5 mappings cover Neon low/medium/high/xhigh, Hydrogen
 low/medium/high, Argon medium/high and Flash low/medium/high. Neon's unsuffixed
 AA slug means Xhigh; Argon's and Flash's mean High. Hydrogen's unsuffixed Xhigh
@@ -457,6 +494,7 @@ to exclude those models and select Neon within Antigravity:
 {
   "benchmark": {"indexVersion": "5"},
   "providerPreference": ["antigravity", "codex", "claudeAgent"],
+  "roleProviderExclusions": {"bulk-read": ["antigravity"]},
   "bans": [
     "*sonnet*", "gemini-pro-orchestrator-*", "gpt-oss-*",
     "gemini-4-hydrogen*", "gemini-4-argon*", "gemini-3.8-flash*"

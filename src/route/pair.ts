@@ -42,14 +42,6 @@ export function pairRequest(role: Role, driver: string, effort: Effort | undefin
 export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, historyFor?: PairHistory): ReviewPairResult {
   const input = reviewPairInput(value), config = { ...DEFAULT_POLICY, ...data.config };
   const legacyOther = input.authorProvider === "claudeAgent" ? "codex" : "claudeAgent";
-  const order = (drivers: string[]) => [...drivers].sort((a, b) => {
-    const rank = (d: string) => {
-      const i = config.providerPreference.indexOf(d);
-      return i < 0 ? config.providerPreference.length : i;
-    };
-    return rank(a) - rank(b);
-  });
-  const others = order([legacyOther, ...ROUTED_DRIVERS.filter(d => d !== legacyOther && d !== input.authorProvider)]);
   const driverOf = (t: Target) => data.catalog.find(p => p.providerInstanceId === t.providerInstanceId)!.driverKind;
   const mainRole = input.mainRole ?? "builder", peerRole = input.peerRole ?? "builder";
   const select = (driver: string, role: Role, effort: Effort | undefined, main: boolean,
@@ -96,16 +88,65 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
     }
     return null;
   };
-  let main: Target | null = null, peer: Target | null = null, quotaException = false;
-  // Search for a complete independent pair before keeping a partial or considering a waiver.
-  outer: for (const driver of others) {
-    for (const candidate of choices(driver, mainRole, input.mainEffort, true)) {
-      const partner = first(order([input.authorProvider, ...others.filter(d => d !== driver)]),
-        peerRole, input.peerEffort, false, [candidate.model]);
-      main ??= candidate;
-      if (partner) { main = candidate; peer = partner; break outer; }
+  // Same rule as single routing: a preferred driver whose pick is ahead of its weekly pace
+  // (known pace < 0) ranks after drivers whose pace is unknown or not ahead.
+  const demoted = new Set<string>();
+  const order = (drivers: string[], role: Role, effort: Effort | undefined, isMain: boolean, excluded: readonly string[] = []) => {
+    if (!config.providerPreference.length) return [...drivers];
+    const rank = (d: string) => {
+      const i = config.providerPreference.indexOf(d);
+      return i < 0 ? config.providerPreference.length : i;
+    };
+    const ahead = new Map(drivers.map(d => {
+      const r = select(d, role, effort, isMain, excluded);
+      const pace = r?.diagnostics?.quota[r.providerInstanceId + ":" + r.model]?.pace;
+      return [d, pace !== undefined && pace !== null && pace < 0];
+    }));
+    const sorted = [...drivers].sort((a, b) => Number(ahead.get(a)) - Number(ahead.get(b)) || rank(a) - rank(b));
+    for (const d of drivers) if (ahead.get(d) && sorted.indexOf(d) > [...drivers].sort((a, b) => rank(a) - rank(b)).indexOf(d)) demoted.add(d);
+    return sorted;
+  };
+  const others = order([legacyOther, ...ROUTED_DRIVERS.filter(d => d !== legacyOther && d !== input.authorProvider)],
+    mainRole, input.mainEffort, true);
+  // Main candidates in choices() order, each with whether its own pace is ahead (known pace < 0).
+  function* pacedChoices(driver: string): Generator<[Target, boolean]> {
+    const omitted: string[] = [];
+    const bound = data.catalog.filter(p => p.driverKind === driver).reduce((n, p) => n + p.models.length, 0);
+    for (let i = 0; i < bound; i++) {
+      const next = select(driver, mainRole, input.mainEffort, true, omitted);
+      if (!next) break;
+      for (const t of [next, ...next.alternatives].filter(t => t.model === next.model)) {
+        const pace = next.diagnostics?.quota[t.providerInstanceId + ":" + t.model]?.pace;
+        yield [pairTarget(t), pace !== undefined && pace !== null && pace < 0];
+      }
+      omitted.push(next.model);
     }
   }
+  const preferred = config.providerPreference.length > 0;
+  const preference = (d: string) => {
+    const i = config.providerPreference.indexOf(d);
+    return i < 0 ? config.providerPreference.length : i;
+  };
+  // With a preference, every not-ahead main candidate (in preference order) is tried before
+  // any ahead-of-pace one, so backtracking within a driver cannot bypass pace ordering.
+  // Without a preference this is the original single pass over others.
+  const mainDrivers = preferred ? [...others].sort((a, b) => preference(a) - preference(b)) : others;
+  const skipped = new Set<string>();
+  let main: Target | null = null, peer: Target | null = null, quotaException = false;
+  // Search for a complete independent pair before keeping a partial or considering a waiver.
+  outer: for (const pass of preferred ? [false, true] : [null]) {
+    for (const driver of mainDrivers) {
+      for (const [candidate, ahead] of pacedChoices(driver)) {
+        if (pass !== null && ahead !== pass) { if (!pass) skipped.add(driver); continue; }
+        const partner = first(order([input.authorProvider, ...others.filter(d => d !== driver)],
+          peerRole, input.peerEffort, false, [candidate.model]), peerRole, input.peerEffort, false, [candidate.model]);
+        main ??= candidate;
+        if (partner) { main = candidate; peer = partner; break outer; }
+      }
+    }
+  }
+  if (main && peer) for (const d of skipped)
+    if (d !== driverOf(main) && preference(d) < preference(driverOf(main))) demoted.add(d);
   const primaryPressure = (driver: string) => {
     const providers = data.catalog.filter(p => p.driverKind === driver && p.canRunChildTask && p.models.length);
     return providers.length > 0 && providers.every(p => {
@@ -153,5 +194,6 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
     main, peer, quotaException, reasons: [quotaException ? peer ? "Fresh quota pressure permits two different models on the same provider" : "Fresh quota pressure permits the returned same-provider main reviewer"
       : status === "complete" ? "Main reviewer uses the other provider; peer uses an independent model"
       : pinConflict ? "Explicit role pin conflicts with an available independent pair; authority required to change it"
-      : "Independent pair unavailable; unknown quota or missing catalog never waives separation"] };
+      : "Independent pair unavailable; unknown quota or missing catalog never waives separation",
+      ...[...demoted].map(d => "Provider preference demoted " + d + " for pace: a candidate is ahead of its weekly pace")] };
 }
