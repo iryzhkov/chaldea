@@ -85,6 +85,34 @@ test("pace demotion only applies with an explicit provider preference", () => {
   assert.notEqual(r.providerInstanceId, "antigravity");
   assert.ok(!r.reasons.some(x => x.includes("demoted for pace")));
 });
+// Antigravity offers paced Gemini (ahead) and unpaced 3p Opus; Codex pace is unknown.
+function mixed(opusCheapest: boolean): PolicyData {
+  const f = data(66);
+  f.catalog = f.catalog.map(p => p.driverKind !== "antigravity" ? p
+    : { ...p, models: [...p.models, { ...p.models[0]!, id: "claude-opus-5-5" }] });
+  f.quota = { antigravity: f.quota.antigravity! };
+  f.capacity = {};
+  if (opusCheapest) f.scores = { ...f.scores!, models: f.scores!.models.map(s =>
+    s.model === "claude-opus-5-5" ? { ...s, benchmarkCostUSDPerTask: .1 }
+    : s.model === "gemini-4-neon" ? { ...s, benchmarkCostUSDPerTask: 3 } : s) };
+  f.config = { ...f.config, driverModels: { antigravity: ["gemini-4-neon", "claude-opus-5-5"] } };
+  return f;
+}
+for (const opusCheapest of [true, false]) {
+  test(`benchmark ranking keeps pace groups ahead of price and driver grouping (${opusCheapest ? "Opus" : "Gemini"} cheapest)`, () => {
+    const r = recommend({ role: "general" }, mixed(opusCheapest));
+    const order = [...new Set([r, ...r.alternatives].map(t => t.providerInstanceId + "/" + t.model))];
+    assert.deepEqual(order, ["antigravity/claude-opus-5-5", "codex/gpt-6.1-sol", "claudeAgent/claude-opus-5-5", "antigravity/gemini-4-neon"]);
+    assert.equal(r.byProvider.antigravity?.model, "claude-opus-5-5");
+    assert.ok(r.reasons.some(x => x.includes("demoted for pace: gemini-4-neon")));
+  });
+}
+test("no_candidate names the role provider exclusions that removed drivers", () => {
+  const f = { ...data(null), scores: null };
+  f.config = { ...f.config, benchmark: null, roleProviderExclusions: { general: ["codex", "claudeAgent"] } };
+  assert.throws(() => recommend({ role: "general" }, f), /roleProviderExclusions excludes claudeAgent, codex for role general/);
+  assert.doesNotThrow(() => recommend({ role: "builder" }, f));
+});
 test("review pair ordering demotes a preferred driver that is ahead of pace", () => {
   const ahead = recommendReviewPair({ authorProvider: "codex" }, data(66));
   assert.equal(ahead.status, "complete");

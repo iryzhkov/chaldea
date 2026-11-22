@@ -418,7 +418,11 @@ the explain output prints as "on/ahead of pace" or "under-paced". While a
 preference list is configured, a candidate whose known pace is below zero (it is
 burning faster than linear) ranks after every candidate whose pace is unknown or
 not below zero. Preference order still applies inside each of those two groups.
-Unknown pace never demotes a provider. When a demotion changes the order, the
+Unknown pace never demotes a provider. Under benchmark routing the pace groups
+apply before price and driver grouping: a driver's ahead-of-pace and not-ahead
+models rank as separate groups, so a cheap ahead-of-pace model never outranks a
+not-ahead candidate and a not-ahead model is never pulled down by its driver's
+ahead-of-pace model. When a demotion changes the order, the
 reasons include a line such as `antigravity: preferred provider antigravity
 demoted for pace: gemini-4-neon weekly pace -0.14 is ahead of linear; ranked
 after providers whose pace is unknown or not ahead`. Each candidate's pace is
@@ -436,7 +440,8 @@ for that role, for example `{"bulk-read": ["antigravity"]}`. Keys must be route
 roles and values unique routed driver kinds (at most 20); anything else is
 rejected. The default is `{}`. An excluded driver gets a reason line and an
 ineligible `byProvider` entry for that role, and stays eligible for every other
-role. Exclusions also apply to pinned roles. `route review-pair` routes each slot
+role. When nothing eligible remains, the `no_candidate` error names the
+excluded drivers and the role. Exclusions also apply to pinned roles. `route review-pair` routes each slot
 with its own role (`builder` unless `--main-role`/`--peer-role` say otherwise),
 so an exclusion affects a review slot only when that slot's role is excluded.
 

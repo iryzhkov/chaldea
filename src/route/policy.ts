@@ -257,18 +257,27 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       const localCompare = (x: typeof candidates[number], y: typeof candidates[number]) =>
         compareBenchmark(x, y, scores!) || quotaCompare(x, y) || x.model.localeCompare(y.model) ||
         targetEffort(x).localeCompare(targetEffort(y));
+      // With a provider preference, a driver's ahead-of-pace and not-ahead candidates form
+      // separate groups, so price never lifts an ahead-of-pace model over a not-ahead one
+      // and a not-ahead model is never dragged down by its driver's ahead-of-pace model.
+      // Without a preference the group is the driver, exactly as before.
+      const group = (c: typeof candidates[number]) =>
+        config.providerPreference.length && aheadOfPace(c) ? c.driver + "\u0000ahead" : c.driver;
       const representatives = new Map<string, typeof candidates[number]>();
       for (const c of pool) {
-        const prior = representatives.get(c.driver);
-        if (!prior || localCompare(c, prior) < 0) representatives.set(c.driver, c);
+        const prior = representatives.get(group(c));
+        if (!prior || localCompare(c, prior) < 0) representatives.set(group(c), c);
       }
-      const drivers = [...representatives.values()].sort(quotaCompare).map(c => c.driver);
-      pool.sort((x, y) => drivers.indexOf(x.driver) - drivers.indexOf(y.driver) || localCompare(x, y));
+      const groups = [...representatives.values()].sort(quotaCompare).map(group);
+      pool.sort((x, y) => groups.indexOf(group(x)) - groups.indexOf(group(y)) || localCompare(x, y));
     } else pool.sort(quotaCompare);
   };
   rankCandidates(eligible, !benchmark);
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
-  if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target" + catalog.filter(p => p.driverKind === "antigravity" && p.admissionHold).map(p => "; " + p.admissionHold).join("") + (benchmark ? "; " + Object.entries(diagnostics.benchmarkCoverage ?? {}).filter(([, c]) => !c.complete).map(([p, c]) => p + " missing benchmark coverage: " + c.missing.join(", ")).join("; ") : ""));
+  if (!eligible[0]) throw new RouteError("no_candidate", "No eligible routing candidate; " + (input.authorProvider ? "review requires the other provider from " + input.authorProvider + "; " : "") + "availability, quota, pins or effort exclude the requested target" + (() => {
+    const excluded = [...new Set(catalog.filter(p => config.roleProviderExclusions?.[input.role]?.includes(p.driverKind)).map(p => p.driverKind))].sort();
+    return excluded.length ? "; roleProviderExclusions excludes " + excluded.join(", ") + " for role " + input.role : "";
+  })() + catalog.filter(p => p.driverKind === "antigravity" && p.admissionHold).map(p => "; " + p.admissionHold).join("") + (benchmark ? "; " + Object.entries(diagnostics.benchmarkCoverage ?? {}).filter(([, c]) => !c.complete).map(([p, c]) => p + " missing benchmark coverage: " + c.missing.join(", ")).join("; ") : ""));
   if (input.authorProvider) reasons.push(`Review must use the other provider from ${input.authorProvider}`);
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
