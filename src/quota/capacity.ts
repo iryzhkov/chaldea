@@ -97,8 +97,17 @@ export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: 
   // quota is exhausted or ordinary included usage is denied. Unknown evidence never qualifies.
   if (wallet && p.accountKey && spendControl === false) {
     c.creditFunded = true;
-    return creditCapacity("credit-funded lane: fresh account-bound Codex credits, spend control not reached; " +
-      "included windows and ordinary-usage denial do not gate it; no credit reserve floor");
+    const funded = "credit-funded lane: fresh account-bound Codex credits, spend control not reached; " +
+      "included windows and ordinary-usage denial do not gate it; no credit reserve floor";
+    // Credits are drawn only after included usage. An open, under-paced included weekly window
+    // will expire unused at its native reset, so that included quota is use-it.
+    const includedOpen = !advice.gate && fresh(p.ordinaryUsageAllowed, now, config.maxAgeMs) !== false;
+    if (includedOpen && advice.pacing && !advice.limit && advice.pace !== null && advice.pace >= config.paceMargin) {
+      c.remainingFraction = advice.pacing.remainingPercent / 100;
+      return finish("use-it", funded + (creditExpiry ? "; expiry " + creditExpiry : "") +
+        "; included weekly window under-paced and would expire unused at the native reset; credits are drawn only after included usage");
+    }
+    return creditCapacity(funded);
   }
   if (advice.gate) return finish(advice.gate, "short window " + (advice.gate === "stopped" ? "exhausted" : "under minimum remaining quota") + "; wait until its reset");
   if (fresh(p.ordinaryUsageAllowed, now, config.maxAgeMs) === false)
