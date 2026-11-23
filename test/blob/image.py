@@ -20,8 +20,13 @@ ACCEPT = ", ".join([
 ])
 
 
-def read(url, cap, headers=None):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=60) as response:
+def read(url, cap, headers=None, token=None):
+    request = urllib.request.Request(url, headers=headers or {})
+    if token:
+        # Registry credentials must not follow the blob redirect: urllib copies
+        # ordinary headers to the CDN, which rejects a second auth mechanism.
+        request.add_unredirected_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(request, timeout=60) as response:
         value = response.read(cap + 1)
         if len(value) > cap:
             raise ValueError("OCI response exceeds bound")
@@ -31,8 +36,7 @@ def read(url, cap, headers=None):
 def verified(token, kind, identifier, cap):
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", identifier):
         raise ValueError("invalid digest")
-    data = read(REGISTRY + kind + "/" + identifier, cap,
-                {"Authorization": "Bearer " + token, "Accept": ACCEPT})
+    data = read(REGISTRY + kind + "/" + identifier, cap, {"Accept": ACCEPT}, token)
     if "sha256:" + hashlib.sha256(data).hexdigest() != identifier:
         raise ValueError("OCI digest mismatch")
     return data
