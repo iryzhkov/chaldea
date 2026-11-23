@@ -71,10 +71,15 @@ fraction minus fraction of native window time left is at least 0.10; otherwise
 it prefers Codex. Missing/stale pacing keeps the role default unless capacity
 preference or usable Slopalytics statistics decide the comparison.
 
-When Claude and Codex candidates are both use-it, or both under-paced (known
-pace at least 0.10), the larger expiring surplus goes first regardless of
-driver. The surplus is the candidate's pace: remaining fraction minus the
-fraction of the window's time left. The explain output then reads, for example,
+When Claude and Codex are both use-it, or (with no capacity evidence at all)
+both under-paced (known pace at least 0.10), the larger expiring surplus goes
+first regardless of driver. The surplus is pace: remaining fraction minus the
+fraction of the window's time left. It is decided once per ranking, from each
+driver's representative: the candidate the same-driver rules rank first, or the
+cheapest benchmark representative under benchmark routing. The winning driver
+then ranks first for every Claude/Codex pair in that tier, which keeps the
+ordering consistent: adding a candidate of one driver never reorders the other
+driver's candidates. The explain output then reads, for example,
 `Quota pacing prefers codex: larger expiring weekly surplus (codex 0.86,
 claudeAgent 0.27)`. If either pace is unknown, the rules above apply unchanged,
 including the Claude default. Executor's Codex preference, explicit

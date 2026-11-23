@@ -213,15 +213,31 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     const preferred: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent"
       : pacedClaude.length ? "codex" : "claudeAgent";
     const hasPace = pacedClaude.length > 0;
-    // Under-paced (pace >= paceMargin) quota expires unused at its reset. When two primary
-    // drivers both have it, the larger expiring surplus (pace) goes first, regardless of driver.
-    const surplus = (c: typeof candidates[number]) => PRIMARY_DRIVERS.includes(c.driver) && c.pace !== null && c.pace >= config.paceMargin;
-    const best = (driver: string) => Math.max(-Infinity, ...pool.filter(c => c.driver === driver && surplus(c)).map(c => c.pace!));
-    const surplusLeader = best("claudeAgent") > -Infinity && best("codex") > -Infinity && best("claudeAgent") !== best("codex")
-      ? (best("codex") > best("claudeAgent") ? "codex" : "claudeAgent") : null;
-    if (explain && !preferCodex && !config.providerPreference.length) reasons.push(surplusLeader
-      ? `Quota pacing prefers ${surplusLeader}: larger expiring weekly surplus (codex ${best("codex").toFixed(2)}, claudeAgent ${best("claudeAgent").toFixed(2)})`
-      : hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
+    const rank = (c: typeof candidates[number]) => {
+      if (!c.scopeKnown && !capacityFor(data, c.providerInstanceId, c.model)?.creditFunded) return data.capacity ? 2 : null;
+      const kind = capacityFor(data, c.providerInstanceId, c.model)?.class;
+      return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
+    };
+    // Expiring-surplus leader between the two primary drivers. It is decided once, from each
+    // driver's representative (the candidate the existing same-driver rules rank first), and
+    // then orders every Claude/Codex pair in the same tier by driver alone. A driver-level key
+    // keeps the comparator a total preorder; candidate-level pace comparisons across drivers
+    // could cycle with the same-driver pace rule.
+    let surplusLeader: { driver: Provider; codex: number; claudeAgent: number } | null = null;
+    const tier = (c: typeof candidates[number]) => rank(c) === 0 ? "use-it" : rank(c) === null ? "unknown" : null;
+    const decideLeader = (representatives: ReadonlyArray<typeof candidates[number]>) => {
+      const first = (driver: string) => representatives.filter(c => c.driver === driver)
+        .reduce<typeof candidates[number] | undefined>((m, c) => !m || quotaCompare(c, m) < 0 ? c : m, undefined);
+      const cl = first("claudeAgent"), cx = first("codex");
+      // Both use-it, or (without any capacity evidence) both under-paced with known pace.
+      const surplus = (c: typeof candidates[number]) => c.pace !== null && c.pace >= config.paceMargin;
+      surplusLeader = cl && cx && cl.pace !== null && cx.pace !== null && cl.pace !== cx.pace && tier(cl) !== null &&
+        tier(cl) === tier(cx) && (tier(cl) === "use-it" || surplus(cl) && surplus(cx))
+        ? { driver: cx.pace > cl.pace ? "codex" : "claudeAgent", codex: cx.pace, claudeAgent: cl.pace } : null;
+      if (explain && !preferCodex && !config.providerPreference.length) reasons.push(surplusLeader
+        ? `Quota pacing prefers ${surplusLeader.driver}: larger expiring weekly surplus (codex ${surplusLeader.codex.toFixed(2)}, claudeAgent ${surplusLeader.claudeAgent.toFixed(2)})`
+        : hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
+    };
     const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
       if (config.providerPreference.length) {
         // Pace demotion applies to every candidate, including same-driver pairs, so the
@@ -236,17 +252,12 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       // Fallback drivers such as Antigravity rank after every eligible primary driver.
       const fallback = (c: typeof x) => !PRIMARY_DRIVERS.includes(c.driver);
       if (fallback(x) !== fallback(y)) return Number(fallback(x)) - Number(fallback(y));
-      const rank = (c: typeof x) => {
-        if (!c.scopeKnown && !capacityFor(data, c.providerInstanceId, c.model)?.creditFunded) return data.capacity ? 2 : null;
-        const kind = capacityFor(data, c.providerInstanceId, c.model)?.class;
-        return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
-      };
       const xr = rank(x), yr = rank(y);
       if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
-      // Both use-it or both under-paced primary drivers: larger expiring surplus first.
-      if (x.driver !== y.driver && PRIMARY_DRIVERS.includes(x.driver) && PRIMARY_DRIVERS.includes(y.driver) &&
-          x.pace !== null && y.pace !== null && x.pace !== y.pace &&
-          (xr === 0 && yr === 0 || surplus(x) && surplus(y))) return y.pace - x.pace;
+      // Larger expiring surplus first, by driver, within the leader's tier.
+      const leader = surplusLeader as { driver: Provider } | null;
+      if (leader && x.driver !== y.driver && PRIMARY_DRIVERS.includes(x.driver) && PRIMARY_DRIVERS.includes(y.driver) &&
+          tier(x) !== null && tier(x) === tier(y)) return Number(y.driver === leader.driver) - Number(x.driver === leader.driver);
       const underPaced = (c: typeof x) => c.driver === "claudeAgent" && c.pace !== null && c.pace >= config.paceMargin;
       if (underPaced(x) !== underPaced(y)) return Number(underPaced(y)) - Number(underPaced(x));
       if (xr !== null && yr !== null && xr !== yr) return xr - yr;
@@ -288,9 +299,10 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
         const prior = representatives.get(group(c));
         if (!prior || localCompare(c, prior) < 0) representatives.set(group(c), c);
       }
+      decideLeader([...representatives.values()]);
       const groups = [...representatives.values()].sort(quotaCompare).map(group);
       pool.sort((x, y) => groups.indexOf(group(x)) - groups.indexOf(group(y)) || localCompare(x, y));
-    } else pool.sort(quotaCompare);
+    } else { decideLeader(pool); pool.sort(quotaCompare); }
   };
   rankCandidates(eligible, !benchmark);
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });

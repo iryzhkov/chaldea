@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { newProvider } from "../../src/quota/headroom.ts";
 import type { Metric, ProviderHeadroom, Window } from "../../src/quota/headroom.ts";
 import { classifyCapacity } from "../../src/quota/capacity.ts";
+import type { Capacity } from "../../src/quota/capacity.ts";
 import { recommend } from "../../src/route/policy.ts";
 import type { PolicyData } from "../../src/route/policy.ts";
 import type { Role } from "../../src/route/types.ts";
@@ -79,6 +80,89 @@ test("Codex ahead of pace with credits stays unlimited and under-paced Claude st
   const paced = data([codex(5, .5), claude(30, .4)]);
   assert.equal(paced.capacity?.claudeAgent?.class, "paced");
   assert.equal(recommend({ role: "builder" }, paced).providerInstanceId, "codex");
+});
+// Generated pools: each instance is (driver, pace, capacity class). Pace p is produced by a weekly
+// window with remaining - timeLeft = p; null means no window.
+type Spec = { driver: "claudeAgent" | "codex"; pace: number | null; kind: "use-it" | "unlimited" };
+const paceWindow: Record<string, [number, number]> = { "-0.3": [.5, .8], "0.05": [.55, .5], "0.2": [.7, .5], "0.6": [.9, .3] };
+const cap = (s: Spec): Capacity => ({ class: s.kind, reasons: ["fixture"], remainingFraction: null, reserveWeeks: 0,
+  observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null, observedAt: iso(now),
+  ...(s.driver === "codex" ? { creditFunded: true as const } : {}) });
+function pool(specs: ReadonlyArray<Spec>, ids: ReadonlyArray<string>, withCapacity = true): PolicyData {
+  const model = (d: Spec["driver"]) => catalog.find(p => p.providerInstanceId === d)!.models.find(m => m.id === (d === "codex" ? "gpt-6.1-sol" : "claude-opus-5-5"))!;
+  return { now, analytics: null,
+    catalog: specs.map((s, i) => ({ providerInstanceId: ids[i]!, driverKind: s.driver, canRunChildTask: true, models: [model(s.driver)] })),
+    quota: Object.fromEntries(specs.map((s, i) => {
+      const w = s.pace === null ? null : paceWindow[String(s.pace)]!;
+      return [ids[i]!, { observedAt: iso(now), activeStop: false, windows: w ? [weekly(w[0] * 100, w[1])] : [] }];
+    })),
+    ...(withCapacity ? { capacity: Object.fromEntries(specs.map((s, i) => [ids[i]!, cap(s)])) } : {}) };
+}
+const label = (s: Spec) => s.driver + "/" + s.pace + "/" + s.kind;
+/** Ranked specs, by label, so identically described instances are indistinguishable. */
+function ranked(specs: ReadonlyArray<Spec>, ids: ReadonlyArray<string>, withCapacity = true): string[] {
+  const r = recommend({ role: "builder" }, pool(specs, ids, withCapacity));
+  // Without capacity evidence the class is not an input, so it is not part of the label.
+  return [r, ...r.alternatives].map(t => specs[ids.indexOf(t.providerInstanceId)]!)
+    .map(s => withCapacity ? label(s) : s.driver + "/" + s.pace);
+}
+const permutations = <T>(xs: T[]): T[][] => xs.length <= 1 ? [xs] : xs.flatMap((x, i) =>
+  permutations([...xs.slice(0, i), ...xs.slice(i + 1)]).map(rest => [x, ...rest]));
+test("ranking is a total preorder over generated mixed-driver triples", () => {
+  const specs: Spec[] = [];
+  for (const driver of ["claudeAgent", "codex"] as const) for (const pace of [null, -0.3, 0.05, 0.2, 0.6])
+    for (const kind of ["use-it", "unlimited"] as const) specs.push({ driver, pace, kind });
+  let checked = 0;
+  for (let i = 0; i < specs.length; i++) for (let j = i; j < specs.length; j++) for (let k = j; k < specs.length; k++) {
+    const triple = [specs[i]!, specs[j]!, specs[k]!];
+    for (const withCapacity of [true, false]) {
+      // Input order (instance ids are sorted before ranking) must not change the ranking.
+      const orders = permutations(["a", "b", "c"]).map(ids => ranked(triple, ids, withCapacity).join(" > "));
+      assert.equal(new Set(orders).size, 1, triple.map(label).join(", ") + (withCapacity ? "" : " (no capacity)") + ": " + [...new Set(orders)].join(" | "));
+      // Adding or removing another driver's candidate never reorders one driver's candidates.
+      const full = ranked(triple, ["a", "b", "c"], withCapacity);
+      for (const drop of [0, 1, 2]) {
+        const rest = triple.filter((_, n) => n !== drop);
+        if (rest[0]!.driver !== rest[1]!.driver || triple[drop]!.driver === rest[0]!.driver) continue;
+        const sub = ranked(rest, ["a", "b"], withCapacity);
+        assert.deepEqual(full.filter(l => sub.includes(l) && l.startsWith(rest[0]!.driver + "/")).filter((l, n, a) => a.indexOf(l) === n),
+          sub.filter((l, n, a) => a.indexOf(l) === n), triple.map(label).join(", "));
+      }
+      checked++;
+    }
+  }
+  assert.ok(checked > 400);
+});
+test("reviewer repro: adding a Claude candidate does not change which Codex account wins", () => {
+  // A: Claude use-it (refill expiring), pace 0.05. B: funded Codex use-it (credits expiring),
+  // unknown pace. C: funded Codex use-it (credits expiring), pace -0.30.
+  const A: Spec = { driver: "claudeAgent", pace: 0.05, kind: "use-it" };
+  const B: Spec = { driver: "codex", pace: null, kind: "use-it" };
+  const C: Spec = { driver: "codex", pace: -0.3, kind: "use-it" };
+  assert.deepEqual(ranked([A, B, C], ["a", "b", "c"]), [label(A), label(C), label(B)]);
+  assert.deepEqual(ranked([B, C], ["b", "c"]), [label(C), label(B)]);
+  for (const ids of permutations(["a", "b", "c"])) assert.deepEqual(ranked([A, B, C], ids), [label(A), label(C), label(B)]);
+});
+test("benchmark surplus reason names the representatives actually compared", () => {
+  // Claude Opus pace 0.60, cheaper Claude Haiku pace 0.15, Codex pace 0.40; all use-it.
+  const opts = (id: string) => [{ id, type: "select", options: [{ id: "medium" }] }];
+  const s = (model: string, cost: number) => ({ model, effort: "medium" as const, aaSlug: model, intelligence: 60, coding: 60,
+    inputPrice: 1, outputPrice: 1, benchmarkCostUSDPerTask: cost });
+  const paced = (left: number, timeLeft: number) => ({ observedAt: iso(now), activeStop: false, windows: [weekly(left, timeLeft)] });
+  const use = cap({ driver: "claudeAgent", pace: null, kind: "use-it" });
+  const d: PolicyData = { now, analytics: null,
+    catalog: [
+      { providerInstanceId: "claude-a", driverKind: "claudeAgent", canRunChildTask: true, models: [{ id: "claude-opus-5-5", options: opts("effort") }] },
+      { providerInstanceId: "claude-b", driverKind: "claudeAgent", canRunChildTask: true, models: [{ id: "claude-haiku-5-5", options: opts("effort") }] },
+      { providerInstanceId: "codex", driverKind: "codex", canRunChildTask: true, models: [{ id: "gpt-6.1-sol", options: opts("reasoningEffort") }] }],
+    quota: { "claude-a": paced(90, .3), "claude-b": paced(65, .5), codex: paced(90, .5) },
+    capacity: { "claude-a": use, "claude-b": use, codex: { ...use, creditFunded: true } },
+    scores: { version: 2, metric: "aa-intelligence-cost-per-task", indexVersion: "5", fetchedAt: iso(now), unmapped: [],
+      models: [s("claude-opus-5-5", 5), s("claude-haiku-5-5", 1), s("gpt-6.1-sol", 3)] },
+    config: { benchmark: { indexVersion: "5", anchors: { general: ["claude-opus-5-5", "claude-haiku-5-5", "gpt-6.1-sol"] } } } };
+  const r = recommend({ role: "general" }, d);
+  assert.equal(r.providerInstanceId, "codex");
+  assert.ok(r.reasons.includes("Quota pacing prefers codex: larger expiring weekly surplus (codex 0.40, claudeAgent 0.15)"), r.reasons.join("\n"));
 });
 test("unknown Claude pace keeps the role default", () => {
   // No capacity evidence at all: an under-paced Codex never overrides the Claude default.
