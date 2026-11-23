@@ -103,8 +103,8 @@ def feed_delivery(record):
         # The callback's redacted one-line detail is the only body content.
         command += ["--body-file", "-"]
         body = (record["detail"] + "\n").encode()
-    # Neither feed output nor raw child output is copied to the journal/status.
-    # A separate session lets the timeout kill curl and other descendants too.
+    # Neither feed output nor raw child output is copied to the journal/status;
+    # only the callback's redacted detail line is. A separate session lets the timeout kill curl and other descendants too.
     process = None
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE if body else subprocess.DEVNULL,

@@ -1,10 +1,15 @@
-"""Bounded timer summary: no module arguments, raw results or environment.
+"""Bounded timer summary: no module messages, arguments, results or environment.
 
-A failed task contributes one redacted, single-line detail built only from
-allowlisted result fields (message, HTTP status/response and the last line of
-standard error), so a feed entry says why a run failed without carrying output.
+A failed task contributes one short detail that fails closed: it is assembled
+only from fixed phrases for causes recognised in the result's message, HTTP
+response and standard error, standard HTTP reason phrases and errno names, the
+validated module name and an integer exit status. No byte of result text is
+copied, so a credential templated into a message from any variable cannot be
+published; an unrecognised message is reported as withheld.
 """
 
+import errno
+import http
 import json
 import os
 import re
@@ -12,83 +17,86 @@ from pathlib import Path
 
 from ansible.plugins.callback import CallbackBase
 
-DETAIL_LIMIT = 300
 INPUT_LIMIT = 65536
-REDACTED = "<redacted>"
-GENERIC_MESSAGES = {"", "non-zero return code", "MODULE FAILURE", "MODULE FAILURE\nSee stdout/stderr for the exact error",
-                    "One or more items failed", "All items completed"}
-SENSITIVE_NAME = r"[A-Za-z0-9_.-]*(?:token|secret|passw(?:or)?d|passphrase|credential|api[_-]?key|access[_-]?key|private[_-]?key|auth|cookie|session|signature)[A-Za-z0-9_.-]*"
-PATTERNS = (
-    # URL user information and query strings can carry credentials.
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@"), r"\1" + REDACTED + "@"),
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s?#]*)\?[^\s#'\"<>]*"), r"\1?" + REDACTED),
-    # Authorization schemes and private key blocks.
-    (re.compile(r"(?i)\b(bearer|basic|token|digest)(\s+)[^\s,;'\"]+"), r"\1\2" + REDACTED),
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)", re.S),
-     REDACTED),
-    # name=value, name: value and "name": "value" where the name looks sensitive.
-    (re.compile(r"(?i)(" + SENSITIVE_NAME + r")(['\"]?\s*[=:]\s*['\"]?)[^\s,;&'\"}]+"), r"\1\2" + REDACTED),
+# Literal alternations only, so matching stays linear in the bounded input.
+CAUSES = (
+    (re.compile(r"timed out|timeout", re.I), "timed out"),
+    (re.compile(r"connection refused", re.I), "connection refused"),
+    (re.compile(r"connection reset|connection aborted|remote end closed connection", re.I), "connection reset"),
+    (re.compile(r"name or service not known|temporary failure in name resolution|nodename nor servname"
+                r"|could not resolve host|getaddrinfo failed|no address associated with hostname", re.I),
+     "DNS resolution failed"),
+    (re.compile(r"no route to host|network is unreachable", re.I), "network unreachable"),
+    (re.compile(r"certificate verify failed|certificate_verify_failed", re.I), "TLS certificate verification failed"),
+    (re.compile(r"ssl: |sslerror|tlsv1 alert|wrong version number", re.I), "TLS error"),
+    (re.compile(r"incomplete read", re.I), "incomplete download"),
+    (re.compile(r"checksum mismatch|checksums? (?:do(?:es)? not|did not) match|sha256 mismatch", re.I),
+     "checksum mismatch"),
+    (re.compile(r"no space left on device", re.I), "no space left on device"),
+    (re.compile(r"read-only file system", re.I), "read-only file system"),
+    (re.compile(r"permission denied", re.I), "permission denied"),
+    (re.compile(r"no such file or directory|could not find or access|does not exist", re.I), "path not found"),
+    (re.compile(r"could not get lock|lock-frontend|unable to acquire the dpkg", re.I), "package manager lock held"),
+    (re.compile(r"no package matching|unable to locate package|no match for argument", re.I), "package not found"),
+    (re.compile(r"could not read from remote repository|repository not found|authentication failed", re.I),
+     "remote access refused"),
+    (re.compile(r"missing sudo password|a password is required|incorrect sudo password", re.I),
+     "privilege escalation needs a password"),
+    (re.compile(r"unit [^ ]{1,200} not found|could not find the requested service", re.I), "systemd unit not found"),
+    (re.compile(r"assertion failed", re.I), "assertion failed"),
+    (re.compile(r"module failure|traceback \(most recent call last\)", re.I), "module crashed"),
 )
-# Opaque credentials: long runs mixing letters and digits (also hashes), and
-# base64 that may contain slashes. Ordinary paths and URLs split at / and . so
-# only their long mixed segments are removed.
-# The slash-aware pattern runs first so a base64 value is removed whole.
-OPAQUE = (
-    re.compile(r"(?<![A-Za-z0-9+/=_-])(?=[A-Za-z0-9+/=_-]*[0-9])(?=[A-Za-z0-9+/=_-]*[a-z])"
-               r"(?=[A-Za-z0-9+/=_-]*[A-Z])[A-Za-z0-9+/=_-]{24,}"),
-    re.compile(r"(?<![A-Za-z0-9+=_-])(?=[A-Za-z0-9+=_-]*[0-9])(?=[A-Za-z0-9+=_-]*[A-Za-z])[A-Za-z0-9+=_-]{20,}"),
-)
-# Environment values that are ordinary paths or identities stay readable.
-BENIGN_ENVIRONMENT = {"HOME", "PATH", "PWD", "OLDPWD", "USER", "LOGNAME", "SHELL", "LANG", "TERM",
-                      "TMPDIR", "HOSTNAME", "CHALDEA_RUN_STATE"}
+HTTP_STATUS = re.compile(r"\bHTTP Error (\d{3})\b|\bstatus code was (\d{3})\b|\bHTTP/\d(?:\.\d)? (\d{3})\b", re.I)
+ERRNO = re.compile(r"\[Errno (\d{1,4})\]")
 
 
-def redact(text):
-    """Return one bounded line with credentials and environment values removed."""
-    text = str(text)[:INPUT_LIMIT]
-    for name, value in os.environ.items():
-        if (len(value) >= 8 and name not in BENIGN_ENVIRONMENT and not name.startswith(("ANSIBLE_", "LC_", "XDG_"))
-                and value in text):
-            text = text.replace(value, REDACTED)
-    for pattern, replacement in PATTERNS:
-        text = pattern.sub(replacement, text)
-    for pattern in OPAQUE:
-        text = pattern.sub(REDACTED, text)
-    text = re.sub(r"[\x00-\x1f\x7f]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text if len(text) <= DETAIL_LIMIT else text[:DETAIL_LIMIT - 3].rstrip() + "..."
+def http_phrase(code):
+    try:
+        return f"HTTP {code} {http.HTTPStatus(code).phrase}"
+    except ValueError:
+        return f"HTTP {code}" if 100 <= code <= 599 else ""
 
 
-def last_line(value):
-    if not isinstance(value, str):
-        return ""
-    lines = [line.strip() for line in value[-INPUT_LIMIT:].splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+def module_name(task):
+    action = str(getattr(task, "action", "") or "").rsplit(".", 1)[-1]
+    return action if re.fullmatch(r"[A-Za-z0-9_]{1,64}", action) else "task"
 
 
-def failure_detail(data, no_log=False):
-    """Explain a failed result from allowlisted fields only."""
+def classify(data):
+    """Fixed phrases for recognised causes in allowlisted fields; never their text."""
+    texts = [data.get(key) for key in ("msg", "response", "stderr", "module_stderr")]
+    text = "\n".join(t[-INPUT_LIMIT:] for t in texts if isinstance(t, str))
+    causes = []
+    status = data.get("status_code", data.get("status"))
+    codes = [status] if type(status) is int and status >= 100 else []
+    codes += [int(next(g for g in m.groups() if g)) for m in HTTP_STATUS.finditer(text)]
+    for code in codes:
+        phrase = http_phrase(code)
+        if phrase and phrase not in causes:
+            causes.append(phrase)
+    for match in ERRNO.finditer(text):
+        name = errno.errorcode.get(int(match.group(1)))
+        if name and name not in causes:
+            causes.append(name)
+    for pattern, phrase in CAUSES:
+        if phrase not in causes and pattern.search(text):
+            causes.append(phrase)
+    rc = data.get("rc")
+    if type(rc) is int and rc != 0:
+        causes.append(f"exit status {max(-1000, min(rc, 1000))}")
+    return causes[:6]
+
+
+def failure_detail(data, task=None, no_log=False):
+    """One short line for a failed result, built only from fixed text."""
     if no_log or not isinstance(data, dict) or data.get("censored") or data.get("_ansible_no_log"):
         return "output hidden by no_log"
     if isinstance(data.get("results"), list):
         for item in data["results"]:
             if isinstance(item, dict) and (item.get("failed") or item.get("unreachable")):
-                return failure_detail(item)
-    parts = []
-    message = data.get("msg")
-    if isinstance(message, str) and message.strip() not in GENERIC_MESSAGES:
-        parts.append(message)
-    status = data.get("status_code", data.get("status"))
-    if type(status) is int and status > 0:
-        parts.append(f"HTTP status {status}")
-    response = data.get("response")
-    if isinstance(response, str) and response.strip() and response.strip() not in parts:
-        parts.append(response)
-    if not parts:
-        stderr = last_line(data.get("stderr")) or last_line(data.get("module_stderr"))
-        if stderr:
-            parts.append(stderr)
-    return redact("; ".join(parts)) if parts else ""
+                return failure_detail(item, task)
+    causes = classify(data)
+    return module_name(task) + ": " + ("; ".join(causes) if causes else "unrecognised error, message withheld")
 
 
 class CallbackModule(CallbackBase):
@@ -165,7 +173,7 @@ class CallbackModule(CallbackBase):
     @staticmethod
     def detail(result):
         try:
-            return failure_detail(result._result, getattr(result._task, "no_log", False) is True)
+            return failure_detail(result._result, result._task, getattr(result._task, "no_log", False) is True)
         except Exception:
             # Reporting must never change the play's own outcome.
             return ""

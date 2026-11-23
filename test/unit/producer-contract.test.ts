@@ -36,6 +36,8 @@ test("timer failure detail is carried bounded, dropped when invalid and absent o
   const failed = timerPublication({ ...raw, detail }, "agent-a");
   assert.equal(normalize(failed.payload, { ...identity, source: failed.source }, false).kind, "job_finished");
   assert.equal(body({ ...raw, detail }).detail, detail);
+  const astral = "\u{1F600}".repeat(300);
+  assert.equal(body({ ...raw, detail: astral }).detail, astral);
   for (const invalid of ["x".repeat(301), "two\nlines", "", 7])
     assert.ok(!("detail" in body({ ...raw, detail: invalid })));
   assert.ok(!("detail" in body({ ...raw, outcome: "changed", changed: 1, detail })));

@@ -97,9 +97,12 @@ function generation(fd: number, old: Cursor | null): Cursor {
   return { generation: randomUUID(), dev: String(st.dev), ino: String(st.ino), offset: 0,
     prefixLength, prefix: sha(bytes(fd, 0, prefixLength)), tail: sha(""), size, modified: String(st.mtimeNs) };
 }
-/** An optional bounded line; an invalid value is dropped rather than rejecting the event. */
+/**
+ * An optional bounded line; an invalid value is dropped rather than rejecting the event.
+ * The bound counts code points, as the Python producer does, not UTF-16 units.
+ */
 function optionalLine(value: unknown, max: number): string | undefined {
-  return typeof value === "string" && value && value.length <= max && !/[\x00-\x1f\x7f]/.test(value) ? value : undefined;
+  return typeof value === "string" && value && [...value].length <= max && !/[\x00-\x1f\x7f]/.test(value) ? value : undefined;
 }
 /** Timer input is already redacted by the wrapper; allowlist again at the boundary. */
 export function timerPublication(raw: Record<string, unknown>, host: string): Publication {
