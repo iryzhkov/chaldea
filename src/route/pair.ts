@@ -1,4 +1,4 @@
-import { recommend, type PolicyData } from "./policy.ts";
+import { capacityFor, recommend, type PolicyData } from "./policy.ts";
 import { benchmarkCoverage } from "./benchmark.ts";
 import { RouteError } from "./errors.ts";
 import { ageSeconds, DEFAULT_POLICY, ROUTED_DRIVERS, routeInput } from "./types.ts";
@@ -167,7 +167,7 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
     if (!primaries.length || !primaries.every(primaryPressure)) return false;
     const targets = drivers.includes("antigravity") ? [...choices("antigravity", role, effort, isMain, excluded, !isMain, true)] : [];
     return primaries.length + targets.length > 0 && targets.every(target => {
-      const q = data.quota[target.providerInstanceId], c = data.capacity?.[target.providerInstanceId];
+      const q = data.quota[target.providerInstanceId], c = capacityFor(data, target.providerInstanceId, target.model);
       if (q?.activeStop || c?.class === "stopped" && c.reasons.some(r => r.startsWith("active usage stop"))) return true;
       if (antigravityExhaustion([...(q?.knownWindows ?? []), ...(q?.windows ?? [])], target.model, data.now, config.minimumRemaining)) return true;
       const age = ageSeconds(q?.observedAt, data.now);

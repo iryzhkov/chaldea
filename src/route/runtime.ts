@@ -147,6 +147,10 @@ async function collectContext(options: RouteOptions) {
         if (!classified.creditFunded && !["tight", "stopped"].includes(classified.class)) classified.class = "unknown";
       }
       capacity[p.providerInstanceId] = classified;
+      // Antigravity windows are per model family, so routing reads a per-model entry
+      // keyed "instance:model"; the provider-wide entry above stays for other readers.
+      if (p.driverKind === "antigravity") for (const m of p.models)
+        capacity[p.providerInstanceId + ":" + m.id] = classifyCapacity(row, stop, now, capacityConfig, m.id);
     }
     const admissionHold = admissionHolds.get(p.providerInstanceId);
     return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId),

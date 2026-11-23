@@ -206,8 +206,9 @@ test("live Antigravity weekly pacing reaches the ranked candidate through the ro
         models: [{ model: "gemini-4-neon", effort: "medium", aaSlug: "gemini-4-neon", intelligence: 60, coding: 60,
           inputPrice: 1, outputPrice: 1, benchmarkCostUSDPerTask: 1 }] } });
     assert.equal(r.providerInstanceId, "antigravity");
-    // Capacity drops family-scoped windows and reports unknown, but the model-scoped pace is known.
-    assert.ok(r.reasons.some(x => x.includes("capacity unknown")));
+    // Capacity is classified from the same family-scoped windows as the model's pace.
+    assert.ok(r.reasons.some(x => x.startsWith("antigravity capacity paced: ")));
+    assert.ok(!r.reasons.some(x => x.includes("capacity unknown")));
     assert.ok(r.reasons.some(x => x === "antigravity weekly 66% left with 80% of window left: on/ahead of pace"));
     assert.ok(Math.abs(r.diagnostics!.quota["antigravity:gemini-4-neon"]!.pace! - (-.14)) < 1e-6);
   } finally { d.remove(); }

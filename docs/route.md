@@ -436,8 +436,13 @@ demoted for pace: gemini-4-neon weekly pace -0.14 is ahead of linear; ranked
 after providers whose pace is unknown or not ahead`. Each candidate's pace is
 also reported as `pace` in its `diagnostics.quota` entry. For Antigravity the
 pace comes from the model family's weekly window (for example `gemini-weekly`
-for Gemini models). The capacity classifier ignores family-scoped windows, so
-Antigravity capacity can still read "unknown" while its pace is known.
+for Gemini models). Antigravity capacity is classified per routed model from
+the same family-scoped windows, so a Gemini model's capacity reflects
+`gemini-weekly` and `gemini-5h`, while Claude/GPT models through Antigravity use
+the `3p-*` windows (unknown while `3p-weekly` has no reset). The provider-wide
+Antigravity capacity entry, which ignores family windows, remains for status
+readers. Capacity never lifts Antigravity above an eligible primary driver: the
+fallback-driver rule is applied before capacity rank.
 `route review-pair` applies the same rule when it orders drivers for the main
 and peer reviewers: a preferred driver whose pick is ahead of pace is tried after
 the others, and the pair reasons name the demoted driver. Main reviewer
