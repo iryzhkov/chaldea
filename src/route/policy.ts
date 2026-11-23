@@ -381,14 +381,21 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       rule = ranking.decide(top, other)[1];
       const kind = (c: typeof top) => capacityFor(data, c.providerInstanceId, c.model)?.class ?? "unknown";
       const stat = (c: typeof top) => a!.models[c.model]!;
-      line = rule === "surplus" && leader ? `Quota pacing prefers ${leader.driver}: larger expiring weekly surplus (codex ${leader.codex.toFixed(2)}, claudeAgent ${leader.claudeAgent.toFixed(2)})`
+      // Print two decided values with the fewest decimals (at least `min`) that keep them
+      // distinct, so rounding never shows a strict difference as a tie.
+      const pair = (x: number, y: number, min: number): [string, string] => {
+        for (let d = min; d <= 12; d++) if (x.toFixed(d) !== y.toFixed(d)) return [x.toFixed(d), y.toFixed(d)];
+        return [String(x), String(y)];
+      };
+      const [surplusCodex, surplusClaude] = leader ? pair(leader.codex, leader.claudeAgent, 2) : ["", ""];
+      line = rule === "surplus" && leader ? `Quota pacing prefers ${leader.driver}: larger expiring weekly surplus (codex ${surplusCodex}, claudeAgent ${surplusClaude})`
         : rule === "capacity" ? `Quota pacing did not decide; capacity class ranks ${top.driver} first (${top.driver} ${kind(top)}, ${other.driver} ${kind(other)})`
         : rule === "under-paced" ? `Quota pacing prefers ${top.driver}`
         : rule === "pacing" ? ranking.preferred === ranking.settledPreferred ? `Quota pacing prefers ${top.driver}`
           : `Quota pacing including probation-held candidates prefers ${top.driver}`
         : rule === "objective" ? `Quota pacing did not decide; role objective (AA scores) ranks ${top.driver} first`
-        : rule === "reliability" ? `Quota pacing did not decide; Slopalytics completion rate ranks ${top.driver} first (${stat(top).completionRate.toFixed(2)} vs ${stat(other).completionRate.toFixed(2)})`
-        : rule === "speed" ? `Quota pacing did not decide; Slopalytics speed ranks ${top.driver} first (${stat(top).minutesPerTurn!.toFixed(1)} vs ${stat(other).minutesPerTurn!.toFixed(1)} minutes per turn)`
+        : rule === "reliability" ? `Quota pacing did not decide; Slopalytics completion rate ranks ${top.driver} first (${pair(stat(top).completionRate, stat(other).completionRate, 2).join(" vs ")})`
+        : rule === "speed" ? `Quota pacing did not decide; Slopalytics speed ranks ${top.driver} first (${pair(stat(top).minutesPerTurn!, stat(other).minutesPerTurn!, 1).join(" vs ")} minutes per turn)`
         : rule === "role-default" ? `Claude pacing unknown; role default prefers ${top.driver === "claudeAgent" ? "Claude" : top.driver}`
         : `Quota pacing did not decide; instance order ranks ${top.driver} first`;
     }

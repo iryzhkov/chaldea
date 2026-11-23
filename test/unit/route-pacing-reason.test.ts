@@ -74,6 +74,13 @@ test("Slopalytics completion rate and speed decisions cite the metric that decid
   assert.equal(reliability.result.providerInstanceId, "codex");
   assert.equal(reliability.trace?.rule, "reliability");
   assert.deepEqual(pacingLines(reliability.result.reasons), ["Quota pacing did not decide; Slopalytics completion rate ranks codex first (0.97 vs 0.95)"]);
+  // Close values that decide the order are printed with enough decimals to stay distinct.
+  const closeRate = route(stats(.951, 1), stats(.954, 1));
+  assert.equal(closeRate.result.providerInstanceId, "codex");
+  assert.deepEqual(pacingLines(closeRate.result.reasons), ["Quota pacing did not decide; Slopalytics completion rate ranks codex first (0.954 vs 0.951)"]);
+  const closeSpeed = route(stats(.95, 1.04), stats(.95, 1.01));
+  assert.equal(closeSpeed.result.providerInstanceId, "codex");
+  assert.deepEqual(pacingLines(closeSpeed.result.reasons), ["Quota pacing did not decide; Slopalytics speed ranks codex first (1.01 vs 1.04 minutes per turn)"]);
 });
 test("a review route names only the provider it may use", () => {
   const r = recommend({ role: "builder", authorProvider: "claudeAgent" }, { ...fixture(), quota: {} });
