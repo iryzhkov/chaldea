@@ -5,7 +5,7 @@ import { constants } from 'node:fs';
 import { once } from 'node:events';
 import { connect } from './queue.ts';
 import { send, json, VERSION, FETCH_VERSION, COMMANDS, MAX_ARTIFACT, safePath } from './protocol.ts';
-import { record, prune, type Intent } from './journal.ts';
+import { record, prune, refusalReason, type Intent } from './journal.ts';
 import { active, artifactLocation, cleanArtifacts } from './artifacts.ts';
 import { stateDir, withStateLock, privateDirectory } from './state.ts';
 import { JobLog, cleanLogs, validJobId, logPath, LOG_CAP } from './logs.ts';
@@ -23,6 +23,7 @@ export function summary(entry: Intent) {
     'Job: ' + entry.jobId, 'Outcome: ' + entry.outcome, 'Exit code: ' + (entry.exitCode ?? 'unknown'),
     'Host: ' + entry.host, 'Started: ' + entry.started, 'Ended: ' + (entry.ended ?? 'unknown'),
     'Log: ' + (entry.logPath ?? 'unavailable') + (entry.logTruncated ? ' (truncated at 64 MiB)' : '') + (entry.outputSyncFailed ? ' (local output sync failed)' : ''),
+    ...(entry.refusalReason ? ['Refusal reason: ' + refusalReason(entry.refusalReason)] : []),
     'Artifacts: ' + (entry.artifactPaths?.join(', ') || 'none'),
     ...(entry.blob ? ['Artifact custody: ' + entry.blob.state] : []),
   ].join('\n') + '\n';
@@ -53,9 +54,9 @@ export async function history(args: string[]): Promise<number> {
     if (command === 'list') {
       const entries = await Promise.all((await fs.readdir(journal)).filter(name => name.endsWith('.json'))
         .map(async name => JSON.parse(await fs.readFile(join(journal, name), 'utf8')) as Intent));
-      await write('JOB ID  OUTCOME  EXIT  HOST  STARTED\n');
+      await write('JOB ID  OUTCOME  EXIT  HOST  STARTED  REFUSAL REASON\n');
       for (const entry of entries.sort((a, b) => Date.parse(b.started) - Date.parse(a.started)).slice(0, 100)) {
-        await write([entry.jobId, entry.outcome, entry.exitCode ?? '?', entry.host, entry.started].join('  ') + '\n');
+        await write([entry.jobId, entry.outcome, entry.exitCode ?? '?', entry.host, entry.started, ...(entry.refusalReason ? [refusalReason(entry.refusalReason)] : [])].join('  ') + '\n');
       }
       return 0;
     }

@@ -10,7 +10,7 @@ import { once } from 'node:events';
 import { connect, queueHost, probeHost, probeHosts, ProbeUnavailable, type Transport } from './queue.ts';
 import { manifest } from './manifest.ts';
 import { cleanArtifacts, BOOT_ID } from './artifacts.ts';
-import { record, prune, DAYS, type Intent } from './journal.ts';
+import { record, prune, DAYS, refusalReason, type Intent } from './journal.ts';
 import { stateDir, withStateLock } from './state.ts';
 import { openLog, cleanLogs, logPath, LOG_CAP } from './logs.ts';
 import { blobConfig, storeIdentity } from './blob.ts';
@@ -168,7 +168,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   catch (e) {
     if (!automatic || !(e instanceof RetryableFailure)) throw e;
     const refused: Intent = { jobId: randomUUID(), host: options.host, argv: options.argv,
-      started: new Date().toISOString(), ended: new Date().toISOString(), outcome: 'refused' };
+      started: new Date().toISOString(), ended: new Date().toISOString(), outcome: 'refused', refusalReason: refusalReason(e.reason) };
     refused.logPath = logPath(state, refused.jobId);
     await withStateLock(state, async () => {
       await prune(journal, DAYS, 999);
@@ -207,7 +207,7 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
   // Attach error handlers immediately: a host can refuse while input is uploading.
   let writeError: Error | undefined;
   ssh.stdin.on('error', e => { writeError = e; });
-  const stop = () => { ssh.stdin.destroy(); ssh.kill('SIGTERM'); };
+  const stop = () => { ssh.stdin.destroy(); ssh.stdout.destroy(); ssh.kill('SIGTERM'); };
   let interrupted = false;
   const interrupt = () => { interrupted = true; stop(); };
   process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt);
@@ -292,6 +292,11 @@ async function runOnHost(options: ReturnType<typeof argumentsFor> & { host: stri
       e instanceof RetryableFailure ? 'connection-failed' : 'uncertain', requestSent, started, interrupted);
     if (retry || (e instanceof RemoteFailure && e.outcome !== 'uncertain' && (!automatic || e.outcome === 'preempted'))) {
       intent.outcome = retry ? 'refused' : (e as RemoteFailure).outcome;
+    }
+    if (intent.outcome === 'refused') {
+      // Only protocol refusals and our fixed pre-dispatch messages are retained,
+      // never raw OS exceptions, argv, environment or snapshot content.
+      intent.refusalReason = refusalReason((e as Error).message);
     }
     const message = (e as Error).message + '; outcome ' + intent.outcome + '; inspect journal ' + join(journal, jobId + '.json');
     if (retry) throw new RetryableFailure(message, (e as Error).message, e instanceof RemoteFailure && e.busy);

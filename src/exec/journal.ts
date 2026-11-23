@@ -4,7 +4,10 @@ import { atomicWrite, syncDirectory } from '../fs/atomic.ts';
 import { removeArtifacts, active as liveIntent } from './artifacts.ts';
 import { removeLog, validJobId } from './logs.ts';
 
-export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; logPath?: string; logTruncated?: boolean; outputSyncFailed?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[]; artifactRecoveryComplete?: boolean; artifactRecoveryPending?: boolean; blob?: { state: 'pending' | 'confirmed'; store: string; draft?: string; manifestKey?: string } };
+export type Intent = { jobId: string; host: string; argv: string[]; started: string; pid?: number; bootId?: string; outcome: 'uncertain' | 'finished' | 'refused' | 'preempted'; worktree?: string; artifactDir?: string; artifactReserve?: number; exitCode?: number; ended?: string; refusalReason?: string; logPath?: string; logTruncated?: boolean; outputSyncFailed?: boolean; artifactPaths?: string[]; requestedArtifacts?: string[]; artifactRecoveryComplete?: boolean; artifactRecoveryPending?: boolean; blob?: { state: 'pending' | 'confirmed'; store: string; draft?: string; manifestKey?: string } };
+// Host refusal messages are protocol diagnostics, never command output. Strip
+// terminal controls and line separators, and cap retained/displayed text.
+export const refusalReason = (text: string) => text.replace(/[\x00-\x1f\x7f-\x9f\u2028\u2029]+/g, ' ').slice(0, 1024);
 export const DAYS = 14 * 86400000;
 export const KEEP = 1000;
 

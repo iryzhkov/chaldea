@@ -40,6 +40,9 @@ export async function probeHost(config: string, host: string): Promise<void> {
   } finally {
     clearTimeout(timer);
     transport.ssh.stdin.destroy();
+    // frames() is suspended at the greeting yield. Unread stdout can keep
+    // ChildProcess 'close' pending even after exit and all handles drain.
+    transport.ssh.stdout.destroy();
     transport.ssh.kill('SIGTERM');
     await transport.exit.catch(() => {});
   }
