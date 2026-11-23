@@ -201,6 +201,7 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   // A probation model whose recommendation (trial) share is exhausted is withheld after ranking.
   const held = (c: typeof candidates[number]) => !!scores && !pin &&
     inProbation(c.model, input.role, history, config, data.now, c.driver) && !trialAvailable(history, config, c.model, c.driver);
+  let finalSurplusLeader: { driver: Provider; codex: number; claudeAgent: number } | null = null;
   const rankCandidates = (pool: typeof candidates, explain: boolean) => {
     if (explain && config.providerPreference.length) {
       for (const driver of config.providerPreference) {
@@ -237,9 +238,8 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       surplusLeader = cl && cx && cl.pace !== null && cx.pace !== null && cl.pace !== cx.pace && tier(cl) !== null &&
         tier(cl) === tier(cx) && (tier(cl) === "use-it" || surplus(cl) && surplus(cx))
         ? { driver: cx.pace > cl.pace ? "codex" : "claudeAgent", codex: cx.pace, claudeAgent: cl.pace } : null;
-      if (explain && !preferCodex && !config.providerPreference.length) reasons.push(surplusLeader
-        ? `Quota pacing prefers ${surplusLeader.driver}: larger expiring weekly surplus (codex ${surplusLeader.codex.toFixed(2)}, claudeAgent ${surplusLeader.claudeAgent.toFixed(2)})`
-        : hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
+      // The last ranking is the final one; its leader feeds the pacing reason.
+      finalSurplusLeader = surplusLeader;
     };
     const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
       if (config.providerPreference.length) {
@@ -334,6 +334,24 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   if (!eligible[0]) throw new RouteError("no_candidate", "No settled candidate while probation share is exhausted");
   // Trial admission can replace a provider representative and its scoped quota.
   if (benchmark) rankCandidates(eligible, true);
+  // Describe the primary-driver decision actually made: the final, post-probation ranking.
+  // Never names a driver without an eligible, settled candidate.
+  if (!preferCodex && !config.providerPreference.length) {
+    const primaries = eligible.filter(c => PRIMARY_DRIVERS.includes(c.driver));
+    const present = [...new Set(primaries.map(c => c.driver))];
+    const leader = finalSurplusLeader as { driver: Provider; codex: number; claudeAgent: number } | null;
+    const pacedClaude = primaries.filter(c => c.driver === "claudeAgent" && c.pace !== null);
+    const pacing: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent" : pacedClaude.length ? "codex" : "claudeAgent";
+    const winner = primaries[0]?.driver;
+    reasons.push(leader && present.length === 2
+      ? `Quota pacing prefers ${leader.driver}: larger expiring weekly surplus (codex ${leader.codex.toFixed(2)}, claudeAgent ${leader.claudeAgent.toFixed(2)})`
+      : !winner ? "No eligible primary candidate; quota pacing comparison does not apply"
+      : present.length === 1 ? `Only ${winner} has an eligible primary candidate; quota pacing comparison does not apply`
+      : !pacedClaude.length ? winner === "claudeAgent" ? "Claude pacing unknown; role default prefers Claude"
+        : `Claude pacing unknown; ${winner} ranks first on capacity class, role objective or statistics`
+      : winner === pacing ? `Quota pacing prefers ${winner}`
+      : `Quota pacing alone would prefer ${pacing}; capacity class ranks ${winner} first`);
+  }
   const byProvider: RouteResult["byProvider"] = Object.fromEntries([...providerReasons].map(([driver, details]) => {
     const best = eligible.find(c => c.driver === driver);
     return [driver, best ? { ...target(best), eligible: true, reasons: [...new Set([...policyReasons, ...details]),
