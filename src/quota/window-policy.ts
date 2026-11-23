@@ -5,15 +5,17 @@ export interface IncludedWindow {
 /** Native IDs preserve account-wide and model-specific limits on the existing wire. */
 export const modelScopedWindow = (w: IncludedWindow) => /^seven_day_/.test(w.id ?? "");
 export const fableModel = (model: string) => /(?:^|[-_/:])(?:claude[-_])?fable(?:[-_.:/]|$)/i.test(model);
-export function modelWindowPolicy(input: ReadonlyArray<IncludedWindow>, model: string, now: number, minimum: number, margin: number, driver?: string) {
+/** Antigravity windows that bind one model: account-wide windows plus that model's family. */
+export function antigravityModelWindows<T extends IncludedWindow>(input: ReadonlyArray<T>, model: string): T[] {
   // Antigravity family windows must never gate a different model family.
   // Unknown family IDs still constrain that family; never infer a duration.
-  if (driver === "antigravity") {
-    const family = model.startsWith("gemini-") ? "gemini" : /^(claude-|gpt-)/.test(model) ? "3p" : null;
-    const scoped = input.filter(w => w.id === "gemini-argon-wtu-weekly"
-      ? model === "gemini-4-argon" : family !== null && w.id?.startsWith(family + "-"));
-    input = input.filter(w => !/^(gemini-|3p-)/.test(w.id ?? "") || scoped.includes(w));
-  }
+  const family = model.startsWith("gemini-") ? "gemini" : /^(claude-|gpt-)/.test(model) ? "3p" : null;
+  const scoped = input.filter(w => w.id === "gemini-argon-wtu-weekly"
+    ? model === "gemini-4-argon" : family !== null && w.id?.startsWith(family + "-"));
+  return input.filter(w => !/^(gemini-|3p-)/.test(w.id ?? "") || scoped.includes(w));
+}
+export function modelWindowPolicy(input: ReadonlyArray<IncludedWindow>, model: string, now: number, minimum: number, margin: number, driver?: string) {
+  if (driver === "antigravity") input = antigravityModelWindows(input, model);
   const common = windowPolicy(input, now, minimum, margin);
   if (!fableModel(model)) return { ...common, scopedLimit: undefined as IncludedWindow | undefined, scopeKnown: true,
     binding: common.gate ? input.find(w => !modelScopedWindow(w) && (w.kind === "session" || w.windowDurationMins !== null && w.windowDurationMins <= 300) && w.remainingPercent / 100 < minimum) : common.limit ?? common.pacing };

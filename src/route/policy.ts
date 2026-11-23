@@ -16,8 +16,16 @@ export interface PolicyData {
   scores?: ScoreSnapshot | null;
   history?: RoutingHistory;
   capacity?: Readonly<Record<string, Capacity>>;
+  /** Antigravity capacity per instance, then per model id. Kept apart from the provider-wide
+   * map so no instance or model id can collide with or overwrite another instance's entry. */
+  modelCapacity?: ReadonlyMap<string, ReadonlyMap<string, Capacity>>;
   now: number;
   config?: Partial<PolicyConfig>;
+}
+/** Capacity for one routed model: Antigravity's per-model entry when the runtime supplied one,
+ * otherwise the provider-wide entry. Claude/Codex have only the latter. */
+export function capacityFor(data: Pick<PolicyData, "capacity" | "modelCapacity">, instance: string, model: string): Capacity | undefined {
+  return data.modelCapacity?.get(instance)?.get(model) ?? data.capacity?.[instance];
 }
 /** Pure policy. No IO, provider launch, feed posting or quota redemption. */
 export function recommend(input: RouteInput, data: PolicyData): RouteResult {
@@ -125,7 +133,7 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     const q = data.quota[p.providerInstanceId];
     const age = ageSeconds(q?.observedAt, data.now);
     ages[p.providerInstanceId] = age;
-    const capacity = data.capacity?.[p.providerInstanceId];
+    const capacity = capacityFor(data, p.providerInstanceId, model);
     if (capacity) reasons.push(`${p.providerInstanceId} capacity ${capacity.class}: ${capacity.reasons.join("; ")}`);
     if (capacity && ["tight", "stopped"].includes(capacity.class)) { reasons.push(`${p.providerInstanceId}: avoid ${capacity.class}`); continue; }
     if (q?.activeStop) { reasons.push(`${p.providerInstanceId}: active usage stop, avoid`); continue; }
@@ -221,8 +229,8 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       const fallback = (c: typeof x) => !PRIMARY_DRIVERS.includes(c.driver);
       if (fallback(x) !== fallback(y)) return Number(fallback(x)) - Number(fallback(y));
       const rank = (c: typeof x) => {
-        if (!c.scopeKnown && !data.capacity?.[c.providerInstanceId]?.creditFunded) return data.capacity ? 2 : null;
-        const kind = data.capacity?.[c.providerInstanceId]?.class;
+        if (!c.scopeKnown && !capacityFor(data, c.providerInstanceId, c.model)?.creditFunded) return data.capacity ? 2 : null;
+        const kind = capacityFor(data, c.providerInstanceId, c.model)?.class;
         return kind === "use-it" ? 0 : kind === "unlimited" ? 1 : data.capacity ? 2 : null;
       };
       const xr = rank(x), yr = rank(y);

@@ -1,6 +1,6 @@
 // Capacity is advice over cached observations. This module performs no IO or redemption.
 import { capacityKey } from "./account.ts";
-import { windowPolicy } from "./window-policy.ts";
+import { antigravityModelWindows, windowPolicy } from "./window-policy.ts";
 import type { ObserverState } from "./state.ts";
 import type { Metric, ProviderHeadroom, Window } from "./headroom.ts";
 export type CapacityClass = "unlimited" | "use-it" | "paced" | "tight" | "stopped" | "unknown";
@@ -63,13 +63,18 @@ function timedReserves(count: number, expiresAt: string | null, hours: number,
   return { useful, weeks: Math.max(0, valueHours / 168),
     reason: `projected first exhaustion in ${first.toFixed(1)}h; ${useful}/${count} reserves usable before expiry with at least ${minLead}h lead to native reset` };
 }
-export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: number, config: CapacityConfig = DEFAULT_CAPACITY): Capacity {
+/** For Antigravity, `model` scopes the classification to the windows that bind that model's
+ * family (for example gemini-weekly for Gemini). Without it, or for any other driver, the
+ * provider-wide classification is unchanged. */
+export function classifyCapacity(p: ProviderHeadroom, activeStop: boolean, now: number, config: CapacityConfig = DEFAULT_CAPACITY, model?: string): Capacity {
   const c: Capacity = { class: "unknown", reasons: [], remainingFraction: null, reserveWeeks: 0,
     observedBurnPerHour: null, projectedHeavyUse: null, burnTargetPerHour: null, observedAt: p.included.observedAt };
   const finish = (kind: CapacityClass, reason: string) => { c.class = kind; c.reasons.push(reason); return c; };
   const maxAge = p.included.source === "operator-weekly-target" ? 7 * 86400000 : config.maxAgeMs;
   const windows = fresh(p.included, now, maxAge) ?? [];
-  const advice = windowPolicy(windows, now, config.minimumRemaining, config.paceMargin, p.driver);
+  const advice = p.driver === "antigravity" && model !== undefined
+    ? windowPolicy(antigravityModelWindows(windows, model), now, config.minimumRemaining, config.paceMargin)
+    : windowPolicy(windows, now, config.minimumRemaining, config.paceMargin, p.driver);
   c.reasons.push(...advice.reasons);
   // An active usage stop is the provider's own refusal; nothing below overrides it.
   if (activeStop) return finish("stopped", "active usage stop; reserves do not authorize redemption");
