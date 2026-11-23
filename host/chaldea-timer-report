@@ -18,6 +18,7 @@ JOBS = ("chaldea-fleet-pull", "chaldea-retention")
 MAX_RECORDS = 50
 MAX_BYTES = 131072
 FEED_TIMEOUT = 8
+DETAIL_LIMIT = 300
 STATE = Path.home() / ".local/state/chaldea"
 
 
@@ -95,15 +96,22 @@ def feed_delivery(record):
         title += "; releases=" + ",".join(record["releases"])
         if record.get("releases_omitted"):
             title += f' (+{record["releases_omitted"]} more)'
+    command = ["feed", "post", title, "--source", source,
+               "--host", record["host"], "--severity", record["severity"]]
+    body = None
+    if record.get("detail"):
+        # The callback's redacted one-line detail is the only body content.
+        command += ["--body-file", "-"]
+        body = (record["detail"] + "\n").encode()
     # Neither feed output nor raw child output is copied to the journal/status.
     # A separate session lets the timeout kill curl and other descendants too.
     process = None
     try:
-        process = subprocess.Popen(["feed", "post", title, "--source", source,
-                                    "--host", record["host"], "--severity", record["severity"]],
+        process = subprocess.Popen(command, stdin=subprocess.PIPE if body else subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                    start_new_session=True)
-        return "posted" if process.wait(timeout=FEED_TIMEOUT) == 0 else "feed-failed"
+        process.communicate(body, timeout=FEED_TIMEOUT)
+        return "posted" if process.returncode == 0 else "feed-failed"
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait()
@@ -132,7 +140,8 @@ def queue_delivery(record):
     # Eight MiB of immutable local inputs; status, database and rollback journal
     # have separate budgets keeping all new host state below 64 MiB.
     data = {k: record[k] for k in ("job", "invocation", "host", "timestamp", "outcome",
-                                     "changed", "task", "reason", "releases", "releases_omitted", "notes") if k in record}
+                                     "changed", "task", "reason", "detail", "releases", "releases_omitted", "notes")
+            if k in record}
     encoded = (json.dumps(data, separators=(",", ":")) + "\n").encode()
     # Only this lock owner writes inputs. Incomplete atomic writes are not events.
     for stale in spool.glob("*.new"):
@@ -196,6 +205,12 @@ def record_outcome(job, invocation, status, fallback_reason="", checkout=None):
             record["notes"] = [f"temporary entries left after best-effort cleanup: {min(leftovers, 1000000)}"]
         record["task"] = str(record["task"])[:160]
         record["reason"] = str(record["reason"])[:160]
+        detail = state.get("detail") if failed else ""
+        if isinstance(detail, str):
+            # Already redacted by the callback; keep it one bounded line here too.
+            detail = re.sub(r"\s+", " ", re.sub(r"[\x00-\x1f\x7f]", " ", detail)).strip()[:DETAIL_LIMIT]
+            if detail:
+                record["detail"] = detail
         records = records[-(MAX_RECORDS - 1):] + [record]
         mode = delivery_mode()
         if mode == "queue":

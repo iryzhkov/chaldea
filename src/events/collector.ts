@@ -97,6 +97,10 @@ function generation(fd: number, old: Cursor | null): Cursor {
   return { generation: randomUUID(), dev: String(st.dev), ino: String(st.ino), offset: 0,
     prefixLength, prefix: sha(bytes(fd, 0, prefixLength)), tail: sha(""), size, modified: String(st.mtimeNs) };
 }
+/** An optional bounded line; an invalid value is dropped rather than rejecting the event. */
+function optionalLine(value: unknown, max: number): string | undefined {
+  return typeof value === "string" && value && value.length <= max && !/[\x00-\x1f\x7f]/.test(value) ? value : undefined;
+}
 /** Timer input is already redacted by the wrapper; allowlist again at the boundary. */
 export function timerPublication(raw: Record<string, unknown>, host: string): Publication {
   const job = safeString(raw.job), invocation = safeString(raw.invocation);
@@ -112,6 +116,8 @@ export function timerPublication(raw: Record<string, unknown>, host: string): Pu
         changed: Number.isSafeInteger(raw.changed) ? Math.max(0, Math.min(Number(raw.changed), 1000000)) : 0,
         task: typeof raw.task === "string" ? safeString(raw.task || "unknown", 160) : "",
         reason: typeof raw.reason === "string" ? safeString(raw.reason || "unknown", 160) : "",
+        // The callback's redacted failure excerpt; absent on success.
+        detail: status === "failed" ? optionalLine(raw.detail, 300) : undefined,
         releases: Array.isArray(raw.releases) ? raw.releases.filter(r => typeof r === "string" && /^[a-zA-Z0-9@._+:/-]{1,100}$/.test(r)).slice(0, 24) : [],
         releases_omitted: Number.isSafeInteger(raw.releases_omitted) ? Math.max(0, Math.min(Number(raw.releases_omitted), 1000000)) : 0,
       }),

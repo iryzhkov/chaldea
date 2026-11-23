@@ -173,7 +173,7 @@ def test_real_ansible_callback_counts_changes_and_redacts_failure(home, failed):
            "        - name: Rescue failure\n          ansible.builtin.debug:\n            msg: recovered\n"
            if failed == "rescued" else
            "    - name: 'Fail with {{ lookup(\"env\", \"SECRET\") }}'\n"
-           "      ansible.builtin.fail:\n        msg: 'SECRET_ENV_VALUE'\n" if failed else "")
+           "      ansible.builtin.fail:\n        msg: 'Request failed: SECRET_ENV_VALUE timed out'\n" if failed else "")
     )
     environment = os.environ.copy()
     environment["SECRET"] = "SECRET_ENV_VALUE"
@@ -190,9 +190,117 @@ def test_real_ansible_callback_counts_changes_and_redacts_failure(home, failed):
     if failed is True:
         assert data["task"] == "Fail with <redacted>"
         assert data["reason"] == "Ansible task failed"
+        assert data["detail"] == "Request failed: <redacted> timed out"
+        queued = next((home / ".local/state/chaldea/timer-spool").glob("*.jsonl")).read_text()
+        assert json.loads(queued)["detail"] == data["detail"]
+    else:
+        assert "detail" not in data
     if failed == "rescued":
         state = json.loads((home / ".local/state/chaldea/chaldea-fleet-pull-run.json").read_text())
         assert state["failed_task"] == ""
+
+
+def test_real_get_url_failure_carries_redacted_cause(home):
+    """The fleet manifest download path: a real get_url failure against a closed port."""
+    callback_dir = home / ".local/share/chaldea/timer-reporting"
+    callback_dir.mkdir(parents=True)
+    shutil.copyfile(CALLBACK, callback_dir / CALLBACK.name)
+    play = home / "play.yml"
+    play.write_text(
+        "- hosts: localhost\n  gather_facts: false\n  tasks:\n"
+        "    - name: Download the host release manifest\n      ansible.builtin.get_url:\n"
+        "        url: 'http://operator:SECRET_ENV_VALUE@127.0.0.1:9/manifest.json?token=Zq81UNSAFE'\n"
+        f"        dest: {home}/manifest.json\n        timeout: 2\n")
+    environment = os.environ.copy()
+    environment["ANSIBLE_LOCAL_TEMP"] = str(home / "ansible-local")
+    environment["ANSIBLE_REMOTE_TEMP"] = str(home / "ansible-remote")
+    result = subprocess.run([sys.executable, str(SCRIPT), "run", "--job", "chaldea-fleet-pull",
+                             "--", shutil.which("ansible-playbook"), "-i", "localhost,", "-c", "local",
+                             str(play), "-e", "ansible_python_interpreter=" + sys.executable],
+                            capture_output=True, text=True, env=environment)
+    assert result.returncode != 0
+    data = records(home)[0]
+    assert data["task"] == "Download the host release manifest"
+    assert data["detail"] and len(data["detail"]) <= 300 and "\n" not in data["detail"]
+    assert "refused" in data["detail"].lower() or "failed" in data["detail"].lower(), data["detail"]
+    published = json.dumps(data) + result.stdout + result.stderr
+    assert "SECRET_ENV_VALUE" not in published and "Zq81UNSAFE" not in published
+
+
+def load_callback():
+    pytest.importorskip("ansible")
+    loader = importlib.machinery.SourceFileLoader("chaldea_outcome_detail", str(CALLBACK))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("text,secret", [
+    ("Authorization: Bearer abc.def-ghi", "abc.def-ghi"),
+    ("GET https://example.invalid/m.json?sig=s3cr3tvalue&x=1 failed", "s3cr3tvalue"),
+    ("clone https://bot:pa55word@git.example.invalid/repo.git failed", "pa55word"),
+    ("password=hunter2 rejected", "hunter2"),
+    ('{"api_key": "k-1234"} rejected', "k-1234"),
+    ("FEED_TOKEN: abc rejected", "abc rejected"),
+    ("key -----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY----- bad", "AAAA"),
+    ("token ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4 invalid", "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4"),
+    ("saw aGVsbG8vd29ybGQ/Zm9vYmFyMTIzNDU2Nzg5MA== here", "aGVsbG8vd29ybGQ"),
+    ("digest 090bd269f0369f71b746d800ed68ced14f6ed9dff313cb439dfecb2d556bb524 mismatch", "090bd269f0369f71"),
+    ("value OPAQUE_ENV_VALUE_42 leaked", "OPAQUE_ENV_VALUE_42"),
+])
+def test_redaction_removes_credentials(monkeypatch, text, secret):
+    monkeypatch.setenv("SOME_SETTING", "OPAQUE_ENV_VALUE_42")
+    redacted = load_callback().redact(text)
+    assert secret not in redacted and "<redacted>" in redacted
+
+
+def test_redaction_keeps_ordinary_diagnostics_and_bounds_one_line():
+    module = load_callback()
+    for text in ("Request failed: <urlopen error timed out>", "HTTP Error 404: Not Found",
+                 "Destination /opt/chaldea-host/releases/host-v0.2.21/host/manifest.json not writable",
+                 "Connection failure: [Errno 111] Connection refused"):
+        assert module.redact(text) == text
+    long = module.redact("line one\n\tline two " + "word " * 200)
+    assert len(long) <= module.DETAIL_LIMIT and "\n" not in long and long.startswith("line one line two")
+
+
+def test_failure_detail_uses_allowlisted_fields_only():
+    module = load_callback()
+    assert module.failure_detail({"msg": "x"}, no_log=True) == "output hidden by no_log"
+    assert module.failure_detail({"censored": "hidden", "msg": "x"}) == "output hidden by no_log"
+    assert module.failure_detail({"msg": "Request failed", "status_code": 503,
+                                  "response": "HTTP Error 503: Service Unavailable",
+                                  "invocation": {"module_args": {"url": "SECRET_ARGUMENT"}}}) == \
+        "Request failed; HTTP status 503; HTTP Error 503: Service Unavailable"
+    assert module.failure_detail({"msg": "non-zero return code", "rc": 1, "stdout": "SECRET_STDOUT",
+                                  "stderr": "warning\nfatal: repository not found\n"}) == \
+        "fatal: repository not found"
+    assert module.failure_detail({"msg": "One or more items failed", "results": [
+        {"failed": False, "msg": "fine"}, {"failed": True, "msg": "second item broke"}]}) == "second item broke"
+    assert module.failure_detail({"msg": "", "stdout": "env dump"}) == ""
+
+
+def test_feed_mode_posts_detail_as_body_only_on_failure(home, monkeypatch):
+    (home / ".config/chaldea/timer-reporting.json").write_text('{"delivery":"feed"}')
+    feed = home / "bin/feed"
+    feed.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$HOME/feed-calls\"\n"
+                    "case \"$*\" in *--body-file*) cat >> \"$HOME/feed-bodies\";; esac\n")
+    monkeypatch.setenv("FEED_TOKEN", "test-only")
+    reporter = load_reporter()
+    reporter.STATE.mkdir(parents=True)
+    reporter.write_json(reporter.run_path("chaldea-fleet-pull"), dict(
+        invocation="d" * 32, changed=0, task="Download the host release manifest",
+        reason="Ansible task failed", detail="Request failed: <urlopen error timed out>\n"))
+    reporter.record_outcome("chaldea-fleet-pull", "d" * 32, 2)
+    assert records(home)[0]["delivery"] == "posted"
+    assert (home / "feed-bodies").read_text() == "Request failed: <urlopen error timed out>\n"
+    reporter.write_json(reporter.run_path("chaldea-fleet-pull"), dict(
+        invocation="e" * 32, changed=1, detail="stale detail from a rescued task"))
+    reporter.record_outcome("chaldea-fleet-pull", "e" * 32, 0)
+    calls = (home / "feed-calls").read_text().splitlines()
+    assert len(calls) == 2 and "--body-file" not in calls[1]
+    assert "detail" not in records(home)[1]
 
 
 def test_missing_summary_is_visible_failure(home):

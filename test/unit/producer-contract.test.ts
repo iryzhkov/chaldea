@@ -27,6 +27,20 @@ test("argumentless Go records and shell records satisfy the accepted service sch
     host: "agent-a", timestamp: base.ts, outcome: "failed", changed: 1, task: "safe task", reason: "safe reason" }, "agent-a");
   assert.equal(normalize(timer.payload, { ...identity, source: timer.source }, false).kind, "job_finished");
 });
+test("timer failure detail is carried bounded, dropped when invalid and absent on success", () => {
+  const raw = { job: "chaldea-fleet-pull", invocation: "b".repeat(32), host: "agent-a", timestamp: base.ts,
+    outcome: "failed", changed: 0, task: "Download the host release manifest", reason: "Ansible task failed" };
+  const body = (value: Record<string, unknown>) =>
+    JSON.parse(timerPublication(value, "agent-a").payload.body as string) as Record<string, unknown>;
+  const detail = "Request failed: <urlopen error timed out>";
+  const failed = timerPublication({ ...raw, detail }, "agent-a");
+  assert.equal(normalize(failed.payload, { ...identity, source: failed.source }, false).kind, "job_finished");
+  assert.equal(body({ ...raw, detail }).detail, detail);
+  for (const invalid of ["x".repeat(301), "two\nlines", "", 7])
+    assert.ok(!("detail" in body({ ...raw, detail: invalid })));
+  assert.ok(!("detail" in body({ ...raw, outcome: "changed", changed: 1, detail })));
+  assert.ok(!("detail" in body(raw)));
+});
 test("collector ignores root transcript indexes and deeper trees, including retention", async () => {
   const f = scratchDir("spool-layout"), db = new Outbox(join(f.path, "state.db"));
   const spool = join(f.path, "spool"); mkdirSync(join(spool, "tool", "deeper"), { recursive: true });
