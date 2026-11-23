@@ -136,6 +136,7 @@ async function collectContext(options: RouteOptions) {
   const stoppedAccounts = new Set(capacityState.headroom.providers.filter(p => p.driver !== "antigravity" && p.accountKey && quota[p.alias]?.activeStop)
     .map(p => capacityKey(p.driver, p.accountKey!)));
   const capacity: Record<string, ReturnType<typeof classifyCapacity>> = {};
+  const modelCapacity = new Map<string, Map<string, ReturnType<typeof classifyCapacity>>>();
   const boundCatalog = catalog.map(p => {
     let row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);
     const key = mappings.get(p.providerInstanceId) ?? p.accountKey ?? row?.accountKey;
@@ -147,16 +148,16 @@ async function collectContext(options: RouteOptions) {
         if (!classified.creditFunded && !["tight", "stopped"].includes(classified.class)) classified.class = "unknown";
       }
       capacity[p.providerInstanceId] = classified;
-      // Antigravity windows are per model family, so routing reads a per-model entry
-      // keyed "instance:model"; the provider-wide entry above stays for other readers.
-      if (p.driverKind === "antigravity") for (const m of p.models)
-        capacity[p.providerInstanceId + ":" + m.id] = classifyCapacity(row, stop, now, capacityConfig, m.id);
+      // Antigravity windows are per model family, so routing reads a per-model entry from a
+      // separate map; the provider-wide entry above stays for other readers.
+      if (p.driverKind === "antigravity") modelCapacity.set(p.providerInstanceId,
+        new Map(p.models.map(m => [m.id, classifyCapacity(row!, stop, now, capacityConfig, m.id)])));
     }
     const admissionHold = admissionHolds.get(p.providerInstanceId);
     return { ...p, canRunChildTask: p.canRunChildTask && !blockedInstances.has(p.providerInstanceId),
       ...(admissionHold ? { admissionHold } : {}), ...(key ? { accountKey: key } : {}) };
   });
-  const data: PolicyData = { catalog: boundCatalog, quota, analytics: analytics.value, scores: scores.value, now, config, capacity };
+  const data: PolicyData = { catalog: boundCatalog, quota, analytics: analytics.value, scores: scores.value, now, config, capacity, modelCapacity };
   return { data, config, reasons,
     provenance: Object.fromEntries(boundCatalog.map(p => {
       const row = capacityState.headroom.providers.find(r => r.alias === p.providerInstanceId);

@@ -16,13 +16,16 @@ export interface PolicyData {
   scores?: ScoreSnapshot | null;
   history?: RoutingHistory;
   capacity?: Readonly<Record<string, Capacity>>;
+  /** Antigravity capacity per instance, then per model id. Kept apart from the provider-wide
+   * map so no instance or model id can collide with or overwrite another instance's entry. */
+  modelCapacity?: ReadonlyMap<string, ReadonlyMap<string, Capacity>>;
   now: number;
   config?: Partial<PolicyConfig>;
 }
-/** Capacity for one routed model: Antigravity's per-model entry ("instance:model") when the
- * runtime supplied one, otherwise the provider-wide entry. Claude/Codex have only the latter. */
-export function capacityFor(data: Pick<PolicyData, "capacity">, instance: string, model: string): Capacity | undefined {
-  return data.capacity?.[instance + ":" + model] ?? data.capacity?.[instance];
+/** Capacity for one routed model: Antigravity's per-model entry when the runtime supplied one,
+ * otherwise the provider-wide entry. Claude/Codex have only the latter. */
+export function capacityFor(data: Pick<PolicyData, "capacity" | "modelCapacity">, instance: string, model: string): Capacity | undefined {
+  return data.modelCapacity?.get(instance)?.get(model) ?? data.capacity?.[instance];
 }
 /** Pure policy. No IO, provider launch, feed posting or quota redemption. */
 export function recommend(input: RouteInput, data: PolicyData): RouteResult {

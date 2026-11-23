@@ -62,7 +62,7 @@ export function recommendReviewPair(value: ReviewPairInput, data: PolicyData, hi
     try {
       const history = historyFor?.(request) ?? data.history;
       return recommend(request, { ...data, catalog, ...(history ? { history } : {}),
-        ...(withoutQuota ? { quota: {}, capacity: {} } : {}) });
+        ...(withoutQuota ? { quota: {}, capacity: {}, modelCapacity: new Map() } : {}) });
     } catch (error) {
       if (!(error instanceof RouteError) || error.code !== "no_candidate") throw error;
       return null;

@@ -76,8 +76,9 @@ function data(): PolicyData {
 }
 test("a use-it Antigravity model still ranks after every eligible primary driver", () => {
   const f = data();
-  f.capacity = { codex: capacity("paced"), claudeAgent: capacity("paced"), antigravity: capacity("unknown"),
-    "antigravity:gemini-4-neon": capacity("use-it") };
+  const neon = (kind: Capacity["class"]) => new Map([["antigravity", new Map([["gemini-4-neon", capacity(kind)]])]]);
+  f.capacity = { codex: capacity("paced"), claudeAgent: capacity("paced"), antigravity: capacity("unknown") };
+  f.modelCapacity = neon("use-it");
   for (const role of ["general", "builder", "executor"] as const) {
     const r = recommend({ role }, f);
     assert.notEqual(r.providerInstanceId, "antigravity", role);
@@ -85,34 +86,65 @@ test("a use-it Antigravity model still ranks after every eligible primary driver
     assert.ok(r.reasons.some(x => x.startsWith("antigravity capacity use-it")), role);
   }
   // The per-model entry, not the provider-wide one, gates the routed model.
-  f.capacity = { ...f.capacity, "antigravity:gemini-4-neon": capacity("tight") };
+  f.modelCapacity = neon("tight");
   assert.equal(recommend({ role: "general" }, f).byProvider.antigravity?.eligible, false);
-  f.capacity = { ...f.capacity, antigravity: capacity("tight"), "antigravity:gemini-4-neon": capacity("paced") };
+  f.capacity = { ...f.capacity, antigravity: capacity("tight") };
+  f.modelCapacity = neon("paced");
   assert.equal(recommend({ role: "general" }, f).byProvider.antigravity?.eligible, true);
+});
+test("a provider-wide entry named like instance:model never stands in for another instance's model", () => {
+  const f = data();
+  // Another (unavailable) instance literally named "codex:gpt-6.1-sol" is stopped.
+  f.capacity = { codex: capacity("paced"), "codex:gpt-6.1-sol": capacity("stopped"),
+    "antigravity:gemini-4-neon": capacity("stopped") };
+  const r = recommend({ role: "builder" }, { ...f, config: { ...f.config, providerPreference: ["codex", "antigravity"] } });
+  assert.deepEqual([r.providerInstanceId, r.model], ["codex", "gpt-6.1-sol"]);
+  assert.equal(r.byProvider.antigravity?.eligible, true);
+});
+const codexInstance = (instanceId: string): SwitchProvider => ({ instanceId, driver: "codex", enabled: true, installed: true,
+  status: "ready", auth: { status: "authenticated" }, models: [{ slug: "gpt-6.1-sol",
+    capabilities: { optionDescriptors: [{ id: "reasoningEffort", type: "select", options: [{ id: "medium" }] }] } }] });
+async function liveContext(path: string, extra: SwitchProvider[] = [], extraFirst = false) {
+  const stateFile = join(path, "observer.json"), configPath = join(path, "route.json");
+  const state = emptyState();
+  writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(path, "cache") }));
+  const usage = (at: number) => ({ credentialFingerprint: "a".repeat(64), checkedAt: iso(at), windows: live().map(w =>
+    ({ id: w.id, kind: w.kind, usedPercent: w.usedPercent, windowDurationMins: w.windowDurationMins!, ...(w.resetsAt ? { resetsAt: w.resetsAt } : {}) })) });
+  const ag = (at: number): SwitchProvider => ({ instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true,
+    status: "ready", auth: { status: "authenticated" }, models: ["gemini-4-neon", "claude-opus-5-5"].map(slug => ({ slug,
+      capabilities: { optionDescriptors: [{ id: "thought_level", type: "select", options: [{ id: "medium" }] }] } })),
+    usageLimits: usage(at) });
+  // Two attributed snapshots admit the live credential context, as in the observer.
+  let clock = now - 20;
+  const monitor = new HeadroomMonitor({ state: state.headroom, config: { contexts: [], lowHeadroomPercent: 10 },
+    local: true, now: () => clock, save: () => {} });
+  monitor.update([ag(clock - 1)]); clock += 10; monitor.update([ag(clock - 1)]);
+  saveState(stateFile, state, now);
+  const providers = extraFirst ? [...extra, ag(now - 1)] : [ag(now - 1), ...extra];
+  return (await collectRouteContext({ home: path, configPath, now, catalog: async () => routeCatalog(providers),
+    fetcher: async () => { throw new Error("fixture offline"); } })).data;
+}
+test("per-model capacity cannot be overwritten by, or overwrite, an instance named instance:model", async () => {
+  for (const extraFirst of [false, true]) {
+    const d = routeScratch();
+    try {
+      const context = await liveContext(d.path, [codexInstance("antigravity:gemini-4-neon")], extraFirst);
+      // The codex instance keeps its own provider-wide classification in either catalog order.
+      assert.equal(context.capacity?.["antigravity:gemini-4-neon"]?.class, "unknown", String(extraFirst));
+      assert.ok(context.capacity?.["antigravity:gemini-4-neon"]?.reasons.some(r => r.startsWith("missing, stale or expired")));
+      assert.equal(context.modelCapacity?.get("antigravity")?.get("gemini-4-neon")?.class, "paced", String(extraFirst));
+      assert.equal(context.modelCapacity?.has("antigravity:gemini-4-neon"), false);
+    } finally { d.remove(); }
+  }
 });
 test("route context reports the live Gemini weekly pacing as Antigravity capacity", async () => {
   const d = routeScratch();
   try {
-    const stateFile = join(d.path, "observer.json"), configPath = join(d.path, "route.json");
-    const state = emptyState();
-    writeFileSync(configPath, JSON.stringify({ stateFile, cacheDir: join(d.path, "cache") }));
-    const usage = (at: number) => ({ credentialFingerprint: "a".repeat(64), checkedAt: iso(at), windows: live().map(w =>
-      ({ id: w.id, kind: w.kind, usedPercent: w.usedPercent, windowDurationMins: w.windowDurationMins!, ...(w.resetsAt ? { resetsAt: w.resetsAt } : {}) })) });
-    const ag = (at: number): SwitchProvider => ({ instanceId: "antigravity", driver: "antigravity", enabled: true, installed: true,
-      status: "ready", auth: { status: "authenticated" }, models: ["gemini-4-neon", "claude-opus-5-5"].map(slug => ({ slug,
-        capabilities: { optionDescriptors: [{ id: "thought_level", type: "select", options: [{ id: "medium" }] }] } })),
-      usageLimits: usage(at) });
-    // Two attributed snapshots admit the live credential context, as in the observer.
-    let clock = now - 20;
-    const monitor = new HeadroomMonitor({ state: state.headroom, config: { contexts: [], lowHeadroomPercent: 10 },
-      local: true, now: () => clock, save: () => {} });
-    monitor.update([ag(clock - 1)]); clock += 10; monitor.update([ag(clock - 1)]);
-    saveState(stateFile, state, now);
-    const { data: context } = await collectRouteContext({ home: d.path, configPath, now, catalog: async () => routeCatalog([ag(now - 1)]),
-      fetcher: async () => { throw new Error("fixture offline"); } });
+    const context = await liveContext(d.path);
     assert.equal(context.capacity?.antigravity?.class, "unknown");
-    assert.equal(context.capacity?.["antigravity:gemini-4-neon"]?.class, "paced");
-    assert.equal(context.capacity?.["antigravity:claude-opus-5-5"]?.class, "unknown");
+    assert.deepEqual(Object.keys(context.capacity ?? {}), ["antigravity"]);
+    assert.equal(context.modelCapacity?.get("antigravity")?.get("gemini-4-neon")?.class, "paced");
+    assert.equal(context.modelCapacity?.get("antigravity")?.get("claude-opus-5-5")?.class, "unknown");
     const r = recommend({ role: "general" }, { ...context, config: { ...context.config, benchmark: { indexVersion: "5" },
       driverModels: { antigravity: ["gemini-4-neon"] } },
       scores: { version: 2, metric: "aa-intelligence-cost-per-task", indexVersion: "5", fetchedAt: iso(now), unmapped: [],
