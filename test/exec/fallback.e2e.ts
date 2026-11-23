@@ -97,6 +97,7 @@ async function fixture(modes: Record<string, string>, hosts = ['fake-a', 'fake-b
     CHALDEA_EXEC_HOSTS: hostFile, CHALDEA_SSH_CONFIG: sshConfig,
     FAKE_MODES: JSON.stringify(modes), FAKE_LOG: log, FAKE_CONTROL: control, FAKE_REAL_SSH: realSsh };
   return {
+    history: (args: string[]) => collected(spawn(process.execPath, [cli, 'exec', ...args], { cwd: work, env, stdio: ['ignore', 'pipe', 'pipe'] })),
     state, hostFile, banner: () => receivedBanner,
     run: (host?: string, code: number | 'hold' = 0) => spawn(process.execPath,
       [cli, 'exec', '--no-queue', ...(host ? ['--host', host] : []), '--', process.execPath, '-e', 'console.log("ran");process.exit(' + (code === 'hold' ? 0 : code) + ')', ...(code === 'hold' ? ['hold'] : [])],
@@ -122,6 +123,10 @@ test('two fake job hosts: busy first host falls through to exactly one execution
     assert.deepEqual((await f.events()).filter(e => e.event === 'started').map(e => e.host), ['fake-b']);
     const intents = await f.intents();
     assert.equal(new Set(intents.map(i => i.jobId)).size, 2);
+    const refused = intents.find(i => i.outcome === 'refused');
+    assert.equal(refused.refusalReason, 'host refused: busy');
+    assert.match((await f.history(['show', refused.jobId])).out, /Refusal reason: host refused: busy/);
+    assert.match((await f.history(['list'])).out, /host refused: busy/);
     assert.deepEqual(intents.map(i => [i.host, i.outcome]).sort(), [['fake-a', 'refused'], ['fake-b', 'finished']]);
   } finally { await f.remove(); }
 });

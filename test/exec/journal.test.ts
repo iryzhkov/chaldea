@@ -5,7 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { record, prune, type Intent } from '../../src/exec/journal.ts';
+import { record, prune, refusalReason, type Intent } from '../../src/exec/journal.ts';
+
+test('refusal reason is bounded and single line without terminal controls', () => {
+  assert.equal(refusalReason('host busy\r\nall slots\tused\u001b'), 'host busy all slots used ');
+  assert.equal(refusalReason('x'.repeat(2048)).length, 1024);
+});
 
 test('journal survives SIGKILL after durable intent and never replays; confirmed result replaces atomically', async () => {
   const root = await fs.mkdtemp(join(tmpdir(), 'journal-'));
