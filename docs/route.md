@@ -87,7 +87,15 @@ ranking after probation-held models are withheld, so it never names a driver
 without an eligible settled candidate. When only one primary driver remains (for
 example a review, or a Claude model held by its probation share) it reads `Only
 codex has an eligible primary candidate; quota pacing comparison does not
-apply`. Executor's Codex preference, explicit
+apply`. When both remain, the line names the comparison step that ordered the
+top candidate of each primary driver in the final ranking: capacity class
+(`Quota pacing did not decide; capacity class ranks codex first (codex use-it,
+claudeAgent paced)`), expiring surplus, under-paced Claude, quota pacing,
+role objective, Slopalytics reliability, the Claude role default or instance
+order. Legacy ranking computes its pacing preference before probation-held
+models are withheld; when that differs from the settled candidates alone the
+line reads `Quota pacing including probation-held candidates prefers <driver>`.
+The line keeps its earlier position in the reasons. Executor's Codex preference, explicit
 `providerPreference` ordering and the fallback-driver rule all run before this
 comparison.
 

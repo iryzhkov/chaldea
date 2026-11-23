@@ -27,6 +27,24 @@ export interface PolicyData {
 export function capacityFor(data: Pick<PolicyData, "capacity" | "modelCapacity">, instance: string, model: string): Capacity | undefined {
   return data.modelCapacity?.get(instance)?.get(model) ?? data.capacity?.[instance];
 }
+/** The comparison step that ordered two candidates. */
+export type DecidingRule = "preference-pace" | "preference" | "executor" | "fallback" | "capacity" | "surplus" |
+  "under-paced" | "pacing" | "same-driver-pace" | "objective" | "statistics" | "role-default" | "tie-break";
+export interface PacingTrace {
+  line: string; rule: DecidingRule | null; sign: number | null; reverse: number | null;
+  top: { driver: string; providerInstanceId: string; model: string } | null;
+  other: { driver: string; providerInstanceId: string; model: string } | null;
+  ranks: [number | null, number | null] | null; preferred: string | null; settledPreferred: string | null;
+  hasPace: boolean | null; surplusLeader: string | null;
+}
+let traceSink: ((trace: PacingTrace) => void) | null = null;
+/** Test and differential hook: the pacing line with the rule that decided the final top pair. */
+export function recommendTraced(input: RouteInput, data: PolicyData): { result: RouteResult; trace: PacingTrace | null } {
+  const traces: PacingTrace[] = [];
+  traceSink = trace => traces.push(trace);
+  try { const result = recommend(input, data); return { result, trace: traces.at(-1) ?? null }; }
+  finally { traceSink = null; }
+}
 /** Pure policy. No IO, provider launch, feed posting or quota redemption. */
 export function recommend(input: RouteInput, data: PolicyData): RouteResult {
   return recommendPolicy(input, data);
@@ -202,6 +220,9 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   const held = (c: typeof candidates[number]) => !!scores && !pin &&
     inProbation(c.model, input.role, history, config, data.now, c.driver) && !trialAvailable(history, config, c.model, c.driver);
   let finalSurplusLeader: { driver: Provider; codex: number; claudeAgent: number } | null = null;
+  let pacingSlot: number | null = null;
+  const final: { ranking: { decide: (x: typeof candidates[number], y: typeof candidates[number]) => [number, DecidingRule];
+    rank: (c: typeof candidates[number]) => number | null; preferred: Provider; hasPace: boolean; settledPreferred: Provider } | null } = { ranking: null };
   const rankCandidates = (pool: typeof candidates, explain: boolean) => {
     if (explain && config.providerPreference.length) {
       for (const driver of config.providerPreference) {
@@ -240,51 +261,62 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
         ? { driver: cx.pace > cl.pace ? "codex" : "claudeAgent", codex: cx.pace, claudeAgent: cl.pace } : null;
       // The last ranking is the final one; its leader feeds the pacing reason.
       finalSurplusLeader = surplusLeader;
+      // Keep the pacing line where it has always appeared, so the published headline is unchanged.
+      if (explain) pacingSlot = reasons.length;
     };
-    const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
+    // Each step returns the order and the rule that decided it, so the explanation can cite
+    // the step that actually ordered the final top pair.
+    const quotaDecide = (x: typeof candidates[number], y: typeof candidates[number]): [number, DecidingRule] => {
       if (config.providerPreference.length) {
         // Pace demotion applies to every candidate, including same-driver pairs, so the
         // comparator stays transitive when one driver has both paced and unknown models.
         const pace = Number(aheadOfPace(x)) - Number(aheadOfPace(y));
-        if (pace) return pace;
+        if (pace) return [pace, "preference-pace"];
         const order = x.driver === y.driver ? 0 : position(x.driver) - position(y.driver);
-        if (order) return order;
+        if (order) return [order, "preference"];
       }
       if (preferCodex && (x.driver === "codex") !== (y.driver === "codex"))
-        return Number(y.driver === "codex") - Number(x.driver === "codex");
+        return [Number(y.driver === "codex") - Number(x.driver === "codex"), "executor"];
       // Fallback drivers such as Antigravity rank after every eligible primary driver.
       const fallback = (c: typeof x) => !PRIMARY_DRIVERS.includes(c.driver);
-      if (fallback(x) !== fallback(y)) return Number(fallback(x)) - Number(fallback(y));
+      if (fallback(x) !== fallback(y)) return [Number(fallback(x)) - Number(fallback(y)), "fallback"];
       const xr = rank(x), yr = rank(y);
-      if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
+      if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return [xr - yr, "capacity"];
       // Larger expiring surplus first, by driver, within the leader's tier.
       const leader = surplusLeader as { driver: Provider } | null;
       if (leader && x.driver !== y.driver && PRIMARY_DRIVERS.includes(x.driver) && PRIMARY_DRIVERS.includes(y.driver) &&
-          tier(x) !== null && tier(x) === tier(y)) return Number(y.driver === leader.driver) - Number(x.driver === leader.driver);
+          tier(x) !== null && tier(x) === tier(y)) return [Number(y.driver === leader.driver) - Number(x.driver === leader.driver), "surplus"];
       const underPaced = (c: typeof x) => c.driver === "claudeAgent" && c.pace !== null && c.pace >= config.paceMargin;
-      if (underPaced(x) !== underPaced(y)) return Number(underPaced(y)) - Number(underPaced(x));
-      if (xr !== null && yr !== null && xr !== yr) return xr - yr;
+      if (underPaced(x) !== underPaced(y)) return [Number(underPaced(y)) - Number(underPaced(x)), "under-paced"];
+      if (xr !== null && yr !== null && xr !== yr) return [xr - yr, "capacity"];
       // Unknown and paced tie, preserving the role default when Claude pacing is unknown.
       // Known quota preference takes precedence over a statistical tie-break.
-      if (hasPace && x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
-      if (x.driver === y.driver && x.pace !== y.pace) return (y.pace ?? -Infinity) - (x.pace ?? -Infinity);
+      if (hasPace && x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return [Number(y.driver === preferred) - Number(x.driver === preferred), "pacing"];
+      if (x.driver === y.driver && x.pace !== y.pace) return [(y.pace ?? -Infinity) - (x.pace ?? -Infinity), "same-driver-pace"];
       if (scores && !pin && !benchmark) {
         const xs = scoreFor(scores, x.model, effort)!, ys = scoreFor(scores, y.model, effort)!;
         const objective = compareScores(input.role, xs, ys);
-        if (objective) return objective;
+        if (objective) return [objective, "objective"];
       }
       if (usable) {
         const s = a.models[x.model], t = a.models[y.model];
         if (s && t && s.turns >= config.minimumTurns && t.turns >= config.minimumTurns) {
           const reliability = t.completionRate - s.completionRate;
-          if (reliability) return reliability;
+          if (reliability) return [reliability, "statistics"];
           if (s.minutesPerTurn !== null && t.minutesPerTurn !== null && s.minutesPerTurn !== t.minutesPerTurn)
-            return s.minutesPerTurn - t.minutesPerTurn;
+            return [s.minutesPerTurn - t.minutesPerTurn, "statistics"];
         }
       }
-      if (x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return Number(y.driver === preferred) - Number(x.driver === preferred);
-      return x.providerInstanceId.localeCompare(y.providerInstanceId);
+      if (x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return [Number(y.driver === preferred) - Number(x.driver === preferred), "role-default"];
+      return [x.providerInstanceId.localeCompare(y.providerInstanceId), "tie-break"];
     };
+    const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => quotaDecide(x, y)[0];
+    // The last ranking is the final one; the explanation replays its decision.
+    final.ranking = { decide: quotaDecide, rank, preferred, hasPace,
+      settledPreferred: (() => {
+        const settled = pool.filter(c => c.driver === "claudeAgent" && c.pace !== null && !held(c));
+        return settled.some(c => c.pace! >= config.paceMargin) ? "claudeAgent" : settled.length ? "codex" : "claudeAgent";
+      })() };
     if (benchmark) {
       // Choose the cheapest pool model/effort per driver before comparing providers.
       // Representatives keep cross-provider quota ordering independent of model price.
@@ -338,19 +370,32 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   // Never names a driver without an eligible, settled candidate.
   if (!preferCodex && !config.providerPreference.length) {
     const primaries = eligible.filter(c => PRIMARY_DRIVERS.includes(c.driver));
-    const present = [...new Set(primaries.map(c => c.driver))];
+    const top = primaries[0], other = top && primaries.find(c => c.driver !== top.driver);
+    const ranking = final.ranking!;
     const leader = finalSurplusLeader as { driver: Provider; codex: number; claudeAgent: number } | null;
-    const pacedClaude = primaries.filter(c => c.driver === "claudeAgent" && c.pace !== null);
-    const pacing: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent" : pacedClaude.length ? "codex" : "claudeAgent";
-    const winner = primaries[0]?.driver;
-    reasons.push(leader && present.length === 2
-      ? `Quota pacing prefers ${leader.driver}: larger expiring weekly surplus (codex ${leader.codex.toFixed(2)}, claudeAgent ${leader.claudeAgent.toFixed(2)})`
-      : !winner ? "No eligible primary candidate; quota pacing comparison does not apply"
-      : present.length === 1 ? `Only ${winner} has an eligible primary candidate; quota pacing comparison does not apply`
-      : !pacedClaude.length ? winner === "claudeAgent" ? "Claude pacing unknown; role default prefers Claude"
-        : `Claude pacing unknown; ${winner} ranks first on capacity class, role objective or statistics`
-      : winner === pacing ? `Quota pacing prefers ${winner}`
-      : `Quota pacing alone would prefer ${pacing}; capacity class ranks ${winner} first`);
+    let rule: DecidingRule | null = null, line: string;
+    if (!top) line = "No eligible primary candidate; quota pacing comparison does not apply";
+    else if (!other) line = `Only ${top.driver} has an eligible primary candidate; quota pacing comparison does not apply`;
+    else {
+      // Replay the final ranking's comparison of the top candidate of each primary driver.
+      rule = ranking.decide(top, other)[1];
+      const kind = (c: typeof top) => capacityFor(data, c.providerInstanceId, c.model)?.class ?? "unknown";
+      line = rule === "surplus" && leader ? `Quota pacing prefers ${leader.driver}: larger expiring weekly surplus (codex ${leader.codex.toFixed(2)}, claudeAgent ${leader.claudeAgent.toFixed(2)})`
+        : rule === "capacity" ? `Quota pacing did not decide; capacity class ranks ${top.driver} first (${top.driver} ${kind(top)}, ${other.driver} ${kind(other)})`
+        : rule === "under-paced" ? `Quota pacing prefers ${top.driver}`
+        : rule === "pacing" ? ranking.preferred === ranking.settledPreferred ? `Quota pacing prefers ${top.driver}`
+          : `Quota pacing including probation-held candidates prefers ${top.driver}`
+        : rule === "objective" ? `Quota pacing did not decide; role objective (AA scores) ranks ${top.driver} first`
+        : rule === "statistics" ? `Quota pacing did not decide; Slopalytics reliability ranks ${top.driver} first`
+        : rule === "role-default" ? `Claude pacing unknown; role default prefers ${top.driver === "claudeAgent" ? "Claude" : top.driver}`
+        : `Quota pacing did not decide; instance order ranks ${top.driver} first`;
+    }
+    reasons.splice(pacingSlot ?? reasons.length, 0, line);
+    traceSink?.({ line, rule, top: top ? { driver: top.driver, providerInstanceId: top.providerInstanceId, model: top.model } : null,
+      other: other ? { driver: other.driver, providerInstanceId: other.providerInstanceId, model: other.model } : null,
+      sign: top && other ? Math.sign(ranking.decide(top, other)[0]) : null, reverse: top && other ? Math.sign(ranking.decide(other, top)[0]) : null,
+      ranks: top && other ? [ranking.rank(top), ranking.rank(other)] : null, preferred: ranking.preferred,
+      settledPreferred: ranking.settledPreferred, hasPace: ranking.hasPace, surplusLeader: leader?.driver ?? null });
   }
   const byProvider: RouteResult["byProvider"] = Object.fromEntries([...providerReasons].map(([driver, details]) => {
     const best = eligible.find(c => c.driver === driver);
