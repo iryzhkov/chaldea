@@ -8,6 +8,7 @@ import { recommend } from "../../src/route/policy.ts";
 import type { PolicyData } from "../../src/route/policy.ts";
 import type { Role } from "../../src/route/types.ts";
 import { catalog, now, iso } from "../fixtures/route/catalog.ts";
+import { fixture } from "../fixtures/route/targets.ts";
 import { liveCodex } from "../fixtures/route/live-policy.ts";
 
 // Live omarchy-pc state on 2026-11-22, empty providerPreference: Codex weekly 93% left with 7% of
@@ -164,6 +165,48 @@ test("benchmark surplus reason names the representatives actually compared", () 
   assert.equal(r.providerInstanceId, "codex");
   assert.ok(r.reasons.includes("Quota pacing prefers codex: larger expiring weekly surplus (codex 0.40, claudeAgent 0.15)"), r.reasons.join("\n"));
 });
+for (const benchmarkMode of [false, true]) {
+  test(`a probation-held model cannot set the surplus leader (${benchmarkMode ? "benchmark" : "legacy"} routing)`, () => {
+    // Held Claude Fable pace 0.60 (trial share exhausted), settled Claude Opus 0.15, funded Codex 0.40; all use-it.
+    const f = fixture();
+    const model = (id: string, option: string) => ({ id, options: [{ id: option, type: "select", options: [{ id: "medium" }] }] });
+    const d: PolicyData = { ...f, catalog: [
+      { providerInstanceId: "held", driverKind: "claudeAgent", canRunChildTask: true, models: [model("claude-fable-5-1", "effort")] },
+      { providerInstanceId: "settled", driverKind: "claudeAgent", canRunChildTask: true, models: [model("claude-opus-5-5", "effort")] },
+      { providerInstanceId: "codex", driverKind: "codex", canRunChildTask: true, models: [model("gpt-6.1-sol", "reasoningEffort")] }] };
+    const windows = (left: number, timeLeft: number) => [weekly(left, timeLeft)];
+    const w: Record<string, Window[]> = { held: [...windows(90, .3), { ...weekly(90, .3), id: "seven_day_fable" }],
+      settled: windows(65, .5), codex: windows(90, .5) };
+    d.quota = Object.fromEntries(Object.entries(w).map(([id, windows]) => [id, { observedAt: iso(now), activeStop: false, windows }]));
+    d.capacity = Object.fromEntries(d.catalog.map(c => {
+      const p = newProvider(c.providerInstanceId, c.driverKind);
+      p.included = metric(w[c.providerInstanceId]!);
+      if (c.driverKind === "codex") {
+        p.accountKey = "a".repeat(64);
+        p.credits = metric({ hasCredits: true, balance: "10", unlimited: false });
+        p.spendControlReached = metric(false);
+      }
+      return [c.providerInstanceId, classifyCapacity(p, false, now)];
+    }));
+    for (const c of Object.values(d.capacity!)) assert.equal(c.class, "use-it");
+    if (benchmarkMode) {
+      d.scores = { version: 2, metric: "aa-intelligence-cost-per-task", indexVersion: "5", fetchedAt: iso(now), unmapped: [],
+        models: ([["claude-fable-5-1", 1], ["claude-opus-5-5", 5], ["gpt-6.1-sol", 3]] as const).map(([m, cost]) => ({ model: m, effort: "medium" as const,
+          aaSlug: m, intelligence: 60, coding: 60, inputPrice: 1, outputPrice: 1, benchmarkCostUSDPerTask: cost })) };
+      d.config = { benchmark: { indexVersion: "5" } };
+    }
+    const r = recommend({ role: "general" }, d);
+    assert.ok(r.reasons.includes("claude-fable-5-1: probation recommendation share limited to 0.1"), r.reasons.join("\n"));
+    assert.equal(r.providerInstanceId, "codex");
+    assert.deepEqual(r.alternatives.map(t => t.providerInstanceId), ["settled"]);
+    assert.ok(r.reasons.includes("Quota pacing prefers codex: larger expiring weekly surplus (codex 0.40, claudeAgent 0.15)"), r.reasons.join("\n"));
+    assert.ok(!r.reasons.some(x => x.includes("claudeAgent 0.60")));
+    // Removing the held model changes nothing.
+    const without = recommend({ role: "general" }, { ...d, catalog: d.catalog.filter(c => c.providerInstanceId !== "held") });
+    assert.equal(without.providerInstanceId, "codex");
+    assert.deepEqual(without.alternatives.map(t => t.providerInstanceId), ["settled"]);
+  });
+}
 test("unknown Claude pace keeps the role default", () => {
   // No capacity evidence at all: an under-paced Codex never overrides the Claude default.
   const bare = data([codex(93, .07), claude(null)], false);

@@ -198,6 +198,9 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   };
   // Pace is remaining fraction minus time-left fraction; below zero burns faster than linear.
   const aheadOfPace = (c: typeof candidates[number]) => c.pace !== null && c.pace < 0;
+  // A probation model whose recommendation (trial) share is exhausted is withheld after ranking.
+  const held = (c: typeof candidates[number]) => !!scores && !pin &&
+    inProbation(c.model, input.role, history, config, data.now, c.driver) && !trialAvailable(history, config, c.model, c.driver);
   const rankCandidates = (pool: typeof candidates, explain: boolean) => {
     if (explain && config.providerPreference.length) {
       for (const driver of config.providerPreference) {
@@ -299,10 +302,18 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
         const prior = representatives.get(group(c));
         if (!prior || localCompare(c, prior) < 0) representatives.set(group(c), c);
       }
-      decideLeader([...representatives.values()]);
+      // The leader's representatives come only from candidates that survive the probation
+      // share filter below, so a held model can neither set the leader nor appear in its reason.
+      const settled = new Map<string, typeof candidates[number]>();
+      for (const c of pool) {
+        if (held(c)) continue;
+        const prior = settled.get(group(c));
+        if (!prior || localCompare(c, prior) < 0) settled.set(group(c), c);
+      }
+      decideLeader([...settled.values()]);
       const groups = [...representatives.values()].sort(quotaCompare).map(group);
       pool.sort((x, y) => groups.indexOf(group(x)) - groups.indexOf(group(y)) || localCompare(x, y));
-    } else { decideLeader(pool); pool.sort(quotaCompare); }
+    } else { decideLeader(pool.filter(c => !held(c))); pool.sort(quotaCompare); }
   };
   rankCandidates(eligible, !benchmark);
   const target = (c: Target): Target => ({ ...(c.accountKey ? { accountKey: c.accountKey } : {}), providerInstanceId: c.providerInstanceId, model: c.model, options: c.options });
@@ -314,12 +325,11 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
   const topPick = target(eligible[0]);
   // Every exposed provider pick is a recommendation and obeys its trial share.
   eligible = eligible.filter(c => {
-    const held = scores && !pin && inProbation(c.model, input.role, history, config, data.now, c.driver) && !trialAvailable(history, config, c.model, c.driver);
-    if (held) {
+    if (held(c)) {
       const reason = c.model + ": probation recommendation share limited to " + config.probationShare;
       reasons.push(reason); providerReasons.get(c.driver)!.push(reason);
     }
-    return !held;
+    return !held(c);
   });
   if (!eligible[0]) throw new RouteError("no_candidate", "No settled candidate while probation share is exhausted");
   // Trial admission can replace a provider representative and its scoped quota.
