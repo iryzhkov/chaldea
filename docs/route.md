@@ -82,7 +82,22 @@ ordering consistent: adding a candidate of one driver never reorders the other
 driver's candidates. The explain output then reads, for example,
 `Quota pacing prefers codex: larger expiring weekly surplus (codex 0.86,
 claudeAgent 0.27)`. If either pace is unknown, the rules above apply unchanged,
-including the Claude default. Executor's Codex preference, explicit
+including the Claude default. The pacing reason line describes the final
+ranking after probation-held models are withheld, so it never names a driver
+without an eligible settled candidate. When only one primary driver remains (for
+example a review, or a Claude model held by its probation share) it reads `Only
+codex has an eligible primary candidate; quota pacing comparison does not
+apply`. When both remain, the line names the comparison step that ordered the
+top candidate of each primary driver in the final ranking: capacity class
+(`Quota pacing did not decide; capacity class ranks codex first (codex use-it,
+claudeAgent paced)`), expiring surplus, under-paced Claude, quota pacing,
+role objective, Slopalytics completion rate (`Quota pacing did not decide;
+Slopalytics completion rate ranks codex first (0.97 vs 0.95)`), Slopalytics speed
+(`... speed ranks codex first (1.0 vs 8.0 minutes per turn)`), the Claude role default or instance
+order. Legacy ranking computes its pacing preference before probation-held
+models are withheld; when that differs from the settled candidates alone the
+line reads `Quota pacing including probation-held candidates prefers <driver>`.
+The line keeps its earlier position in the reasons. Executor's Codex preference, explicit
 `providerPreference` ordering and the fallback-driver rule all run before this
 comparison.
 
