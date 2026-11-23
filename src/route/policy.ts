@@ -29,7 +29,7 @@ export function capacityFor(data: Pick<PolicyData, "capacity" | "modelCapacity">
 }
 /** The comparison step that ordered two candidates. */
 export type DecidingRule = "preference-pace" | "preference" | "executor" | "fallback" | "capacity" | "surplus" |
-  "under-paced" | "pacing" | "same-driver-pace" | "objective" | "statistics" | "role-default" | "tie-break";
+  "under-paced" | "pacing" | "same-driver-pace" | "objective" | "reliability" | "speed" | "role-default" | "tie-break";
 export interface PacingTrace {
   line: string; rule: DecidingRule | null; sign: number | null; reverse: number | null;
   top: { driver: string; providerInstanceId: string; model: string } | null;
@@ -302,9 +302,9 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
         const s = a.models[x.model], t = a.models[y.model];
         if (s && t && s.turns >= config.minimumTurns && t.turns >= config.minimumTurns) {
           const reliability = t.completionRate - s.completionRate;
-          if (reliability) return [reliability, "statistics"];
+          if (reliability) return [reliability, "reliability"];
           if (s.minutesPerTurn !== null && t.minutesPerTurn !== null && s.minutesPerTurn !== t.minutesPerTurn)
-            return [s.minutesPerTurn - t.minutesPerTurn, "statistics"];
+            return [s.minutesPerTurn - t.minutesPerTurn, "speed"];
         }
       }
       if (x.driver !== y.driver && (x.driver === preferred || y.driver === preferred)) return [Number(y.driver === preferred) - Number(x.driver === preferred), "role-default"];
@@ -380,13 +380,15 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       // Replay the final ranking's comparison of the top candidate of each primary driver.
       rule = ranking.decide(top, other)[1];
       const kind = (c: typeof top) => capacityFor(data, c.providerInstanceId, c.model)?.class ?? "unknown";
+      const stat = (c: typeof top) => a!.models[c.model]!;
       line = rule === "surplus" && leader ? `Quota pacing prefers ${leader.driver}: larger expiring weekly surplus (codex ${leader.codex.toFixed(2)}, claudeAgent ${leader.claudeAgent.toFixed(2)})`
         : rule === "capacity" ? `Quota pacing did not decide; capacity class ranks ${top.driver} first (${top.driver} ${kind(top)}, ${other.driver} ${kind(other)})`
         : rule === "under-paced" ? `Quota pacing prefers ${top.driver}`
         : rule === "pacing" ? ranking.preferred === ranking.settledPreferred ? `Quota pacing prefers ${top.driver}`
           : `Quota pacing including probation-held candidates prefers ${top.driver}`
         : rule === "objective" ? `Quota pacing did not decide; role objective (AA scores) ranks ${top.driver} first`
-        : rule === "statistics" ? `Quota pacing did not decide; Slopalytics reliability ranks ${top.driver} first`
+        : rule === "reliability" ? `Quota pacing did not decide; Slopalytics completion rate ranks ${top.driver} first (${stat(top).completionRate.toFixed(2)} vs ${stat(other).completionRate.toFixed(2)})`
+        : rule === "speed" ? `Quota pacing did not decide; Slopalytics speed ranks ${top.driver} first (${stat(top).minutesPerTurn!.toFixed(1)} vs ${stat(other).minutesPerTurn!.toFixed(1)} minutes per turn)`
         : rule === "role-default" ? `Claude pacing unknown; role default prefers ${top.driver === "claudeAgent" ? "Claude" : top.driver}`
         : `Quota pacing did not decide; instance order ranks ${top.driver} first`;
     }

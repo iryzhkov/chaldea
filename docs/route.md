@@ -91,7 +91,9 @@ apply`. When both remain, the line names the comparison step that ordered the
 top candidate of each primary driver in the final ranking: capacity class
 (`Quota pacing did not decide; capacity class ranks codex first (codex use-it,
 claudeAgent paced)`), expiring surplus, under-paced Claude, quota pacing,
-role objective, Slopalytics reliability, the Claude role default or instance
+role objective, Slopalytics completion rate (`Quota pacing did not decide;
+Slopalytics completion rate ranks codex first (0.97 vs 0.95)`), Slopalytics speed
+(`... speed ranks codex first (1.0 vs 8.0 minutes per turn)`), the Claude role default or instance
 order. Legacy ranking computes its pacing preference before probation-held
 models are withheld; when that differs from the settled candidates alone the
 line reads `Quota pacing including probation-held candidates prefers <driver>`.

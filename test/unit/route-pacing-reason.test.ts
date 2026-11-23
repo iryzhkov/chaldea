@@ -58,6 +58,23 @@ test("the pacing line cites the rule that ordered the final top pair, including 
   // The pacing line keeps its historical position, so the published headline does not change.
   assert.ok(r.reasons.indexOf(pacingLines(r.reasons)[0]!) < r.reasons.indexOf("claude-opus-5-5: probation recommendation share limited to 0.1"));
 });
+test("Slopalytics completion rate and speed decisions cite the metric that decided", () => {
+  const stats = (completionRate: number, minutesPerTurn: number) => ({ turns: 100, completionRate, failedRate: .03, interruptedRate: .02, minutesPerTurn });
+  const route = (claude: ReturnType<typeof stats>, codex: ReturnType<typeof stats>) => {
+    const f = fixture();
+    return recommendTraced({ role: "builder" }, { ...f, scores: null, quota: {},
+      analytics: { ...f.analytics, models: { ...f.analytics.models, "claude-opus-5-5": claude, "gpt-6.1-sol": codex } } });
+  };
+  // Reviewer repro: equal completion rate, Claude 8 minutes per turn, Codex 1.
+  const speed = route(stats(.95, 8), stats(.95, 1));
+  assert.equal(speed.result.providerInstanceId, "codex");
+  assert.equal(speed.trace?.rule, "speed");
+  assert.deepEqual(pacingLines(speed.result.reasons), ["Quota pacing did not decide; Slopalytics speed ranks codex first (1.0 vs 8.0 minutes per turn)"]);
+  const reliability = route(stats(.95, 1), stats(.97, 8));
+  assert.equal(reliability.result.providerInstanceId, "codex");
+  assert.equal(reliability.trace?.rule, "reliability");
+  assert.deepEqual(pacingLines(reliability.result.reasons), ["Quota pacing did not decide; Slopalytics completion rate ranks codex first (0.97 vs 0.95)"]);
+});
 test("a review route names only the provider it may use", () => {
   const r = recommend({ role: "builder", authorProvider: "claudeAgent" }, { ...fixture(), quota: {} });
   assert.equal(r.providerInstanceId, "codex");
