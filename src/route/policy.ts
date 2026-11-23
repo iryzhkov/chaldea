@@ -213,7 +213,15 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
     const preferred: Provider = pacedClaude.some(c => c.pace! >= config.paceMargin) ? "claudeAgent"
       : pacedClaude.length ? "codex" : "claudeAgent";
     const hasPace = pacedClaude.length > 0;
-    if (explain && !preferCodex && !config.providerPreference.length) reasons.push(hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
+    // Under-paced (pace >= paceMargin) quota expires unused at its reset. When two primary
+    // drivers both have it, the larger expiring surplus (pace) goes first, regardless of driver.
+    const surplus = (c: typeof candidates[number]) => PRIMARY_DRIVERS.includes(c.driver) && c.pace !== null && c.pace >= config.paceMargin;
+    const best = (driver: string) => Math.max(-Infinity, ...pool.filter(c => c.driver === driver && surplus(c)).map(c => c.pace!));
+    const surplusLeader = best("claudeAgent") > -Infinity && best("codex") > -Infinity && best("claudeAgent") !== best("codex")
+      ? (best("codex") > best("claudeAgent") ? "codex" : "claudeAgent") : null;
+    if (explain && !preferCodex && !config.providerPreference.length) reasons.push(surplusLeader
+      ? `Quota pacing prefers ${surplusLeader}: larger expiring weekly surplus (codex ${best("codex").toFixed(2)}, claudeAgent ${best("claudeAgent").toFixed(2)})`
+      : hasPace ? `Quota pacing prefers ${preferred}` : "Claude pacing unknown; role default prefers Claude");
     const quotaCompare = (x: typeof candidates[number], y: typeof candidates[number]) => {
       if (config.providerPreference.length) {
         // Pace demotion applies to every candidate, including same-driver pairs, so the
@@ -235,6 +243,10 @@ function recommendPolicy(input: RouteInput, data: PolicyData, retainOverrideScor
       };
       const xr = rank(x), yr = rank(y);
       if (xr !== null && yr !== null && xr !== yr && (xr === 0 || yr === 0)) return xr - yr;
+      // Both use-it or both under-paced primary drivers: larger expiring surplus first.
+      if (x.driver !== y.driver && PRIMARY_DRIVERS.includes(x.driver) && PRIMARY_DRIVERS.includes(y.driver) &&
+          x.pace !== null && y.pace !== null && x.pace !== y.pace &&
+          (xr === 0 && yr === 0 || surplus(x) && surplus(y))) return y.pace - x.pace;
       const underPaced = (c: typeof x) => c.driver === "claudeAgent" && c.pace !== null && c.pace >= config.paceMargin;
       if (underPaced(x) !== underPaced(y)) return Number(underPaced(y)) - Number(underPaced(x));
       if (xr !== null && yr !== null && xr !== yr) return xr - yr;

@@ -71,6 +71,16 @@ fraction minus fraction of native window time left is at least 0.10; otherwise
 it prefers Codex. Missing/stale pacing keeps the role default unless capacity
 preference or usable Slopalytics statistics decide the comparison.
 
+When Claude and Codex candidates are both use-it, or both under-paced (known
+pace at least 0.10), the larger expiring surplus goes first regardless of
+driver. The surplus is the candidate's pace: remaining fraction minus the
+fraction of the window's time left. The explain output then reads, for example,
+`Quota pacing prefers codex: larger expiring weekly surplus (codex 0.86,
+claudeAgent 0.27)`. If either pace is unknown, the rules above apply unchanged,
+including the Claude default. Executor's Codex preference, explicit
+`providerPreference` ordering and the fallback-driver rule all run before this
+comparison.
+
 The observer keeps up to 288 previous window observations per provider, sampled
 at least five minutes apart and retained for 48 hours, with a 16 KiB per-provider
 history budget. Burn uses the most recent
@@ -110,7 +120,14 @@ observer holds fresh, positive, unexpired, account-bound Codex credits and a fre
 `creditFunded: true`, even if included quota is exhausted, short included windows
 are gated, or the provider reports that ordinary included usage is not allowed.
 Routing then ranks it like any unlimited provider: ahead of paced Claude, behind
-use-it capacity and under-paced Claude. Review separation, bans, pins, quality
+use-it capacity and under-paced Claude. Credits are drawn only after included
+usage, so when the included lane is open (no short-window gate, ordinary usage
+not denied) and its weekly window is under-paced (pace at least 0.10, not under
+the minimum remaining), the credit-funded lane is classified use-it instead: the
+included quota would otherwise expire unused at the native reset. It keeps
+`creditFunded: true` and the credit-funded reason text, so short included
+windows still do not gate it. An ahead-of-pace or exhausted included window
+keeps it unlimited. Review separation, bans, pins, quality
 floors and catalog effort checks still apply. Without that proof, the included
 lane decides: a fresh ordinary-usage denial is tight, short gates exclude the
 account, and a fresh `spendControlReached: true` means credits add no capacity.
