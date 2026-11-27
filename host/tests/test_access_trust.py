@@ -67,7 +67,13 @@ def fake_commands(monkeypatch, config, *, failure=None, size=6):
             data = b"signed"
         return subprocess.CompletedProcess(args, 0, data, b"")
 
+    def run_git(args, env, timeout=fetcher.GIT_TIMEOUT, pass_fds=()):
+        # The state lock is the only descriptor Git may inherit.
+        assert len(pass_fds) == 1
+        return run(args, env=env, check=True, timeout=timeout).stdout
+
     monkeypatch.setattr(fetcher.subprocess, "run", run)
+    monkeypatch.setattr(fetcher, "run_git", run_git)
     return calls
 
 
