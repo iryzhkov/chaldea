@@ -1,17 +1,28 @@
 #!/usr/bin/env python3
 """Fetch signed bytes only; never check out or execute remote repository content."""
+import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shlex
+import signal
 import stat
 import subprocess
 import sys
+import time
 
 REMOTE = "ssh://git@github.com/iryzhkov/chaldea-trust.git"
 REF = "refs/heads/trust-source"
 BUNDLE = "bundle.jws"
 MAX_BUNDLE = 262144
+GIT_TIMEOUT = 20
+# Git removes its own lock files on SIGTERM; SIGKILL only follows if it ignores that.
+GIT_TERM_GRACE = 5
+# Longer than any single bounded Git run, so a lock this old has no live writer.
+STALE_LOCK_AGE = 60
+STDERR_LINES = 4
+STDERR_WIDTH = 240
 
 
 def trusted(path, private=False):
@@ -33,6 +44,80 @@ def trusted_runtime(path):
             raise ValueError("runtime and ancestors must be immutable root-owned paths")
 
 
+def signal_group(proc, signum):
+    try:
+        os.killpg(proc.pid, signum)
+    except ProcessLookupError:
+        pass
+
+
+def run_git(argv, env, timeout=GIT_TIMEOUT, pass_fds=()):
+    """Run Git in its own process group and stop it gracefully on timeout.
+
+    A plain SIGKILL leaves shallow.lock and ref locks behind and every later
+    fetch fails; SIGTERM lets Git remove them before it exits.
+    """
+    with subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, start_new_session=True,
+                          pass_fds=pass_fds) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            signal_group(proc, signal.SIGTERM)
+            try:
+                out, err = proc.communicate(timeout=GIT_TERM_GRACE)
+            except subprocess.TimeoutExpired:
+                signal_group(proc, signal.SIGKILL)
+                out, err = proc.communicate()
+            raise subprocess.TimeoutExpired(argv, timeout, output=out, stderr=err) from None
+    if proc.returncode:
+        raise subprocess.CalledProcessError(proc.returncode, argv, out, err)
+    return out
+
+
+def clear_stale_locks(cache, now=None):
+    """Remove Git lock files left by a killed run.
+
+    The caller holds the exclusive state lock, which every Git run started by
+    this fetcher inherits, so no fetcher Git process can still own a lock. The
+    age bound additionally spares a lock held by an operator's concurrent Git.
+    """
+    try:
+        if not stat.S_ISDIR(cache.lstat().st_mode):
+            return []
+    except FileNotFoundError:
+        return []
+    now = time.time() if now is None else now
+    removed = []
+    for directory, _, names in os.walk(cache):
+        for name in names:
+            if not name.endswith(".lock"):
+                continue
+            path = Path(directory) / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or now - info.st_mtime < STALE_LOCK_AGE:
+                continue
+            path.unlink(missing_ok=True)
+            removed.append(str(path.relative_to(cache)))
+    if removed:
+        print("chaldea trust: removed stale transport cache lock(s): " + ", ".join(sorted(removed)),
+              file=sys.stderr)
+    return removed
+
+
+def lock_state(state):
+    fd = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RuntimeError("another trust update holds the state lock") from None
+    return fd
+
+
 def fetch(config):
     if config["repository"] != REMOTE or config["bundle_path"] != BUNDLE:
         raise ValueError("trust transport pin mismatch")
@@ -45,6 +130,14 @@ def fetch(config):
         raise ValueError("unsafe state")
     trusted(config["key"], private=True)
     trusted(config["known_hosts"])
+    lock = lock_state(state)
+    try:
+        install(config, state, lock)
+    finally:
+        os.close(lock)
+
+
+def install(config, state, lock):
     cache = state / "git"
     env = {
         "PATH": "/usr/bin:/bin", "HOME": str(state), "TMPDIR": str(state),
@@ -62,15 +155,16 @@ def fetch(config):
     }
 
     def git(*args):
-        return subprocess.run([
+        # Git inherits the state lock so it stays held while any Git child lives.
+        return run_git([
             "/usr/bin/git", "-c", "core.hooksPath=/dev/null", "-c", "gc.auto=0",
             "-c", "protocol.allow=never", "-c", "protocol.ssh.allow=always",
             *args,
-        ], env=env, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=20).stdout
+        ], env=env, pass_fds=(lock,))
 
     if not cache.exists():
         git("init", "--bare", "--template=", str(cache))
+    clear_stale_locks(cache)
     git("--git-dir=" + str(cache), "fetch", "--depth=1", "--no-tags",
         "--no-recurse-submodules", REMOTE, "+refs/heads/main:" + REF)
     commit = git("--git-dir=" + str(cache), "rev-parse", "--verify", REF).decode().strip()
@@ -107,8 +201,67 @@ def fetch(config):
     try:
         git("--git-dir=" + str(cache), "reflog", "expire", "--expire=now", "--all")
         git("--git-dir=" + str(cache), "gc", "--prune=now", "--quiet")
-    except (subprocess.SubprocessError, OSError):
-        print("chaldea trust: transport cache housekeeping failed", file=sys.stderr)
+    except (subprocess.SubprocessError, OSError) as error:
+        print("chaldea trust: transport cache housekeeping failed: " + describe(error),
+              file=sys.stderr)
+
+
+def git_subcommand(argv):
+    args = iter(argv[1:])
+    for arg in args:
+        if arg == "-c":
+            next(args, None)
+        elif not arg.startswith("-"):
+            return arg
+    return "command"
+
+
+UNSAFE_STDERR = re.compile(r"PRIVATE KEY|BEGIN [A-Z ]*KEY|^[A-Za-z0-9+/=]{60,}$")
+
+
+def stderr_excerpt(raw):
+    """Return the decisive Git stderr lines as printable ASCII, or nothing.
+
+    The window ends just after the first fatal or error line, because Git
+    follows it with generic advice; ssh's own reason comes just before it.
+    Git and ssh report paths, refs and host key fingerprints here, never the
+    deploy key; anything resembling key material withholds the whole excerpt.
+    """
+    if not raw:
+        return ""
+    text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+    lines = []
+    for line in text.replace("\r", "\n").splitlines():
+        line = "".join(c if " " <= c <= "~" else "?" for c in line).strip()
+        if UNSAFE_STDERR.search(line):
+            return "(stderr withheld)"
+        if line:
+            lines.append(line[:STDERR_WIDTH])
+    decisive = next((i for i, line in enumerate(lines)
+                     if line.startswith(("fatal:", "error:"))), None)
+    if decisive is not None:
+        lines = lines[max(0, decisive - 2):decisive + 2]
+    return " | ".join(lines[-STDERR_LINES:])
+
+
+def describe(error):
+    """A failure summary that never includes signed inputs or credentials."""
+    if isinstance(error, (subprocess.CalledProcessError, subprocess.TimeoutExpired)):
+        argv = error.cmd if isinstance(error.cmd, (list, tuple)) else []
+        if argv and argv[0] == "/usr/bin/git":
+            name = "git " + git_subcommand(argv)
+            excerpt = stderr_excerpt(error.stderr)
+        else:
+            # The installer writes its own diagnostics straight to the journal.
+            name, excerpt = "installer", ""
+        if isinstance(error, subprocess.TimeoutExpired):
+            summary = "%s timed out after %s s" % (name, error.timeout)
+        else:
+            summary = "%s exited %s" % (name, error.returncode)
+        return summary + (": " + excerpt if excerpt else "")
+    if isinstance(error, (ValueError, RuntimeError)) and not isinstance(error, UnicodeError):
+        return str(error)[:STDERR_WIDTH]
+    return type(error).__name__
 
 
 def main():
@@ -123,8 +276,9 @@ def main():
         trusted(sys.argv[1])
         config = json.loads(Path(sys.argv[1]).read_text())
         fetch(config)
-    except Exception:
-        # Do not expose credentials, signed inputs or subprocess output on failure.
+    except Exception as error:
+        # Report only the sanitized cause: never credentials, signed inputs or stdout.
+        print("chaldea trust: " + describe(error), file=sys.stderr)
         print("chaldea trust: update failed; cached signed expiry is unchanged", file=sys.stderr)
         return 1
     return 0
