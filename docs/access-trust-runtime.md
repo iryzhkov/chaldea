@@ -25,6 +25,16 @@ own read-only deploy key and pinned SSH host key. The byte-only downloader never
 checks out or executes remote code. Signature verification uses an independently
 pinned Ed25519 deployment anchor; transport credentials cannot grant authority.
 
+The downloader owns its private Git cache (`<state>/git`). Each run takes an
+exclusive `flock` on the state directory, which every Git it starts inherits, and
+then deletes `*.lock` files in the cache older than 60 s as remnants of a killed
+run. On timeout Git gets SIGTERM, so it can drop its own locks, and SIGKILL only
+5 s later. Any manual Git command in the cache must hold the same lock, for example
+`sudo flock /var/lib/chaldea-access-trust git --git-dir=/var/lib/chaldea-access-trust/git ...`;
+a lock that an unlocked command has held for 60 s would be treated as abandoned.
+On failure the journal shows the failing Git subcommand and a sanitized excerpt of
+its stderr before the generic `update failed` line.
+
 install-bundle requires explicitly initialized private state and fresh host clock
 evidence. It calls TrustStore.install then atomically replaces the public file.
 An updater crash after the state commit is recovered by retrying the identical envelope.

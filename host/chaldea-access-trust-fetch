@@ -78,9 +78,11 @@ def run_git(argv, env, timeout=GIT_TIMEOUT, pass_fds=()):
 def clear_stale_locks(cache, now=None):
     """Remove Git lock files left by a killed run.
 
-    The caller holds the exclusive state lock, which every Git run started by
-    this fetcher inherits, so no fetcher Git process can still own a lock. The
-    age bound additionally spares a lock held by an operator's concurrent Git.
+    The cache belongs to this fetcher. The caller holds the exclusive state
+    lock, which every Git it starts inherits, so no fetcher Git process can
+    still own a lock. A manual Git command in the cache must hold the same lock
+    (flock(1) on the state directory); the age bound only spares a brief
+    unlocked one, because age alone cannot prove a lock is abandoned.
     """
     try:
         if not stat.S_ISDIR(cache.lstat().st_mode):

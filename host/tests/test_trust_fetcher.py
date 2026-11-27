@@ -229,6 +229,47 @@ class FetcherTest(unittest.TestCase):
             self.fetch()
         self.assertEqual(self.calls, [])
 
+    def test_git_keeps_the_state_lock_after_the_fetcher_dies(self):
+        ready = self.root / "ready"
+        child = (
+            "import importlib.machinery, importlib.util, sys\n"
+            "loader = importlib.machinery.SourceFileLoader('f', sys.argv[1])\n"
+            "f = importlib.util.module_from_spec(importlib.util.spec_from_loader('f', loader))\n"
+            "loader.exec_module(f)\n"
+            "lock = f.lock_state(sys.argv[2])\n"
+            "f.run_git(['/bin/sh', '-c', ': > \"$0\"; exec sleep 3', sys.argv[3]],"
+            " env={'PATH': '/usr/bin:/bin'}, pass_fds=(lock,))\n")
+        fetcher_process = subprocess.Popen(
+            [sys.executable, "-c", child, str(ROOT / "chaldea-access-trust-fetch"),
+             str(self.root), str(ready)])
+        self.addCleanup(fetcher_process.wait)
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        fetcher_process.kill()
+        fetcher_process.wait()
+        # The orphaned Git-like child still holds the inherited lock ...
+        with self.assertRaisesRegex(RuntimeError, "state lock"):
+            fetcher.lock_state(self.root)
+        # ... and releases it when it exits.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                os.close(fetcher.lock_state(self.root))
+                break
+            except RuntimeError:
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.1)
+
+    def test_git_ignoring_sigterm_is_killed_after_the_grace_period(self):
+        started = time.monotonic()
+        with mock.patch.object(fetcher, "GIT_TERM_GRACE", 0.5), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            fetcher.run_git(["/bin/sh", "-c", "trap '' TERM; sleep 30"],
+                            env=dict(os.environ), timeout=0.5)
+        self.assertLess(time.monotonic() - started, 10)
+
     def test_git_stderr_is_sanitized(self):
         argv = ["/usr/bin/git", "-c", "gc.auto=0", "--git-dir=/state/git", "fetch", "--depth=1"]
         error = subprocess.CalledProcessError(
